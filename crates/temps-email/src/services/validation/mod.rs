@@ -38,11 +38,6 @@ impl std::fmt::Debug for ProxyConfig {
     }
 }
 
-const PROXY_HOST_ENV: &str = "TEMPS_EMAIL_VALIDATION_PROXY_HOST";
-const PROXY_PORT_ENV: &str = "TEMPS_EMAIL_VALIDATION_PROXY_PORT";
-const PROXY_USERNAME_ENV: &str = "TEMPS_EMAIL_VALIDATION_PROXY_USERNAME";
-const PROXY_PASSWORD_ENV: &str = "TEMPS_EMAIL_VALIDATION_PROXY_PASSWORD";
-
 /// Configuration for the validation service.
 #[derive(Debug, Clone, Default)]
 pub struct ValidationConfig {
@@ -52,57 +47,6 @@ pub struct ValidationConfig {
     pub from_email: Option<String>,
     /// Name announced in the SMTP `EHLO` command.
     pub hello_name: Option<String>,
-}
-
-impl ValidationConfig {
-    /// Load SMTP validation settings controlled by the Temps operator.
-    pub fn from_env() -> Result<Self, EmailError> {
-        Self::from_lookup(|name| std::env::var(name).ok())
-    }
-
-    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, EmailError> {
-        let host = lookup(PROXY_HOST_ENV);
-        let port = lookup(PROXY_PORT_ENV);
-        let username = lookup(PROXY_USERNAME_ENV);
-        let password = lookup(PROXY_PASSWORD_ENV);
-
-        let proxy = match (host, port) {
-            (None, None) if username.is_none() && password.is_none() => None,
-            (Some(host), Some(port)) => {
-                let port = port.parse::<u16>().map_err(|source| {
-                    EmailError::InvalidValidationProxyPort {
-                        variable: PROXY_PORT_ENV,
-                        value: port.clone(),
-                        source,
-                    }
-                })?;
-                if username.is_some() != password.is_some() {
-                    return Err(EmailError::InvalidValidationProxyConfig {
-                        reason: format!(
-                            "{PROXY_USERNAME_ENV} and {PROXY_PASSWORD_ENV} must be set together"
-                        ),
-                    });
-                }
-                Some(ProxyConfig {
-                    host,
-                    port,
-                    username,
-                    password,
-                })
-            }
-            _ => {
-                return Err(EmailError::InvalidValidationProxyConfig {
-                    reason: format!("{PROXY_HOST_ENV} and {PROXY_PORT_ENV} must be set together"),
-                });
-            }
-        };
-
-        Ok(Self {
-            proxy,
-            from_email: lookup("TEMPS_EMAIL_VALIDATION_FROM_EMAIL"),
-            hello_name: lookup("TEMPS_EMAIL_VALIDATION_HELLO_NAME"),
-        })
-    }
 }
 
 /// Request to validate a single email address.
@@ -491,51 +435,6 @@ mod tests {
     fn test_config_default() {
         let c = ValidationConfig::default();
         assert!(c.proxy.is_none() && c.from_email.is_none() && c.hello_name.is_none());
-    }
-
-    #[test]
-    fn test_config_loads_operator_proxy() {
-        let values = std::collections::HashMap::from([
-            (PROXY_HOST_ENV, "proxy.example.com"),
-            (PROXY_PORT_ENV, "1080"),
-            (PROXY_USERNAME_ENV, "smtp-user"),
-            (PROXY_PASSWORD_ENV, "secret"),
-            ("TEMPS_EMAIL_VALIDATION_FROM_EMAIL", "probe@example.com"),
-            ("TEMPS_EMAIL_VALIDATION_HELLO_NAME", "mx.example.com"),
-        ]);
-        let config = ValidationConfig::from_lookup(|name| {
-            values.get(name).map(|value| (*value).to_string())
-        })
-        .expect("complete operator proxy configuration should load");
-
-        let proxy = config.proxy.expect("proxy should be configured");
-        assert_eq!(proxy.host, "proxy.example.com");
-        assert_eq!(proxy.port, 1080);
-        assert_eq!(proxy.username.as_deref(), Some("smtp-user"));
-        assert_eq!(proxy.password.as_deref(), Some("secret"));
-        assert_eq!(config.from_email.as_deref(), Some("probe@example.com"));
-        assert_eq!(config.hello_name.as_deref(), Some("mx.example.com"));
-    }
-
-    #[test]
-    fn test_config_rejects_partial_or_invalid_proxy() {
-        for values in [
-            std::collections::HashMap::from([(PROXY_HOST_ENV, "proxy.example.com")]),
-            std::collections::HashMap::from([
-                (PROXY_HOST_ENV, "proxy.example.com"),
-                (PROXY_PORT_ENV, "not-a-port"),
-            ]),
-            std::collections::HashMap::from([
-                (PROXY_HOST_ENV, "proxy.example.com"),
-                (PROXY_PORT_ENV, "1080"),
-                (PROXY_USERNAME_ENV, "smtp-user"),
-            ]),
-        ] {
-            let result = ValidationConfig::from_lookup(|name| {
-                values.get(name).map(|value| (*value).to_string())
-            });
-            assert!(result.is_err(), "invalid proxy values must fail startup");
-        }
     }
 
     #[test]

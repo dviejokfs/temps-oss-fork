@@ -37,17 +37,6 @@ pub enum EmailError {
     #[error("Configuration error: {0}")]
     Configuration(String),
 
-    #[error("Invalid email validation proxy configuration: {reason}")]
-    InvalidValidationProxyConfig { reason: String },
-
-    #[error("Invalid port in {variable}: {value}")]
-    InvalidValidationProxyPort {
-        variable: &'static str,
-        value: String,
-        #[source]
-        source: std::num::ParseIntError,
-    },
-
     #[error("AWS SES error: {0}")]
     AwsSes(String),
 

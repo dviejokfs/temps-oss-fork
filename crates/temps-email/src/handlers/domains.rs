@@ -56,8 +56,6 @@ impl From<EmailError> for Problem {
             | EmailError::Encryption(_)
             | EmailError::Decryption(_)
             | EmailError::Configuration(_)
-            | EmailError::InvalidValidationProxyConfig { .. }
-            | EmailError::InvalidValidationProxyPort { .. }
             | EmailError::AwsSes(_)
             | EmailError::Scaleway(_)
             | EmailError::ScalewayClientBuild { .. }

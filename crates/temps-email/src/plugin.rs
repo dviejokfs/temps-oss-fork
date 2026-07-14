@@ -70,15 +70,8 @@ impl TempsPlugin for EmailPlugin {
             ));
             context.register_service(email_service.clone());
 
-            // SMTP proxy credentials are read only from operator-owned process
-            // configuration; API callers cannot choose a network route.
-            let validation_config = ValidationConfig::from_env().map_err(|error| {
-                PluginError::PluginRegistrationFailed {
-                    plugin_name: "email".to_string(),
-                    error: error.to_string(),
-                }
-            })?;
-            let validation_service = Arc::new(ValidationService::new(validation_config));
+            // API callers cannot choose a control-plane network path.
+            let validation_service = Arc::new(ValidationService::new(ValidationConfig::default()));
             context.register_service(validation_service.clone());
 
             // Get AuditService dependency from other plugins
