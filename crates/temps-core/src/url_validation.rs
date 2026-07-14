@@ -39,6 +39,9 @@ pub enum UrlValidationError {
     #[error("Unspecified addresses are not allowed")]
     UnspecifiedIp,
 
+    #[error("Reserved or non-global addresses are not allowed")]
+    ReservedIp,
+
     #[error("DNS resolution failed: {0}")]
     DnsResolutionFailed(String),
 
@@ -268,6 +271,21 @@ pub fn validate_ipv4(ip: &Ipv4Addr) -> Result<(), UrlValidationError> {
         return Err(UrlValidationError::UnspecifiedIp);
     }
 
+    // Reject special-use ranges that may be routed internally by the host,
+    // cloud provider, VPN, or container network. These are not globally
+    // reachable destinations and must never be accepted by an external-only
+    // SSRF allowlist.
+    let octets = ip.octets();
+    let is_reserved = octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1])) // RFC 6598 CGNAT
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // IETF protocols
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99) // deprecated 6to4 relay
+        || (octets[0] == 198 && (18..=19).contains(&octets[1])) // benchmarking
+        || octets[0] >= 240; // reserved for future use
+    if is_reserved {
+        return Err(UrlValidationError::ReservedIp);
+    }
+
     Ok(())
 }
 
@@ -281,6 +299,14 @@ pub fn validate_ipv4(ip: &Ipv4Addr) -> Result<(), UrlValidationError> {
 /// - Unspecified (::)
 /// - IPv6 cloud metadata (fd00:ec2::254 for AWS)
 pub fn validate_ipv6(ip: &Ipv6Addr) -> Result<(), UrlValidationError> {
+    // IPv4-compatible and IPv4-mapped IPv6 addresses are routed through the
+    // embedded IPv4 destination by operating systems. Validate that embedded
+    // address with the IPv4 policy so forms such as ::ffff:127.0.0.1 cannot
+    // bypass loopback/private/cloud-metadata checks.
+    if let Some(ipv4) = ip.to_ipv4() {
+        return validate_ipv4(&ipv4);
+    }
+
     // Check for cloud metadata (AWS IPv6)
     if is_cloud_metadata_ipv6(ip) {
         return Err(UrlValidationError::CloudMetadata);
@@ -299,6 +325,12 @@ pub fn validate_ipv6(ip: &Ipv6Addr) -> Result<(), UrlValidationError> {
     // Check for unique local addresses (fc00::/7) - similar to IPv4 private addresses
     if is_unique_local_ipv6(ip) {
         return Err(UrlValidationError::PrivateIp);
+    }
+
+    // Deprecated site-local addresses (fec0::/10) may still be routed by
+    // internal networks and are never valid external destinations.
+    if (ip.segments()[0] & 0xffc0) == 0xfec0 {
+        return Err(UrlValidationError::ReservedIp);
     }
 
     // Check for multicast (ff00::/8)
@@ -619,6 +651,15 @@ mod tests {
 
         // Invalid unspecified
         assert!(validate_ipv4(&Ipv4Addr::new(0, 0, 0, 0)).is_err());
+
+        // Invalid special-use/non-global ranges
+        assert!(validate_ipv4(&Ipv4Addr::new(0, 1, 2, 3)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(100, 64, 0, 1)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(100, 127, 255, 254)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(192, 0, 0, 1)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(192, 88, 99, 1)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(198, 18, 0, 1)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(240, 0, 0, 1)).is_err());
     }
 
     #[test]
@@ -638,6 +679,15 @@ mod tests {
         // Invalid unique local (fc00::/7)
         assert!(validate_ipv6(&"fc00::1".parse::<Ipv6Addr>().unwrap()).is_err());
         assert!(validate_ipv6(&"fd00::1".parse::<Ipv6Addr>().unwrap()).is_err());
+
+        // IPv4-mapped/compatible forms must inherit the IPv4 policy.
+        assert!(validate_ipv6(&"::ffff:127.0.0.1".parse::<Ipv6Addr>().unwrap()).is_err());
+        assert!(validate_ipv6(&"::ffff:10.0.0.5".parse::<Ipv6Addr>().unwrap()).is_err());
+        assert!(validate_ipv6(&"::ffff:169.254.169.254".parse::<Ipv6Addr>().unwrap()).is_err());
+        assert!(validate_ipv6(&"::ffff:100.64.0.1".parse::<Ipv6Addr>().unwrap()).is_err());
+
+        // Deprecated site-local addresses are internal-only.
+        assert!(validate_ipv6(&"fec0::1".parse::<Ipv6Addr>().unwrap()).is_err());
     }
 
     #[test]

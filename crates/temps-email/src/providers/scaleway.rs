@@ -35,9 +35,7 @@ impl ScalewayProvider {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| {
-                EmailError::Scaleway(format!("Failed to build Scaleway HTTP client: {}", e))
-            })?;
+            .map_err(|source| EmailError::ScalewayClientBuild { source })?;
 
         Ok(Self {
             client,

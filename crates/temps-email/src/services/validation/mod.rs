@@ -18,7 +18,7 @@ use tracing::{debug, info};
 use crate::errors::EmailError;
 
 /// SOCKS5 proxy configuration for routing SMTP probes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub host: String,
     pub port: u16,
@@ -26,10 +26,27 @@ pub struct ProxyConfig {
     pub password: Option<String>,
 }
 
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProxyConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
+
+const PROXY_HOST_ENV: &str = "TEMPS_EMAIL_VALIDATION_PROXY_HOST";
+const PROXY_PORT_ENV: &str = "TEMPS_EMAIL_VALIDATION_PROXY_PORT";
+const PROXY_USERNAME_ENV: &str = "TEMPS_EMAIL_VALIDATION_PROXY_USERNAME";
+const PROXY_PASSWORD_ENV: &str = "TEMPS_EMAIL_VALIDATION_PROXY_PASSWORD";
+
 /// Configuration for the validation service.
 #[derive(Debug, Clone, Default)]
 pub struct ValidationConfig {
-    /// SOCKS5 proxy applied to every probe (per-request proxy overrides it).
+    /// Operator-configured SOCKS5 proxy applied to every probe.
     pub proxy: Option<ProxyConfig>,
     /// Envelope sender used in `MAIL FROM` during SMTP probing.
     pub from_email: Option<String>,
@@ -37,12 +54,61 @@ pub struct ValidationConfig {
     pub hello_name: Option<String>,
 }
 
+impl ValidationConfig {
+    /// Load SMTP validation settings controlled by the Temps operator.
+    pub fn from_env() -> Result<Self, EmailError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, EmailError> {
+        let host = lookup(PROXY_HOST_ENV);
+        let port = lookup(PROXY_PORT_ENV);
+        let username = lookup(PROXY_USERNAME_ENV);
+        let password = lookup(PROXY_PASSWORD_ENV);
+
+        let proxy = match (host, port) {
+            (None, None) if username.is_none() && password.is_none() => None,
+            (Some(host), Some(port)) => {
+                let port = port.parse::<u16>().map_err(|source| {
+                    EmailError::InvalidValidationProxyPort {
+                        variable: PROXY_PORT_ENV,
+                        value: port.clone(),
+                        source,
+                    }
+                })?;
+                if username.is_some() != password.is_some() {
+                    return Err(EmailError::InvalidValidationProxyConfig {
+                        reason: format!(
+                            "{PROXY_USERNAME_ENV} and {PROXY_PASSWORD_ENV} must be set together"
+                        ),
+                    });
+                }
+                Some(ProxyConfig {
+                    host,
+                    port,
+                    username,
+                    password,
+                })
+            }
+            _ => {
+                return Err(EmailError::InvalidValidationProxyConfig {
+                    reason: format!("{PROXY_HOST_ENV} and {PROXY_PORT_ENV} must be set together"),
+                });
+            }
+        };
+
+        Ok(Self {
+            proxy,
+            from_email: lookup("TEMPS_EMAIL_VALIDATION_FROM_EMAIL"),
+            hello_name: lookup("TEMPS_EMAIL_VALIDATION_HELLO_NAME"),
+        })
+    }
+}
+
 /// Request to validate a single email address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidateEmailRequest {
     pub email: String,
-    /// Optional per-request SOCKS5 proxy (overrides the service default).
-    pub proxy: Option<ProxyConfig>,
 }
 
 /// Overall deliverability verdict.
@@ -214,7 +280,6 @@ impl ValidationService {
         }
 
         // ── Stage 4: SMTP probe ─────────────────────────────────────────
-        let proxy = request.proxy.as_ref().or(self.config.proxy.as_ref());
         let from_email = self
             .config
             .from_email
@@ -228,7 +293,8 @@ impl ValidationService {
             from_email,
             hello_name,
             timeout: Duration::from_secs(10),
-            proxy,
+            deadline: Duration::from_secs(30),
+            proxy: self.config.proxy.as_ref(),
         })
         .await;
 
@@ -264,10 +330,7 @@ impl ValidationService {
     ) -> Result<Vec<ValidateEmailResponse>, EmailError> {
         let mut results = Vec::with_capacity(emails.len());
         for email in emails {
-            results.push(
-                self.validate(ValidateEmailRequest { email, proxy: None })
-                    .await?,
-            );
+            results.push(self.validate(ValidateEmailRequest { email }).await?);
         }
         Ok(results)
     }
@@ -395,7 +458,6 @@ mod tests {
         let resp = service
             .validate(ValidateEmailRequest {
                 email: "not-an-email".to_string(),
-                proxy: None,
             })
             .await
             .unwrap();
@@ -414,7 +476,6 @@ mod tests {
         let resp = service
             .validate(ValidateEmailRequest {
                 email: "alice@nonexistent-temps-test.invalid".to_string(),
-                proxy: None,
             })
             .await
             .unwrap();
@@ -430,5 +491,64 @@ mod tests {
     fn test_config_default() {
         let c = ValidationConfig::default();
         assert!(c.proxy.is_none() && c.from_email.is_none() && c.hello_name.is_none());
+    }
+
+    #[test]
+    fn test_config_loads_operator_proxy() {
+        let values = std::collections::HashMap::from([
+            (PROXY_HOST_ENV, "proxy.example.com"),
+            (PROXY_PORT_ENV, "1080"),
+            (PROXY_USERNAME_ENV, "smtp-user"),
+            (PROXY_PASSWORD_ENV, "secret"),
+            ("TEMPS_EMAIL_VALIDATION_FROM_EMAIL", "probe@example.com"),
+            ("TEMPS_EMAIL_VALIDATION_HELLO_NAME", "mx.example.com"),
+        ]);
+        let config = ValidationConfig::from_lookup(|name| {
+            values.get(name).map(|value| (*value).to_string())
+        })
+        .expect("complete operator proxy configuration should load");
+
+        let proxy = config.proxy.expect("proxy should be configured");
+        assert_eq!(proxy.host, "proxy.example.com");
+        assert_eq!(proxy.port, 1080);
+        assert_eq!(proxy.username.as_deref(), Some("smtp-user"));
+        assert_eq!(proxy.password.as_deref(), Some("secret"));
+        assert_eq!(config.from_email.as_deref(), Some("probe@example.com"));
+        assert_eq!(config.hello_name.as_deref(), Some("mx.example.com"));
+    }
+
+    #[test]
+    fn test_config_rejects_partial_or_invalid_proxy() {
+        for values in [
+            std::collections::HashMap::from([(PROXY_HOST_ENV, "proxy.example.com")]),
+            std::collections::HashMap::from([
+                (PROXY_HOST_ENV, "proxy.example.com"),
+                (PROXY_PORT_ENV, "not-a-port"),
+            ]),
+            std::collections::HashMap::from([
+                (PROXY_HOST_ENV, "proxy.example.com"),
+                (PROXY_PORT_ENV, "1080"),
+                (PROXY_USERNAME_ENV, "smtp-user"),
+            ]),
+        ] {
+            let result = ValidationConfig::from_lookup(|name| {
+                values.get(name).map(|value| (*value).to_string())
+            });
+            assert!(result.is_err(), "invalid proxy values must fail startup");
+        }
+    }
+
+    #[test]
+    fn test_proxy_config_debug_redacts_password() {
+        let proxy = ProxyConfig {
+            host: "proxy.example.com".to_string(),
+            port: 1080,
+            username: Some("smtp-user".to_string()),
+            password: Some("super-secret-password".to_string()),
+        };
+
+        let debug = format!("{proxy:?}");
+        assert!(!debug.contains("super-secret-password"));
+        assert!(debug.contains("***"));
     }
 }

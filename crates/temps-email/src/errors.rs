@@ -37,11 +37,28 @@ pub enum EmailError {
     #[error("Configuration error: {0}")]
     Configuration(String),
 
+    #[error("Invalid email validation proxy configuration: {reason}")]
+    InvalidValidationProxyConfig { reason: String },
+
+    #[error("Invalid port in {variable}: {value}")]
+    InvalidValidationProxyPort {
+        variable: &'static str,
+        value: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+
     #[error("AWS SES error: {0}")]
     AwsSes(String),
 
     #[error("Scaleway error: {0}")]
     Scaleway(String),
+
+    #[error("Failed to build Scaleway HTTP client")]
+    ScalewayClientBuild {
+        #[source]
+        source: reqwest::Error,
+    },
 
     #[error("SMTP error: {0}")]
     Smtp(String),
