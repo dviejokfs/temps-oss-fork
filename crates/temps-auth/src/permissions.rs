@@ -906,7 +906,6 @@ impl Role {
                 Permission::NotificationProvidersWrite,
                 Permission::PipelinesCreate,
                 Permission::PipelinesDelete,
-                Permission::PipelinesExecute,
                 Permission::PipelinesRead,
                 Permission::PipelinesWrite,
                 Permission::PlatformInfoRead,
@@ -975,14 +974,12 @@ impl Role {
                 Permission::AiGatewayRead,
                 Permission::AiGatewayWrite,
                 Permission::AiGatewayExecute,
-                Permission::ContainersExec,
                 Permission::StacksRead,
                 Permission::StacksWrite,
                 Permission::StacksDelete,
                 Permission::StacksCreate,
                 Permission::SandboxesRead,
                 Permission::SandboxesWrite,
-                Permission::SandboxesExec,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -1408,5 +1405,28 @@ mod tests {
         assert!(!reader_permissions.contains(&Permission::DeploymentTokensWrite));
         assert!(!reader_permissions.contains(&Permission::DeploymentTokensCreate));
         assert!(!reader_permissions.contains(&Permission::DeploymentTokensDelete));
+    }
+
+    #[test]
+    fn test_platform_admin_cannot_execute_in_customer_workloads() {
+        // PlatformAdmin is documented as read-only on deployable resources, so
+        // it must not hold permissions that run code inside customer workloads
+        // (a container/sandbox shell or a pipeline run would bypass that intent).
+        // An operator who wants that capability can grant these to an API key.
+        let platform_admin = Role::PlatformAdmin.permissions();
+        assert!(!platform_admin.contains(&Permission::ContainersExec));
+        assert!(!platform_admin.contains(&Permission::SandboxesExec));
+        assert!(!platform_admin.contains(&Permission::PipelinesExecute));
+
+        // The Admin role still holds them (unchanged), and User keeps the two it
+        // legitimately needs for its own deployable resources.
+        let admin = Role::Admin.permissions();
+        assert!(admin.contains(&Permission::ContainersExec));
+        assert!(admin.contains(&Permission::SandboxesExec));
+        assert!(admin.contains(&Permission::PipelinesExecute));
+        let user = Role::User.permissions();
+        assert!(user.contains(&Permission::SandboxesExec));
+        assert!(user.contains(&Permission::PipelinesExecute));
+        assert!(!user.contains(&Permission::ContainersExec));
     }
 }
