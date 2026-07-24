@@ -707,6 +707,10 @@ impl DockerRuntime {
                 })?;
         }
 
+        // Re-applied on every deploy (not just network creation) so the block
+        // survives host firewall flushes; best-effort, never fails the deploy.
+        crate::metadata_egress::apply_metadata_egress_block(&self.docker, &self.network_name).await;
+
         Ok(())
     }
 
