@@ -7026,6 +7026,61 @@ echo "[restore] Pre-seed complete"
         }
     }
 
+    /// Initialize a plugin-owned service instance from its stored config and
+    /// persist whatever the engine inferred back onto the row.
+    ///
+    /// The blob and kv plugins construct their own `RustfsService` /
+    /// `RedisService` and used to call `init()` directly, dropping the
+    /// inferred parameters. That let `external_services.config` drift from
+    /// the container it describes — most consequentially the port, which
+    /// `ExternalService::health_probe` reads straight out of the stored
+    /// config rather than from the live instance.
+    ///
+    /// On an install upgraded across the #495 naming fix, the stored port is
+    /// the one the pre-fix manager container took. Uploads are fine (they go
+    /// through the instance, which adopts the running container's real
+    /// port), but the health monitor probes the stale port — so the console
+    /// reports Blob as down the moment the leftover container is removed,
+    /// while the service is actually healthy. Writing back on this path
+    /// keeps the row describing the container that exists.
+    ///
+    /// Only genuinely inferred keys are merged (see
+    /// `is_inferred_parameter`), so operator-set configuration such as
+    /// `docker_image` or `access_key` is never overwritten.
+    pub async fn initialize_plugin_service(
+        &self,
+        service_id: i32,
+        service_instance: &dyn ExternalService,
+    ) -> Result<(), ExternalServiceError> {
+        let config = self.get_service_config(service_id).await?;
+
+        let inferred_params = service_instance.init(config).await.map_err(|e| {
+            ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: e.to_string(),
+            }
+        })?;
+
+        // Persisting is best-effort. By this point the instance is
+        // initialized and the service is usable, so failing the caller would
+        // turn a working enable into a 500 over bookkeeping. A stale row
+        // only degrades health reporting, and the next successful start or
+        // enable rewrites it.
+        if let Err(e) = self
+            .store_inferred_parameters(service_id, service_instance, inferred_params)
+            .await
+        {
+            warn!(
+                service_id,
+                error = %e,
+                "Service initialized, but its inferred parameters could not be persisted — \
+                 health checks may report a stale port until the next start"
+            );
+        }
+
+        Ok(())
+    }
+
     async fn store_inferred_parameters(
         &self,
         service_id: i32,
@@ -11122,6 +11177,33 @@ mod tests {
              `redis-temps-kv`",
             instance.get_name()
         );
+    }
+
+    /// `initialize_plugin_service` runs on every boot, so the write-back it
+    /// performs must be able to correct the port without touching anything
+    /// the operator configured. `store_inferred_parameters` merges only keys
+    /// this predicate accepts — if `docker_image` or the credentials ever
+    /// leaked into it, a restart would silently overwrite operator config.
+    #[test]
+    fn write_back_corrects_the_port_and_leaves_operator_config_alone() {
+        assert!(
+            ExternalServiceManager::is_inferred_parameter("port"),
+            "the port must be written back, or health_probe keeps reading a stale one"
+        );
+
+        for operator_set in [
+            "docker_image",
+            "access_key",
+            "secret_key",
+            "host",
+            "region",
+            "console_port",
+        ] {
+            assert!(
+                !ExternalServiceManager::is_inferred_parameter(operator_set),
+                "'{operator_set}' is operator-facing and must survive a plugin re-init"
+            );
+        }
     }
 
     /// The sweep at the end of `delete_service` reaches pre-fix containers by
