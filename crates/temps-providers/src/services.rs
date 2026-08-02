@@ -2220,10 +2220,20 @@ impl ExternalServiceManager {
         Ok(())
     }
 
+    /// Whether the most recent probe found this service operational.
+    ///
+    /// Reads the verdict `ExternalServiceHealthMonitor` persists on the row
+    /// rather than probing inline, so polling this can't stall on a service
+    /// that is unreachable. `degraded` reports `false` here; callers that
+    /// need the distinction should read the health snapshot instead.
+    ///
+    /// This used to return a hardcoded `false` while still doing the lookup,
+    /// so `GET /external-services/{id}/health` reported every service as
+    /// unhealthy — including ones the monitor had just marked operational.
     pub async fn check_service_health(&self, service_id: i32) -> Result<bool> {
-        let _service = self.get_service(service_id).await?;
+        let service = self.get_service(service_id).await?;
 
-        Ok(false)
+        Ok(service.health_status.as_deref() == Some(HealthProbeStatus::Operational.as_str()))
     }
 
     /// Return the current health status for many services in one query.
@@ -7026,6 +7036,61 @@ echo "[restore] Pre-seed complete"
         }
     }
 
+    /// Initialize a plugin-owned service instance from its stored config and
+    /// persist whatever the engine inferred back onto the row.
+    ///
+    /// The blob and kv plugins construct their own `RustfsService` /
+    /// `RedisService` and used to call `init()` directly, dropping the
+    /// inferred parameters. That let `external_services.config` drift from
+    /// the container it describes — most consequentially the port, which
+    /// `ExternalService::health_probe` reads straight out of the stored
+    /// config rather than from the live instance.
+    ///
+    /// On an install upgraded across the #495 naming fix, the stored port is
+    /// the one the pre-fix manager container took. Uploads are fine (they go
+    /// through the instance, which adopts the running container's real
+    /// port), but the health monitor probes the stale port — so the console
+    /// reports Blob as down the moment the leftover container is removed,
+    /// while the service is actually healthy. Writing back on this path
+    /// keeps the row describing the container that exists.
+    ///
+    /// Only genuinely inferred keys are merged (see
+    /// `is_inferred_parameter`), so operator-set configuration such as
+    /// `docker_image` or `access_key` is never overwritten.
+    pub async fn initialize_plugin_service(
+        &self,
+        service_id: i32,
+        service_instance: &dyn ExternalService,
+    ) -> Result<(), ExternalServiceError> {
+        let config = self.get_service_config(service_id).await?;
+
+        let inferred_params = service_instance.init(config).await.map_err(|e| {
+            ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: e.to_string(),
+            }
+        })?;
+
+        // Persisting is best-effort. By this point the instance is
+        // initialized and the service is usable, so failing the caller would
+        // turn a working enable into a 500 over bookkeeping. A stale row
+        // only degrades health reporting, and the next successful start or
+        // enable rewrites it.
+        if let Err(e) = self
+            .store_inferred_parameters(service_id, service_instance, inferred_params)
+            .await
+        {
+            warn!(
+                service_id,
+                error = %e,
+                "Service initialized, but its inferred parameters could not be persisted — \
+                 health checks may report a stale port until the next start"
+            );
+        }
+
+        Ok(())
+    }
+
     async fn store_inferred_parameters(
         &self,
         service_id: i32,
@@ -11124,6 +11189,33 @@ mod tests {
         );
     }
 
+    /// `initialize_plugin_service` runs on every boot, so the write-back it
+    /// performs must be able to correct the port without touching anything
+    /// the operator configured. `store_inferred_parameters` merges only keys
+    /// this predicate accepts — if `docker_image` or the credentials ever
+    /// leaked into it, a restart would silently overwrite operator config.
+    #[test]
+    fn write_back_corrects_the_port_and_leaves_operator_config_alone() {
+        assert!(
+            ExternalServiceManager::is_inferred_parameter("port"),
+            "the port must be written back, or health_probe keeps reading a stale one"
+        );
+
+        for operator_set in [
+            "docker_image",
+            "access_key",
+            "secret_key",
+            "host",
+            "region",
+            "console_port",
+        ] {
+            assert!(
+                !ExternalServiceManager::is_inferred_parameter(operator_set),
+                "'{operator_set}' is operator-facing and must survive a plugin re-init"
+            );
+        }
+    }
+
     /// The sweep at the end of `delete_service` reaches pre-fix containers by
     /// building an instance from each legacy name. That only works if the
     /// instance comes out named exactly what the old code produced — if this
@@ -11175,6 +11267,32 @@ mod tests {
             ),
             Arc::new(temps_dns::DnsRegistry::new(db)),
         )
+    }
+
+    /// `check_service_health` backed `GET /external-services/{id}/health` with
+    /// a hardcoded `false`, so the endpoint called every service unhealthy no
+    /// matter what the health monitor had just written to the row.
+    #[tokio::test]
+    async fn health_check_reports_the_monitors_verdict() {
+        for (persisted, expected) in [
+            (Some("operational"), true),
+            (Some("degraded"), false),
+            (Some("down"), false),
+            (None, false),
+        ] {
+            let mut model = encrypted_service_model(1, serde_json::json!({}));
+            model.health_status = persisted.map(String::from);
+            let manager = mock_service_manager(vec![vec![model]]);
+
+            assert_eq!(
+                manager
+                    .check_service_health(1)
+                    .await
+                    .expect("health lookup should succeed"),
+                expected,
+                "persisted health_status {persisted:?} should report {expected}"
+            );
+        }
     }
 
     fn encrypted_service_model(id: i32, parameters: serde_json::Value) -> external_services::Model {
