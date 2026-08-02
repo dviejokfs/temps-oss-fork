@@ -122,6 +122,7 @@ mod m20260618_000001_create_on_demand_cert_attempts;
 mod m20260618_000002_add_domains_on_demand_backoff;
 mod m20260619_000001_add_settings_change_trigger;
 mod m20260621_000001_create_telemetry_milestones;
+mod m20260622_000001_managed_domain_hostnames;
 mod m20260623_000001_add_external_services_default_backup_provisioned;
 mod m20260626_000001_create_metric_dashboards;
 mod m20260626_000002_create_metric_alert_rules;
@@ -145,9 +146,26 @@ mod m20260707_000001_add_external_service_to_logs;
 mod m20260707_000002_add_external_services_container_name;
 mod m20260708_000001_add_node_id_to_monitoring_alert_rules;
 mod m20260711_000001_add_proxy_logs_stats_cagg;
+mod m20260711_000001_normalize_email_event_types;
 mod m20260711_000002_add_ip_geolocations_hosting_provider;
+mod m20260711_000002_create_suppressed_recipients;
 mod m20260711_000003_add_visitor_non_crawler_partial_index;
 mod m20260713_000001_add_mfa_pending_to_sessions;
+mod m20260714_000001_fix_otel_spans_compression_segmentby;
+mod m20260714_000001_secure_sns_email_events;
+mod m20260716_000001_observability_compression_24h;
+mod m20260717_000001_drop_magic_link_tokens;
+mod m20260720_000001_add_backend_to_sandboxes;
+mod m20260720_000001_audit_logs_keep_history_on_user_delete;
+mod m20260720_000002_create_sandbox_events;
+mod m20260722_000001_create_source_files;
+mod m20260722_000002_add_source_context_enabled_to_projects;
+mod m20260723_000001_add_error_source_root_to_projects;
+mod m20260724_000001_add_run_config_to_agent_runs;
+mod m20260725_000001_sandboxes_agent_run_link;
+mod m20260728_000001_add_environment_id_to_metric_alert_rules;
+mod m20260730_000001_add_architecture_to_nodes;
+mod m20260802_000001_add_environment_force_https;
 
 pub struct Migrator;
 
@@ -273,6 +291,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260618_000002_add_domains_on_demand_backoff::Migration),
             Box::new(m20260619_000001_add_settings_change_trigger::Migration),
             Box::new(m20260621_000001_create_telemetry_milestones::Migration),
+            Box::new(m20260622_000001_managed_domain_hostnames::Migration),
             Box::new(m20260623_000001_add_external_services_default_backup_provisioned::Migration),
             Box::new(m20260626_000001_create_metric_dashboards::Migration),
             Box::new(m20260626_000002_create_metric_alert_rules::Migration),
@@ -298,9 +317,28 @@ impl MigratorTrait for Migrator {
             Box::new(m20260707_000002_add_external_services_container_name::Migration),
             Box::new(m20260708_000001_add_node_id_to_monitoring_alert_rules::Migration),
             Box::new(m20260711_000001_add_proxy_logs_stats_cagg::Migration),
+            Box::new(m20260711_000001_normalize_email_event_types::Migration),
             Box::new(m20260711_000002_add_ip_geolocations_hosting_provider::Migration),
+            Box::new(m20260711_000002_create_suppressed_recipients::Migration),
             Box::new(m20260711_000003_add_visitor_non_crawler_partial_index::Migration),
             Box::new(m20260713_000001_add_mfa_pending_to_sessions::Migration),
+            Box::new(m20260714_000001_fix_otel_spans_compression_segmentby::Migration),
+            Box::new(m20260714_000001_secure_sns_email_events::Migration),
+            Box::new(m20260716_000001_observability_compression_24h::Migration),
+            Box::new(m20260717_000001_drop_magic_link_tokens::Migration),
+            Box::new(m20260720_000001_add_backend_to_sandboxes::Migration),
+            Box::new(m20260720_000002_create_sandbox_events::Migration),
+            Box::new(m20260720_000001_audit_logs_keep_history_on_user_delete::Migration),
+            Box::new(m20260722_000001_create_source_files::Migration),
+            Box::new(m20260722_000002_add_source_context_enabled_to_projects::Migration),
+            Box::new(m20260723_000001_add_error_source_root_to_projects::Migration),
+            Box::new(m20260724_000001_add_run_config_to_agent_runs::Migration),
+            Box::new(m20260725_000001_sandboxes_agent_run_link::Migration),
+            Box::new(
+                m20260728_000001_add_environment_id_to_metric_alert_rules::Migration,
+            ),
+            Box::new(m20260730_000001_add_architecture_to_nodes::Migration),
+            Box::new(m20260802_000001_add_environment_force_https::Migration),
         ]
     }
 }

@@ -168,6 +168,8 @@ async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
         is_deleted: Set(false),
         is_public_repo: Set(false),
         attack_mode: Set(false),
+        error_source_context_enabled: Set(false),
+        error_source_root: Set(None),
         enable_preview_environments: Set(false),
         ..Default::default()
     };
@@ -603,6 +605,8 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         is_deleted: Set(false),
         is_public_repo: Set(false),
         attack_mode: Set(false),
+        error_source_context_enabled: Set(false),
+        error_source_root: Set(None),
         enable_preview_environments: Set(false),
         ..Default::default()
     }

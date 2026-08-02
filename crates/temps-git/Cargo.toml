@@ -19,6 +19,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = "0.22"
 futures = { workspace = true }
+rustls = { workspace = true }
 
 [dependencies]
 temps-auth = { path = "../temps-auth" }
@@ -48,7 +49,7 @@ sha2 = { workspace = true }
 url = { workspace = true }
 serde_json = { workspace = true }
 serde_derive = { workspace = true }
-jsonwebtoken = "10.3.0"
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 uuid = { workspace = true }
 http-body-util = { workspace = true }
 git2 = { version = "0.21.0", features = ["https", "ssh"] }
