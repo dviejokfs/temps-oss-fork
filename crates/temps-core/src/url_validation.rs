@@ -343,6 +343,22 @@ pub fn validate_ipv6(ip: &Ipv6Addr) -> Result<(), UrlValidationError> {
         return Err(UrlValidationError::UnspecifiedIp);
     }
 
+    // External SMTP destinations must be globally routable unicast addresses.
+    // Today those allocations live in 2000::/3. Keep this as an allowlist so
+    // special-use prefixes such as NAT64, discard-only, benchmarking, and
+    // future local allocations cannot become SSRF targets merely because the
+    // host happens to route them internally.
+    let segments = ip.segments();
+    let is_global_unicast = (segments[0] & 0xe000) == 0x2000;
+    let is_ietf_special = segments[0] == 0x2001 && segments[1] <= 0x01ff; // 2001::/23
+    let is_documentation_2001 = segments[0] == 0x2001 && segments[1] == 0x0db8; // 2001:db8::/32
+    let is_6to4 = segments[0] == 0x2002; // deprecated transition prefix
+    let is_documentation = segments[0] == 0x3fff && (segments[1] & 0xf000) == 0; // 3fff::/20
+    if !is_global_unicast || is_ietf_special || is_documentation_2001 || is_6to4 || is_documentation
+    {
+        return Err(UrlValidationError::ReservedIp);
+    }
+
     Ok(())
 }
 
@@ -688,6 +704,26 @@ mod tests {
 
         // Deprecated site-local addresses are internal-only.
         assert!(validate_ipv6(&"fec0::1".parse::<Ipv6Addr>().unwrap()).is_err());
+
+        // Every special-use prefix stays outside the external-address
+        // allowlist, including translation ranges that an internal router may
+        // map to IPv4 services.
+        for address in [
+            "64:ff9b::1",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001::1",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+            "5f00::1",
+        ] {
+            let ip = address.parse::<Ipv6Addr>().unwrap();
+            assert!(
+                validate_ipv6(&ip).is_err(),
+                "special-use IPv6 address {address} must be rejected"
+            );
+        }
     }
 
     #[test]

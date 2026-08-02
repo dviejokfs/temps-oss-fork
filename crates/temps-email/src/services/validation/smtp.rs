@@ -51,11 +51,21 @@ enum SmtpConnectError {
         #[source]
         source: std::io::Error,
     },
-    #[error("SOCKS5 connect via {proxy} to validated MX addresses for {host} timed out")]
-    SocksTimeout { proxy: String, host: String },
-    #[error("SOCKS5 connect via {proxy} to validated MX addresses for {host} failed: {source}")]
+    #[error("SOCKS5 proxy credentials must provide both username and password, or neither")]
+    InvalidProxyCredentials,
+    #[error("SOCKS5 proxy DNS resolution timed out")]
+    ProxyDnsTimeout,
+    #[error("Failed to resolve SOCKS5 proxy: {source}")]
+    ProxyResolve {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("SOCKS5 proxy resolved without any addresses")]
+    ProxyNoAddresses,
+    #[error("SOCKS5 connect to validated MX addresses for {host} timed out")]
+    SocksTimeout { host: String },
+    #[error("SOCKS5 connect to validated MX addresses for {host} failed: {source}")]
     SocksConnect {
-        proxy: String,
         host: String,
         #[source]
         source: tokio_socks::Error,
@@ -345,25 +355,26 @@ async fn connect(
     match config.proxy {
         Some(proxy) => {
             let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
+            let credentials = proxy_credentials(proxy)?;
             // Resolve the trusted operator proxy once to avoid a second DNS
             // lookup between selection and connection. Private proxy addresses
             // remain supported because this setting is not exposed by the API.
-            let proxy_addresses = resolve_addresses(&proxy_addr, config.timeout).await?;
+            let proxy_addresses = resolve_proxy_addresses(&proxy_addr, config.timeout).await?;
             let mut last_error = None;
 
             for target in &resolved {
                 let connect = async {
-                    match (&proxy.username, &proxy.password) {
-                        (Some(user), Some(pass)) => {
+                    match credentials {
+                        Some((user, pass)) => {
                             tokio_socks::tcp::Socks5Stream::connect_with_password(
                                 proxy_addresses.as_slice(),
                                 *target,
-                                user.as_str(),
-                                pass.as_str(),
+                                user,
+                                pass,
                             )
                             .await
                         }
-                        _ => {
+                        None => {
                             tokio_socks::tcp::Socks5Stream::connect(
                                 proxy_addresses.as_slice(),
                                 *target,
@@ -377,14 +388,12 @@ async fn connect(
                     Ok(Ok(stream)) => return Ok(SmtpStream::Proxied(stream)),
                     Ok(Err(source)) => {
                         last_error = Some(SmtpConnectError::SocksConnect {
-                            proxy: proxy_addr.clone(),
                             host: host.to_string(),
                             source,
                         })
                     }
                     Err(_) => {
                         last_error = Some(SmtpConnectError::SocksTimeout {
-                            proxy: proxy_addr.clone(),
                             host: host.to_string(),
                         })
                     }
@@ -406,6 +415,32 @@ async fn connect(
                 source,
             }),
     }
+}
+
+fn proxy_credentials(proxy: &ProxyConfig) -> Result<Option<(&str, &str)>, SmtpConnectError> {
+    match (&proxy.username, &proxy.password) {
+        (Some(username), Some(password)) => Ok(Some((username.as_str(), password.as_str()))),
+        (None, None) => Ok(None),
+        _ => Err(SmtpConnectError::InvalidProxyCredentials),
+    }
+}
+
+async fn resolve_proxy_addresses(
+    proxy_addr: &str,
+    op_timeout: Duration,
+) -> Result<Vec<std::net::SocketAddr>, SmtpConnectError> {
+    let resolved: Vec<std::net::SocketAddr> =
+        timeout(op_timeout, tokio::net::lookup_host(proxy_addr))
+            .await
+            .map_err(|_| SmtpConnectError::ProxyDnsTimeout)?
+            .map_err(|source| SmtpConnectError::ProxyResolve { source })?
+            .collect();
+
+    if resolved.is_empty() {
+        return Err(SmtpConnectError::ProxyNoAddresses);
+    }
+
+    Ok(resolved)
 }
 
 async fn resolve_addresses(
@@ -675,6 +710,49 @@ mod tests {
             error.to_string().contains("Refusing to probe"),
             "got: {error}"
         );
+    }
+
+    #[test]
+    fn test_proxy_credentials_reject_partial_configuration() {
+        for (username, password) in [
+            (Some("proxy-user".to_string()), None),
+            (None, Some("proxy-password".to_string())),
+        ] {
+            let proxy = ProxyConfig {
+                host: "internal-proxy.example".to_string(),
+                port: 1080,
+                username,
+                password,
+            };
+            let error = proxy_credentials(&proxy)
+                .expect_err("partial proxy credentials must not downgrade to anonymous SOCKS");
+            let message = error.to_string();
+            assert!(message.contains("both username and password"));
+            assert!(!message.contains(&proxy.host));
+            assert!(!message.contains(&proxy.port.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_proxy_connection_errors_do_not_expose_endpoint() {
+        let endpoint = "sensitive-proxy.internal:1080";
+        let errors = [
+            SmtpConnectError::ProxyDnsTimeout.to_string(),
+            SmtpConnectError::ProxyResolve {
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "host not found"),
+            }
+            .to_string(),
+            SmtpConnectError::ProxyNoAddresses.to_string(),
+            SmtpConnectError::SocksTimeout {
+                host: "mx.example.com".to_string(),
+            }
+            .to_string(),
+        ];
+        for error in errors {
+            assert!(!error.contains(endpoint));
+            assert!(!error.contains("sensitive-proxy"));
+            assert!(!error.contains("1080"));
+        }
     }
 
     #[tokio::test]
