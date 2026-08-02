@@ -2220,10 +2220,20 @@ impl ExternalServiceManager {
         Ok(())
     }
 
+    /// Whether the most recent probe found this service operational.
+    ///
+    /// Reads the verdict `ExternalServiceHealthMonitor` persists on the row
+    /// rather than probing inline, so polling this can't stall on a service
+    /// that is unreachable. `degraded` reports `false` here; callers that
+    /// need the distinction should read the health snapshot instead.
+    ///
+    /// This used to return a hardcoded `false` while still doing the lookup,
+    /// so `GET /external-services/{id}/health` reported every service as
+    /// unhealthy — including ones the monitor had just marked operational.
     pub async fn check_service_health(&self, service_id: i32) -> Result<bool> {
-        let _service = self.get_service(service_id).await?;
+        let service = self.get_service(service_id).await?;
 
-        Ok(false)
+        Ok(service.health_status.as_deref() == Some(HealthProbeStatus::Operational.as_str()))
     }
 
     /// Return the current health status for many services in one query.
@@ -11257,6 +11267,32 @@ mod tests {
             ),
             Arc::new(temps_dns::DnsRegistry::new(db)),
         )
+    }
+
+    /// `check_service_health` backed `GET /external-services/{id}/health` with
+    /// a hardcoded `false`, so the endpoint called every service unhealthy no
+    /// matter what the health monitor had just written to the row.
+    #[tokio::test]
+    async fn health_check_reports_the_monitors_verdict() {
+        for (persisted, expected) in [
+            (Some("operational"), true),
+            (Some("degraded"), false),
+            (Some("down"), false),
+            (None, false),
+        ] {
+            let mut model = encrypted_service_model(1, serde_json::json!({}));
+            model.health_status = persisted.map(String::from);
+            let manager = mock_service_manager(vec![vec![model]]);
+
+            assert_eq!(
+                manager
+                    .check_service_health(1)
+                    .await
+                    .expect("health lookup should succeed"),
+                expected,
+                "persisted health_status {persisted:?} should report {expected}"
+            );
+        }
     }
 
     fn encrypted_service_model(id: i32, parameters: serde_json::Value) -> external_services::Model {
