@@ -979,7 +979,6 @@ impl Role {
                 Permission::StacksDelete,
                 Permission::StacksCreate,
                 Permission::SandboxesRead,
-                Permission::SandboxesWrite,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -1415,6 +1414,7 @@ mod tests {
         // An operator who wants that capability can grant these to an API key.
         let platform_admin = Role::PlatformAdmin.permissions();
         assert!(!platform_admin.contains(&Permission::ContainersExec));
+        assert!(!platform_admin.contains(&Permission::SandboxesWrite));
         assert!(!platform_admin.contains(&Permission::SandboxesExec));
         assert!(!platform_admin.contains(&Permission::PipelinesExecute));
 
@@ -1422,9 +1422,11 @@ mod tests {
         // legitimately needs for its own deployable resources.
         let admin = Role::Admin.permissions();
         assert!(admin.contains(&Permission::ContainersExec));
+        assert!(admin.contains(&Permission::SandboxesWrite));
         assert!(admin.contains(&Permission::SandboxesExec));
         assert!(admin.contains(&Permission::PipelinesExecute));
         let user = Role::User.permissions();
+        assert!(user.contains(&Permission::SandboxesWrite));
         assert!(user.contains(&Permission::SandboxesExec));
         assert!(user.contains(&Permission::PipelinesExecute));
         assert!(!user.contains(&Permission::ContainersExec));

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Platform-admin code-execution boundary**: Remove container, sandbox creation/exec, and pipeline execution permissions from `PlatformAdmin` so the role cannot run caller-selected code inside customer workloads.
 - **PostgreSQL data-explorer query isolation**: Reject function calls and every PostgreSQL subquery form in user-supplied WHERE clauses, and parse PostgreSQL string and quoted-identifier boundaries safely, so expressions cannot read other tables through XML helpers or `IN (TABLE ...)` query expressions.
 - **compose security:** Require URL-safe PostgreSQL and Redis credentials, rotate existing PostgreSQL volumes to SCRAM before startup, keep credentials out of process arguments, bind internal ports to loopback, use authenticated readiness checks, and support unattended initial-admin creation from a mounted password secret.
 - **Webhook retry tenant isolation**: Scope `POST /projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry` lookups to the requested project and webhook so a writer cannot replay another tenant's delivery by guessing its ID.
