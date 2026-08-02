@@ -67,7 +67,7 @@ interface ProjectCardProps {
  * an attempt, and labelling a failed run as a deployment is how a red project
  * ended up claiming it had deployed.
  */
-function deploymentLabel(status?: string | null): string {
+export function deploymentLabel(status?: string | null): string {
   switch (status) {
     case 'completed':
       return 'Deployed'
