@@ -463,34 +463,58 @@ pub(crate) mod cluster_states {
     ];
 }
 
+/// One data node as the monitor sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct ClusterNodeState {
+    pub name: String,
+    /// `reportedstate` — what the node last told the monitor it was doing.
+    pub state: String,
+    /// Monitor's own health check: -1 not yet checked, 0 failing, 1 responding.
+    pub health: i32,
+}
+
+impl ClusterNodeState {
+    /// Whether this node can serve a write *right now*.
+    ///
+    /// Requires both a writable FSM state and a health check that isn't
+    /// actively failing. `health == 0` alone disqualifies it: when every node
+    /// dies at once the monitor cannot promote anything, so it leaves the old
+    /// `reportedstate` in place and a dead primary keeps reporting `primary`.
+    /// `-1` (not yet checked) is not treated as failure — that would false-
+    /// alarm on a freshly registered node.
+    fn is_writable(&self) -> bool {
+        cluster_states::WRITABLE.contains(&self.state.as_str()) && self.health != 0
+    }
+
+    fn label(&self) -> String {
+        if self.health == 0 {
+            format!("{}={} (unreachable)", self.name, self.state)
+        } else {
+            format!("{}={}", self.name, self.state)
+        }
+    }
+}
+
 /// Turn the monitor's per-node states into a health verdict.
 ///
 /// Split out from `probe_cluster` so the classification is testable without a
 /// live monitor — it is the part that decides what an operator is told.
-///
-/// `states` is `(nodename, reportedstate)` for each **data** node.
 pub(crate) fn classify_cluster_states(
     service_id: i32,
-    states: &[(String, String)],
+    states: &[ClusterNodeState],
 ) -> (HealthProbeStatus, Option<String>) {
     const HEALTHY: &[&str] = &["primary", "single", "secondary"];
 
-    let listed = |sel: &[(String, String)]| {
-        sel.iter()
-            .map(|(n, s)| format!("{n}={s}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let listed =
+        |sel: &[ClusterNodeState]| sel.iter().map(|n| n.label()).collect::<Vec<_>>().join(", ");
 
     let unhealthy: Vec<String> = states
         .iter()
-        .filter(|(_, s)| !HEALTHY.contains(&s.as_str()))
-        .map(|(n, s)| format!("{n}={s}"))
+        .filter(|n| !HEALTHY.contains(&n.state.as_str()) || n.health == 0)
+        .map(|n| n.label())
         .collect();
 
-    let has_writer = states
-        .iter()
-        .any(|(_, s)| cluster_states::WRITABLE.contains(&s.as_str()));
+    let has_writer = states.iter().any(|n| n.is_writable());
 
     // No node is accepting writes. This is what actually breaks an
     // application, and it is NOT the same as "no node reports `primary`":
@@ -499,7 +523,7 @@ pub(crate) fn classify_cluster_states(
     if !has_writer {
         let failing_over = states
             .iter()
-            .any(|(_, s)| cluster_states::TRANSITIONAL.contains(&s.as_str()));
+            .any(|n| cluster_states::TRANSITIONAL.contains(&n.state.as_str()));
 
         // A failover in flight passes through `prepare_promotion` /
         // `stop_replication` / `demoted` for a few seconds. Saying "no leader,
@@ -534,7 +558,9 @@ pub(crate) fn classify_cluster_states(
     // Writable, but something is off. Call out the case where writes work yet
     // there is no standby at all: the next failure is not survivable, which is
     // a materially different warning from "a replica is catching up".
-    let unprotected = !states.iter().any(|(_, s)| s == "secondary");
+    let unprotected = !states
+        .iter()
+        .any(|n| n.state == "secondary" && n.health != 0);
     let detail = format!(
         "{}/{} data node(s) not in a healthy state: {}",
         unhealthy.len(),
@@ -2773,7 +2799,12 @@ impl ExternalServiceManager {
         let rows_result = tokio::time::timeout(
             PROBE_TIMEOUT,
             client.query(
-                "SELECT nodename::text, nodehost::text, reportedstate::text \
+                // `health` matters as much as `reportedstate`: when every node
+                // dies at once the monitor has nothing to promote, so the FSM
+                // leaves the last reported states in place and a dead cluster
+                // still reads as `primary`/`secondary`. Only `health` reveals
+                // it. (-1 = not yet checked, 0 = failing, 1 = responding.)
+                "SELECT nodename::text, nodehost::text, reportedstate::text, health \
                  FROM pgautofailover.node",
                 &[],
             ),
@@ -2812,13 +2843,12 @@ impl ExternalServiceManager {
             ));
         }
 
-        let states: Vec<(String, String)> = rows
+        let states: Vec<ClusterNodeState> = rows
             .iter()
-            .map(|row| {
-                (
-                    row.get::<_, &str>(0).to_string(),
-                    row.get::<_, &str>(2).to_string(),
-                )
+            .map(|row| ClusterNodeState {
+                name: row.get::<_, &str>(0).to_string(),
+                state: row.get::<_, &str>(2).to_string(),
+                health: row.get::<_, i32>(3),
             })
             .collect();
 
@@ -10101,11 +10131,75 @@ mod tests {
 
     // ── Cluster write availability ──────────────────────────────────────
 
-    fn st(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    /// Healthy-by-default node states (health = 1, i.e. responding).
+    fn st(pairs: &[(&str, &str)]) -> Vec<ClusterNodeState> {
         pairs
             .iter()
-            .map(|(n, s)| (n.to_string(), s.to_string()))
+            .map(|(n, s)| ClusterNodeState {
+                name: n.to_string(),
+                state: s.to_string(),
+                health: 1,
+            })
             .collect()
+    }
+
+    /// Node states with an explicit monitor health value.
+    fn st_h(triples: &[(&str, &str, i32)]) -> Vec<ClusterNodeState> {
+        triples
+            .iter()
+            .map(|(n, s, h)| ClusterNodeState {
+                name: n.to_string(),
+                state: s.to_string(),
+                health: *h,
+            })
+            .collect()
+    }
+
+    /// The total-outage case, and the reason `health` is read at all: when
+    /// every node dies at once the monitor has nothing to promote, so it never
+    /// demotes anyone and `reportedstate` still says primary/secondary. Judging
+    /// on state alone reported a dead cluster as Operational.
+    #[test]
+    fn test_all_nodes_unreachable_is_leaderless_despite_stale_primary_state() {
+        let (status, msg) = classify_cluster_states(
+            2,
+            &st_h(&[("node-1", "primary", 0), ("node-2", "secondary", 0)]),
+        );
+        let msg = msg.expect("a dead cluster must not be silent");
+
+        assert_eq!(status, HealthProbeStatus::Degraded);
+        assert!(msg.contains("no leader"), "got: {msg}");
+        assert!(msg.contains("writes will fail"), "got: {msg}");
+        // The operator needs to see it is a reachability problem, not an
+        // election problem — the state still reads "primary".
+        assert!(msg.contains("node-1=primary (unreachable)"), "got: {msg}");
+    }
+
+    /// A primary the monitor has not yet health-checked (-1) must not be
+    /// treated as dead, or every freshly registered cluster would alarm.
+    #[test]
+    fn test_unchecked_health_is_not_treated_as_failure() {
+        let (status, msg) = classify_cluster_states(
+            1,
+            &st_h(&[("node-1", "primary", -1), ("node-2", "secondary", -1)]),
+        );
+        assert_eq!(status, HealthProbeStatus::Operational, "got: {msg:?}");
+    }
+
+    /// A live primary with a dead standby still serves writes — that is the
+    /// unprotected warning, not the leaderless one.
+    #[test]
+    fn test_dead_standby_leaves_a_working_primary() {
+        let (status, msg) = classify_cluster_states(
+            1,
+            &st_h(&[("node-1", "primary", 1), ("node-2", "secondary", 0)]),
+        );
+        let msg = msg.expect("degraded");
+
+        assert_eq!(status, HealthProbeStatus::Degraded);
+        assert!(!msg.contains("writes will fail"), "got: {msg}");
+        assert!(msg.contains("no healthy standby"), "got: {msg}");
+        assert!(msg.contains("node-2=secondary (unreachable)"), "got: {msg}");
     }
 
     /// The condition that actually breaks an application: nothing can accept a
