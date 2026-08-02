@@ -399,20 +399,32 @@ pub fn validate_git_url(url: &str) -> Result<Url, UrlValidationError> {
     if parsed.scheme() != "https" {
         return Err(UrlValidationError::InvalidScheme);
     }
+    // Git credentials belong in the provider/token fields, never URL userinfo.
+    // Apart from being easy to leak through libgit2 errors, a username can
+    // itself be the token when no password is present.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(UrlValidationError::InvalidFormat(
+            "credentials embedded in Git URLs are not allowed".to_string(),
+        ));
+    }
     // Reuse the external-URL validator for the host/IP checks.
     validate_external_url(url)
 }
 
-/// Redact the password portion of a URL so it is safe to include in
+/// Redact the userinfo portion of a URL so it is safe to include in
 /// error messages and structured logs (Fix #12 — credentials in errors).
 ///
 /// Examples:
-/// - `https://user:secret@host/repo` → `https://user:***@host/repo`
+/// - `https://user:secret@host/repo` → `https://***:***@host/repo`
+/// - `https://token@host/repo`       → `https://***@host/repo`
 /// - `https://host/repo`             → `https://host/repo`
 /// - non-URL strings are returned unchanged
 pub fn redact_url_password(url: &str) -> String {
     match Url::parse(url) {
         Ok(mut parsed) => {
+            if !parsed.username().is_empty() {
+                let _ = parsed.set_username("***");
+            }
             if parsed.password().is_some() {
                 let _ = parsed.set_password(Some("***"));
             }
@@ -695,6 +707,30 @@ mod tests {
     fn test_validate_git_url_accepts_https() {
         assert!(validate_git_url("https://github.com/foo/bar.git").is_ok());
         assert!(validate_git_url("https://gitlab.example.com/team/repo.git").is_ok());
+    }
+
+    #[test]
+    fn test_validate_git_url_rejects_embedded_credentials() {
+        for url in [
+            "https://token:secret@github.com/foo/bar.git",
+            "https://token@github.com/foo/bar.git",
+        ] {
+            assert!(matches!(
+                validate_git_url(url),
+                Err(UrlValidationError::InvalidFormat(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_redact_url_password_masks_all_userinfo() {
+        let with_password = redact_url_password("https://token:secret@github.com/foo/bar.git");
+        assert!(!with_password.contains("token"));
+        assert!(!with_password.contains("secret"));
+
+        let username_only = redact_url_password("https://token@github.com/foo/bar.git");
+        assert!(!username_only.contains("token"));
+        assert!(username_only.contains("***"));
     }
 
     #[test]
