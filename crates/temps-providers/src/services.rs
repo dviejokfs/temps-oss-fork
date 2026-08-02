@@ -432,6 +432,127 @@ fn role_from_str(s: &str) -> Option<crate::ClusterRole> {
     crate::ClusterRole::from_str(s).ok()
 }
 
+/// pg_auto_failover node states, grouped by what they mean for an application.
+///
+/// These are `reportedstate` values from `pgautofailover.node` on the monitor,
+/// not our own roles — `service_members.role` is static config, while the FSM
+/// state is the runtime truth about whether anyone can serve a write.
+pub(crate) mod cluster_states {
+    /// States in which a node accepts writes.
+    ///
+    /// `wait_primary` and `single` belong here even though neither is named
+    /// "primary": pg_auto_failover clears `synchronous_standby_names` in those
+    /// states precisely so writes keep flowing while there is no standby. A
+    /// cluster sitting in `wait_primary` is unprotected, not down, and warning
+    /// that writes will fail there would be wrong.
+    pub const WRITABLE: &[&str] = &["primary", "wait_primary", "single", "apply_settings"];
+
+    /// States a node passes through during a failover.
+    ///
+    /// While any node reports one of these, an election is underway and the
+    /// absence of a writer is expected for a few seconds — so it is reported as
+    /// a failover in progress rather than a stuck cluster.
+    pub const TRANSITIONAL: &[&str] = &[
+        "prepare_promotion",
+        "stop_replication",
+        "demoted",
+        "demote_timeout",
+        "draining",
+        "prepare_maintenance",
+        "wait_maintenance",
+    ];
+}
+
+/// Turn the monitor's per-node states into a health verdict.
+///
+/// Split out from `probe_cluster` so the classification is testable without a
+/// live monitor — it is the part that decides what an operator is told.
+///
+/// `states` is `(nodename, reportedstate)` for each **data** node.
+pub(crate) fn classify_cluster_states(
+    service_id: i32,
+    states: &[(String, String)],
+) -> (HealthProbeStatus, Option<String>) {
+    const HEALTHY: &[&str] = &["primary", "single", "secondary"];
+
+    let listed = |sel: &[(String, String)]| {
+        sel.iter()
+            .map(|(n, s)| format!("{n}={s}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let unhealthy: Vec<String> = states
+        .iter()
+        .filter(|(_, s)| !HEALTHY.contains(&s.as_str()))
+        .map(|(n, s)| format!("{n}={s}"))
+        .collect();
+
+    let has_writer = states
+        .iter()
+        .any(|(_, s)| cluster_states::WRITABLE.contains(&s.as_str()));
+
+    // No node is accepting writes. This is what actually breaks an
+    // application, and it is NOT the same as "no node reports `primary`":
+    // `wait_primary` and `single` are writable, so treating those as
+    // leaderless would cry wolf on a cluster that is merely unprotected.
+    if !has_writer {
+        let failing_over = states
+            .iter()
+            .any(|(_, s)| cluster_states::TRANSITIONAL.contains(&s.as_str()));
+
+        // A failover in flight passes through `prepare_promotion` /
+        // `stop_replication` / `demoted` for a few seconds. Saying "no leader,
+        // go fix it" there would flap on every normal failover.
+        let message = if failing_over {
+            format!(
+                "Failover in progress — no node is accepting writes right now. \
+                 Node states: {}. This normally clears within seconds; if it \
+                 persists, promote a member explicitly.",
+                listed(states)
+            )
+        } else {
+            format!(
+                "Cluster has no leader — writes will fail. No node is in a writable state \
+                 ({}), so the monitor has not elected a primary. Node states: {}. \
+                 Recover by promoting a running member \
+                 (POST /external-services/{}/members/{{member_id}}/promote). If no member \
+                 is running, start or retry the members first — promotion needs a running \
+                 container.",
+                cluster_states::WRITABLE.join("/"),
+                listed(states),
+                service_id
+            )
+        };
+        return (HealthProbeStatus::Degraded, Some(message));
+    }
+
+    if unhealthy.is_empty() {
+        return (HealthProbeStatus::Operational, None);
+    }
+
+    // Writable, but something is off. Call out the case where writes work yet
+    // there is no standby at all: the next failure is not survivable, which is
+    // a materially different warning from "a replica is catching up".
+    let unprotected = !states.iter().any(|(_, s)| s == "secondary");
+    let detail = format!(
+        "{}/{} data node(s) not in a healthy state: {}",
+        unhealthy.len(),
+        states.len(),
+        unhealthy.join(", ")
+    );
+    let message = if unprotected {
+        format!(
+            "Writes are being accepted, but the cluster has no healthy standby — a failure \
+             now would take it down with no node to fail over to. {detail}"
+        )
+    } else {
+        detail
+    };
+
+    (HealthProbeStatus::Degraded, Some(message))
+}
+
 fn is_role_monitor(s: &str) -> bool {
     role_from_str(s) == Some(crate::ClusterRole::Monitor)
 }
@@ -2683,16 +2804,6 @@ impl ExternalServiceManager {
         let elapsed_ms = start.elapsed().as_millis();
         let response_time_ms = i32::try_from(elapsed_ms).ok();
 
-        let healthy_states = ["primary", "single", "secondary"];
-        let mut unhealthy: Vec<String> = Vec::new();
-        for row in &rows {
-            let nodename: &str = row.get(0);
-            let state: &str = row.get(2);
-            if !healthy_states.contains(&state) {
-                unhealthy.push(format!("{nodename}={state}"));
-            }
-        }
-
         if rows.is_empty() {
             // Monitor reachable but no data nodes registered — cluster is
             // half-built. Treat as Down so it's visibly broken.
@@ -2701,23 +2812,21 @@ impl ExternalServiceManager {
             ));
         }
 
-        if unhealthy.is_empty() {
-            ClusterProbeResult {
-                status: HealthProbeStatus::Operational,
-                response_time_ms,
-                error_message: None,
-            }
-        } else {
-            ClusterProbeResult {
-                status: HealthProbeStatus::Degraded,
-                response_time_ms,
-                error_message: Some(format!(
-                    "{}/{} data node(s) not in a healthy state: {}",
-                    unhealthy.len(),
-                    rows.len(),
-                    unhealthy.join(", ")
-                )),
-            }
+        let states: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<_, &str>(0).to_string(),
+                    row.get::<_, &str>(2).to_string(),
+                )
+            })
+            .collect();
+
+        let (status, error_message) = classify_cluster_states(service.id, &states);
+        ClusterProbeResult {
+            status,
+            response_time_ms,
+            error_message,
         }
     }
 
@@ -9989,6 +10098,106 @@ fn rewrite_env_vars_for_cross_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Cluster write availability ──────────────────────────────────────
+
+    fn st(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, s)| (n.to_string(), s.to_string()))
+            .collect()
+    }
+
+    /// The condition that actually breaks an application: nothing can accept a
+    /// write. The operator has to be told that plainly, and told how to get out
+    /// of it — the promote endpoint is the only self-service recovery.
+    #[test]
+    fn test_no_writable_node_warns_about_writes_and_names_the_recovery() {
+        let (status, msg) = classify_cluster_states(
+            7,
+            &st(&[("node-1", "catchingup"), ("node-2", "wait_standby")]),
+        );
+        let msg = msg.expect("must explain itself");
+
+        assert_eq!(status, HealthProbeStatus::Degraded);
+        assert!(msg.contains("no leader"), "got: {msg}");
+        assert!(msg.contains("writes will fail"), "got: {msg}");
+        // Actionable: names the endpoint and the service it applies to.
+        assert!(msg.contains("/external-services/7/members/"), "got: {msg}");
+        assert!(msg.contains("promote"), "got: {msg}");
+        // And still lists the states, so the operator can see why.
+        assert!(msg.contains("node-1=catchingup"), "got: {msg}");
+    }
+
+    /// `wait_primary` accepts writes — pg_auto_failover clears
+    /// `synchronous_standby_names` there so the cluster keeps serving without a
+    /// standby. Warning "writes will fail" would be flatly wrong, and this is
+    /// the exact state a half-built cluster sits in.
+    #[test]
+    fn test_wait_primary_is_not_reported_as_leaderless() {
+        let (status, msg) = classify_cluster_states(
+            1,
+            &st(&[("node-1", "wait_primary"), ("node-2", "wait_standby")]),
+        );
+        let msg = msg.expect("still degraded — no standby");
+
+        assert_eq!(status, HealthProbeStatus::Degraded);
+        assert!(!msg.contains("writes will fail"), "got: {msg}");
+        assert!(!msg.contains("no leader"), "got: {msg}");
+        // It gets the milder, accurate warning instead.
+        assert!(msg.contains("Writes are being accepted"), "got: {msg}");
+        assert!(msg.contains("no healthy standby"), "got: {msg}");
+    }
+
+    /// `single` is a one-node cluster: writable, and legitimately has no
+    /// standby.
+    #[test]
+    fn test_single_node_is_writable() {
+        let (status, msg) = classify_cluster_states(1, &st(&[("node-1", "single")]));
+        assert_eq!(status, HealthProbeStatus::Operational);
+        assert!(msg.is_none(), "got: {msg:?}");
+    }
+
+    /// A failover passes through these states for a few seconds. Reporting a
+    /// stuck cluster there would flap on every normal promotion.
+    #[test]
+    fn test_failover_in_flight_is_not_reported_as_stuck() {
+        for transient in ["prepare_promotion", "stop_replication", "demoted"] {
+            let (status, msg) =
+                classify_cluster_states(1, &st(&[("node-1", transient), ("node-2", "catchingup")]));
+            let msg = msg.expect("should say something");
+
+            assert_eq!(status, HealthProbeStatus::Degraded);
+            assert!(
+                msg.contains("Failover in progress"),
+                "{transient} should read as a failover, got: {msg}"
+            );
+            assert!(
+                !msg.contains("writes will fail"),
+                "{transient} must not be reported as permanently broken, got: {msg}"
+            );
+        }
+    }
+
+    /// A healthy pair stays quiet — no warning fatigue.
+    #[test]
+    fn test_primary_plus_secondary_is_operational() {
+        let (status, msg) =
+            classify_cluster_states(1, &st(&[("node-1", "primary"), ("node-2", "secondary")]));
+        assert_eq!(status, HealthProbeStatus::Operational);
+        assert!(msg.is_none());
+    }
+
+    /// A primary with a replica still catching up is degraded, but it has a
+    /// standby — so it must NOT get the "no standby" wording.
+    #[test]
+    fn test_catching_up_replica_is_degraded_but_not_unprotected() {
+        let (_, msg) =
+            classify_cluster_states(1, &st(&[("node-1", "primary"), ("node-2", "catchingup")]));
+        let msg = msg.expect("degraded");
+        assert!(msg.contains("node-2=catchingup"), "got: {msg}");
+        assert!(!msg.contains("writes will fail"), "got: {msg}");
+    }
 
     // ── Cluster member placement ────────────────────────────────────────
 
