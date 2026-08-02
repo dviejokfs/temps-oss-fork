@@ -17757,7 +17757,6 @@ export type ValidateEmailRequest = {
      * Email address to validate
      */
     email: string;
-    proxy?: null | ProxyRequest;
 };
 
 /**

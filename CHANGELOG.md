@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **email:** Pin validated SMTP probe addresses and remove request-controlled proxy routing ([#305](https://github.com/gotempsh/temps/pull/305))
 ### Fixed
 
 - **Clone-error credential redaction:** Reject Git URLs with embedded userinfo and redact both usernames and passwords from libgit2 clone errors before deployment failures are persisted to project logs.

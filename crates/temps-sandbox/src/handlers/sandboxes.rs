@@ -225,6 +225,7 @@ fn validate_seed_url(url: &str, kind: &str) -> Result<(), SandboxError> {
             | UrlValidationError::MulticastIp
             | UrlValidationError::BroadcastIp
             | UrlValidationError::DocumentationIp
+            | UrlValidationError::ReservedIp
             | UrlValidationError::UnspecifiedIp
             | UrlValidationError::DomainResolvesToBlockedIp => {
                 "host points to a private, loopback, or metadata address".to_string()
