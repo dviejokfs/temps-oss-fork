@@ -17,6 +17,8 @@ use temps_presets::preset_config_schema::PresetConfigSchema;
 
 pub struct AppState {
     pub project_service: Arc<ProjectService>,
+    pub deployment_canceller: Arc<dyn temps_core::DeploymentCanceller>,
+    pub deployment_container_cleaner: Arc<dyn temps_core::DeploymentContainerCleaner>,
     pub custom_domain_service: Arc<CustomDomainService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub template_service: Arc<TemplateService>,
@@ -154,7 +156,8 @@ pub struct CreateProjectRequest {
     ///
     /// Different presets accept different configuration options:
     /// - **Dockerfile preset**: Accepts `DockerfilePresetConfig` with `dockerfile_path` and `build_context`
-    /// - **Nixpacks preset**: Uses `nixpacks.toml` file for configuration (no params needed)
+    /// - **Nixpacks preset**: Accepts ordered `providers` (for example `["...", "python"]`)
+    ///   and optional inline `nixpacksConfig` TOML
     /// - **Static presets** (Vite, Next.js, etc.): Accept `StaticPresetConfig` with build commands and output dir
     ///
     /// Example for Dockerfile preset:
@@ -436,6 +439,10 @@ impl ProjectResponse {
                     .clone()
                     .map(|c| c.container_exec_enabled)
                     .unwrap_or(false),
+                cross_architecture_builds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.cross_architecture_builds),
             },
         }
     }
@@ -553,6 +560,11 @@ pub struct UpdateDeploymentConfigRequest {
     pub session_recording_enabled: Option<bool>,
     pub replicas: Option<i32>,
     pub security: Option<temps_entities::deployment_config::SecurityConfig>,
+    /// Build one image per architecture the eligible nodes run. Off by
+    /// default; environments inherit this and may override it. Cross-builds
+    /// are emulated on the control plane and substantially slower, so they are
+    /// opted into rather than triggered by cluster topology.
+    pub cross_architecture_builds: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]

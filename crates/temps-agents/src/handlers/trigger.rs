@@ -46,8 +46,8 @@ impl AuditOperation for AgentRunTriggeredAudit {
     fn operation_type(&self) -> String {
         "AGENT_RUN_TRIGGERED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -780,9 +780,12 @@ pub async fn smoke_test_agent(
             }
         }
 
-        let image = format!("temps-sandbox-{}:latest", global_sandbox.runtime);
+        // Same image the real runs and the status check use — an unqualified
+        // `temps-sandbox-<runtime>:latest` resolves to Docker Hub and 404s.
+        let image = crate::sandbox::docker::image_name_for_runtime(&global_sandbox.runtime);
         let sandbox_config = crate::sandbox::SandboxCreateConfig {
             run_id: test_run_id,
+            owner_user_id: Some(auth.user_id()),
             container_name_override: None,
             host_work_dir: work_dir.clone(),
             workspace_volume: None,

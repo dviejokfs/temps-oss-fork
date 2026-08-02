@@ -35,6 +35,7 @@ import { AlertRuleForm } from '@/pages/AlertRuleForm'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { resolveStableUrl } from '@/lib/deployment-url'
 import { useAssistantProject } from '@/components/ai/AiAssistantContext'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
 import { ErrorEventDetail } from './ErrorEventDetail'
@@ -61,7 +62,7 @@ import {
   Routes,
   useParams,
   useSearchParams,
-} from 'react-router-dom'
+} from 'react-router'
 import { Card, CardContent } from '@/components/ui/card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { ShieldAlert } from 'lucide-react'
@@ -303,7 +304,9 @@ export function ProjectDetail() {
                 ? `https://github.com/${project.repo_owner}/${project.repo_name}`
                 : undefined)
             }
-            lastDeploymentUrl={lastDeployment?.url}
+            lastDeploymentUrl={
+              lastDeployment ? resolveStableUrl(lastDeployment) : null
+            }
             isLoadingLastDeployment={isLoadingLastDeployment}
           />
           <div className="flex-1 overflow-y-auto overflow-x-hidden p-4">

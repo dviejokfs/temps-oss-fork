@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Cloud metadata egress isolation:** Block IPv4 and IPv6 metadata endpoints for routed app and Compose bridge traffic with an atomic, startup-reconciled nftables policy; reject Compose network drivers that bypass host filtering ([#431](https://github.com/gotempsh/temps/pull/431))
+- **Credential reveal boundaries:** Mask environment variables, container configuration, external-service parameters, notification providers, MCP servers, and legacy agent tool credentials by default; plaintext now requires an explicit, audited, non-cacheable reveal request
+### Added
+
+- **providers:** `pg_stat_statements`-based slow-query monitoring for user-provisioned Postgres services — a dedicated "Query Performance" page (sortable, paginated, with a per-query detail view) alongside a `GET /external-services/{id}/pg-stat-statements/slow-queries` endpoint and a `temps services slow-queries --id <id>` CLI command ([#460](https://github.com/gotempsh/temps/pull/460))
+- **providers:** self-service "Enable & Restart" action to load `pg_stat_statements` on standalone Postgres services that predate this feature — clustered/HA services are rejected with a clear error instead, since a blind single-container restart bypasses controlled failover ([#460](https://github.com/gotempsh/temps/pull/460))
+- **web:** date/time range picker (15m/1h/24h/7d + custom) on the service Logs screen, and a `temps services logs --id <id>` CLI command with `--from`/`--to` filtering ([#460](https://github.com/gotempsh/temps/pull/460))
+
+### Fixed
+
+- **Platform-admin code-execution boundary**: Remove container, sandbox creation/exec, and pipeline execution permissions from `PlatformAdmin` so the role cannot run caller-selected code inside customer workloads.
+- **PostgreSQL data-explorer query isolation**: Reject function calls and every PostgreSQL subquery form in user-supplied WHERE clauses, and parse PostgreSQL string and quoted-identifier boundaries safely, so expressions cannot read other tables through XML helpers or `IN (TABLE ...)` query expressions.
+- **compose security:** Require URL-safe PostgreSQL and Redis credentials, rotate existing PostgreSQL volumes to SCRAM before startup, keep credentials out of process arguments, bind internal ports to loopback, use authenticated readiness checks, and support unattended initial-admin creation from a mounted password secret.
+- **Webhook retry tenant isolation**: Scope `POST /projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry` lookups to the requested project and webhook so a writer cannot replay another tenant's delivery by guessing its ID.
+- **No-op visitor deduplication migration**: `m20260705_000001_add_visitor_unique_index` now skips bulk foreign-key rewrites when no duplicate `(visitor_id, project_id)` pairs exist, preventing TimescaleDB from eagerly decompressing unrelated hypertable chunks and exceeding `timescaledb.max_tuples_decompressed_per_dml_transaction` during upgrades.
+- **security:** Require the dedicated `secrets:read` permission before returning plaintext project or provider credentials, and mask container environment values for callers without it.
+- **providers:** `shared_preload_libraries` was unconditionally overwritten to just `pg_stat_statements` at container-creation time, silently dropping any image-required library (e.g. `timescaledb` for the `timescale/timescaledb-ha:pg18` image option) — the value is now merged, not overwritten ([#460](https://github.com/gotempsh/temps/pull/460))
+- **providers:** Postgres container restarts never picked up a corrected `shared_preload_libraries` value — the drift-reconciliation check only compared `archive_mode`; it now also detects `shared_preload_libraries` drift and recreates the container accordingly ([#460](https://github.com/gotempsh/temps/pull/460))
+- **web:** the service Logs tab crashed with a React error boundary (`Cannot read properties of undefined (reading 'next_cursor')`) when the logs API returned a non-2xx response ([#460](https://github.com/gotempsh/temps/pull/460))
+- **skills:** Scan changed agent skills in pull requests and all skills nightly, on demand, after relevant pushes to `main`, or when scanner controls change, using the hash-locked Cisco AI Defense Skill Scanner with behavioral analysis, a high-severity merge gate, and fail-closed symlink validation.
+- **temps-best-practices skill:** Add an application runtime contract covering `.temps.yaml` readiness paths, OpenTelemetry health-request suppression, port binding, graceful shutdown, replica-safe state, migrations, telemetry privacy, and browser credential boundaries so generated deployment guidance is safe and production-ready.
+
+### Fixed
+
+- **temps-cli skill:** Use an integrity-pinned, lifecycle-script-disabled CLI installation and the installed `temps` binary so agents no longer download mutable package code on every command; add explicit context, confirmation, secret-handling, credential-reveal, and untrusted-output boundaries.
+- **agent skills:** Make platform setup stop at human-controlled installation and secret boundaries, remove mutable package runners and credential-bearing examples, and pin React analytics/session-recording installation to a reviewed artifact while treating downloaded package content as untrusted.
+
+## [0.1.0-beta.55] - 2026-07-28
+
+### Added
+
+- **agents:** Configurable AI autofix runs with per-provider turn limits ([#435](https://github.com/gotempsh/temps/issues/435))
+- **email:** Choose provider type on a dedicated page before configuring ([#438](https://github.com/gotempsh/temps/issues/438))
+- **web:** Onboard users into AI autofix from error tracking ([#439](https://github.com/gotempsh/temps/issues/439))
+- **sandbox:** Track agent-run sandboxes as first-class sandbox items ([#436](https://github.com/gotempsh/temps/issues/436))
+- **import:** Kubernetes, Coolify, Dokploy, CapRover, Portainer, and Kamal importers with deploy-and-verify ([#441](https://github.com/gotempsh/temps/issues/441))
+
+### CI
+
+- **release:** Add nightly build workflow ([#452](https://github.com/gotempsh/temps/issues/452))
+
+### Documentation
+
+- README overhaul, unified project creation, provider brand logos ([#446](https://github.com/gotempsh/temps/issues/446))
+
+### Fixed
+
+- **web:** Stop analytics/errors setup-redirect from breaking project tour ([#434](https://github.com/gotempsh/temps/issues/434))
+- **agents:** Stop dumping raw CLI JSONL as autofix error messages ([#437](https://github.com/gotempsh/temps/issues/437))
+- **web:** Clear all high-severity bun audit advisories ([#443](https://github.com/gotempsh/temps/issues/443))
+- **deps:** Patch Dependabot advisories in next, setuptools and serde_with ([#442](https://github.com/gotempsh/temps/issues/442))
+- **import:** Trim session credential lifetime + drop stale web cast ([#448](https://github.com/gotempsh/temps/issues/448))
+- **monitoring:** Close race that fires false ContainerCrash alerts on deploy ([#451](https://github.com/gotempsh/temps/issues/451))
+
+### Performance
+
+- **observe:** Stop proxy-log and span listings scanning the whole retention window ([#447](https://github.com/gotempsh/temps/issues/447))
+
+## [0.1.0-beta.54] - 2026-07-24
+
+### Added
+
+- **otel:** Store cross-project trace refs in ClickHouse when enabled ([#429](https://github.com/gotempsh/temps/issues/429))
+
+### Fixed
+
+- **web:** Bump rrweb-player to 2.1.1 (broken 2.1.0 dist → blank replays) ([#430](https://github.com/gotempsh/temps/issues/430))
+
 ## [0.1.0-beta.53] - 2026-07-23
 
 ### Added
