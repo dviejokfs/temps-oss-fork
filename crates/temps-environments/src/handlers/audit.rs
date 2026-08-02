@@ -18,8 +18,8 @@ impl AuditOperation for EnvironmentVariableValueRevealedAudit {
         "ENVIRONMENT_VARIABLE_VALUE_REVEALED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -69,8 +69,8 @@ impl AuditOperation for EnvironmentSettingsUpdatedAudit {
         "ENVIRONMENT_SETTINGS_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -103,8 +103,8 @@ impl AuditOperation for EnvironmentSleepStateChangedAudit {
         "ENVIRONMENT_SLEEP_STATE_CHANGED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -139,8 +139,8 @@ impl AuditOperation for EnvironmentSubdomainUpdatedAudit {
         "ENVIRONMENT_SUBDOMAIN_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -173,8 +173,8 @@ impl AuditOperation for EnvironmentDeletedAudit {
         "ENVIRONMENT_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
