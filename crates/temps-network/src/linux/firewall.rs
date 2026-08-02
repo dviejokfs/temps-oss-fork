@@ -72,9 +72,11 @@ add chain inet {table} forward {{ type filter hook forward priority -100; policy
 # caller; containers must never reach them. These sit BEFORE the bridge
 # accept rules (this chain runs at priority -100, ahead of Docker's own
 # chains, so a later iptables rule could not catch this traffic).
-# 169.254.169.254 = AWS/GCP/Azure/Hetzner/DO; 100.100.100.200 = Alibaba.
-add rule inet {table} forward iifname \"{bridge}\" ip daddr 169.254.169.254 counter reject
-add rule inet {table} forward iifname \"{bridge}\" ip daddr 100.100.100.200 counter reject
+# 169.254/16 = AWS/GCP/Azure/Hetzner/DO/Tencent; 100.100.100.200 = Alibaba.
+add rule inet {table} forward ip daddr 169.254.0.0/16 counter reject
+add rule inet {table} forward ip daddr 100.100.100.200 counter reject
+add rule inet {table} forward ip6 daddr fd00:ec2::254 counter reject
+add rule inet {table} forward ip6 daddr fd20:ce::254 counter reject
 add rule inet {table} forward iifname \"{bridge}\" accept
 add rule inet {table} forward oifname \"{bridge}\" accept
 
@@ -154,16 +156,25 @@ mod tests {
         };
         let s = render_baseline(&cfg, &alloc);
         let aws_block = s
-            .find("ip daddr 169.254.169.254 counter reject")
-            .expect("AWS/GCP/Azure metadata reject rule present");
+            .find("ip daddr 169.254.0.0/16 counter reject")
+            .expect("link-local cloud metadata reject rule present");
         let alibaba_block = s
             .find("ip daddr 100.100.100.200 counter reject")
             .expect("Alibaba metadata reject rule present");
+        let aws_ipv6_block = s
+            .find("ip6 daddr fd00:ec2::254 counter reject")
+            .expect("AWS IPv6 metadata reject rule present");
+        let google_ipv6_block = s
+            .find("ip6 daddr fd20:ce::254 counter reject")
+            .expect("Google IPv6 metadata reject rule present");
         let bridge_accept = s
             .find("forward iifname \"br-temps0\" accept")
             .expect("bridge accept rule present");
         assert!(
-            aws_block < bridge_accept && alibaba_block < bridge_accept,
+            aws_block < bridge_accept
+                && alibaba_block < bridge_accept
+                && aws_ipv6_block < bridge_accept
+                && google_ipv6_block < bridge_accept,
             "metadata rejects must precede the bridge accept rule, \
              or accepted traffic would never reach them"
         );

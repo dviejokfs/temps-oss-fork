@@ -168,6 +168,16 @@ impl TempsPlugin for DeployerPlugin {
                 );
             }
 
+            // Reconcile the app network and its metadata-egress rules during
+            // every server start, even when cluster DNS is disabled and no new
+            // deployment occurs after a Docker or firewall restart.
+            if let Err(error) = docker_runtime.ensure_network_exists().await {
+                tracing::warn!(
+                    error = %error,
+                    "Could not reconcile the app network during deployer startup"
+                );
+            }
+
             // ADR-024: optionally start the control-plane DNS resolver so
             // containers deployed locally on the control plane — and every
             // single-node install — can resolve `*.temps.local`.

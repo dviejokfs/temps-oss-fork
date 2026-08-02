@@ -709,7 +709,17 @@ impl DockerRuntime {
 
         // Re-applied on every deploy (not just network creation) so the block
         // survives host firewall flushes; best-effort, never fails the deploy.
-        crate::metadata_egress::apply_metadata_egress_block(&self.docker, &self.network_name).await;
+        if let Err(error) =
+            crate::metadata_egress::apply_metadata_egress_block(&self.docker, &self.network_name)
+                .await
+        {
+            warn!(
+                network = %self.network_name,
+                error = %error,
+                "Cloud-metadata egress block is incomplete; ensure nftables is \
+                 installed and Temps has CAP_NET_ADMIN"
+            );
+        }
 
         Ok(())
     }
