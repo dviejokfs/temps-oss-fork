@@ -7,7 +7,7 @@ use crate::externalsvc::{
     redis::RedisService,
     rustfs::RustfsService,
     s3::S3Service,
-    AvailableContainer, ClusterMemberSpec, ExternalService, HealthProbeStatus,
+    AvailableContainer, ClusterMemberResult, ClusterMemberSpec, ExternalService, HealthProbeStatus,
     ManagedS3BackendKind, ManagedS3BackendSelection, ServiceConfig, ServiceType,
 };
 use crate::parameter_strategies;
@@ -4885,32 +4885,9 @@ echo "[restore] Pre-seed complete"
         // Writing them up front makes the requested topology durable from the
         // start, so every later failure is retryable. Rows are `pending` until
         // their container exists.
-        let mut pre_created: std::collections::HashMap<i32, service_members::Model> =
-            std::collections::HashMap::new();
-        for (result, spec) in member_results.iter().zip(member_specs.iter()) {
-            let stored_role = if is_role_monitor(&result.role) {
-                "monitor".to_string()
-            } else {
-                "replica".to_string()
-            };
-            let record = service_members::ActiveModel {
-                service_id: Set(service_id),
-                node_id: Set(spec.node_id),
-                role: Set(stored_role),
-                container_id: Set(None),
-                container_name: Set(result.container_name.clone()),
-                hostname: Set(spec.hostname.clone()),
-                port: Set(None),
-                status: Set("pending".to_string()),
-                ordinal: Set(result.ordinal),
-                config: Set(None),
-                created_at: Set(Utc::now()),
-                updated_at: Set(Utc::now()),
-                ..Default::default()
-            };
-            let model = record.insert(self.db.as_ref()).await?;
-            pre_created.insert(result.ordinal, model);
-        }
+        let pre_created =
+            precreate_cluster_members(self.db.as_ref(), service_id, &member_results, &member_specs)
+                .await?;
 
         // Get the Postgres cluster service for building member params
         let pg_cluster = match service_type {
@@ -10157,6 +10134,47 @@ fn compute_stats_sample(
     }
 }
 
+/// Persist the complete intended topology as one transaction so a database
+/// failure cannot leave a retry with only a prefix of the requested members.
+async fn precreate_cluster_members(
+    db: &DatabaseConnection,
+    service_id: i32,
+    member_results: &[ClusterMemberResult],
+    member_specs: &[ClusterMemberSpec],
+) -> Result<HashMap<i32, service_members::Model>, ExternalServiceError> {
+    let transaction = db.begin().await?;
+    let mut pre_created = HashMap::new();
+
+    for (result, spec) in member_results.iter().zip(member_specs.iter()) {
+        let stored_role = if is_role_monitor(&result.role) {
+            "monitor".to_string()
+        } else {
+            "replica".to_string()
+        };
+        let now = Utc::now();
+        let record = service_members::ActiveModel {
+            service_id: Set(service_id),
+            node_id: Set(spec.node_id),
+            role: Set(stored_role),
+            container_id: Set(None),
+            container_name: Set(result.container_name.clone()),
+            hostname: Set(spec.hostname.clone()),
+            port: Set(None),
+            status: Set("pending".to_string()),
+            ordinal: Set(result.ordinal),
+            config: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let model = record.insert(&transaction).await?;
+        pre_created.insert(result.ordinal, model);
+    }
+
+    transaction.commit().await?;
+    Ok(pre_created)
+}
+
 /// Rewrites env var values for cross-node deployments.
 ///
 /// Replaces container names and localhost references with the service node's
@@ -10457,6 +10475,84 @@ mod tests {
                 .expect("node 3 exists");
 
         assert_eq!(resolved[0].node_id, Some(3));
+    }
+
+    fn cluster_member_result(ordinal: i32, role: &str) -> ClusterMemberResult {
+        ClusterMemberResult {
+            ordinal,
+            role: role.to_string(),
+            container_id: String::new(),
+            container_name: format!("cluster-member-{ordinal}"),
+            port: None,
+            status: "pending".to_string(),
+        }
+    }
+
+    fn service_member_model(id: i32, ordinal: i32, role: &str) -> service_members::Model {
+        service_members::Model {
+            id,
+            service_id: 7,
+            node_id: None,
+            role: role.to_string(),
+            container_id: None,
+            container_name: format!("cluster-member-{ordinal}"),
+            hostname: None,
+            port: None,
+            compute_ip: None,
+            status: "pending".to_string(),
+            ordinal,
+            config: None,
+            provisioning_step: None,
+            provisioning_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_precreated_cluster_topology_is_one_transaction() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([
+                vec![service_member_model(1, 0, "monitor")],
+                vec![service_member_model(2, 1, "replica")],
+            ])
+            .into_connection();
+        let results = [
+            cluster_member_result(0, "monitor"),
+            cluster_member_result(1, "replica"),
+        ];
+        let specs = [
+            ClusterMemberSpec {
+                role: "monitor".to_string(),
+                node_id: None,
+                ordinal: 0,
+                hostname: None,
+            },
+            ClusterMemberSpec {
+                role: "replica".to_string(),
+                node_id: None,
+                ordinal: 1,
+                hostname: None,
+            },
+        ];
+
+        let created = precreate_cluster_members(&db, 7, &results, &specs)
+            .await
+            .expect("the full topology should commit");
+        assert_eq!(created.len(), 2);
+
+        let log = db.into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "all member inserts must commit as one transaction"
+        );
+        let insert_count = log[0]
+            .statements()
+            .iter()
+            .filter(|statement| statement.sql.starts_with("INSERT INTO \"service_members\""))
+            .count();
+        assert_eq!(insert_count, 2);
     }
 
     fn test_s3_credentials() -> crate::S3Credentials {
