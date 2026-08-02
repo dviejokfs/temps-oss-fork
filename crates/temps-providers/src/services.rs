@@ -4518,6 +4518,78 @@ echo "[restore] Pre-seed complete"
         }
     }
 
+    /// Node id the API uses for the control plane in the node list.
+    ///
+    /// It is synthetic — there is no `nodes` row for the control plane, and
+    /// containers it runs are stored with `node_id = NULL`. Mirrors
+    /// `CONTROL_PLANE_NODE_ID` in `temps-deployments`.
+    const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+    /// Normalize and validate the node placement of every requested member.
+    ///
+    /// Returns the requests with the control-plane pseudo-node collapsed to
+    /// `None` (which is how local placement is represented everywhere else),
+    /// and fails with a validation error naming the offending member if any
+    /// remaining id has no `nodes` row.
+    ///
+    /// Runs before any container is created so an unknown node is a rejected
+    /// request rather than a half-built cluster.
+    async fn resolve_member_placement(
+        db: &DatabaseConnection,
+        service_id: i32,
+        member_requests: &[ClusterMemberRequest],
+    ) -> Result<Vec<ClusterMemberRequest>, ExternalServiceError> {
+        let normalized: Vec<ClusterMemberRequest> = member_requests
+            .iter()
+            .map(|m| ClusterMemberRequest {
+                role: m.role.clone(),
+                node_id: match m.node_id {
+                    Some(Self::CONTROL_PLANE_NODE_ID) | None => None,
+                    Some(id) => Some(id),
+                },
+            })
+            .collect();
+
+        // One query for every distinct remote id rather than a lookup per
+        // member.
+        let mut wanted: Vec<i32> = normalized.iter().filter_map(|m| m.node_id).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        if wanted.is_empty() {
+            return Ok(normalized);
+        }
+
+        let found: Vec<i32> = nodes::Entity::find()
+            .filter(nodes::Column::Id.is_in(wanted.clone()))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+
+        let missing: Vec<String> = wanted
+            .iter()
+            .filter(|id| !found.contains(id))
+            .map(|id| id.to_string())
+            .collect();
+
+        if !missing.is_empty() {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "Unknown node id(s) [{}] requested for cluster members. Use an id from \
+                     the node list, or omit it (or use {}) to place the member on the \
+                     control plane.",
+                    missing.join(", "),
+                    Self::CONTROL_PLANE_NODE_ID
+                ),
+            });
+        }
+
+        Ok(normalized)
+    }
+
     /// Initialize a cluster service: create member containers across nodes,
     /// then record them in the service_members table.
     async fn initialize_cluster(
@@ -4561,6 +4633,22 @@ echo "[restore] Pre-seed complete"
                 });
             }
         }
+
+        // Resolve placement before anything is created.
+        //
+        // Two things go wrong without this. The node list API surfaces the
+        // control plane as a synthetic node with id 0 — it has no `nodes` row,
+        // because containers it runs are stored with `node_id = NULL` — so a
+        // member placed on it used to reach the node lookup below and fail
+        // with `Internal error: Node 0 not found`. And an id that simply
+        // doesn't exist failed the same way, mid-creation, after other members
+        // had already been built.
+        //
+        // Node 0 is normalized to `None` (the local/control-plane placement it
+        // actually denotes), and every other id is checked up front so a bad
+        // request is a validation error before any container exists.
+        let member_requests =
+            &Self::resolve_member_placement(self.db.as_ref(), service_id, member_requests).await?;
 
         // Parameter decryption only after validation has passed; otherwise
         // operators creating a cluster with an unsupported type or invalid
@@ -4633,6 +4721,47 @@ echo "[restore] Pre-seed complete"
                 id: service_id,
                 reason: format!("Cluster init_cluster failed: {}", e),
             })?;
+
+        // Record the intended membership before building anything.
+        //
+        // These rows used to be inserted one at a time inside the creation
+        // loop below, which meant a failure before the first container — a bad
+        // config, an unreachable node, a parse error — left the service
+        // `failed` with zero `service_members`. Retry reconstructs its member
+        // list from exactly those rows, so it had nothing to work from and
+        // dead-ended on "no previous member records found", telling the
+        // operator to supply a members array the console has no way to send.
+        // Delete-and-recreate was the only way out.
+        //
+        // Writing them up front makes the requested topology durable from the
+        // start, so every later failure is retryable. Rows are `pending` until
+        // their container exists.
+        let mut pre_created: std::collections::HashMap<i32, service_members::Model> =
+            std::collections::HashMap::new();
+        for (result, spec) in member_results.iter().zip(member_specs.iter()) {
+            let stored_role = if is_role_monitor(&result.role) {
+                "monitor".to_string()
+            } else {
+                "replica".to_string()
+            };
+            let record = service_members::ActiveModel {
+                service_id: Set(service_id),
+                node_id: Set(spec.node_id),
+                role: Set(stored_role),
+                container_id: Set(None),
+                container_name: Set(result.container_name.clone()),
+                hostname: Set(spec.hostname.clone()),
+                port: Set(None),
+                status: Set("pending".to_string()),
+                ordinal: Set(result.ordinal),
+                config: Set(None),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            };
+            let model = record.insert(self.db.as_ref()).await?;
+            pre_created.insert(result.ordinal, model);
+        }
 
         // Get the Postgres cluster service for building member params
         let pg_cluster = match service_type {
@@ -4710,27 +4839,23 @@ echo "[restore] Pre-seed complete"
                 // catching up was the bug behind the "two primaries"
                 // display. Treating roles as static config eliminates the
                 // class.
-                let stored_role = if is_role_monitor(&result.role) {
-                    "monitor".to_string()
-                } else {
-                    "replica".to_string()
+                // The row already exists — it was written before any container
+                // work started so a failure here is still retryable. Move it
+                // from `pending` to `creating`.
+                let member_model = {
+                    let existing = pre_created.get(&result.ordinal).cloned().ok_or(
+                        ExternalServiceError::InternalError {
+                            reason: format!(
+                                "No pre-created member record for ordinal {} of service {}",
+                                result.ordinal, service_id
+                            ),
+                        },
+                    )?;
+                    let mut active: service_members::ActiveModel = existing.into();
+                    active.status = Set("creating".to_string());
+                    active.updated_at = Set(Utc::now());
+                    active.update(self.db.as_ref()).await?
                 };
-                let member_record = service_members::ActiveModel {
-                    service_id: Set(service_id),
-                    node_id: Set(spec.node_id),
-                    role: Set(stored_role),
-                    container_id: Set(None),
-                    container_name: Set(result.container_name.clone()),
-                    hostname: Set(spec.hostname.clone()),
-                    port: Set(None),
-                    status: Set("creating".to_string()),
-                    ordinal: Set(result.ordinal),
-                    config: Set(None),
-                    created_at: Set(Utc::now()),
-                    updated_at: Set(Utc::now()),
-                    ..Default::default()
-                };
-                let member_model = member_record.insert(self.db.as_ref()).await?;
 
                 // Assign port: monitor gets base_port, data nodes get base + ordinal
                 let member_port = if is_role_monitor(&spec.role) {
@@ -9864,6 +9989,107 @@ fn rewrite_env_vars_for_cross_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Cluster member placement ────────────────────────────────────────
+
+    fn member(role: &str, node_id: Option<i32>) -> ClusterMemberRequest {
+        ClusterMemberRequest {
+            role: role.to_string(),
+            node_id,
+        }
+    }
+
+    fn nodes_test_model(id: i32) -> nodes::Model {
+        nodes::Model {
+            id,
+            name: format!("worker-{id}"),
+            token_hash: "hash".to_string(),
+            token_encrypted: None,
+            address: "http://10.0.0.2:3100".to_string(),
+            private_address: "10.0.0.2".to_string(),
+            public_endpoint: None,
+            wg_public_key: None,
+            role: "worker".to_string(),
+            status: "active".to_string(),
+            labels: serde_json::json!({}),
+            capacity: serde_json::json!({}),
+            last_heartbeat: None,
+            edge_public_key: None,
+            compute_cidr: None,
+            architecture: None,
+            underlay_address: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn db_with_nodes(rows: Vec<nodes::Model>) -> DatabaseConnection {
+        sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![rows])
+            .into_connection()
+    }
+
+    /// The node list surfaces the control plane as id 0, but it has no `nodes`
+    /// row — local placement is `None` everywhere else. Without collapsing it,
+    /// creating a cluster member there failed with
+    /// `Internal error: Node 0 not found`.
+    #[tokio::test]
+    async fn test_control_plane_node_id_resolves_to_local() {
+        let db = db_with_nodes(vec![]);
+        let resolved = ExternalServiceManager::resolve_member_placement(
+            &db,
+            1,
+            &[member("monitor", Some(0)), member("replica", None)],
+        )
+        .await
+        .expect("node 0 is the control plane, not an unknown node");
+
+        assert_eq!(resolved.len(), 2);
+        assert!(
+            resolved.iter().all(|m| m.node_id.is_none()),
+            "both members should be local: {:?}",
+            resolved.iter().map(|m| m.node_id).collect::<Vec<_>>()
+        );
+        // Roles must survive normalization untouched.
+        assert_eq!(resolved[0].role, "monitor");
+        assert_eq!(resolved[1].role, "replica");
+    }
+
+    /// An id that has no row must be rejected as a validation error *before*
+    /// any container is created — it used to surface as an internal error
+    /// partway through building the cluster.
+    #[tokio::test]
+    async fn test_unknown_node_id_is_a_validation_error() {
+        let db = db_with_nodes(vec![]);
+        let err = ExternalServiceManager::resolve_member_placement(
+            &db,
+            7,
+            &[member("replica", Some(42))],
+        )
+        .await
+        .expect_err("node 42 does not exist");
+
+        match err {
+            ExternalServiceError::ParameterValidationFailed { service_id, reason } => {
+                assert_eq!(service_id, 7);
+                assert!(reason.contains("42"), "must name the bad id: {reason}");
+            }
+            other => panic!("expected ParameterValidationFailed, got {other:?}"),
+        }
+    }
+
+    /// A real worker id passes through so remote placement still works.
+    #[tokio::test]
+    async fn test_known_node_id_is_preserved() {
+        let db = db_with_nodes(vec![nodes_test_model(3)]);
+
+        let resolved =
+            ExternalServiceManager::resolve_member_placement(&db, 1, &[member("replica", Some(3))])
+                .await
+                .expect("node 3 exists");
+
+        assert_eq!(resolved[0].node_id, Some(3));
+    }
 
     fn test_s3_credentials() -> crate::S3Credentials {
         crate::S3Credentials {
