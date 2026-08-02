@@ -94,6 +94,7 @@ pub mod sessions;
 pub mod source_type;
 pub mod static_asset_cache;
 pub mod static_bundles;
+pub mod suppressed_recipients;
 pub mod tls_acme_certificates;
 pub mod types;
 pub mod upstream_config;
@@ -103,7 +104,6 @@ pub mod users;
 // OpenTelemetry entities
 
 pub mod events;
-pub mod magic_link_tokens;
 pub mod session_replay_events;
 pub mod session_replay_sessions;
 pub mod settings;
@@ -115,6 +115,7 @@ pub mod error_alert_rules;
 pub mod error_events;
 pub mod error_groups;
 pub mod project_dsns;
+pub mod source_files;
 pub mod source_maps;
 pub mod tokenizer;
 
@@ -152,6 +153,7 @@ pub mod log_chunks;
 pub mod log_events;
 
 // Standalone sandbox API (Vercel-compatible)
+pub mod sandbox_events;
 pub mod sandboxes;
 
 // Workflow memory

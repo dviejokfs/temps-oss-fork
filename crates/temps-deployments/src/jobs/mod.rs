@@ -3,9 +3,11 @@
 //! This module provides ready-to-use job implementations for common deployment tasks.
 
 pub mod build_image;
+pub mod capture_source_files;
 pub mod capture_source_maps;
 pub mod configure_agents;
 pub mod configure_crons;
+pub mod configure_metric_alerts;
 pub mod deploy_compose;
 pub mod deploy_image;
 pub mod deploy_static;
@@ -22,9 +24,11 @@ pub mod take_screenshot;
 pub mod verify_local_image;
 
 pub use build_image::*;
+pub use capture_source_files::*;
 pub use capture_source_maps::*;
 pub use configure_agents::*;
 pub use configure_crons::*;
+pub use configure_metric_alerts::*;
 pub use deploy_compose::*;
 pub use deploy_image::*;
 pub use deploy_static::*;

@@ -1355,6 +1355,8 @@ mod tests {
             git_url: Set(None),
             git_provider_connection_id: Set(None),
             attack_mode: Set(false),
+            error_source_context_enabled: Set(false),
+            error_source_root: Set(None),
             enable_preview_environments: Set(false),
             source_type: Set(temps_entities::source_type::SourceType::Git),
             created_at: Set(chrono::Utc::now()),
