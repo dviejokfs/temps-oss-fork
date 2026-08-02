@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Clone-error credential redaction:** Reject Git URLs with embedded userinfo and redact both usernames and passwords from libgit2 clone errors before deployment failures are persisted to project logs.
 - **Credential reveal boundaries:** Mask environment variables, container configuration, external-service parameters, notification providers, MCP servers, and legacy agent tool credentials by default; plaintext now requires an explicit, audited, non-cacheable reveal request
 ### Added
 
