@@ -5182,6 +5182,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "11.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hmac 0.12.1",
+ "js-sys",
+ "p256",
+ "p384",
+ "pem",
+ "rand 0.8.7",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "signature",
+ "simple_asn1",
+ "zeroize",
+]
+
+[[package]]
 name = "kqueue"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6536,7 +6560,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-timeout",
  "hyper-util",
- "jsonwebtoken",
+ "jsonwebtoken 10.4.0",
  "once_cell",
  "percent-encoding",
  "pin-project",
@@ -11803,7 +11827,7 @@ dependencies = [
  "hmac 0.13.0",
  "http-body-util",
  "hyper",
- "jsonwebtoken",
+ "jsonwebtoken 10.4.0",
  "log",
  "mockito",
  "octocrab",
@@ -11859,7 +11883,7 @@ dependencies = [
  "base64 0.23.0",
  "chrono",
  "include_dir",
- "jsonwebtoken",
+ "jsonwebtoken 11.0.0",
  "mime_guess",
  "reqwest 0.12.28",
  "rsa",
