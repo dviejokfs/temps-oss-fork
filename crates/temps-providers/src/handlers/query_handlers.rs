@@ -234,6 +234,32 @@ pub struct ReadRowsQuery {
 /// explicitly via `offset`.
 const AI_MAX_ROWS: usize = 100;
 
+/// Hard ceiling for any caller, agent or human.
+///
+/// Rows are materialised into a `Vec<DataRow>` before serialising, so an
+/// unbounded `limit` is a memory bomb on the 3 vCPU / 4 GB reference box —
+/// `?limit=10000000` would try to pull an entire table into the control
+/// plane. Matches the ceiling `list_entities` already applies.
+const MAX_ROWS: usize = 1000;
+
+/// Resolve the effective row limit for a request.
+///
+/// Split out from the handler so the clamp is unit-testable: it is the only
+/// thing standing between a stray query string and an OOM.
+fn effective_row_limit(requested: usize, is_ai_call: bool) -> usize {
+    let ceiling = if is_ai_call { AI_MAX_ROWS } else { MAX_ROWS };
+    requested.min(ceiling)
+}
+
+/// Whether an agent-originated request may read this service's rows.
+///
+/// Pure so the gate can be tested without standing up an `AppState`; this is
+/// the branch that decides whether table contents reach a third-party LLM
+/// provider, so it must not be exercised only through integration paths.
+fn ai_may_read_rows(is_ai_call: bool, service_ai_data_access: bool) -> bool {
+    !is_ai_call || service_ai_data_access
+}
+
 /// Parse the `filter` query-string parameter into the backend-specific JSON
 /// the data source expects.
 ///
@@ -308,6 +334,17 @@ pub async fn read_entity_rows(
     // Per-service opt-in for agent row access. Schema browsing stays open —
     // only the rows themselves are gated, because those are what would be
     // shipped to a third-party LLM provider.
+    //
+    // NOTE ON PROJECT SCOPING: `ApiCallScope::project_ids` constrains only
+    // operations that take a `project_id` parameter (see `build_request_parts`
+    // in temps-ai-api-tools). This route is keyed by `service_id`, so the
+    // conversation's project boundary does NOT narrow it — an agent chatting
+    // about project A can reach a service linked only to project B, bounded by
+    // the caller's own `ExternalServicesRead`. That is accepted deliberately:
+    // services are a platform-level resource that can be shared across
+    // projects, so there is no single owning project to scope to, and the
+    // `ai_data_access` opt-in below is the intended boundary — an operator
+    // enables row access per service, whatever project the chat is about.
     if is_ai_call {
         let service = app_state
             .external_service_manager
@@ -319,7 +356,7 @@ pub async fn read_entity_rows(
                     .with_detail(e.to_string())
             })?;
 
-        if !service.ai_data_access {
+        if !ai_may_read_rows(is_ai_call, service.ai_data_access) {
             return Err(temps_core::problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("AI Data Access Not Enabled")
                 .with_detail(format!(
@@ -346,11 +383,7 @@ pub async fn read_entity_rows(
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments);
 
-    let limit = if is_ai_call {
-        query.limit.min(AI_MAX_ROWS)
-    } else {
-        query.limit
-    };
+    let limit = effective_row_limit(query.limit, is_ai_call);
 
     let options = QueryOptions {
         limit: Some(limit),
@@ -1187,6 +1220,11 @@ pub async fn get_ai_data_access(
     State(app_state): State<Arc<AppState>>,
     Path(service_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
+    // Read side deliberately carries no `assert_service_owned_by_caller`,
+    // unlike `set_ai_data_access` below. It matches every other read in this
+    // module (explorer-support, containers, entities), and the response is a
+    // single boolean about the platform's own configuration — no tenant data.
+    // The write path is where widening access must be tenancy-checked.
     permission_guard!(auth, ExternalServicesRead);
 
     let service = app_state
@@ -1345,6 +1383,44 @@ pub fn configure_query_routes() -> axum::Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_row_limit_clamps_every_caller_not_just_the_agent() {
+        // Rows are materialised into a Vec before serialising, so an
+        // unbounded limit is an OOM on a 4 GB box. The clamp originally only
+        // applied to agent calls, leaving `?limit=10000000` open to anyone.
+        assert_eq!(effective_row_limit(10_000_000, false), MAX_ROWS);
+        assert_eq!(effective_row_limit(10_000_000, true), AI_MAX_ROWS);
+    }
+
+    #[test]
+    fn effective_row_limit_leaves_reasonable_requests_alone() {
+        assert_eq!(effective_row_limit(20, false), 20);
+        assert_eq!(effective_row_limit(20, true), 20);
+        // Agents get the tighter ceiling so a response stays well-formed
+        // rather than being truncated mid-body by the tool caller.
+        assert_eq!(effective_row_limit(500, false), 500);
+        assert_eq!(effective_row_limit(500, true), AI_MAX_ROWS);
+    }
+
+    #[test]
+    fn ai_may_read_rows_requires_the_per_service_opt_in() {
+        // The whole point of the gate: an agent call against a service that
+        // has not opted in must be refused, even though the caller's
+        // ExternalServicesRead permission would otherwise allow it.
+        assert!(!ai_may_read_rows(true, false));
+        assert!(ai_may_read_rows(true, true));
+    }
+
+    #[test]
+    fn ai_may_read_rows_never_blocks_human_callers() {
+        // The opt-in governs the built-in assistant only. Console and CLI
+        // traffic is governed by permissions, and must be unaffected whatever
+        // the flag says — otherwise enabling the AI feature would silently
+        // change who can browse their own data.
+        assert!(ai_may_read_rows(false, false));
+        assert!(ai_may_read_rows(false, true));
+    }
 
     #[test]
     fn parse_row_filter_returns_none_for_absent_or_blank() {

@@ -143,7 +143,9 @@ export function ServiceDataBrowser() {
   // read the tree *after* each load, which the `treeNodes` captured in its
   // closure can never reflect.
   const treeNodesRef = useRef<TreeNode[]>([])
-  treeNodesRef.current = treeNodes
+  useEffect(() => {
+    treeNodesRef.current = treeNodes
+  }, [treeNodes])
 
   // Filter state (for sidebar tree only)
   const [filterText, setFilterText] = useState('')

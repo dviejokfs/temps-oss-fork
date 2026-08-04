@@ -147,13 +147,13 @@ async function resolveService(
  * blob or a long text column otherwise destroys the table. `--json` is the
  * escape hatch and returns everything untouched.
  */
-function cell(value: unknown, maxLength = 40): string {
+export function cell(value: unknown, maxLength = 40): string {
   if (value === null || value === undefined) return colors.dim('null')
   const text = typeof value === 'string' ? value : JSON.stringify(value)
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text
 }
 
-function formatBytes(bytes: number | null | undefined): string {
+export function formatBytes(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined) return colors.dim('—')
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let value = bytes
@@ -172,7 +172,7 @@ function formatBytes(bytes: number | null | undefined): string {
  * return the whole unfiltered table, which reads as a correct answer. Better
  * to refuse before the request leaves.
  */
-function validateFilter(raw: string | undefined, service: string): string | undefined {
+export function validateFilter(raw: string | undefined, service: string): string | undefined {
   if (raw === undefined) return undefined
   try {
     JSON.parse(raw)
