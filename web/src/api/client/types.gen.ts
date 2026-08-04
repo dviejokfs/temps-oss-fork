@@ -15900,6 +15900,14 @@ export type StepResult = {
     success: boolean;
 };
 
+export type StepUpResponse = {
+    /**
+     * ISO 8601 timestamp after which sensitive actions require verification
+     * again.
+     */
+    expires_at: string;
+};
+
 export type StopSequence = string | Array<string>;
 
 /**
@@ -17928,6 +17936,13 @@ export type ValidationSummary = {
 };
 
 export type VerifyMfaRequest = {
+    code: string;
+};
+
+export type VerifyStepUpRequest = {
+    /**
+     * Current TOTP value or an unused recovery code.
+     */
     code: string;
 };
 
@@ -21379,6 +21394,10 @@ export type CreateApiKeyErrors = {
      */
     409: unknown;
     /**
+     * Recent MFA verification required
+     */
+    428: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -21654,6 +21673,10 @@ export type RotateApiKeyErrors = {
      */
     404: unknown;
     /**
+     * Recent MFA verification required
+     */
+    428: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -21681,6 +21704,10 @@ export type CliDeviceApproveErrors = {
      */
     401: unknown;
     /**
+     * Browser session required
+     */
+    403: unknown;
+    /**
      * Unknown user_code
      */
     404: unknown;
@@ -21692,6 +21719,10 @@ export type CliDeviceApproveErrors = {
      * Session expired
      */
     410: unknown;
+    /**
+     * Recent MFA verification required
+     */
+    428: unknown;
     /**
      * Internal server error
      */
@@ -22019,6 +22050,49 @@ export type ResetPasswordResponses = {
 };
 
 export type ResetPasswordResponse = ResetPasswordResponses[keyof ResetPasswordResponses];
+
+export type VerifyStepUpData = {
+    body: VerifyStepUpRequest;
+    path?: never;
+    query?: never;
+    url: '/auth/step-up';
+};
+
+export type VerifyStepUpErrors = {
+    /**
+     * Verification code is empty
+     */
+    400: unknown;
+    /**
+     * Invalid code or expired session
+     */
+    401: unknown;
+    /**
+     * Browser session required
+     */
+    403: unknown;
+    /**
+     * MFA setup required
+     */
+    428: unknown;
+    /**
+     * Too many verification attempts
+     */
+    429: unknown;
+    /**
+     * Verification infrastructure failed
+     */
+    500: unknown;
+};
+
+export type VerifyStepUpResponses = {
+    /**
+     * Session elevated for sensitive actions
+     */
+    200: StepUpResponse;
+};
+
+export type VerifyStepUpResponse = VerifyStepUpResponses[keyof VerifyStepUpResponses];
 
 export type VerifyEmailData = {
     body?: never;
@@ -38331,6 +38405,10 @@ export type DeleteEnvironmentErrors = {
      * Project or environment not found
      */
     404: unknown;
+    /**
+     * Recent MFA verification required
+     */
+    428: unknown;
     /**
      * Internal server error
      */
