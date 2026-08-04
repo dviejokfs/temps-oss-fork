@@ -1,0 +1,24 @@
+[package]
+name = "temps-cloud-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optional client that links a self-hosted Temps instance to a managed backend."
+
+[dependencies]
+temps-cloud-protocol = { path = "../temps-cloud-protocol" }
+
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

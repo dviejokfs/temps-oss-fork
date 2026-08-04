@@ -10696,6 +10696,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-cloud-client"
+version = "0.1.0-beta.55"
+dependencies = [
+ "axum",
+ "chrono",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "temps-cloud-protocol",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "temps-cloud-protocol"
+version = "0.1.0-beta.55"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "temps-config"
 version = "0.1.0-beta.55"
 dependencies = [
