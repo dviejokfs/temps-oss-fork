@@ -30,6 +30,7 @@ import { registerMonitorsCommands } from '../src/commands/monitors/index.js'
 import { registerWebhooksCommands } from '../src/commands/webhooks/index.js'
 import { registerContainersCommands } from '../src/commands/containers/index.js'
 import { registerFlagsCommands } from '../src/commands/flags/index.js'
+import { registerDataCommands } from '../src/commands/data/index.js'
 
 interface CommandInfo {
   name: string
@@ -302,6 +303,7 @@ async function main() {
   registerWebhooksCommands(program)
   registerContainersCommands(program)
 registerFlagsCommands(program)
+registerDataCommands(program)
 
   // Extract command information
   const commands: CommandInfo[] = program.commands.map((cmd: Command) =>
