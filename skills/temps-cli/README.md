@@ -4,7 +4,7 @@ Comprehensive command-line reference for the Temps deployment platform CLI.
 
 ## What This Skill Covers
 
-Complete documentation for all **440+ CLI commands across 69 command groups**
+Complete documentation for all **440+ CLI commands across 70 command groups**
 (catalog generated from `@temps-sdk/cli` v0.1.26; pinned runtime v0.1.28)
 including:
 
@@ -13,6 +13,7 @@ including:
 - ✅ Deployments (Git, static, Docker images, local images)
 - ✅ Environments (create, scale, variables, cron jobs)
 - ✅ Services (PostgreSQL, Redis, MongoDB, S3)
+- ✅ Data browser (read-only: list tables/collections, inspect schema, query rows)
 - ✅ Git Providers (GitHub, GitLab, Bitbucket)
 - ✅ Domains & TLS Certificates
 - ✅ Custom Domains (environment targeting, redirects)
@@ -100,6 +101,11 @@ temps deployments rollback -p my-app
 temps services create -t postgres -n mydb
 temps services list
 temps services link --id 1 --project-id 5
+
+# Browse service data (read-only)
+temps data containers mydb
+temps data tables mydb --path mydb/public
+temps data rows mydb users --path mydb/public --limit 20
 
 # Domains
 temps domains add -p my-app -d example.com
@@ -203,7 +209,7 @@ Use this skill when you need:
 
 ## Full Documentation
 
-See [SKILL.md](SKILL.md) for the complete command reference with examples (6000+ lines, all 69 command groups).
+See [SKILL.md](SKILL.md) for the complete command reference with examples (6000+ lines, all 70 command groups).
 
 ---
 
