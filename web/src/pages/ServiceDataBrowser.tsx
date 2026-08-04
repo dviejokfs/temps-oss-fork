@@ -760,6 +760,39 @@ export function ServiceDataBrowser() {
     ...queryDataMutation(),
   })
 
+  // Sort state outlives the entity it was created for. `navigateTo` clears it,
+  // but restoring a tab, opening a saved view, or landing on a deep link all
+  // reinstate a `sortField` captured against a *different* table — and the
+  // backend then emits `ORDER BY "channel"` on a table with no `channel`
+  // column, so the table simply fails to open:
+  //
+  //   Query failed: column "channel" does not exist
+  //   SELECT * FROM "public"."db_mutex" ORDER BY "channel" DESC …
+  //
+  // Rather than clearing sort at each of those call sites (and missing the
+  // next one), validate against the schema we already fetched: a sort field
+  // the current entity doesn't have is dropped. Falls back to trusting the
+  // field while `entityInfo` is still loading, so the first paint of a
+  // legitimately-sorted view isn't thrown away.
+  const entityFieldNames = useMemo(
+    () => new Set((entityInfo?.fields ?? []).map((f: FieldResponse) => f.name)),
+    [entityInfo]
+  )
+  const sortFieldIsValid =
+    !dataSortField || entityFieldNames.size === 0 || entityFieldNames.has(dataSortField)
+  const effectiveSortField = sortFieldIsValid ? dataSortField : ''
+
+  // Drop the stale field from state too, so the column header doesn't show a
+  // sort indicator for a column this table doesn't have.
+  useEffect(() => {
+    if (dataSortField && !sortFieldIsValid) {
+      setDataSortField('')
+      setDataSortOrder('asc')
+      commitActiveTab({ sortField: undefined, sortOrder: undefined })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataSortField, sortFieldIsValid])
+
   // Load entity data when entity is selected or page changes
   // Skip for S3 objects as they should be downloaded, not queried
   useEffect(() => {
@@ -771,8 +804,8 @@ export function ServiceDataBrowser() {
         const queryRequest: QueryDataRequest = {
           limit: pageSize,
           offset: (page - 1) * pageSize,
-          sort_by: dataSortField || undefined,
-          sort_order: dataSortField ? dataSortOrder : undefined,
+          sort_by: effectiveSortField || undefined,
+          sort_order: effectiveSortField ? dataSortOrder : undefined,
           filters: dataFilter || undefined,
         }
 
@@ -1831,7 +1864,7 @@ export function ServiceDataBrowser() {
               appliedFilter={dataFilter}
               onApplyFilter={handleApplyFilter}
               onClearFilter={handleClearFilter}
-              dataSortField={dataSortField}
+              dataSortField={effectiveSortField}
               dataSortOrder={dataSortOrder}
               explorerSupport={explorerSupport}
               onSort={(field: string) => {
@@ -1864,8 +1897,8 @@ export function ServiceDataBrowser() {
                     body: {
                       limit: pageSize,
                       offset: (page - 1) * pageSize,
-                      sort_by: dataSortField || undefined,
-                      sort_order: dataSortField ? dataSortOrder : undefined,
+                      sort_by: effectiveSortField || undefined,
+                      sort_order: effectiveSortField ? dataSortOrder : undefined,
                       filters: dataFilter || undefined,
                     },
                   })
