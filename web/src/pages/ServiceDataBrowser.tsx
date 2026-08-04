@@ -138,6 +138,13 @@ export function ServiceDataBrowser() {
   // Track the last expanded path to avoid re-expanding
   const lastExpandedPathRef = useRef<string>('')
 
+  // Live mirror of `treeNodes`. The URL-restore effect below walks the path
+  // one level at a time, loading each level's children as it goes; it must
+  // read the tree *after* each load, which the `treeNodes` captured in its
+  // closure can never reflect.
+  const treeNodesRef = useRef<TreeNode[]>([])
+  treeNodesRef.current = treeNodes
+
   // Filter state (for sidebar tree only)
   const [filterText, setFilterText] = useState('')
 
@@ -654,6 +661,8 @@ export function ServiceDataBrowser() {
 
     // Expand each level of the path sequentially
     const expandPath = async () => {
+      let resolvedEveryLevel = true
+
       for (let i = 0; i < pathSegments.length; i++) {
         const currentPath = pathSegments.slice(0, i + 1).join('/')
 
@@ -669,10 +678,23 @@ export function ServiceDataBrowser() {
           return null
         }
 
-        const node = findNode(treeNodes, currentPath)
+        // Read the LIVE tree, not the `treeNodes` captured when this effect
+        // ran. Each `loadNodeChildren` below appends the next level, and the
+        // closure copy predates every one of them — so from i=1 onward this
+        // lookup always returned null and the deeper segments were never
+        // expanded. That is why reloading on ?path=db/schema left the schema
+        // collapsed.
+        const node = findNode(treeNodesRef.current, currentPath)
+
+        if (!node) {
+          // The level isn't in the tree yet (still loading, or the path is
+          // stale). Leave the guard unset so a later run can finish the job.
+          resolvedEveryLevel = false
+          break
+        }
 
         // If node exists and can have children
-        if (node && node.type === 'container') {
+        if (node.type === 'container') {
           // If not already expanded and can contain children, expand it
           if (
             !node.isExpanded &&
@@ -693,18 +715,26 @@ export function ServiceDataBrowser() {
               return updateNodes(prevNodes)
             })
 
-            // Load children if not loaded - wait for it to complete before moving to next level
+            // Load children before descending — the next iteration looks the
+            // child up in the tree this call populates. Yield afterwards so
+            // React commits the state update and `treeNodesRef` reflects it;
+            // if it hasn't landed yet, the `!node` branch above leaves the
+            // guard unset and a later pass retries rather than giving up.
             if (!node.isLoaded) {
               await loadNodeChildren(currentPath)
-              // Wait a bit for state to update
-              await new Promise((resolve) => setTimeout(resolve, 100))
+              await new Promise((resolve) => setTimeout(resolve, 50))
             }
           }
         }
       }
 
-      // Mark this path as expanded
-      lastExpandedPathRef.current = selectedPath
+      // Only latch when the whole path actually opened. Setting this
+      // unconditionally was the second half of the reload bug: the first
+      // (failed) pass marked the path done, so the re-run triggered by the
+      // freshly-loaded children bailed out at the guard above.
+      if (resolvedEveryLevel) {
+        lastExpandedPathRef.current = selectedPath
+      }
     }
 
     expandPath()
@@ -1245,6 +1275,7 @@ export function ServiceDataBrowser() {
           isObjectStore={isObjectStore}
           formatFileSize={formatFileSize}
           formatDate={formatDate}
+          onOpenEntity={(entityName) => navigateTo(selectedPath, entityName)}
         />
       )
     }
@@ -1669,40 +1700,38 @@ export function ServiceDataBrowser() {
             px-4 md:px-0
           `}
         >
-          <Card className="h-full flex flex-col">
-            <CardHeader className="pb-3">
-              <CardTitle className="text-base flex items-center gap-2">
-                <Database className="h-4 w-4" />
-                Containers
-              </CardTitle>
-              <CardDescription className="text-xs">
-                Navigate through your data
-              </CardDescription>
-            </CardHeader>
-
-            {/* Search Control */}
-            <div className="px-4 pb-3">
+          {/* Flush rail rather than a card: the tree is primary navigation,
+              not a standalone object, and a card here only added a border,
+              ~90px of chrome and a second scroll container. */}
+          <div className="h-full flex flex-col border-r bg-background">
+            {/* Search first — with dozens of tables per schema, filtering is
+                the fast path and expanding the tree is the slow one. */}
+            <div className="p-3">
               <div className="relative">
-                <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                <Search className="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <input
                   type="text"
-                  placeholder="Filter..."
+                  name="container-filter"
+                  aria-label="Filter containers and tables"
+                  placeholder="Filter tables…"
                   value={filterText}
                   onChange={(e) => setFilterText(e.target.value)}
-                  className="w-full pl-8 pr-8 py-1.5 text-sm border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-ring"
+                  className="w-full rounded-md border bg-background py-1.5 pl-8 pr-8 text-base/6 focus:outline-none focus:ring-2 focus:ring-ring sm:text-sm/6"
                 />
                 {filterText && (
                   <button
+                    type="button"
+                    aria-label="Clear filter"
                     onClick={() => setFilterText('')}
                     className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                   >
-                    <X className="h-4 w-4" />
+                    <X className="size-4" />
                   </button>
                 )}
               </div>
             </div>
 
-            <CardContent className="flex-1 p-0 overflow-hidden border-t min-h-0">
+            <div className="flex-1 min-h-0 overflow-hidden">
               {/* Show tree error if present */}
               {treeError && (
                 <div className="p-4 border-b">
@@ -1749,13 +1778,13 @@ export function ServiceDataBrowser() {
                     getEntityIcon={getEntityIcon}
                   />
                 ) : (
-                  <div className="text-center py-8 text-sm text-muted-foreground">
+                  <div className="py-8 text-center text-base/7 text-muted-foreground sm:text-sm/6">
                     {filterText ? 'No matches found' : 'No containers'}
                   </div>
                 )}
               </div>
-            </CardContent>
-          </Card>
+            </div>
+          </div>
         </div>
 
         {/* Overlay for mobile when sidebar is open */}
@@ -1998,31 +2027,40 @@ function TreeNodeComponent({
           // Prevent browser autoscroll on middle-click
           if (e.button === 1) e.preventDefault()
         }}
-        className={`min-w-full w-max flex items-center gap-2 px-2 py-1.5 text-sm rounded-md transition-colors hover:bg-accent whitespace-nowrap ${
+        className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-accent ${
           isSelected ? 'bg-accent text-accent-foreground' : ''
         }`}
-        style={{ paddingLeft: `${level * 16 + 8}px` }}
       >
-        {canExpand && (
-          <span className="flex-shrink-0">
-            {node.isExpanded ? (
-              <ChevronDown className="h-3.5 w-3.5" />
+        {/* Reserve the chevron column even when a node can't expand, so
+            names stay aligned instead of stepping in and out. */}
+        <span className="shrink-0">
+          {canExpand ? (
+            node.isExpanded ? (
+              <ChevronDown className="size-3.5" />
             ) : (
-              <ChevronRight className="h-3.5 w-3.5" />
-            )}
-          </span>
-        )}
+              <ChevronRight className="size-3.5" />
+            )
+          ) : (
+            <span className="block size-3.5" />
+          )}
+        </span>
         {node.type === 'container'
           ? getContainerIcon(node.containerType, node.isExpanded || false)
           : getEntityIcon(node.entityType)}
-        <span className="text-left">{node.name}</span>
-        {node.containerType && (
-          <Badge variant="outline" className="text-xs flex-shrink-0 ml-auto">
-            {node.containerType}
-          </Badge>
-        )}
+        {/* min-w-0 + truncate: long table names ellipsize. The previous
+            `w-max` + type Badge forced the whole rail to scroll sideways,
+            and the badge was redundant — every sibling shares a type. */}
+        <span className="min-w-0 flex-1 truncate text-left">{node.name}</span>
       </button>
+      {/* Indent guide. Nesting used to be flat `paddingLeft: level*16`, which
+          left a child's icon only ~16px right of its parent's with nothing
+          joining them — at a glance the schemas read as siblings of the
+          database, not children. A rule dropped from the parent's chevron
+          makes the relationship explicit and survives long, truncated names.
+          The line sits at the chevron's centre: px-2 (8px) + half of
+          size-3.5 (7px). */}
       {node.isExpanded && node.children && node.children.length > 0 && (
+        <div className="ml-[15px] border-l border-border pl-2">
         <TreeView
           nodes={node.children}
           level={level + 1}
@@ -2034,6 +2072,7 @@ function TreeNodeComponent({
           getContainerIcon={getContainerIcon}
           getEntityIcon={getEntityIcon}
         />
+        </div>
       )}
     </div>
   )
@@ -2233,6 +2272,7 @@ function ContainerEntitiesView({
   isObjectStore,
   formatFileSize,
   formatDate,
+  onOpenEntity,
 }: {
   serviceId: string
   containerPath: string
@@ -2241,8 +2281,11 @@ function ContainerEntitiesView({
   isObjectStore: () => boolean
   formatFileSize: (bytes: number) => string
   formatDate: (dateString: string | undefined) => string
+  /** Open an entity's rows in the main pane. */
+  onOpenEntity?: (entityName: string) => void
 }) {
   const [nextToken, setNextToken] = useState<string | null>(null)
+  const [entityFilter, setEntityFilter] = useState('')
   const [selectedEntityForInfo, setSelectedEntityForInfo] = useState<
     string | null
   >(null)
@@ -2299,7 +2342,8 @@ function ContainerEntitiesView({
     ...queryDataMutation(),
   })
 
-  // Handler to view key value
+  // Handler to view key value (Redis/KV: the "entity" IS the value, so the
+  // row opens a peek dialog rather than navigating to a rows table).
   const handleViewKeyValue = (entityName: string) => {
     setSelectedKeyForValue(entityName)
     queryKeyValue.mutate({
@@ -2313,6 +2357,16 @@ function ContainerEntitiesView({
         offset: 0,
       },
     })
+  }
+
+  // Object stores download; key-value stores peek at the value; everything
+  // else (tables, collections) opens its rows in the main pane.
+  const openEntity = (entityName: string) => {
+    if (onOpenEntity) {
+      onOpenEntity(entityName)
+    } else {
+      handleViewKeyValue(entityName)
+    }
   }
 
   if (isLoading) {
@@ -2392,35 +2446,61 @@ function ContainerEntitiesView({
   // Split path into segments for display
   const pathSegments = containerPath.split('/')
 
+  // Narrow the loaded page client-side. A schema like pg_catalog has 60+
+  // tables; without this the only way to find one is to read the whole list.
+  const visibleEntities = entityFilter.trim()
+    ? entitiesList.filter((e: EntityResponse) =>
+        e.name.toLowerCase().includes(entityFilter.trim().toLowerCase())
+      )
+    : entitiesList
+
+  const entityNoun = isObjectStore() ? 'objects' : 'tables'
+
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center justify-between">
-          <div className="flex-1">
-            <div className="flex items-center gap-2 text-sm text-muted-foreground mb-2">
-              {pathSegments.map((segment, index) => (
-                <div key={index} className="flex items-center gap-2">
-                  {index > 0 && <span>/</span>}
-                  <span
-                    className={
-                      index === pathSegments.length - 1
-                        ? 'font-medium text-foreground'
-                        : ''
-                    }
-                  >
-                    {segment}
-                  </span>
-                </div>
-              ))}
-            </div>
-            <CardTitle className="flex items-center gap-2">
-              <Database className="h-5 w-5" />
-              {containerName}
-            </CardTitle>
-            <CardDescription>
-              Showing {count} {isObjectStore() ? 'objects' : 'entities'}
-              {total !== null && total !== undefined && ` of ${total}`}
-            </CardDescription>
+    <div className="flex flex-col gap-4">
+      {/* Header — breadcrumb, count, filter. No card: the table is the
+          content, and wrapping it in one only adds a border and padding. */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div className="min-w-0">
+          <nav className="flex flex-wrap items-center gap-1 text-sm/6 text-muted-foreground">
+            {pathSegments.map((segment, index) => (
+              <span key={index} className="flex items-center gap-1">
+                {index > 0 && <span aria-hidden="true">/</span>}
+                <span
+                  className={
+                    index === pathSegments.length - 1
+                      ? 'font-medium text-foreground'
+                      : ''
+                  }
+                >
+                  {segment}
+                </span>
+              </span>
+            ))}
+          </nav>
+          <h2 className="mt-1 truncate text-lg/7 font-semibold sm:text-base/6">
+            {count} {entityNoun}
+            {total !== null && total !== undefined && total !== count
+              ? ` of ${total}`
+              : ''}
+            {entityFilter.trim() && visibleEntities.length !== count
+              ? ` · ${visibleEntities.length} matching`
+              : ''}
+          </h2>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="text"
+              name="entity-filter"
+              aria-label={`Filter ${entityNoun}`}
+              placeholder={`Filter ${entityNoun}…`}
+              value={entityFilter}
+              onChange={(e) => setEntityFilter(e.target.value)}
+              className="w-full rounded-md border bg-background py-1.5 pl-8 pr-2 text-base/6 focus:outline-none focus:ring-2 focus:ring-ring sm:w-56 sm:text-sm/6"
+            />
           </div>
           <Button
             variant="ghost"
@@ -2429,60 +2509,75 @@ function ContainerEntitiesView({
               setNextToken(null)
               refetch()
             }}
-            className="gap-2"
+            title="Refresh"
           >
-            <RefreshCcw className="h-4 w-4" />
-            Refresh
+            <RefreshCcw className="size-4" />
+            <span className="sr-only">Refresh</span>
           </Button>
         </div>
-      </CardHeader>
-      <CardContent>
-        {entitiesList.length > 0 ? (
+      </div>
+
+      <div>
+        {visibleEntities.length > 0 ? (
           <>
-            <div className="rounded-md border overflow-x-auto">
+            <div className="-my-2 overflow-x-auto">
+              <div className="inline-block min-w-full py-2 align-middle">
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="border-b bg-muted/50">
-                    <th className="text-left p-3 font-medium whitespace-nowrap">
-                      Type
-                    </th>
-                    <th className="text-left p-3 font-medium whitespace-nowrap">
+                  <tr className="border-b">
+                    <th className="whitespace-nowrap p-3 text-left font-medium">
                       Name
                     </th>
                     {isObjectStore() ? (
                       <>
-                        <th className="text-left p-3 font-medium whitespace-nowrap">
-                          Content Type
+                        <th className="whitespace-nowrap p-3 text-left font-medium">
+                          Content type
                         </th>
-                        <th className="text-left p-3 font-medium whitespace-nowrap">
+                        <th className="whitespace-nowrap p-3 text-left font-medium">
                           Size
                         </th>
-                        <th className="text-left p-3 font-medium whitespace-nowrap">
-                          Last Modified
+                        <th className="whitespace-nowrap p-3 text-left font-medium">
+                          Last modified
                         </th>
-                        <th className="text-right p-3 font-medium whitespace-nowrap">
-                          Actions
+                        <th className="whitespace-nowrap p-3 text-right font-medium">
+                          <span className="sr-only">Actions</span>
                         </th>
                       </>
                     ) : (
-                      <th className="text-right p-3 font-medium whitespace-nowrap">
-                        Actions
-                      </th>
+                      <>
+                        <th className="whitespace-nowrap p-3 text-left font-medium">
+                          Type
+                        </th>
+                        <th className="whitespace-nowrap p-3 text-right font-medium">
+                          Rows
+                        </th>
+                      </>
                     )}
                   </tr>
                 </thead>
                 <tbody>
-                  {entitiesList.map((entity: EntityResponse, idx: number) => (
+                  {visibleEntities.map((entity: EntityResponse, idx: number) => (
                     <tr
                       key={`${entity.name}-${idx}`}
                       className="border-b last:border-0 hover:bg-muted/30"
                     >
                       <td className="p-3">
-                        <div className="[&>svg]:h-4 [&>svg]:w-4">
-                          {getEntityIcon(entity.entity_type)}
-                        </div>
+                        {/* The name is the link. A row whose only affordance
+                            is a button at the far right reads as inert —
+                            people click the thing they came for. */}
+                        <button
+                          type="button"
+                          onClick={() => openEntity(entity.name)}
+                          className="flex items-center gap-2 text-left hover:underline"
+                        >
+                          <span className="shrink-0 [&>svg]:size-4">
+                            {getEntityIcon(entity.entity_type)}
+                          </span>
+                          <span className="font-mono text-xs">
+                            {entity.name}
+                          </span>
+                        </button>
                       </td>
-                      <td className="p-3 font-mono text-xs">{entity.name}</td>
                       {isObjectStore() ? (
                         <>
                           <td className="p-3 text-xs">
@@ -2572,51 +2667,60 @@ function ContainerEntitiesView({
                           </td>
                         </>
                       ) : (
-                        <td className="p-3 text-right">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-8 px-2"
-                            onClick={() => handleViewKeyValue(entity.name)}
-                            title="View Value"
-                          >
-                            <Eye className="h-4 w-4" />
-                          </Button>
-                        </td>
+                        <>
+                          <td className="p-3 text-xs text-muted-foreground">
+                            {entity.entity_type === 'BASE TABLE'
+                              ? 'table'
+                              : (entity.entity_type ?? '—').toLowerCase()}
+                          </td>
+                          <td className="p-3 text-right text-xs tabular-nums">
+                            {entity.row_count === null ||
+                            entity.row_count === undefined ? (
+                              <span className="text-muted-foreground">—</span>
+                            ) : (
+                              entity.row_count.toLocaleString()
+                            )}
+                          </td>
+                        </>
                       )}
                     </tr>
                   ))}
                 </tbody>
               </table>
+              </div>
             </div>
 
-            {/* Pagination Controls */}
-            <div className="flex items-center justify-between mt-4">
-              <div className="text-sm text-muted-foreground">
-                {count} {isObjectStore() ? 'objects' : 'entities'} shown
-                {total !== null && total !== undefined && ` of ${total} total`}
+            {/* Pagination — only shown when the backend actually pages
+                (S3/Redis token cursors). A 60-table schema arrives in one
+                response, and showing dead controls under it is noise. */}
+            {(hasMore || nextToken) && (
+              <div className="mt-4 flex items-center justify-between">
+                <div className="text-sm/6 text-muted-foreground">
+                  {count} {entityNoun} shown
+                  {total !== null && total !== undefined && ` of ${total} total`}
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!nextToken}
+                    onClick={() => setNextToken(null)}
+                  >
+                    First page
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!hasMore}
+                    onClick={() =>
+                      setNextToken(entitiesResponse?.next_token || null)
+                    }
+                  >
+                    Next page
+                  </Button>
+                </div>
               </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={!nextToken}
-                  onClick={() => setNextToken(null)}
-                >
-                  First Page
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={!hasMore}
-                  onClick={() =>
-                    setNextToken(entitiesResponse?.next_token || null)
-                  }
-                >
-                  Next Page
-                </Button>
-              </div>
-            </div>
+            )}
 
             {/* Entity Info Modal */}
             <Dialog
@@ -2843,14 +2947,29 @@ function ContainerEntitiesView({
               </DialogContent>
             </Dialog>
           </>
+        ) : entityFilter.trim() ? (
+          <div className="py-10 text-center">
+            <p className="text-base/7 text-muted-foreground sm:text-sm/6">
+              No {entityNoun} match &ldquo;{entityFilter.trim()}&rdquo;.
+            </p>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="mt-2"
+              onClick={() => setEntityFilter('')}
+            >
+              Clear filter
+            </Button>
+          </div>
         ) : (
-          <div className="text-center py-8 text-sm text-muted-foreground">
-            No {isObjectStore() ? 'objects' : 'entities'} found in this
-            container
+          <div className="py-10 text-center">
+            <p className="text-base/7 text-muted-foreground sm:text-sm/6">
+              This container has no {entityNoun}.
+            </p>
           </div>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   )
 }
 
@@ -3027,27 +3146,50 @@ function EntityDataView({
   const errorDetail = error?.detail
 
   return (
-    <div className="space-y-6">
-      {/* Entity Info Card */}
+    <div className="space-y-4">
+      {/* Entity header. Previously two stacked cards — one for the title, one
+          for "Data" — pushed the first row ~470px down the page. The table is
+          the content; the name and its stats fit on one line above it, and a
+          card around a heading adds a border for nothing. */}
       {entityInfo && (
-        <Card>
-          <CardHeader>
-            <div className="flex items-center justify-between">
-              <div>
-                <CardTitle className="flex items-center gap-2">
-                  <div className="[&>svg]:h-5 [&>svg]:w-5">
+        <div>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <h2 className="flex items-center gap-2 text-lg/7 font-semibold sm:text-base/6">
+                  <span className="shrink-0 [&>svg]:size-4">
                     {getEntityIcon(entityInfo.entity_type)}
-                  </div>
-                  {entityInfo.entity}
-                </CardTitle>
-                <CardDescription>
-                  Type: {entityInfo.entity_type}
+                  </span>
+                  <span className="truncate">{entityInfo.entity}</span>
+                </h2>
+                {/* Everything that was spread across two card descriptions
+                    and a standalone badge, on one muted line. */}
+                <p className="mt-0.5 text-base/6 text-muted-foreground sm:text-sm/6">
+                  {entityInfo.entity_type === 'BASE TABLE'
+                    ? 'table'
+                    : entityInfo.entity_type}
                   {!isObjectStore() && entityInfo.fields && (
-                    <> • {entityInfo.fields.length} fields</>
+                    <> · {entityInfo.fields.length} fields</>
                   )}
-                </CardDescription>
+                  {queryResult?.total_count !== undefined && (
+                    <>
+                      {' '}
+                      · <span className="tabular-nums">
+                        {queryResult.total_count.toLocaleString()}
+                      </span>{' '}
+                      rows
+                    </>
+                  )}
+                  {queryResult?.execution_time_ms !== undefined && (
+                    <>
+                      {' '}
+                      · <span className="tabular-nums">
+                        {queryResult.execution_time_ms}ms
+                      </span>
+                    </>
+                  )}
+                </p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex shrink-0 items-center gap-2">
                 {/* Download button for S3 objects */}
                 {isObjectStore() && entityInfo.entity_type === 'object' && (
                   <Button
@@ -3076,30 +3218,24 @@ function EntityDataView({
                     size="sm"
                     onClick={() => setShowSchema(!showSchema)}
                   >
-                    {showSchema ? 'Hide' : 'Show'} Schema
+                    {showSchema ? 'Hide' : 'Show'} schema
                   </Button>
                 )}
                 {/* Only show Refresh button for non-S3-objects */}
                 {!(isObjectStore() && entityInfo.entity_type === 'object') && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={onRefresh}
-                    className="gap-2"
-                  >
-                    <RefreshCcw className="h-4 w-4" />
-                    Refresh
+                  <Button variant="ghost" size="sm" onClick={onRefresh}>
+                    <RefreshCcw className="size-4" />
+                    <span className="sr-only">Refresh</span>
                   </Button>
                 )}
               </div>
             </div>
-          </CardHeader>
 
           {/* Show object metadata for S3 objects */}
           {isObjectStore() &&
             entityInfo.entity_type === 'object' &&
             (entityInfo as any).metadata && (
-              <CardContent className="pt-0">
+              <div className="pt-2">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4">
                   {/* File Size */}
                   {(entityInfo as any).size_bytes !== undefined && (
@@ -3188,11 +3324,11 @@ function EntityDataView({
                     </div>
                   )}
                 </div>
-              </CardContent>
+              </div>
             )}
 
           {!isObjectStore() && showSchema && entityInfo.fields && (
-            <CardContent>
+            <div className="pt-2">
               <div className="space-y-2">
                 <h3 className="font-medium text-sm mb-3">Schema</h3>
                 <div className="rounded-md border">
@@ -3224,54 +3360,44 @@ function EntityDataView({
                   </table>
                 </div>
               </div>
-            </CardContent>
+            </div>
           )}
-        </Card>
+        </div>
       )}
 
       {/* Data Table - Only show for non-S3-objects */}
       {!(isObjectStore() && entityInfo?.entity_type === 'object') && (
-        <Card>
-          <CardHeader>
-            <div className="flex items-center justify-between">
-              <div>
-                <CardTitle className="flex items-center gap-2">
-                  Data
-                  {hasFilterSupport && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setIsFilterExpanded(!isFilterExpanded)}
-                      className="h-7 px-2"
-                    >
-                      {isFilterExpanded ? (
-                        <>
-                          <ChevronDown className="h-4 w-4" />
-                          <span className="text-xs ml-1">Hide Filter</span>
-                        </>
-                      ) : (
-                        <>
-                          <ChevronRight className="h-4 w-4" />
-                          <span className="text-xs ml-1">Show Filter</span>
-                        </>
-                      )}
-                    </Button>
-                  )}
-                </CardTitle>
-                {queryResult && (
-                  <CardDescription>
-                    Showing {queryResult.returned_count} of{' '}
-                    {queryResult.total_count || '?'}{' '}
-                    {isObjectStore() ? 'objects' : 'rows'}
-                    {appliedFilter !== undefined && ' (filtered)'} • Execution
-                    time: {queryResult.execution_time_ms}ms
-                  </CardDescription>
+        <div>
+          <div className="pb-3">
+            <div className="flex items-center justify-between gap-2">
+              {/* No "Data" heading: the table below is self-evidently the
+                  data, and the counts now live in the entity header line.
+                  Only the filter toggle needs a home here. */}
+              <div className="flex items-center gap-2">
+                {hasFilterSupport && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setIsFilterExpanded(!isFilterExpanded)}
+                  >
+                    {isFilterExpanded ? (
+                      <ChevronDown className="size-4" />
+                    ) : (
+                      <ChevronRight className="size-4" />
+                    )}
+                    {isFilterExpanded ? 'Hide filter' : 'Filter'}
+                  </Button>
+                )}
+                {appliedFilter !== undefined && (
+                  <span className="text-sm/6 text-muted-foreground">
+                    filtered
+                  </span>
                 )}
               </div>
               {queryLoading && (
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  <span>Loading...</span>
+                <div className="flex items-center gap-2 text-sm/6 text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" />
+                  <span>Loading…</span>
                 </div>
               )}
             </div>
@@ -3351,22 +3477,12 @@ function EntityDataView({
                 </div>
               </div>
             )}
-            {/* Show info badge about capabilities */}
-            {explorerSupport && (
-              <div className="flex gap-2 mt-3">
-                {explorerSupport.capabilities.map((capability) => (
-                  <Badge
-                    key={capability}
-                    variant="secondary"
-                    className="text-xs"
-                  >
-                    {capability.toUpperCase()}
-                  </Badge>
-                ))}
-              </div>
-            )}
-          </CardHeader>
-          <CardContent>
+            {/* The capability badges ("SQL") used to sit on their own row
+                here. They describe the service, not this table, and are
+                already implied by the filter placeholder — dropping the row
+                buys back vertical space on every single table view. */}
+          </div>
+          <div>
             {queryResult && queryResult.rows && queryResult.rows.length > 0 ? (
               <>
                 <div className="rounded-md border overflow-x-auto">
@@ -3463,8 +3579,8 @@ function EntityDataView({
                   : 'No data found'}
               </div>
             )}
-          </CardContent>
-        </Card>
+          </div>
+        </div>
       )}
     </div>
   )
