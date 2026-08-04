@@ -10842,6 +10842,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "ipnet",
+ "libc",
  "mockall",
  "octocrab",
  "rand 0.10.2",
@@ -12103,6 +12104,7 @@ dependencies = [
  "tracing",
  "url",
  "utoipa",
+ "zip 8.6.0",
 ]
 
 [[package]]
