@@ -53,6 +53,43 @@ pub struct ExternalServiceStatusChangedAudit {
     pub new_status: String,
 }
 
+/// Operator changed whether the AI assistant may read this service's row data.
+///
+/// Audited because it widens what a third party (the configured AI provider)
+/// can see: rows may contain password hashes, tokens and personal data. Both
+/// directions are recorded so the trail shows when access was opened *and*
+/// closed.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiDataAccessChangedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub service_name: String,
+    pub enabled: bool,
+}
+
+impl AuditOperation for AiDataAccessChangedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_AI_DATA_ACCESS_CHANGED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalServiceProjectLinkedAudit {
     pub context: AuditContext,

@@ -49,6 +49,56 @@ impl ApiToolsProvider {
     }
 }
 
+/// Playbook appended to every chat's system framing so the model can answer
+/// data questions ("read the users from the landing production database")
+/// without the user knowing container paths or table names.
+///
+/// Without this, the model sees `list_root_containers` / `read_entity_rows` in
+/// the index but has no way to know they compose into a navigation sequence,
+/// that `path` is slash-separated, or that the hierarchy depth differs per
+/// engine (Postgres nests schemas under databases; MySQL, MongoDB, Redis and S3
+/// do not). It then guesses paths and loops on 400s.
+const DATA_BROWSING_PLAYBOOK: &str = "\
+## Reading data from a database or bucket
+
+The `external-services` section can browse the *contents* of managed services \
+(Postgres, MySQL/MariaDB, MongoDB, Redis, S3). Use it when the user asks about \
+their application's data — \"how many users signed up\", \"show me the orders \
+table\", \"what's in the sessions collection\".
+
+Resolve the question in this order; do not skip ahead and guess a path:
+
+1. **Find the service.** The user names it loosely (\"landing production\", \
+\"the main db\"). List services and match on name — never invent a service_id.
+2. **`check_explorer_support --service_id N`** — returns `hierarchy` (how deep \
+containers nest for this engine) and `filter_schema` (the exact filter shape \
+this engine accepts). Read both before querying.
+3. **`list_root_containers --service_id N`** — databases, or buckets for S3.
+4. **`list_containers_at_path --service_id N --path <db>`** — only when the \
+hierarchy says this level nests further. Postgres nests schemas under databases \
+(`mydb/public`); MySQL, MongoDB, Redis and S3 are flat (`mydb`).
+5. **`list_entities --service_id N --path <path>`** — tables, collections, keys \
+or objects. Match the user's wording to a real name here rather than assuming \
+the obvious one exists (`users` may actually be `app_users` or `auth_user`).
+6. **`get_entity_info --service_id N --path <path> --entity <name>`** — column \
+names and types, plus the row count. Enough to answer many questions on its own.
+7. **`read_entity_rows --service_id N --path <path> --entity <name> --limit 20`** \
+— the actual rows. `--filter` takes JSON matching the `filter_schema` from step \
+2 (for SQL engines: `{\\\"where\\\":\\\"created_at > now() - interval '7 days'\\\"}`). \
+Also supports `--offset`, `--sort_by`, `--sort_order`. Responses are capped at \
+100 rows — page with `--offset` instead of asking for more.
+
+Steps 1–6 are always available. **Step 7 is opt-in per service and off by \
+default**: rows can contain password hashes, tokens and personal data, so the \
+operator must enable AI data access for that service. If you get a 403 titled \
+\"AI Data Access Not Enabled\", tell the user plainly that row access is off for \
+that service and that they can turn it on from the service page — then answer as \
+far as you can from schema and row counts (steps 5–6), which still work.
+
+Never present row data as more current than it is, and never echo values from \
+columns that look like credentials (password, hash, token, secret, key) even \
+when they are returned — summarise instead.";
+
 /// JSON Schema for the `temps` virtual-CLI tool.
 fn temps_schema() -> Value {
     serde_json::json!({
@@ -102,7 +152,8 @@ impl ConversationContextProvider for ApiToolsProvider {
              You have a `temps` tool: a read-only command line over the platform API. Discover \
              with `--help` (`<section> --help` → operations; `<section> <operation> --help` → \
              flags), then run `<section> <operation> --flag value …`. Below is `temps --help` \
-             (the sections). Drill into the relevant one rather than guessing.\n\n```\n{root_help}```"
+             (the sections). Drill into the relevant one rather than guessing.\n\n```\n{root_help}```\
+             \n\n{DATA_BROWSING_PLAYBOOK}"
         ))
     }
 

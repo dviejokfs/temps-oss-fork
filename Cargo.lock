@@ -10185,6 +10185,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-auth",
+ "temps-core",
  "temps-entities",
  "thiserror 2.0.19",
  "tokio",

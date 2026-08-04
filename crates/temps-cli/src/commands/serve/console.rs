@@ -1530,6 +1530,31 @@ fn ai_read_allowlist() -> Vec<String> {
         "list_deliveries",
         "get_delivery",
         "list_event_types",
+        // ── Data browser: schema navigation, plus opt-in row reads ──
+        // Schema shape only (database/schema/bucket names, table and column
+        // names, row counts, sizes). These carry no stored values, so they
+        // are safe on the same footing as the rest of this list — and they
+        // are what lets the agent resolve a question like "the users in the
+        // landing production database" to a concrete container path.
+        "check_explorer_support",
+        "list_root_containers",
+        "list_containers_at_path",
+        // NOTE: the data browser's `get_container_info` is deliberately NOT
+        // listed — that operation_id already belongs to the Docker container
+        // endpoint above, and utoipa keys the index by operation_id, so the
+        // two collide. `list_containers_at_path` covers navigation without
+        // depending on which of the two wins. (Pre-existing collision; fixing
+        // it means renaming a published operation_id.)
+        "list_entities",
+        "get_entity_info",
+        // Row CONTENTS. Unlike every other entry here, this one *can* return
+        // secrets — password hashes, API tokens, customer PII — because it
+        // returns whatever the operator stored. It is therefore gated a
+        // second time inside the handler by the per-service `ai_data_access`
+        // column, which defaults to false: allowlisting it here only makes
+        // the endpoint reachable, it does not grant access to any service.
+        // See `read_entity_rows` in temps-providers.
+        "read_entity_rows",
         // ── KV / Blob: status only, no connection strings ──
         "kv_status",
         "blob_status",

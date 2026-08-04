@@ -750,6 +750,14 @@ impl InternalApiCaller {
         // Inject the caller's AuthContext so permission_guard! can read it.
         req.extensions_mut().insert(scope.auth.clone());
 
+        // Mark the request as agent-originated. Authorization still comes from
+        // the AuthContext above; this only lets handlers apply gates that turn
+        // on *because* a model is the consumer — currently the per-service
+        // `ai_data_access` opt-in for reading table rows, which would otherwise
+        // send row contents to a third-party AI provider.
+        req.extensions_mut()
+            .insert(temps_core::ai_tool_call::AiToolCall);
+
         // Step 4: replay through the router.
         let response =
             self.router

@@ -12,6 +12,7 @@ use temps_core::problemdetails::Problem;
 use temps_query::{ContainerInfo, ContainerPath, EntityInfo, QueryOptions};
 use utoipa::ToSchema;
 
+use super::audit::AiDataAccessChangedAudit;
 use super::types::AppState;
 
 // ============================================================================
@@ -193,6 +194,215 @@ pub struct QueryDataRequest {
 
 fn default_limit() -> usize {
     100
+}
+
+/// Query-string form of [`QueryDataRequest`] for the read-only `GET` rows
+/// endpoint.
+///
+/// The `POST` variant exists because filters are arbitrary backend-specific
+/// JSON. Reading rows is nonetheless a *read*, and the AI agent's tool index
+/// is GET-only by construction, so the same capability has to be reachable
+/// without a body. `filter` therefore carries the JSON as a string.
+#[derive(Debug, Deserialize, ToSchema, Default)]
+pub struct ReadRowsQuery {
+    /// Backend-specific filter, JSON-encoded. Fetch the expected shape from
+    /// the `filter_schema` field of the explorer-support endpoint — e.g.
+    /// `{"where":"created_at > now() - interval '7 days'"}` for SQL sources.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Maximum number of rows to return
+    #[schema(example = 100)]
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    /// Number of rows to skip
+    #[schema(example = 0)]
+    #[serde(default)]
+    pub offset: usize,
+    /// Sort by field name
+    #[serde(default)]
+    pub sort_by: Option<String>,
+    /// Sort order (asc/desc)
+    #[serde(default)]
+    pub sort_order: Option<String>,
+}
+
+/// Rows returned to the AI agent in a single call.
+///
+/// The tool caller already truncates oversized bodies, but truncation produces
+/// a silently-partial result the model can't reason about. Clamping the row
+/// count instead keeps every response well-formed and lets the agent page
+/// explicitly via `offset`.
+const AI_MAX_ROWS: usize = 100;
+
+/// Parse the `filter` query-string parameter into the backend-specific JSON
+/// the data source expects.
+///
+/// Returns a 400 (rather than silently ignoring an unparsable filter) so a
+/// caller that mistypes a filter gets no rows *and an explanation*, instead of
+/// a full unfiltered table that looks like a successful answer.
+fn parse_row_filter(
+    filter: Option<&str>,
+    filter_schema: Option<&serde_json::Value>,
+) -> Result<Option<serde_json::Value>, Problem> {
+    let Some(raw) = filter.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => Ok(Some(value)),
+        Err(e) => {
+            let mut problem = temps_core::problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Filter")
+                .with_detail(format!(
+                    "The `filter` parameter must be JSON matching this service's filter schema, \
+                     but it failed to parse: {e}. Received: {raw}"
+                ));
+            if let Some(schema) = filter_schema {
+                problem = problem.with_value("expected_filter_schema", schema.clone());
+            }
+            Err(problem)
+        }
+    }
+}
+
+/// Read rows from an entity (read-only `GET`; see [`query_data`] for the
+/// `POST` form used by the console).
+///
+/// Gated for AI callers by the service's `ai_data_access` opt-in — see
+/// [`temps_core::ai_tool_call::AiToolCall`].
+#[utoipa::path(
+    get,
+    path = "/external-services/{service_id}/query/containers/{path}/entities/{entity}/data",
+    tag = "External Services - Query",
+    params(
+        ("service_id" = i32, Path, description = "External service id"),
+        ("path" = String, Path, description = "Container path, slash-separated (e.g. `mydb/public`)"),
+        ("entity" = String, Path, description = "Table, collection, key or object name"),
+        ("filter" = Option<String>, Query, description = "JSON-encoded backend-specific filter"),
+        ("limit" = Option<usize>, Query, description = "Maximum rows to return"),
+        ("offset" = Option<usize>, Query, description = "Rows to skip"),
+        ("sort_by" = Option<String>, Query, description = "Field to sort by"),
+        ("sort_order" = Option<String>, Query, description = "asc or desc"),
+    ),
+    responses(
+        (status = 200, description = "Query results", body = QueryDataResponse),
+        (status = 400, description = "Invalid query or filter"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions, or AI data access not enabled for this service"),
+        (status = 404, description = "Service, container, or entity not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn read_entity_rows(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path((service_id, path_str, entity)): Path<(i32, String, String)>,
+    ai_call: Option<axum::Extension<temps_core::ai_tool_call::AiToolCall>>,
+    axum::extract::Query(query): axum::extract::Query<ReadRowsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+
+    let is_ai_call = ai_call.is_some();
+
+    // Per-service opt-in for agent row access. Schema browsing stays open —
+    // only the rows themselves are gated, because those are what would be
+    // shipped to a third-party LLM provider.
+    if is_ai_call {
+        let service = app_state
+            .external_service_manager
+            .get_service(service_id)
+            .await
+            .map_err(|e| {
+                temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Service Not Found")
+                    .with_detail(e.to_string())
+            })?;
+
+        if !service.ai_data_access {
+            return Err(temps_core::problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("AI Data Access Not Enabled")
+                .with_detail(format!(
+                    "Reading row data from service '{}' (id {}) is not enabled for the AI \
+                     assistant. Table and column names are still readable. An operator can turn \
+                     row access on under Settings → AI data access on the service page; it is off \
+                     by default because rows can contain password hashes, tokens and personal \
+                     data that would be sent to the configured AI provider.",
+                    service.name, service_id
+                ))
+                .with_value("service_id", service_id)
+                .with_value("service_name", service.name.clone())
+                .with_value("setup_path", format!("/storage/{service_id}")));
+        }
+    }
+
+    let filter_schema = app_state
+        .query_service
+        .get_filter_schema(service_id)
+        .await
+        .ok();
+    let filters = parse_row_filter(query.filter.as_deref(), filter_schema.as_ref())?;
+
+    let segments: Vec<String> = path_str.split('/').map(String::from).collect();
+    let path = ContainerPath::new(segments);
+
+    let limit = if is_ai_call {
+        query.limit.min(AI_MAX_ROWS)
+    } else {
+        query.limit
+    };
+
+    let options = QueryOptions {
+        limit: Some(limit),
+        offset: Some(query.offset),
+        cursor: None,
+        sort_by: query.sort_by,
+        sort_order: query.sort_order,
+        timeout_ms: None,
+        include_nulls: true,
+    };
+
+    let result = app_state
+        .query_service
+        .query_data(service_id, &path, &entity, filters, options)
+        .await
+        .map_err(|e| {
+            let (status, title) = match &e {
+                temps_query::DataError::QueryFailed(_) => (StatusCode::BAD_REQUEST, "Query Failed"),
+                temps_query::DataError::InvalidQuery(_) => {
+                    (StatusCode::BAD_REQUEST, "Invalid Query")
+                }
+                temps_query::DataError::NotFound(_) => (StatusCode::NOT_FOUND, "Not Found"),
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "Query Error"),
+            };
+
+            temps_core::problemdetails::new(status)
+                .with_title(title)
+                .with_detail(e.to_string())
+        })?;
+
+    let response = QueryDataResponse {
+        fields: result
+            .schema
+            .fields
+            .iter()
+            .map(|f| FieldResponse {
+                name: f.name.clone(),
+                field_type: format!("{:?}", f.field_type),
+                nullable: f.nullable,
+            })
+            .collect(),
+        rows: result
+            .rows
+            .into_iter()
+            .map(|row| serde_json::to_value(row).unwrap_or_default())
+            .collect(),
+        total_count: result.stats.total_rows.unwrap_or(result.stats.row_count) as u64,
+        returned_count: result.stats.row_count,
+        execution_time_ms: result.stats.execution_ms,
+    };
+
+    Ok(Json(response))
 }
 
 /// Describes a level in the data source hierarchy
@@ -934,6 +1144,152 @@ pub async fn download_object(
 }
 
 // ============================================================================
+// AI data access opt-in
+// ============================================================================
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ToggleAiDataAccessRequest {
+    /// Whether the AI assistant may read row data from this service.
+    #[schema(example = false)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AiDataAccessResponse {
+    /// Service id
+    pub service_id: i32,
+    /// Whether the AI assistant may read row data from this service
+    #[schema(example = false)]
+    pub enabled: bool,
+}
+
+/// Report whether the AI assistant may read row data from this service.
+///
+/// Always answers (rather than 404-ing when disabled) so the console can render
+/// the capability with an "off — here's how to turn it on" state instead of
+/// hiding it, and so the agent can tell "not set up" apart from "not supported".
+#[utoipa::path(
+    get,
+    path = "/external-services/{service_id}/query/ai-data-access",
+    operation_id = "get_ai_data_access",
+    tag = "External Services - Query",
+    params(("service_id" = i32, Path, description = "External service id")),
+    responses(
+        (status = 200, description = "Current AI data access setting", body = AiDataAccessResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Service not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_ai_data_access(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(service_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+
+    let service = app_state
+        .external_service_manager
+        .get_service(service_id)
+        .await
+        .map_err(|e| {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Service Not Found")
+                .with_detail(e.to_string())
+        })?;
+
+    Ok(Json(AiDataAccessResponse {
+        service_id,
+        enabled: service.ai_data_access,
+    }))
+}
+
+/// Enable or disable AI assistant access to this service's row data.
+///
+/// Off by default. Row contents can include password hashes, API tokens and
+/// personal data, and enabling this sends them to the configured AI provider —
+/// so it is a deliberate, audited, per-service decision by the operator.
+#[utoipa::path(
+    patch,
+    path = "/external-services/{service_id}/query/ai-data-access",
+    operation_id = "set_ai_data_access",
+    tag = "External Services - Query",
+    request_body = ToggleAiDataAccessRequest,
+    params(("service_id" = i32, Path, description = "External service id")),
+    responses(
+        (status = 200, description = "Setting applied", body = AiDataAccessResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_ai_data_access(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(service_id): Path<i32>,
+    axum::Extension(metadata): axum::Extension<temps_core::RequestMetadata>,
+    Json(request): Json<ToggleAiDataAccessRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesWrite);
+    // Same tenancy check the metrics toggle uses: holding
+    // ExternalServicesWrite must not let a caller widen AI access to a
+    // service that isn't theirs.
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
+
+    let service = app_state
+        .external_service_manager
+        .get_service(service_id)
+        .await
+        .map_err(|e| {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Service Not Found")
+                .with_detail(e.to_string())
+        })?;
+
+    let active = temps_entities::external_services::ActiveModel {
+        id: sea_orm::ActiveValue::Set(service_id),
+        ai_data_access: sea_orm::ActiveValue::Set(request.enabled),
+        ..Default::default()
+    };
+    sea_orm::EntityTrait::update(active)
+        .exec(app_state.db.as_ref())
+        .await
+        .map_err(|e| {
+            tracing::error!(service_id, error = %e, "Failed to update ai_data_access");
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Update Failed")
+                .with_detail(format!(
+                    "Failed to update AI data access for service {service_id}: {e}"
+                ))
+        })?;
+
+    // Audited: this widens what a third party (the AI provider) can see, so it
+    // must be attributable. A failure here must not fail the request — the
+    // setting is already persisted.
+    let audit = AiDataAccessChangedAudit {
+        context: temps_core::audit::AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_id,
+        service_name: service.name.clone(),
+        enabled: request.enabled,
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(service_id, error = %e, "Failed to write ai_data_access audit log");
+    }
+
+    Ok(Json(AiDataAccessResponse {
+        service_id,
+        enabled: request.enabled,
+    }))
+}
+
+// ============================================================================
 // Route Configuration
 // ============================================================================
 
@@ -972,11 +1328,71 @@ pub fn configure_query_routes() -> axum::Router<Arc<AppState>> {
         // Query entity data
         .route(
             "/external-services/{service_id}/query/containers/{path}/entities/{entity}/data",
-            axum::routing::post(query_data),
+            axum::routing::post(query_data).get(read_entity_rows),
+        )
+        // AI data access opt-in (read + toggle)
+        .route(
+            "/external-services/{service_id}/query/ai-data-access",
+            axum::routing::get(get_ai_data_access).patch(set_ai_data_access),
         )
         // Download object (S3 only)
         .route(
             "/external-services/{service_id}/query/containers/{path}/entities/{entity}/download",
             axum::routing::get(download_object),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_row_filter_returns_none_for_absent_or_blank() {
+        // A caller that omits the filter, or sends `?filter=`, means "no
+        // filter" — not "filter that matches nothing".
+        assert!(parse_row_filter(None, None).unwrap().is_none());
+        assert!(parse_row_filter(Some(""), None).unwrap().is_none());
+        assert!(parse_row_filter(Some("   "), None).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_row_filter_parses_backend_json() {
+        let parsed = parse_row_filter(Some(r#"{"where":"id > 5"}"#), None)
+            .expect("valid JSON filter should parse")
+            .expect("non-empty filter should be Some");
+
+        // The value is handed to the data source untouched — Postgres reads
+        // `where`, MongoDB reads its own shape, etc.
+        assert_eq!(parsed["where"], "id > 5");
+    }
+
+    #[test]
+    fn parse_row_filter_rejects_unparsable_filter_rather_than_ignoring_it() {
+        // Silently dropping a malformed filter would return a full unfiltered
+        // table that looks like a correct answer — the worst possible failure
+        // for both a human and an agent.
+        let err = parse_row_filter(Some("id > 5"), None)
+            .expect_err("a bare WHERE clause is not JSON and must be rejected");
+
+        assert_eq!(err.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn parse_row_filter_echoes_expected_schema_so_callers_can_self_correct() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "where": { "type": "string" } }
+        });
+
+        let err = parse_row_filter(Some("oops"), Some(&schema))
+            .expect_err("invalid filter must be rejected");
+
+        // The agent recovers from a 400 only if the response tells it the
+        // shape it should have sent.
+        let echoed = err
+            .body
+            .get("expected_filter_schema")
+            .expect("problem should carry the expected filter schema");
+        assert_eq!(echoed["properties"]["where"]["type"], "string");
+    }
 }
