@@ -528,6 +528,13 @@ impl AnalyticsEventsService {
         let mut conditions = vec!["e.project_id = $1".to_string()];
         conditions.push("e.timestamp >= $2".to_string());
         conditions.push("e.timestamp <= $3".to_string());
+        // Exclude crawlers so this shares a denominator with the headline
+        // counts from `get_unique_counts`, which filters them too. Without it a
+        // "Bot" row appears in the device breakdown and every percentage is
+        // computed over a larger population than the visitor/page-view totals
+        // shown beside it. Crawler traffic has its own AI-agent views, built on
+        // proxy logs rather than on this table.
+        conditions.push("e.is_crawler = false".to_string());
 
         // For referrer_hostname, filter out self-referrals (project's own domains)
         // Skip this filter when drilling down from a channel (filter_channel is set)
@@ -748,6 +755,13 @@ impl AnalyticsEventsService {
         let mut conditions = vec!["e.project_id = $1".to_string()];
         conditions.push("e.timestamp >= $2".to_string());
         conditions.push("e.timestamp <= $3".to_string());
+        // Exclude crawlers so this shares a denominator with the headline
+        // counts from `get_unique_counts`, which filters them too. Without it a
+        // "Bot" row appears in the device breakdown and every percentage is
+        // computed over a larger population than the visitor/page-view totals
+        // shown beside it. Crawler traffic has its own AI-agent views, built on
+        // proxy logs rather than on this table.
+        conditions.push("e.is_crawler = false".to_string());
 
         let mut param_idx = 4;
         if environment_id.is_some() {
@@ -4228,7 +4242,10 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                Some(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                        .to_string(),
+                ),
                 Some("https://www.bing.com/search?q=temps".to_string()),
                 None,
                 None,
@@ -4262,7 +4279,10 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                Some(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                        .to_string(),
+                ),
                 Some("https://www.pornhub.com/".to_string()),
                 None,
                 None,
@@ -4303,5 +4323,216 @@ mod tests {
         );
 
         println!("✅ property breakdown excludes zero-visitor referrer spam!");
+    }
+
+    /// Regression test: property breakdowns must exclude crawler traffic, the
+    /// same way `get_unique_counts` does. When they disagreed, a "Bot" row
+    /// appeared in the device breakdown and every channel/referrer percentage
+    /// was computed over a larger population than the visitor and page-view
+    /// totals rendered next to it.
+    #[tokio::test]
+    async fn test_property_breakdown_excludes_crawlers() {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::{
+            deployments, environments, projects, source_type::SourceType,
+            upstream_config::UpstreamList,
+        };
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let project = projects::ActiveModel {
+            name: Set("crawler-breakdown-test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            preset_config: Set(None),
+            deployment_config: Set(None),
+            slug: Set("crawler-breakdown-test".to_string()),
+            is_deleted: Set(false),
+            deleted_at: Set(None),
+            last_deployment: Set(None),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            git_provider_connection_id: Set(None),
+            attack_mode: Set(false),
+            error_source_context_enabled: Set(false),
+            error_source_root: Set(None),
+            enable_preview_environments: Set(false),
+            source_type: Set(SourceType::Git),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test project");
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            branch: Set(Some("main".to_string())),
+            slug: Set("production".to_string()),
+            subdomain: Set("prod".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            is_preview: Set(false),
+            current_deployment_id: Set(None),
+            deleted_at: Set(None),
+            deployment_config: Set(None),
+            last_deployment: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deploy-{}", uuid::Uuid::new_v4())),
+            state: Set("ready".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            deploying_at: Set(None),
+            ready_at: Set(Some(chrono::Utc::now())),
+            started_at: Set(Some(chrono::Utc::now())),
+            finished_at: Set(Some(chrono::Utc::now())),
+            context_vars: Set(None),
+            branch_ref: Set(Some("main".to_string())),
+            tag_ref: Set(None),
+            commit_sha: Set(None),
+            commit_message: Set(None),
+            commit_author: Set(None),
+            commit_json: Set(None),
+            cancelled_reason: Set(None),
+            static_dir_location: Set(None),
+            screenshot_location: Set(None),
+            image_name: Set(None),
+            deployment_config: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test deployment");
+
+        let service = AnalyticsEventsService::new(db.clone());
+
+        let human_visitor = uuid::Uuid::new_v4().to_string();
+        let bot_visitor = uuid::Uuid::new_v4().to_string();
+
+        service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some("human-session".to_string()),
+                Some(human_visitor.clone()),
+                "page_view",
+                serde_json::json!({}),
+                "/",
+                "",
+                Some("temps.example"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                        .to_string(),
+                ),
+                Some("https://openalternative.co/temps".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record event");
+
+        service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some("bot-session".to_string()),
+                Some(bot_visitor.clone()),
+                "page_view",
+                serde_json::json!({}),
+                "/",
+                "",
+                Some("temps.example"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(
+                    "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)".to_string(),
+                ),
+                Some("https://bot-referrer.example/".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record event");
+
+        let breakdown = service
+            .get_property_breakdown(
+                chrono::Utc::now() - chrono::Duration::hours(1),
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                project.id,
+                None,
+                None,
+                None,
+                crate::types::PropertyColumn::ReferrerHostname,
+                "visitors",
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to get property breakdown");
+
+        let hosts: Vec<&str> = breakdown.items.iter().map(|i| i.value.as_str()).collect();
+        assert!(
+            hosts.contains(&"openalternative.co"),
+            "a human referrer must be present: {:?}",
+            hosts
+        );
+        assert!(
+            !hosts.contains(&"bot-referrer.example"),
+            "crawler traffic must not appear in breakdowns — it is excluded from \
+             the headline counts, so counting it here makes the two disagree: {:?}",
+            hosts
+        );
+        assert_eq!(
+            breakdown.total, 1,
+            "the breakdown denominator must exclude crawlers"
+        );
+
+        println!("✅ property breakdown crawler-exclusion test passed!");
     }
 }

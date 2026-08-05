@@ -2137,6 +2137,10 @@ impl Analytics for AnalyticsService {
             "pv.page_path IS NOT NULL".to_string(),
             "pv.page_path != ''".to_string(),
             "pv.event_type = 'page_view'".to_string(),
+            // Crawler page views are excluded here for the same reason they are
+            // excluded from the headline unique counts: a per-page table that
+            // counts bots cannot be reconciled against a total that doesn't.
+            "pv.is_crawler = false".to_string(),
         ];
         let mut values: Vec<sea_orm::Value> = vec![project_id.into()];
         let mut param_index = 2;
