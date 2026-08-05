@@ -868,12 +868,55 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         ));
     }
 
-    let without_strings = strip_sql_string_literals(&sql_lower);
+    // SECURITY: normalise whitespace before any keyword matching. The list
+    // below matches literal prefixes like `"union "`, so a separator it does
+    // not enumerate (\r, \f, \v — all whitespace to MySQL's lexer) walked
+    // straight past it.
+    let without_strings =
+        temps_query_postgres::normalize_sql_whitespace(&strip_sql_string_literals(&sql_lower));
 
     if without_strings.contains(';') {
         return Err(DataError::InvalidQuery(
             "Multiple SQL statements are not allowed".to_string(),
         ));
+    }
+
+    // STRUCTURAL CHECKS.
+    //
+    // This validator was a pure denylist while the Postgres one also rejects
+    // subqueries and function calls. `select` is not a keyword you can simply
+    // ban here (it appears in legitimate-looking text), so without these a
+    // filter like
+    //
+    //     1 = (SELECT LENGTH(authentication_string) FROM mysql.user LIMIT 1)
+    //
+    // gave blind extraction of any table the connection user could read, and
+    // `extractvalue(1, concat(0x7e, (select …)))` returned the value directly
+    // in the error body. Both are structural, not lexical.
+    if without_strings.contains('(') {
+        // Any parenthesis preceded by an identifier character is a function
+        // call; a bare `(` opening a subquery is caught by the `select` check
+        // that follows. Grouping parens like `(a = 1 or b = 2)` are preceded
+        // by whitespace or an operator, so they still pass.
+        let bytes = without_strings.as_bytes();
+        for (idx, &b) in bytes.iter().enumerate() {
+            if b != b'(' || idx == 0 {
+                continue;
+            }
+            let prev = bytes[idx - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                return Err(DataError::InvalidQuery(
+                    "Function calls are not allowed in the data browser filter".to_string(),
+                ));
+            }
+        }
+
+        // A parenthesised SELECT is a subquery regardless of spacing.
+        if without_strings.contains("(select") || without_strings.contains("( select") {
+            return Err(DataError::InvalidQuery(
+                "Subqueries are not allowed in the data browser filter".to_string(),
+            ));
+        }
     }
 
     if without_strings.contains("--")
@@ -897,9 +940,8 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         "delete ",
         "replace ",
         "load ",
+        // One space suffices now that whitespace is normalised above.
         "union ",
-        "union\t",
-        "union\n",
         "intersect ",
         "except ",
         "sleep(",
@@ -941,6 +983,62 @@ pub(crate) fn is_mariadb_compatible_image(image: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_where_rejected(clause: &str) {
+        assert!(
+            validate_where_clause(clause).is_err(),
+            "expected rejection: {clause}"
+        );
+    }
+
+    #[test]
+    fn where_clause_rejects_subqueries() {
+        // This validator was a pure denylist, unlike the Postgres one. Without
+        // structural checks these gave blind extraction of any table the
+        // connection user could read.
+        assert_where_rejected("1 = (SELECT LENGTH(authentication_string) FROM mysql.user LIMIT 1)");
+        assert_where_rejected("id IN (SELECT user_id FROM admin_users)");
+        assert_where_rejected("EXISTS ( SELECT 1 FROM mysql.user )");
+    }
+
+    #[test]
+    fn where_clause_rejects_function_calls() {
+        // Error-based extraction returned the value straight back in the 400
+        // body, which is faster than blind and equally unblocked before.
+        assert_where_rejected(
+            "extractvalue(1, concat(0x7e, (select authentication_string from mysql.user limit 1)))",
+        );
+        assert_where_rejected("updatexml(1,concat(0x7e,version()),1)");
+        assert_where_rejected("length(password) > 1");
+    }
+
+    #[test]
+    fn where_clause_rejects_union_with_exotic_whitespace() {
+        // The denylist enumerated "union ", "union\t", "union\n" only.
+        assert_where_rejected("false UNION\rSELECT user, authentication_string FROM mysql.user");
+        assert_where_rejected("false UNION\u{000C}SELECT 1");
+        assert_where_rejected("1=1 INTERSECT\rSELECT 1");
+    }
+
+    #[test]
+    fn where_clause_still_accepts_ordinary_filters() {
+        // The structural checks must not break the filters this exists to run.
+        // Grouping parens are preceded by whitespace or an operator, so they
+        // are not mistaken for function calls.
+        for clause in [
+            "plan = 'pro'",
+            "id > 5 AND status = 'active'",
+            "(plan = 'pro' OR plan = 'scale') AND amount_cents > 100",
+            "name LIKE '%test%'",
+            "id IN (1, 2, 3)",
+            "created_at BETWEEN '2025-01-01' AND '2025-02-01'",
+        ] {
+            assert!(
+                validate_where_clause(clause).is_ok(),
+                "should have been accepted: {clause}"
+            );
+        }
+    }
 
     #[test]
     fn maps_mysql_types() {

