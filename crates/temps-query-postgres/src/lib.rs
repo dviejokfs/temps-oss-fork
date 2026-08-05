@@ -215,6 +215,79 @@ pub async fn connect_with_self_signed_tls(
 }
 
 impl PostgresSource {
+    /// Above this many estimated rows, report the planner's estimate rather
+    /// than running an exact `COUNT(*)`.
+    ///
+    /// `COUNT(*)` in PostgreSQL is a full heap scan — there is no maintained
+    /// row counter — so opening a large table in the data browser used to
+    /// block on a scan of the whole thing before a single row could render.
+    /// Below the threshold the exact count is cheap and worth having; above
+    /// it, nobody is reading "12,481,003" as an exact figure anyway.
+    const EXACT_COUNT_MAX_ROWS: f32 = 50_000.0;
+
+    /// Row count and on-disk size for a table, cheaply.
+    ///
+    /// `pg_class.reltuples` and `pg_total_relation_size` are both O(1) catalog
+    /// lookups. `reltuples` is `-1` on a table that has never been analysed
+    /// (PG14+) and `0` on older versions, in which case we fall through to the
+    /// exact count rather than reporting a wrong number.
+    ///
+    /// Returns `(row_count, size_bytes)`; either may be `None` if the catalog
+    /// lookup fails (e.g. insufficient privileges), which callers already
+    /// render as "—" rather than as zero.
+    async fn row_count_and_size(
+        client: &tokio_postgres::Client,
+        schema_name: &str,
+        entity_name: &str,
+    ) -> (Option<usize>, Option<u64>) {
+        let qualified = format!(
+            "\"{}\".\"{}\"",
+            escape_ident(schema_name),
+            escape_ident(entity_name)
+        );
+
+        // Bound as a *string* to ::regclass — never interpolated as SQL — so a
+        // crafted table name cannot escape into the catalog query.
+        let stats = client
+            .query_one(
+                // `$1::text::regclass`, not `$1::regclass`: the latter makes
+                // the extended protocol infer a `regclass` parameter type,
+                // which the driver cannot bind a String to — the query then
+                // fails silently and every table falls back to the full scan
+                // this function exists to avoid.
+                "SELECT reltuples, pg_total_relation_size($1::text::regclass) \
+                 FROM pg_class WHERE oid = $1::text::regclass",
+                &[&qualified],
+            )
+            .await
+            .ok();
+
+        let (reltuples, size_bytes) = match stats {
+            Some(row) => (
+                row.try_get::<_, f32>(0).ok(),
+                row.try_get::<_, i64>(1).ok().map(|s| s.max(0) as u64),
+            ),
+            None => (None, None),
+        };
+
+        // Large and analysed → trust the estimate and skip the scan.
+        if let Some(estimate) = reltuples {
+            if estimate >= Self::EXACT_COUNT_MAX_ROWS {
+                return (Some(estimate as usize), size_bytes);
+            }
+        }
+
+        // Small, or never analysed → exact count is affordable.
+        let count_query = format!("SELECT COUNT(*) FROM {qualified}");
+        let row_count = client
+            .query_one(&count_query, &[])
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<_, i64>(0).ok())
+            .map(|c| c as usize);
+
+        (row_count, size_bytes)
+    }
     /// Return the byte length of a PostgreSQL dollar-quote delimiter at the
     /// start of `sql`. Tags follow unquoted identifier rules, except that `$`
     /// is not permitted inside the tag.
@@ -1092,26 +1165,17 @@ impl DataSource for PostgresSource {
 
         let table_type: String = row.get(0);
 
-        // Get row count
-        let count_query = format!(
-            "SELECT COUNT(*) FROM \"{}\".\"{}\"",
-            escape_ident(schema_name),
-            escape_ident(entity_name)
-        );
-
-        let row_count = client
-            .query_one(&count_query, &[])
-            .await
-            .ok()
-            .and_then(|row| row.try_get::<_, i64>(0).ok())
-            .map(|c| c as usize);
+        // Row count + on-disk size. Both come from planner statistics for
+        // anything large — see `row_count_and_size`.
+        let (row_count, size_bytes) =
+            Self::row_count_and_size(client, schema_name, entity_name).await;
 
         Ok(EntityInfo {
             namespace: schema_name.clone(),
             name: entity_name.to_string(),
             entity_type: table_type,
             row_count,
-            size_bytes: None,
+            size_bytes,
             schema: Some(self.get_schema(container_path, entity_name).await?),
             metadata: None,
         })
