@@ -631,6 +631,45 @@ pub async fn get_unique_counts(
     Ok(Json(counts))
 }
 
+/// Longest BCP-47 tag we will store. Real tags are short ("en", "pt-BR",
+/// "zh-Hant-TW"); anything longer is a client sending junk.
+const MAX_LANGUAGE_TAG_LEN: usize = 35;
+
+/// Extract the highest-priority language tag from an `Accept-Language` header.
+///
+/// Takes the first entry — browsers already send it in preference order — and
+/// drops any `;q=` weight. The result is **validated, not just truncated**:
+/// `language` is a `GROUP BY` dimension in the property breakdowns, so an
+/// unvalidated header would let any client mint unbounded distinct values and
+/// blow up cardinality on a box we expect to run in 4 GB. Anything that isn't a
+/// plausible BCP-47 tag is dropped rather than stored.
+fn primary_accept_language(header: &str) -> Option<String> {
+    let tag = header
+        .split(',')
+        .next()?
+        .split(';')
+        .next()?
+        .trim()
+        .trim_matches('"');
+
+    if tag.is_empty() || tag.len() > MAX_LANGUAGE_TAG_LEN {
+        return None;
+    }
+    // "*" is a valid Accept-Language value but carries no information.
+    if tag == "*" {
+        return None;
+    }
+    // Subtags are alphanumeric, separated by "-". Reject anything else.
+    if !tag
+        .split('-')
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric()))
+    {
+        return None;
+    }
+
+    Some(tag.to_string())
+}
+
 /// Record analytics event
 #[utoipa::path(
     tag = "Metrics",
@@ -724,14 +763,30 @@ pub async fn record_event_metrics(
         .or(payload.referrer.clone())
         .or(referrer_header);
 
-    // Extract language from event_data if not provided in payload
-    let language = payload.language.or_else(|| {
-        payload
-            .event_data
-            .get("language")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    // Extract language from the payload, then event_data, then the
+    // Accept-Language header.
+    //
+    // The header fallback is what actually populates this column in practice:
+    // no browser SDK sends `language` on the event payload (the React SDK only
+    // reports it from the session recorder), so without it every event stored
+    // NULL and the language breakdown was 100% "Unknown". Every browser sends
+    // Accept-Language on the ingest request itself, so the data was always
+    // there — it was simply never read.
+    let language = payload
+        .language
+        .or_else(|| {
+            payload
+                .event_data
+                .get("language")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            headers
+                .get("accept-language")
+                .and_then(|h| h.to_str().ok())
+                .and_then(primary_accept_language)
+        });
 
     // Lookup IP geolocation
     let ip_geolocation_id = if !metadata.ip_address.is_empty() {
@@ -1215,6 +1270,44 @@ mod tests {
     use temps_database::test_utils::TestDatabase;
     use temps_entities::projects;
     use tower::ServiceExt;
+
+    #[test]
+    fn test_primary_accept_language_takes_highest_priority_tag() {
+        // Browsers send preference order already, so the first entry wins and
+        // the q-weight is dropped.
+        assert_eq!(
+            primary_accept_language("en-US,en;q=0.9,es;q=0.8").as_deref(),
+            Some("en-US")
+        );
+        assert_eq!(primary_accept_language("fr").as_deref(), Some("fr"));
+        assert_eq!(
+            primary_accept_language("  pt-BR ;q=1.0 ").as_deref(),
+            Some("pt-BR")
+        );
+        assert_eq!(
+            primary_accept_language("zh-Hant-TW,zh;q=0.9").as_deref(),
+            Some("zh-Hant-TW")
+        );
+    }
+
+    #[test]
+    fn test_primary_accept_language_rejects_junk() {
+        // `language` is a GROUP BY dimension — unvalidated input is a
+        // cardinality bomb, so anything implausible is dropped, not stored.
+        assert_eq!(primary_accept_language(""), None);
+        assert_eq!(primary_accept_language("   "), None);
+        assert_eq!(primary_accept_language("*"), None);
+        assert_eq!(primary_accept_language(";q=0.9"), None);
+        assert_eq!(primary_accept_language("en_US"), None); // underscore, not BCP-47
+        assert_eq!(primary_accept_language("en-"), None); // empty subtag
+        assert_eq!(primary_accept_language("<script>"), None);
+        assert_eq!(primary_accept_language("'; DROP TABLE events--"), None);
+        assert_eq!(primary_accept_language(&"a".repeat(36)), None); // over the cap
+        assert_eq!(
+            primary_accept_language(&"a".repeat(35)).as_deref(),
+            Some("a".repeat(35).as_str())
+        );
+    }
 
     fn create_test_auth_context() -> temps_auth::AuthContext {
         let user = temps_entities::users::Model {
