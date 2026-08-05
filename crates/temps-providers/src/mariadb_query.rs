@@ -16,6 +16,67 @@ pub struct MariaDbSource {
 }
 
 impl MariaDbSource {
+    /// Above this many estimated rows, report `information_schema.TABLE_ROWS`
+    /// rather than running an exact `COUNT(*)`.
+    ///
+    /// Mirrors the Postgres backend's threshold. On InnoDB `COUNT(*)` is a
+    /// full index scan; TABLE_ROWS is a stored estimate that can be off by a
+    /// wide margin on small tables, which is why small ones still get counted
+    /// exactly.
+    const EXACT_COUNT_MAX_ROWS: u64 = 50_000;
+
+    /// Estimated row count and on-disk size (data + indexes) for one table,
+    /// read from `information_schema` — a catalog lookup, not a table scan.
+    ///
+    /// Returns `(None, None)` when the table has no `information_schema` row
+    /// (e.g. a view), so callers fall back to an exact count rather than
+    /// reporting zero.
+    async fn table_stats(
+        &self,
+        container_path: &ContainerPath,
+        entity_name: &str,
+    ) -> Result<(Option<u64>, Option<u64>)> {
+        let database_name = database_from_path(container_path, &self.database_name)?;
+        validate_identifier("table", entity_name)?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH
+            FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+            "#,
+        )
+        .bind(database_name)
+        .bind(entity_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            DataError::QueryFailed(format!(
+                "Failed to read table statistics for '{}.{}': {}",
+                database_name, entity_name, e
+            ))
+        })?;
+
+        let Some(row) = row else {
+            return Ok((None, None));
+        };
+
+        let table_rows = row.try_get::<Option<u64>, _>("TABLE_ROWS").ok().flatten();
+        let data_length = row
+            .try_get::<Option<u64>, _>("DATA_LENGTH")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let index_length = row
+            .try_get::<Option<u64>, _>("INDEX_LENGTH")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+
+        let size = data_length.saturating_add(index_length);
+        Ok((table_rows, (size > 0).then_some(size)))
+    }
+
     pub async fn connect(
         host: &str,
         port: u16,
@@ -335,14 +396,35 @@ impl DataSource for MariaDbSource {
             )));
         }
 
-        let row_count = self.count(container_path, entity_name, None).await.ok();
+        // Row count and size from information_schema rather than COUNT(*).
+        //
+        // `self.count()` issues `SELECT COUNT(*)`, which on InnoDB is a full
+        // index scan — so opening a large table blocked on scanning it before
+        // any rows could render. `list_entities` (above) already reads
+        // TABLE_ROWS/DATA_LENGTH/INDEX_LENGTH for exactly this reason; this
+        // path simply never did.
+        //
+        // TABLE_ROWS is an estimate on InnoDB (exact on MyISAM). Small tables
+        // fall back to the exact count below, where it is cheap and the
+        // estimate's error is proportionally worst.
+        let (estimated_rows, size_bytes) = self
+            .table_stats(container_path, entity_name)
+            .await
+            .unwrap_or((None, None));
+
+        let row_count = match estimated_rows {
+            Some(rows) if rows >= Self::EXACT_COUNT_MAX_ROWS => Some(rows),
+            // Small, or information_schema had nothing (a view, or stats never
+            // gathered) — an exact count is affordable and more useful.
+            _ => self.count(container_path, entity_name, None).await.ok(),
+        };
 
         Ok(EntityInfo {
             namespace: container_path.segments[0].clone(),
             name: entity_name.to_string(),
             entity_type: "table".to_string(),
             row_count: row_count.and_then(|v| usize::try_from(v).ok()),
-            size_bytes: None,
+            size_bytes,
             schema: Some(self.get_schema(container_path, entity_name).await?),
             metadata: None,
         })

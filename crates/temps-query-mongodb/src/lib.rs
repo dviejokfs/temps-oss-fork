@@ -149,8 +149,26 @@ impl MongoDBSource {
 
         let collection = db.collection::<Document>(collection_name);
 
-        // Get document count
+        // Already an O(1) metadata read rather than a full scan — unlike the
+        // SQL backends, Mongo hands us a maintained count.
         let doc_count = collection.estimated_document_count().await.ok();
+
+        // On-disk size via collStats. Also a metadata read; `storageSize` is
+        // the compressed on-disk figure, which is what an operator asking
+        // "how much space does this use" wants (`size` is the uncompressed
+        // logical total). Best-effort: collStats needs privileges the browsing
+        // user may not have, and a missing size renders as "—" rather than 0.
+        let size_bytes = db
+            .run_command(doc! { "collStats": collection_name })
+            .await
+            .ok()
+            .and_then(|stats| {
+                stats
+                    .get("storageSize")
+                    .or_else(|| stats.get("size"))
+                    .and_then(|v| v.as_i64().or_else(|| v.as_i32().map(i64::from)))
+            })
+            .and_then(|s| u64::try_from(s).ok());
 
         // Sample a document to infer schema
         let schema = if let Ok(Some(sample_doc)) = collection.find_one(doc! {}).await {
@@ -170,7 +188,7 @@ impl MongoDBSource {
             name: collection_name.to_string(),
             entity_type: "collection".to_string(),
             row_count: doc_count.map(|c| c as usize),
-            size_bytes: None,
+            size_bytes,
             schema,
             metadata: Some(serde_json::to_value(metadata_map).unwrap()),
         })
