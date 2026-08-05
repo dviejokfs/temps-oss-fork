@@ -763,6 +763,9 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             WHERE project_id = ?
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
+              -- Same crawler gate as the breakdown, so the chart and the table
+              -- rendered next to it count the same population.
+              AND (? = 1 OR is_crawler = 0)
               AND (? = 0 OR environment_id = ?)
               AND (? = 0 OR deployment_id = ?)
               AND (? = 0 OR event_name = ?)
@@ -784,6 +787,8 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             .bind(q.scope.project_id)
             .bind(start_ms)
             .bind(end_ms)
+            // Positional: must stay adjacent to its `(? = 1 OR is_crawler = 0)`.
+            .bind(i32::from(q.include_crawlers))
             .bind(env_filter_flag)
             .bind(env_filter_value)
             .bind(dep_filter_flag)
@@ -1928,6 +1933,38 @@ mod tests {
         assert_eq!(pt.property, "channel");
         let pt_total: i64 = pt.items.iter().map(|i| i.count).sum();
         assert_eq!(pt_total, 5, "got {:?}", pt.items);
+
+        // The timeline must honour include_crawlers exactly like the breakdown.
+        // It previously accepted the flag and silently discarded it, so the
+        // chart counted bots while the table beside it did not — asserted here
+        // on both sides so a dropped bind or a missing predicate fails loudly.
+        let timeline_spec = |include: bool| PropertyTimelineSpec {
+            range: full_range(),
+            scope: project_scope(9),
+            event_name: None,
+            group_by_column: PropertyColumn::Channel,
+            aggregation_level: "visitors".to_string(),
+            bucket_size: Some("1 hour".to_string()),
+            include_crawlers: include,
+        };
+        let tl_off: i64 = backend
+            .query_property_timeline(timeline_spec(false))
+            .await
+            .expect("timeline without crawlers")
+            .items
+            .iter()
+            .map(|i| i.count)
+            .sum();
+        let tl_on: i64 = backend
+            .query_property_timeline(timeline_spec(true))
+            .await
+            .expect("timeline with crawlers")
+            .items
+            .iter()
+            .map(|i| i.count)
+            .sum();
+        assert_eq!(tl_off, 1, "timeline default must exclude the crawler");
+        assert_eq!(tl_on, 2, "timeline opt-in must include the crawler");
 
         // ---- query_dashboard_projects: empty short-circuit ----
         let empty_dash = backend

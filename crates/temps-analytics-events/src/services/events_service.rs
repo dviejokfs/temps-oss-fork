@@ -780,9 +780,12 @@ impl AnalyticsEventsService {
         }
         // When counting DISTINCT visitors/sessions, discard NULL keys up front.
         // `COUNT(DISTINCT x)` already ignores NULLs, so this changes no result —
-        // it just prunes rows before the sort/hash instead of forming groups
-        // that the HAVING clause then throws away. Measured ~20% faster on a
-        // 300k-event range where a third of rows carry no visitor_id.
+        // it just prunes rows before the sort/hash. Note this query has no
+        // HAVING clause, so unlike the breakdown the prune is not purely
+        // cosmetic: a (bucket, value) group whose rows all carry a NULL key
+        // used to emit count = 0 and now drops out entirely. That is the
+        // correct shape for a chart — a bucket with no identified visitors is
+        // absent rather than a spurious zero — but it IS a response change.
         if !agg_distinct.is_empty() {
             conditions.push(format!("e.{} IS NOT NULL", agg_field));
         }

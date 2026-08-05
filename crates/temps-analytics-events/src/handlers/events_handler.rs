@@ -639,24 +639,47 @@ pub async fn get_unique_counts(
 /// "zh-Hant-TW"); anything longer is a client sending junk.
 const MAX_LANGUAGE_TAG_LEN: usize = 35;
 
-/// Extract the highest-priority language tag from an `Accept-Language` header.
+/// Extract the highest-priority language tag from an `Accept-Language` header
+/// (or from an SDK-supplied `language` field, which has the same shape).
 ///
-/// Takes the first entry — browsers already send it in preference order — and
-/// drops any `;q=` weight. The result is **validated, not just truncated**:
-/// `language` is a `GROUP BY` dimension in the property breakdowns, so an
-/// unvalidated header would let any client mint unbounded distinct values and
-/// blow up cardinality on a box we expect to run in 4 GB. Anything that isn't a
-/// plausible BCP-47 tag is dropped rather than stored.
+/// Picks the entry with the highest `q` weight rather than simply the first:
+/// browsers do send preference order, but the ordering is a convention, not a
+/// guarantee, and `de;q=0.1,en;q=0.9` must resolve to `en`. Ties keep the
+/// earlier entry, matching RFC 9110.
+///
+/// The result is **validated and normalised, not merely truncated**. Every
+/// source of this value is attacker-controlled (`/_temps/event` is
+/// unauthenticated) and `language` is a `GROUP BY` dimension, so unvalidated
+/// input is an unbounded-cardinality hazard — worse on ClickHouse, where the
+/// column is `LowCardinality(String)`. Anything that isn't a plausible BCP-47
+/// tag is dropped rather than stored, and casing is normalised so `en-US`,
+/// `en-us` and `EN-US` collapse to one dimension value instead of three.
 fn primary_accept_language(header: &str) -> Option<String> {
-    let tag = header
-        .split(',')
-        .next()?
-        .split(';')
-        .next()?
-        .trim()
-        .trim_matches('"');
+    let mut best: Option<(f32, &str)> = None;
 
-    if tag.is_empty() || tag.len() > MAX_LANGUAGE_TAG_LEN {
+    for entry in header.split(',') {
+        let mut parts = entry.split(';');
+        let tag = parts.next().unwrap_or("").trim().trim_matches('"');
+        if tag.is_empty() {
+            continue;
+        }
+        // q-weight defaults to 1.0 when absent or unparsable.
+        let q = parts
+            .find_map(|p| {
+                let p = p.trim();
+                p.strip_prefix("q=").or_else(|| p.strip_prefix("Q="))
+            })
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(1.0);
+
+        if best.is_none_or(|(best_q, _)| q > best_q) {
+            best = Some((q, tag));
+        }
+    }
+
+    let tag = best.map(|(_, t)| t)?;
+
+    if tag.len() > MAX_LANGUAGE_TAG_LEN {
         return None;
     }
     // "*" is a valid Accept-Language value but carries no information.
@@ -671,7 +694,7 @@ fn primary_accept_language(header: &str) -> Option<String> {
         return None;
     }
 
-    Some(tag.to_string())
+    Some(tag.to_ascii_lowercase())
 }
 
 /// Record analytics event
@@ -767,15 +790,20 @@ pub async fn record_event_metrics(
         .or(payload.referrer.clone())
         .or(referrer_header);
 
-    // Extract language from the payload, then event_data, then the
-    // Accept-Language header.
+    // Resolve the visitor's language from the payload, then event_data, then
+    // the Accept-Language header — and validate whichever one wins.
     //
-    // The header fallback is what actually populates this column in practice:
-    // no browser SDK sends `language` on the event payload (the React SDK only
-    // reports it from the session recorder), so without it every event stored
-    // NULL and the language breakdown was 100% "Unknown". Every browser sends
-    // Accept-Language on the ingest request itself, so the data was always
-    // there — it was simply never read.
+    // The header fallback exists because older SDKs send no `language` at all,
+    // which left this column NULL on every event and the breakdown 100%
+    // "Unknown". Newer SDKs do send it on the payload.
+    //
+    // Validation is applied to the RESOLVED value rather than to any single
+    // branch. All three sources are attacker-controlled — `/_temps/event` is
+    // unauthenticated, so `payload.language` and `event_data.language` are just
+    // as forgeable as the header — and `language` is a GROUP BY dimension, so
+    // an unvalidated value here is an unbounded-cardinality hazard on a box we
+    // expect to run in 4 GB. Validating only the header would have left the
+    // guard covering the branch least likely to be taken.
     let language = payload
         .language
         .or_else(|| {
@@ -789,8 +817,9 @@ pub async fn record_event_metrics(
             headers
                 .get("accept-language")
                 .and_then(|h| h.to_str().ok())
-                .and_then(primary_accept_language)
-        });
+                .map(|h| h.to_string())
+        })
+        .and_then(|raw| primary_accept_language(&raw));
 
     // Lookup IP geolocation
     let ip_geolocation_id = if !metadata.ip_address.is_empty() {
@@ -1281,16 +1310,30 @@ mod tests {
         // the q-weight is dropped.
         assert_eq!(
             primary_accept_language("en-US,en;q=0.9,es;q=0.8").as_deref(),
-            Some("en-US")
+            Some("en-us")
+        );
+        // Highest q wins even when it is not first — browser ordering is a
+        // convention, not a guarantee.
+        assert_eq!(
+            primary_accept_language("de;q=0.1,en;q=0.9").as_deref(),
+            Some("en")
+        );
+        // Ties keep the earlier entry (RFC 9110).
+        assert_eq!(primary_accept_language("fr,de").as_deref(), Some("fr"));
+        // Casing is normalised so one language is one dimension value.
+        assert_eq!(primary_accept_language("EN-US").as_deref(), Some("en-us"));
+        assert_eq!(
+            primary_accept_language("en-us").as_deref(),
+            primary_accept_language("EN-us").as_deref()
         );
         assert_eq!(primary_accept_language("fr").as_deref(), Some("fr"));
         assert_eq!(
             primary_accept_language("  pt-BR ;q=1.0 ").as_deref(),
-            Some("pt-BR")
+            Some("pt-br")
         );
         assert_eq!(
             primary_accept_language("zh-Hant-TW,zh;q=0.9").as_deref(),
-            Some("zh-Hant-TW")
+            Some("zh-hant-tw")
         );
     }
 

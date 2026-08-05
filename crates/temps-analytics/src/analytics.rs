@@ -2198,6 +2198,10 @@ impl Analytics for AnalyticsService {
                     WHERE {where_clause}
                 )
                 AND e.event_type IN ('page_view', 'page_leave')
+                -- Also filter here, not only in the session sub-select above:
+                -- qualifying a session on one human event would otherwise drag
+                -- in every crawler-flagged row that shares its session id.
+                AND e.is_crawler = false
             ),
             -- Priority 1: for each page_view, find the min page_leave timestamp
             -- for same session+page_path within 30 min (via self-join + GROUP BY)
