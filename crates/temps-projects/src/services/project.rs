@@ -183,6 +183,35 @@ fn validate_preset_config(
     Ok(config)
 }
 
+fn normalize_project_directory(directory: &str) -> Result<String, ProjectError> {
+    let normalized = directory
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string();
+    if normalized.is_empty() || normalized == "." {
+        return Ok(".".to_string());
+    }
+    let path = std::path::Path::new(&normalized);
+    let has_windows_drive_prefix = normalized.as_bytes().get(1) == Some(&b':');
+    if has_windows_drive_prefix
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ProjectError::InvalidInput(format!(
+            "Project directory '{directory}' must be a relative path inside the source root"
+        )));
+    }
+    Ok(normalized.trim_start_matches("./").to_string())
+}
+
 /// Resolve an explicit catalog selection for create/update.
 ///
 /// Existing config is retained when it belongs to the same canonical preset.
@@ -298,20 +327,7 @@ impl ProjectService {
             }
         }
 
-        // Normalize directory to ensure it's a relative path
-        let normalized_directory = if request.directory.starts_with('/') {
-            // Remove leading slash to make it relative
-            request.directory.trim_start_matches('/').to_string()
-        } else {
-            request.directory.clone()
-        };
-
-        // If directory is empty after normalization, use current directory marker
-        let normalized_directory = if normalized_directory.is_empty() {
-            ".".to_string()
-        } else {
-            normalized_directory
-        };
+        let normalized_directory = normalize_project_directory(&request.directory)?;
 
         let project_slug = self.generate_unique_project_slug(&request.name).await?;
         let resolved = resolve_preset_selection(
@@ -836,20 +852,7 @@ impl ProjectService {
                 project_id
             )))?;
 
-        // Normalize directory to ensure it's a relative path
-        let normalized_directory = if request.directory.starts_with('/') {
-            // Remove leading slash to make it relative
-            request.directory.trim_start_matches('/').to_string()
-        } else {
-            request.directory.clone()
-        };
-
-        // If directory is empty after normalization, use current directory marker
-        let normalized_directory = if normalized_directory.is_empty() {
-            ".".to_string()
-        } else {
-            normalized_directory
-        };
+        let normalized_directory = normalize_project_directory(&request.directory)?;
 
         let resolved = resolve_preset_selection(
             request.preset.as_str(),
@@ -2409,14 +2412,42 @@ impl ProjectService {
         page: i64,
         per_page: i64,
     ) -> Result<(Vec<Project>, i64), ProjectError> {
+        self.get_projects_paginated_excluding(page, per_page, &[])
+            .await
+    }
+
+    /// [`Self::get_projects_paginated`], minus a caller-supplied set of
+    /// project ids.
+    ///
+    /// `hidden` comes from
+    /// [`ProjectAccessChecker::hidden_project_ids`](temps_core::ProjectAccessChecker::hidden_project_ids)
+    /// and is empty on an instance with no access grants configured, which
+    /// makes this identical to the unfiltered query in that case. The
+    /// exclusion is applied to the **count** as well as the page, so
+    /// pagination doesn't advertise rows the caller can never see.
+    pub async fn get_projects_paginated_excluding(
+        &self,
+        page: i64,
+        per_page: i64,
+        hidden: &[i32],
+    ) -> Result<(Vec<Project>, i64), ProjectError> {
         use sea_orm::PaginatorTrait;
         use sea_orm::QueryOrder;
 
         // Calculate offset
         let offset = ((page - 1) * per_page) as u64;
 
+        let filtered = || {
+            let query = projects::Entity::find();
+            if hidden.is_empty() {
+                query
+            } else {
+                query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()))
+            }
+        };
+
         // Get total count
-        let total = projects::Entity::find()
+        let total = filtered()
             .count(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
@@ -2425,7 +2456,7 @@ impl ProjectService {
         // Get paginated projects. Never-deployed projects (NULL last_deployment)
         // sort last rather than first (a NULL under DESC would otherwise appear
         // as the most-recently-deployed project).
-        let projects = projects::Entity::find()
+        let projects = filtered()
             .order_by_with_nulls(
                 projects::Column::LastDeployment,
                 sea_orm::Order::Desc,
@@ -2455,10 +2486,30 @@ impl ProjectService {
     }
 
     pub async fn get_project_statistics(&self) -> Result<ProjectStatistics, ProjectError> {
+        self.get_project_statistics_excluding(&[]).await
+    }
+
+    /// [`Self::get_project_statistics`], minus a caller-supplied set of
+    /// project ids.
+    ///
+    /// The count has to honour the same exclusion as the list, or the
+    /// dashboard tells a scoped user how many projects exist on the
+    /// instance while showing them only their own — a smaller leak than
+    /// the names, but the same leak.
+    pub async fn get_project_statistics_excluding(
+        &self,
+        hidden: &[i32],
+    ) -> Result<ProjectStatistics, ProjectError> {
         use sea_orm::PaginatorTrait;
 
-        // Get total count of projects
-        let total_count = projects::Entity::find()
+        let query = projects::Entity::find();
+        let query = if hidden.is_empty() {
+            query
+        } else {
+            query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()))
+        };
+
+        let total_count = query
             .count(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
@@ -4712,5 +4763,26 @@ mod tests {
             !matches!(result, Err(ProjectError::NotFound(_))),
             "caller_user_id with no connection_id must not be rejected by the ownership guard"
         );
+    }
+
+    #[test]
+    fn project_directory_must_remain_inside_source_root() {
+        assert_eq!(normalize_project_directory("").unwrap(), ".");
+        assert_eq!(
+            normalize_project_directory("./apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("../secrets"),
+            Err(ProjectError::InvalidInput(_))
+        ));
+        assert_eq!(
+            normalize_project_directory("/apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("apps/../../etc"),
+            Err(ProjectError::InvalidInput(_))
+        ));
     }
 }

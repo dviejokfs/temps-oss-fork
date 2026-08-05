@@ -64,7 +64,7 @@ pub use error::*;
 pub use error_builder::*;
 pub use jobs::*;
 pub use on_demand::*;
-pub use project_access::ProjectAccessChecker;
+pub use project_access::{MembershipPermissionResolver, ProjectAccessChecker};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
     match_strategy, PublicHostnameResolver, StandardHostnameResolver,
@@ -87,11 +87,12 @@ pub use utils::*;
 // Re-export external dependencies
 pub use anyhow;
 pub use app_settings::{
-    AgentSandboxSettings, AiConfigSettings, AppSettings, BuildLimitsSettings, ClusterDnsSettings,
-    ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings,
-    LetsEncryptSettings, MetricsStoreKind, MonitoringSettings, MultiNodeSettings,
-    ObservabilityCompressionSettings, ObservabilityRetentionSettings, PreviewGatewaySettings,
-    ProviderConfig, RateLimitSettings, ScreenshotSettings, SecurityHeadersSettings,
+    AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AppSettings, BuildLimitsSettings,
+    ClusterDnsSettings, ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings,
+    DockerRegistrySettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
+    MultiNodeSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
+    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, ScreenshotSettings,
+    SecurityHeadersSettings,
 };
 pub use async_trait;
 pub use chrono;
@@ -125,3 +126,4 @@ pub use workflow_memory::{
 
 // Re-export standard datetime type for use across all crates
 pub use types::UtcDateTime;
+pub mod archive_security;

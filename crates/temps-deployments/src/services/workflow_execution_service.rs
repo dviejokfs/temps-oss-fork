@@ -20,7 +20,8 @@ use crate::jobs::{
     AgentSyncService, BuildImageJobBuilder, ConfigureAgentsJobBuilder, ConfigureCronsJobBuilder,
     ConfigureMetricAlertsJobBuilder, CronConfigService, DeployImageJobBuilder,
     DeployStaticBundleJob, DeployStaticJob, DeploymentTarget, DownloadRepoBuilder,
-    MetricAlertConfigService, PullExternalImageJob, ResourceUsage, VerifyLocalImageJob,
+    MetricAlertConfigService, PrepareSourceBundleJob, PullExternalImageJob, ResourceUsage,
+    VerifyLocalImageJob,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -2217,6 +2218,11 @@ impl WorkflowExecutionService {
                     .get("static_bundle_id")
                     .and_then(|v| v.as_i64())
                     .map(|id| id as i32);
+                let source_directory = config
+                    .get("source_directory")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(".")
+                    .to_string();
 
                 // Get data directory from config service for local storage
                 let data_dir = self.config_service.data_dir();
@@ -2230,12 +2236,49 @@ impl WorkflowExecutionService {
                     project.slug.clone(),
                     environment.slug.clone(),
                     deployment.slug.clone(),
+                    source_directory,
                     data_dir,
                     self.static_deployer.clone(),
                 )
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
                 Ok(Arc::new(job))
+            }
+
+            "PrepareSourceBundleJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+                let archive_path = config
+                    .get("archive_path")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "archive_path is required".to_string(),
+                        )
+                    })?;
+                let archive_path = std::path::Path::new(archive_path);
+                if archive_path.is_absolute()
+                    || archive_path.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(WorkflowExecutionError::InvalidJobConfig(
+                        "source archive path must remain inside the Temps data directory"
+                            .to_string(),
+                    ));
+                }
+                let absolute_path = self.config_service.data_dir().join(archive_path);
+                Ok(Arc::new(PrepareSourceBundleJob::new(
+                    db_job.job_id.clone(),
+                    absolute_path,
+                    project.slug.clone(),
+                )))
             }
 
             // Unsupported job types - log warning but don't fail the entire workflow

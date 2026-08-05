@@ -10213,6 +10213,7 @@ dependencies = [
  "temps-ai",
  "temps-ai-api-tools",
  "temps-auth",
+ "temps-config",
  "temps-core",
  "temps-entities",
  "temps-git",
@@ -10675,6 +10676,7 @@ dependencies = [
  "temps-screenshots",
  "temps-static-files",
  "temps-status-page",
+ "temps-teams",
  "temps-telemetry",
  "temps-vulnerability-scanner",
  "temps-webhooks",
@@ -10841,6 +10843,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "ipnet",
+ "libc",
  "mockall",
  "octocrab",
  "rand 0.10.2",
@@ -11980,6 +11983,7 @@ dependencies = [
  "http 1.5.0",
  "http-body-util",
  "hyper",
+ "moka",
  "prost 0.14.4",
  "prost-build",
  "sea-orm",
@@ -12101,6 +12105,7 @@ dependencies = [
  "tracing",
  "url",
  "utoipa",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -12523,6 +12528,27 @@ dependencies = [
  "url",
  "utoipa",
  "wiremock",
+]
+
+[[package]]
+name = "temps-teams"
+version = "0.1.0-beta.55"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "moka",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "temps-auth",
+ "temps-core",
+ "temps-entities",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "utoipa",
 ]
 
 [[package]]
