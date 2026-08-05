@@ -898,7 +898,11 @@ impl DataSource for PostgresSource {
                     FROM information_schema.schemata
                     LEFT JOIN information_schema.tables
                         ON information_schema.tables.table_schema = information_schema.schemata.schema_name
-                        AND table_type = 'BASE TABLE'
+                        -- Must match `list_entities`' filter exactly. This
+                        -- counted BASE TABLE only, so once views became
+                        -- browsable a schema advertised "3 tables" in the
+                        -- container overview and then listed 4 entities.
+                        AND table_type IN ('BASE TABLE', 'VIEW')
                     WHERE schema_name NOT IN ('information_schema')
                     GROUP BY schema_name
                     ORDER BY schema_name

@@ -2578,7 +2578,8 @@ function ContainerOverview({
                     </td>
                     <td className="p-3 text-right text-xs tabular-nums">
                       {childEntities !== undefined ? (
-                        `${childEntities.toLocaleString()} tables`
+                        // "entities", not "tables": the count includes views.
+                        `${childEntities.toLocaleString()} ${childEntities === 1 ? 'entity' : 'entities'}`
                       ) : child.sizeBytes !== undefined ? (
                         formatFileSize(child.sizeBytes)
                       ) : (
@@ -3622,20 +3623,24 @@ function EntityDataView({
         <div>
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0">
-                {/* Path back up. Opening an entity left no way out except the
-                    header's back arrow, which exits to the service page —
-                    several levels further than intended. Each segment
-                    navigates to that container. */}
-                {containerPath && (
-                  <nav
-                    aria-label="Breadcrumb"
-                    className="flex flex-wrap items-center gap-1 text-sm/6 text-muted-foreground"
-                  >
-                    {containerPath.split('/').map((segment, index, segments) => {
+                {/* Breadcrumb inline with the name rather than stacked above
+                    it. Path, title and type on three separate rows spent a
+                    third of the header restating one identity; the parent
+                    segments are muted and clickable, the entity is the
+                    emphasis. Also the only way back up — the header's arrow
+                    exits to the service page, several levels too far. */}
+                <h2 className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-lg/7 font-semibold sm:text-base/6">
+                  <span className="shrink-0 [&>svg]:size-4">
+                    {getEntityIcon(entityInfo.entity_type)}
+                  </span>
+                  {containerPath &&
+                    containerPath.split('/').map((segment, index, segments) => {
                       const target = segments.slice(0, index + 1).join('/')
                       return (
-                        <span key={target} className="flex items-center gap-1">
-                          {index > 0 && <span aria-hidden="true">/</span>}
+                        <span
+                          key={target}
+                          className="flex items-center gap-1.5 font-normal text-muted-foreground"
+                        >
                           <button
                             type="button"
                             onClick={() => onNavigateToContainer?.(target)}
@@ -3643,15 +3648,10 @@ function EntityDataView({
                           >
                             {segment}
                           </button>
+                          <span aria-hidden="true">/</span>
                         </span>
                       )
                     })}
-                  </nav>
-                )}
-                <h2 className="flex items-center gap-2 text-lg/7 font-semibold sm:text-base/6">
-                  <span className="shrink-0 [&>svg]:size-4">
-                    {getEntityIcon(entityInfo.entity_type)}
-                  </span>
                   <span className="truncate">{entityInfo.entity}</span>
                 </h2>
                 {/* Everything that was spread across two card descriptions
