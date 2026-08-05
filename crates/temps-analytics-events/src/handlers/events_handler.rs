@@ -771,6 +771,9 @@ pub async fn record_event_metrics(
             payload.event_data,
             &payload.request_path,
             &payload.request_query,
+            // The tracked site's own host, already resolved against the route
+            // table above — lets the service detect self-referrals.
+            Some(host.as_str()),
             payload.screen_width,
             payload.screen_height,
             payload.viewport_width,
@@ -900,6 +903,10 @@ pub async fn record_console_event(
             payload.event_data,
             &payload.request_path,
             &payload.request_query,
+            // No site hostname on the server-side path: the caller is the app
+            // backend, not the browser, and it sends no referrer either — so
+            // there is no self-referral to detect.
+            None, // site_hostname
             None, // screen_width
             None, // screen_height
             None, // viewport_width

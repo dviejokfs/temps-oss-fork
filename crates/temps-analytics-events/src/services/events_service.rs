@@ -1409,6 +1409,10 @@ WHERE project_id = $1
         event_data: serde_json::Value,
         request_path: &str,
         request_query: &str,
+        // Hostname of the tracked site itself, resolved by the caller from the
+        // request Host header. Required for self-referral detection — see the
+        // `hostname` binding below.
+        site_hostname: Option<&str>,
         screen_width: Option<u32>,
         screen_height: Option<u32>,
         viewport_width: Option<u32>,
@@ -1439,10 +1443,22 @@ WHERE project_id = $1
         let session_id =
             Some(session_id.unwrap_or_else(|| temps_core::uuid::Uuid::new_v4().to_string()));
 
-        // Extract hostname from event_data if available, otherwise use default
-        let hostname = event_data
-            .get("hostname")
-            .and_then(|v| v.as_str())
+        // Resolve the hostname of the tracked site. Priority:
+        //   1. `site_hostname` — the request Host header the ingest handler
+        //      already resolved against the route table, so it is the site the
+        //      event actually happened on.
+        //   2. `event_data.hostname` — legacy/server-side callers that embed it.
+        //   3. "localhost" — last resort so the column is never empty.
+        //
+        // Priority 1 matters beyond the stored column: without a site hostname
+        // `get_channel` cannot recognise a self-referral, so every internal
+        // page-to-page navigation gets attributed to the "Referral" channel and
+        // swamps the real acquisition channels. No browser SDK has ever sent
+        // `event_data.hostname` (the React SDK sends a top-level `domain`), so
+        // relying on it alone left self-referral detection permanently off.
+        let hostname = site_hostname
+            .filter(|h| !h.is_empty())
+            .or_else(|| event_data.get("hostname").and_then(|v| v.as_str()))
             .unwrap_or("localhost")
             .to_string();
 
@@ -1460,12 +1476,13 @@ WHERE project_id = $1
             .as_ref()
             .and_then(|r| temps_analytics::extract_referrer_hostname(r));
 
-        // Compute channel attribution
-        let current_hostname = event_data.get("hostname").and_then(|v| v.as_str());
+        // Compute channel attribution. `hostname` is the resolved site host, so
+        // a referrer pointing at our own domain is correctly classified as
+        // Direct (session continuation) rather than Referral.
         let channel = temps_analytics::get_channel(
             &utm_params,
             referrer_hostname.as_deref(),
-            current_hostname,
+            Some(hostname.as_str()),
         );
 
         // Get UTM values from parsed params
@@ -2982,6 +2999,7 @@ mod tests {
                 serde_json::json!({}),
                 "/blog/bot-test",
                 "",
+                None, // site_hostname
                 None,
                 None,
                 None,
@@ -3022,6 +3040,7 @@ mod tests {
                 serde_json::json!({}),
                 "/blog/human-test",
                 "",
+                None, // site_hostname
                 None,
                 None,
                 None,
@@ -3051,6 +3070,205 @@ mod tests {
         );
 
         println!("✅ record_event crawler-flag persistence test passed!");
+    }
+
+    /// Regression test: a page-to-page navigation within the tracked site
+    /// arrives with a referrer on our own host. `record_event` must resolve
+    /// the site hostname from the caller (the ingest handler passes the
+    /// route-resolved Host header) so `get_channel` recognises the
+    /// self-referral and records it as Direct. Before this was wired up the
+    /// service looked for `event_data.hostname`, which no browser SDK sends,
+    /// so self-referral detection never fired and internal navigation
+    /// dominated the Referral channel.
+    #[tokio::test]
+    async fn test_record_event_classifies_self_referral_as_direct() {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::{
+            deployments, environments, projects, source_type::SourceType,
+            upstream_config::UpstreamList,
+        };
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let project = projects::ActiveModel {
+            name: Set("self-referral-test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            preset_config: Set(None),
+            deployment_config: Set(None),
+            slug: Set("self-referral-test".to_string()),
+            is_deleted: Set(false),
+            deleted_at: Set(None),
+            last_deployment: Set(None),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            git_provider_connection_id: Set(None),
+            attack_mode: Set(false),
+            error_source_context_enabled: Set(false),
+            error_source_root: Set(None),
+            enable_preview_environments: Set(false),
+            source_type: Set(SourceType::Git),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test project");
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            branch: Set(Some("main".to_string())),
+            slug: Set("production".to_string()),
+            subdomain: Set("prod".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            is_preview: Set(false),
+            current_deployment_id: Set(None),
+            deleted_at: Set(None),
+            deployment_config: Set(None),
+            last_deployment: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deploy-{}", uuid::Uuid::new_v4())),
+            state: Set("ready".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            deploying_at: Set(None),
+            ready_at: Set(Some(chrono::Utc::now())),
+            started_at: Set(Some(chrono::Utc::now())),
+            finished_at: Set(Some(chrono::Utc::now())),
+            context_vars: Set(None),
+            branch_ref: Set(Some("main".to_string())),
+            tag_ref: Set(None),
+            commit_sha: Set(None),
+            commit_message: Set(None),
+            commit_author: Set(None),
+            commit_json: Set(None),
+            cancelled_reason: Set(None),
+            static_dir_location: Set(None),
+            screenshot_location: Set(None),
+            image_name: Set(None),
+            deployment_config: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test deployment");
+
+        let service = AnalyticsEventsService::new(db.clone());
+
+        // A visitor navigating from one page of the tracked site to another
+        // sends a referrer on our own host. That is session continuation, not
+        // an acquisition channel, so it must be classified Direct.
+        let self_referral = service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some("self-ref-session".to_string()),
+                None,
+                "page_view",
+                serde_json::json!({}),
+                "/pricing",
+                "",
+                Some("temps.example"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                        .to_string(),
+                ),
+                Some("https://temps.example/blog/post".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record self-referral event");
+
+        assert_eq!(
+            self_referral.channel.as_deref(),
+            Some("Direct"),
+            "a referrer on the site's own host is session continuation, not a Referral"
+        );
+        assert_eq!(
+            self_referral.hostname, "temps.example",
+            "the resolved site host must be persisted, not the 'localhost' fallback"
+        );
+
+        // A referrer on a third-party host is a genuine Referral.
+        let external_referral = service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some("ext-ref-session".to_string()),
+                None,
+                "page_view",
+                serde_json::json!({}),
+                "/pricing",
+                "",
+                Some("temps.example"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                        .to_string(),
+                ),
+                Some("https://openalternative.co/temps".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record external-referral event");
+
+        assert_eq!(
+            external_referral.channel.as_deref(),
+            Some("Referral"),
+            "a third-party referrer must still be classified as Referral"
+        );
+
+        println!("✅ self-referral channel attribution test passed!");
     }
 
     /// Regression test for the visitor/event race condition: a brand-new
@@ -3188,6 +3406,7 @@ mod tests {
                 serde_json::json!({}),
                 "/",
                 "?utm_source=newsletter&utm_medium=email&utm_campaign=launch",
+                None, // site_hostname
                 None,
                 None,
                 None,
@@ -3252,6 +3471,7 @@ mod tests {
                 serde_json::json!({}),
                 "/pricing",
                 "",
+                None, // site_hostname
                 None,
                 None,
                 None,
@@ -3413,6 +3633,7 @@ mod tests {
                 serde_json::json!({}),
                 "/",
                 "?utm_source=newsletter&utm_medium=email&utm_campaign=launch",
+                None, // site_hostname
                 None,
                 None,
                 None,
@@ -3501,6 +3722,7 @@ mod tests {
                 serde_json::json!({}),
                 "/about",
                 "",
+                None, // site_hostname
                 None,
                 None,
                 None,
@@ -3998,6 +4220,7 @@ mod tests {
                 serde_json::json!({}),
                 "/",
                 "",
+                None, // site_hostname
                 None,
                 None,
                 None,
@@ -4031,6 +4254,7 @@ mod tests {
                 serde_json::json!({}),
                 "/",
                 "",
+                None, // site_hostname
                 None,
                 None,
                 None,
