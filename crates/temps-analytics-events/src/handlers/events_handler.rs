@@ -522,7 +522,8 @@ pub async fn get_property_breakdown(
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
         ("event_name" = Option<String>, Query, description = "Filter by event name"),
         ("aggregation_level" = Option<String>, Query, description = "Aggregation level: events, sessions, or visitors - default: events"),
-        ("bucket_size" = Option<String>, Query, description = "Time bucket: hour, day, week, month (default: auto-detect)")
+        ("bucket_size" = Option<String>, Query, description = "Time bucket: hour, day, week, month (default: auto-detect)"),
+        ("include_crawlers" = Option<bool>, Query, description = "Include crawler/bot traffic (default: false)")
     ),
     responses(
         (status = 200, description = "Successfully retrieved property timeline", body = PropertyTimelineResponse),
