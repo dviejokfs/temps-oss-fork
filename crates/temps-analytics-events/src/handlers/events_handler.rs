@@ -439,6 +439,7 @@ pub async fn get_hourly_visits(
         ("event_name" = Option<String>, Query, description = "Filter by event name"),
         ("aggregation_level" = Option<String>, Query, description = "Aggregation level: events, sessions, or visitors - default: events"),
         ("limit" = Option<i32>, Query, description = "Maximum number of results (default: 20, max: 100)"),
+        ("include_crawlers" = Option<bool>, Query, description = "Include crawler/bot traffic (default: false)"),
         ("filter_country" = Option<String>, Query, description = "Filter by country (for region/city drill-downs)"),
         ("filter_region" = Option<String>, Query, description = "Filter by region (for city drill-downs)"),
         ("filter_browser" = Option<String>, Query, description = "Filter by browser name (for version drill-downs)"),
@@ -491,7 +492,8 @@ pub async fn get_property_breakdown(
         aggregation_level,
         query.limit,
         Some(filters),
-    );
+    )
+    .with_crawlers(query.include_crawlers.unwrap_or(false));
     let breakdown = state
         .events_service
         .query_property_breakdown(spec)
@@ -557,6 +559,7 @@ pub async fn get_property_timeline(
         group_by_column: query.group_by.clone(),
         aggregation_level: aggregation_level.to_string(),
         bucket_size: query.bucket_size,
+        include_crawlers: query.include_crawlers.unwrap_or(false),
     };
     let timeline = state
         .events_service
