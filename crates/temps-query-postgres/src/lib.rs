@@ -1078,14 +1078,29 @@ impl DataSource for PostgresSource {
 
         debug!("Listing tables in schema: {}", schema_name);
 
+        // Row counts and sizes come from the catalog in the same pass, so the
+        // list can show them without N+1 per-table COUNT(*) queries. The
+        // MariaDB backend already did this via information_schema; Postgres
+        // returned nulls, so the same UI showed real numbers on one engine and
+        // em dashes on the other.
+        //
+        // Views are included: they are browsable like tables and omitting them
+        // made schemas look emptier than they are. reltuples/size are
+        // meaningless for a view, so they are nulled out below rather than
+        // reported as zero.
         let query = r#"
             SELECT
-                table_schema,
-                table_name,
-                table_type
-            FROM information_schema.tables
-            WHERE table_schema = $1 AND table_type = 'BASE TABLE'
-            ORDER BY table_name
+                t.table_schema,
+                t.table_name,
+                t.table_type,
+                c.reltuples,
+                pg_total_relation_size(c.oid) AS total_bytes
+            FROM information_schema.tables t
+            LEFT JOIN pg_namespace n ON n.nspname = t.table_schema
+            LEFT JOIN pg_class c ON c.relname = t.table_name AND c.relnamespace = n.oid
+            WHERE t.table_schema = $1
+              AND t.table_type IN ('BASE TABLE', 'VIEW')
+            ORDER BY t.table_name
         "#;
 
         let rows = client.query(query, &[schema_name]).await.map_err(|e| {
@@ -1101,13 +1116,32 @@ impl DataSource for PostgresSource {
                 let schema: String = row.get(0);
                 let table_name: String = row.get(1);
                 let table_type: String = row.get(2);
+                let is_view = table_type == "VIEW";
+
+                // A view has no heap of its own: reltuples is 0 and
+                // pg_total_relation_size is 0. Reporting those as real figures
+                // would claim "0 rows, 0 B" about something that may return
+                // millions, so leave them unknown instead.
+                let row_count = if is_view {
+                    None
+                } else {
+                    row.try_get::<_, f32>(3)
+                        .ok()
+                        .filter(|estimate| *estimate >= 0.0)
+                        .map(|estimate| estimate as usize)
+                };
+                let size_bytes = if is_view {
+                    None
+                } else {
+                    row.try_get::<_, i64>(4).ok().map(|s| s.max(0) as u64)
+                };
 
                 EntityInfo {
                     namespace: schema,
                     name: table_name,
                     entity_type: table_type,
-                    row_count: None,
-                    size_bytes: None,
+                    row_count,
+                    size_bytes,
                     schema: None,
                     metadata: None,
                 }

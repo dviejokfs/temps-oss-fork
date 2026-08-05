@@ -1306,6 +1306,7 @@ export function ServiceDataBrowser() {
           serviceId={id || ''}
           containerPath={selectedPath}
           containerName={selectedPath.split('/').pop() || ''}
+          containerType={selectedNode?.containerType}
           getEntityIcon={getEntityIcon}
           isObjectStore={isObjectStore}
           formatFileSize={formatFileSize}
@@ -1747,8 +1748,8 @@ export function ServiceDataBrowser() {
                 <input
                   type="text"
                   name="container-filter"
-                  aria-label="Filter containers and tables"
-                  placeholder="Filter tables…"
+                  aria-label="Filter containers and entities"
+                  placeholder="Filter…"
                   value={filterText}
                   onChange={(e) => setFilterText(e.target.value)}
                   className="w-full rounded-md border bg-background py-1.5 pl-8 pr-8 text-base/6 focus:outline-none focus:ring-2 focus:ring-ring sm:text-sm/6"
@@ -2299,10 +2300,46 @@ function DynamicFilterBuilder({
 }
 
 // Container Entities View Component - Shows entities in a leaf container (like S3 bucket)
+/**
+ * Plural noun for a container's entities, taken from what the source calls
+ * them: PostgreSQL/MySQL "table", MongoDB "collection", Redis "key", S3
+ * "object". A schema holding both tables and views falls back to the generic
+ * "entities" rather than picking one and misdescribing the rest.
+ */
+function pluralEntityNoun(
+  entities: EntityResponse[],
+  objectStore: boolean
+): string {
+  if (objectStore) return 'objects'
+  if (entities.length === 0) return 'entities'
+
+  const kinds = new Set(
+    entities.map((e) => (e.entity_type ?? '').toUpperCase())
+  )
+  if (kinds.size !== 1) return 'entities'
+
+  switch (kinds.values().next().value) {
+    case 'BASE TABLE':
+    case 'TABLE':
+      return 'tables'
+    case 'VIEW':
+      return 'views'
+    case 'COLLECTION':
+      return 'collections'
+    case 'KEY':
+      return 'keys'
+    case 'OBJECT':
+      return 'objects'
+    default:
+      return 'entities'
+  }
+}
+
 function ContainerEntitiesView({
   serviceId,
   containerPath,
   containerName,
+  containerType,
   getEntityIcon,
   isObjectStore,
   formatFileSize,
@@ -2312,6 +2349,8 @@ function ContainerEntitiesView({
   serviceId: string
   containerPath: string
   containerName: string
+  /** e.g. "database", "schema", "bucket" — labels an otherwise bare name. */
+  containerType?: string
   getEntityIcon: (entityType: string | undefined) => React.ReactElement
   isObjectStore: () => boolean
   formatFileSize: (bytes: number) => string
@@ -2489,7 +2528,34 @@ function ContainerEntitiesView({
       )
     : entitiesList
 
-  const entityNoun = isObjectStore() ? 'objects' : 'tables'
+  // Name entities the way the backend does. `isObjectStore() ? objects :
+  // tables` is a binary that only covers two of the five engines, so Redis
+  // keys and Mongo collections were both being announced as "tables". The
+  // entity_type the source itself reports is the honest label.
+  const entityNoun = pluralEntityNoun(visibleEntities, isObjectStore())
+
+  // Only render a column that actually says something. Across the five
+  // backends most containers are homogeneous — every Redis entity is a `key`,
+  // every Mongo one a `collection`, every MySQL one a `table` — so a Type
+  // column repeats one word down the page. It earns its place only where
+  // types genuinely differ (a Postgres schema holding both tables and views).
+  // Same for Rows and Size: a backend that reports neither would otherwise get
+  // two columns of em dashes.
+  const showTypeColumn =
+    new Set(visibleEntities.map((e: EntityResponse) => e.entity_type)).size > 1
+  // A column of identical values carries no information. Redis reports
+  // row_count = 1 for every key (a key *is* one entity), which rendered as a
+  // column of 1s down the page; requiring at least two distinct values drops
+  // it there while keeping it wherever counts actually vary.
+  const distinctRowCounts = new Set(
+    visibleEntities
+      .map((e: EntityResponse) => e.row_count)
+      .filter((c) => c !== null && c !== undefined)
+  )
+  const showRowsColumn = distinctRowCounts.size > 1
+  const showSizeColumn = visibleEntities.some(
+    (e: EntityResponse) => e.size_bytes !== null && e.size_bytes !== undefined
+  )
 
   return (
     <div className="flex flex-col gap-4">
@@ -2508,7 +2574,12 @@ function ContainerEntitiesView({
                       : ''
                   }
                 >
-                  {segment}
+                  {/* Label the leaf with its container type. A Redis database
+                      is named "0", which on its own reads as a stray digit
+                      rather than a location. */}
+                  {index === pathSegments.length - 1 && containerType
+                    ? `${containerType} ${segment}`
+                    : segment}
                 </span>
               </span>
             ))}
@@ -2580,12 +2651,21 @@ function ContainerEntitiesView({
                       </>
                     ) : (
                       <>
-                        <th className="whitespace-nowrap p-3 text-left font-medium">
-                          Type
-                        </th>
-                        <th className="whitespace-nowrap p-3 text-right font-medium">
-                          Rows
-                        </th>
+                        {showTypeColumn && (
+                          <th className="whitespace-nowrap p-3 text-left font-medium">
+                            Type
+                          </th>
+                        )}
+                        {showRowsColumn && (
+                          <th className="whitespace-nowrap p-3 text-right font-medium">
+                            Rows
+                          </th>
+                        )}
+                        {showSizeColumn && (
+                          <th className="whitespace-nowrap p-3 text-right font-medium">
+                            Size
+                          </th>
+                        )}
                       </>
                     )}
                   </tr>
@@ -2703,19 +2783,33 @@ function ContainerEntitiesView({
                         </>
                       ) : (
                         <>
-                          <td className="p-3 text-xs text-muted-foreground">
-                            {entity.entity_type === 'BASE TABLE'
-                              ? 'table'
-                              : (entity.entity_type ?? '—').toLowerCase()}
-                          </td>
-                          <td className="p-3 text-right text-xs tabular-nums">
-                            {entity.row_count === null ||
-                            entity.row_count === undefined ? (
-                              <span className="text-muted-foreground">—</span>
-                            ) : (
-                              entity.row_count.toLocaleString()
-                            )}
-                          </td>
+                          {showTypeColumn && (
+                            <td className="p-3 text-xs text-muted-foreground">
+                              {entity.entity_type === 'BASE TABLE'
+                                ? 'table'
+                                : (entity.entity_type ?? '—').toLowerCase()}
+                            </td>
+                          )}
+                          {showRowsColumn && (
+                            <td className="p-3 text-right text-xs tabular-nums">
+                              {entity.row_count === null ||
+                              entity.row_count === undefined ? (
+                                <span className="text-muted-foreground">—</span>
+                              ) : (
+                                entity.row_count.toLocaleString()
+                              )}
+                            </td>
+                          )}
+                          {showSizeColumn && (
+                            <td className="p-3 text-right text-xs tabular-nums">
+                              {entity.size_bytes === null ||
+                              entity.size_bytes === undefined ? (
+                                <span className="text-muted-foreground">—</span>
+                              ) : (
+                                formatFileSize(entity.size_bytes)
+                              )}
+                            </td>
+                          )}
                         </>
                       )}
                     </tr>
