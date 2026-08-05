@@ -1339,7 +1339,10 @@ export type AuthFlavorDto = {
 
 export type AuthResponse = {
     message: string;
+    mfa_enrollment_required: boolean;
     mfa_required: boolean;
+    mfa_setup?: null | MfaSetupResponse;
+    password_change_required: boolean;
     success: boolean;
     user_id?: number | null;
 };
@@ -3958,6 +3961,7 @@ export type CreateTeamRequest = {
 
 export type CreateUserRequest = {
     email?: string | null;
+    must_change_password?: boolean;
     password?: string | null;
     roles: Array<string>;
     username: string;
@@ -13322,6 +13326,18 @@ export type RequestRow = {
     user_agent?: string | null;
 };
 
+export type RequiredPasswordChangeRequest = {
+    new_password: string;
+};
+
+export type RequiredPasswordChangeResponse = {
+    message: string;
+    mfa_enrollment_required: boolean;
+    mfa_setup?: null | MfaSetupResponse;
+    success: boolean;
+    user_id: number;
+};
+
 export type ResetPasswordRequest = {
     new_password: string;
     token: string;
@@ -13830,6 +13846,7 @@ export type RouteUser = {
     id: number;
     image: string;
     mfa_enabled: boolean;
+    must_change_password: boolean;
     name: string;
     updated_at: number;
     username: string;
@@ -22388,6 +22405,37 @@ export type ListPublicProvidersResponses = {
 };
 
 export type ListPublicProvidersResponse = ListPublicProvidersResponses[keyof ListPublicProvidersResponses];
+
+export type ChangeRequiredPasswordData = {
+    body: RequiredPasswordChangeRequest;
+    path?: never;
+    query?: never;
+    url: '/auth/password-change-required';
+};
+
+export type ChangeRequiredPasswordErrors = {
+    /**
+     * Password does not meet requirements
+     */
+    400: unknown;
+    /**
+     * Password-change session is missing or expired
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ChangeRequiredPasswordResponses = {
+    /**
+     * Required password change completed
+     */
+    200: RequiredPasswordChangeResponse;
+};
+
+export type ChangeRequiredPasswordResponse = ChangeRequiredPasswordResponses[keyof ChangeRequiredPasswordResponses];
 
 export type RequestPasswordResetData = {
     body: EmailRequest;
@@ -43931,7 +43979,7 @@ export type GetUniqueCountsResponses = {
 export type GetUniqueCountsResponse = GetUniqueCountsResponses[keyof GetUniqueCountsResponses];
 
 export type UploadStaticBundleData = {
-    body?: never;
+    body: SourceArchiveUpload;
     path: {
         project_id: number;
     };
@@ -47724,6 +47772,10 @@ export type SetupMfaErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * MFA is already enabled; verify and disable it before re-enrollment
+     */
+    409: unknown;
     /**
      * Internal server error
      */
