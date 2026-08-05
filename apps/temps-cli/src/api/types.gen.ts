@@ -28927,7 +28927,7 @@ export type DownloadObjectResponses = {
 
 export type DownloadObjectResponse = DownloadObjectResponses[keyof DownloadObjectResponses];
 
-export type GetContainerInfoData = {
+export type GetQueryContainerInfoData = {
     body?: never;
     path: {
         service_id: number;
@@ -28937,7 +28937,7 @@ export type GetContainerInfoData = {
     url: '/external-services/{service_id}/query/containers/{path}/info';
 };
 
-export type GetContainerInfoErrors = {
+export type GetQueryContainerInfoErrors = {
     /**
      * Unauthorized
      */
@@ -28956,14 +28956,14 @@ export type GetContainerInfoErrors = {
     500: unknown;
 };
 
-export type GetContainerInfoResponses = {
+export type GetQueryContainerInfoResponses = {
     /**
      * Container information
      */
     200: ContainerResponse;
 };
 
-export type GetContainerInfoResponse = GetContainerInfoResponses[keyof GetContainerInfoResponses];
+export type GetQueryContainerInfoResponse = GetQueryContainerInfoResponses[keyof GetQueryContainerInfoResponses];
 
 export type CheckExplorerSupportData = {
     body?: never;

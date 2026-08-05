@@ -615,13 +615,8 @@ impl Queryable for MariaDbSource {
         // because this backend accepts a caller-supplied WHERE clause and a
         // caller-supplied OFFSET, whose cost is O(offset) regardless of LIMIT.
         //
-        // The knob is spelled differently on the two engines this backend serves
-        // — MySQL 5.7.8+ has `max_execution_time` (milliseconds), MariaDB has
-        // `max_statement_time` (seconds, fractional) — and setting the one the
-        // server does not know is an error. Try both and keep whichever lands.
-        // Both statements must run on the SAME pooled connection as the query,
-        // hence the explicit acquire; a session variable set on some other
-        // connection in the pool would bound some other request.
+        // See `apply_statement_timeout` for why both spellings are tried and
+        // why this must share the query's connection.
         let timeout_ms = options.timeout_ms.unwrap_or(30_000);
         let mut conn = self.pool.acquire().await.map_err(|e| {
             DataError::ConnectionFailed(format!(
@@ -629,28 +624,7 @@ impl Queryable for MariaDbSource {
                 database_name, entity_name, e
             ))
         })?;
-
-        let mysql_set = sqlx::query(&format!("SET SESSION max_execution_time = {timeout_ms}"))
-            .execute(&mut *conn)
-            .await
-            .is_ok();
-        let mariadb_set = sqlx::query(&format!(
-            "SET SESSION max_statement_time = {}",
-            timeout_ms as f64 / 1000.0
-        ))
-        .execute(&mut *conn)
-        .await
-        .is_ok();
-        if !mysql_set && !mariadb_set {
-            // Neither knob exists on this server, so only the outer deadline
-            // bounds this query. Say so — an operator staring at a slow database
-            // needs to know the server-side ceiling is not in effect.
-            warn!(
-                database = %database_name,
-                "Neither max_execution_time nor max_statement_time is supported by this server; \
-                 data browser queries are bounded only by the control-plane deadline"
-            );
-        }
+        apply_statement_timeout(&mut conn, timeout_ms, database_name).await;
 
         let rows = sqlx::query(&sql)
             .bind(limit as i64)
@@ -704,8 +678,27 @@ impl Queryable for MariaDbSource {
             }
         }
 
+        // SECURITY: bound this the way `query` is bounded.
+        //
+        // The timeout work originally covered the row-reading path only, which
+        // left the more expensive operation unbounded. `COUNT(*)` is a full
+        // index scan, it takes a caller-supplied WHERE clause, and
+        // `get_entity_info` falls through to it whenever `TABLE_ROWS` is null
+        // or below the estimate threshold — true for every view and every table
+        // whose stats were never gathered, regardless of real size. Since
+        // `get_entity_info` is in the AI read allowlist, "check the row count of
+        // every table" would otherwise be a denial of service against the
+        // customer's production database.
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            DataError::ConnectionFailed(format!(
+                "Failed to acquire a MariaDB connection to count {}.{}: {}",
+                database_name, entity_name, e
+            ))
+        })?;
+        apply_statement_timeout(&mut conn, COUNT_TIMEOUT_MS, database_name).await;
+
         let row = sqlx::query(&sql)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| DataError::QueryFailed(format!("Count query failed: {}", e)))?;
 
@@ -877,6 +870,48 @@ fn normalize_sort_field(sort_by: &str) -> Result<&str> {
     let trimmed = sort_by.trim().trim_start_matches('/');
     validate_identifier("sort field", trimmed)?;
     Ok(trimmed)
+}
+
+/// Server-side ceiling for `count`, which takes no `QueryOptions` and so has no
+/// caller-supplied deadline to honour. See the call site for why it needs one.
+const COUNT_TIMEOUT_MS: u64 = 10_000;
+
+/// Apply a server-side statement timeout to one pooled connection.
+///
+/// The knob is spelled differently on the two engines this backend serves —
+/// MySQL 5.7.8+ has `max_execution_time` (milliseconds), MariaDB has
+/// `max_statement_time` (seconds, fractional) — and setting the one the server
+/// does not know is an error, so both are tried and whichever lands wins. Must
+/// run on the SAME connection as the statement it is meant to bound; a session
+/// variable set on some other connection in the pool bounds some other request.
+///
+/// Best-effort by design: failing to set a ceiling should not fail the query,
+/// but it must be visible, because it means only the control-plane deadline is
+/// in play and the server will keep working after the client gives up.
+async fn apply_statement_timeout(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
+    timeout_ms: u64,
+    database_name: &str,
+) {
+    let mysql_set = sqlx::query(&format!("SET SESSION max_execution_time = {timeout_ms}"))
+        .execute(&mut **conn)
+        .await
+        .is_ok();
+    let mariadb_set = sqlx::query(&format!(
+        "SET SESSION max_statement_time = {}",
+        timeout_ms as f64 / 1000.0
+    ))
+    .execute(&mut **conn)
+    .await
+    .is_ok();
+
+    if !mysql_set && !mariadb_set {
+        warn!(
+            database = %database_name,
+            "Neither max_execution_time nor max_statement_time is supported by this server; \
+             data browser statements are bounded only by the control-plane deadline"
+        );
+    }
 }
 
 fn strip_sql_string_literals(sql: &str) -> Result<String> {
@@ -1077,11 +1112,69 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         "savepoint ",
     ];
 
+    // Match on token boundaries rather than raw substrings. The trailing space
+    // in each entry was doing that job badly: `payload = 'x'` matched `"load "`
+    // and `charset = 'utf8'` matched `"set "`, so two very ordinary column
+    // names were unfilterable. A validator that blocks legitimate queries is a
+    // validator someone eventually switches off.
     for keyword in &dangerous_keywords {
-        if without_strings.contains(keyword) {
+        let keyword = keyword.trim();
+        // `sleep(`/`benchmark(` keep their paren and stay substring matches —
+        // they are not identifiers, and the structural check above is the real
+        // guard for the function-call forms.
+        let hit = if keyword.ends_with('(') {
+            without_strings.contains(keyword)
+        } else {
+            temps_query_postgres::contains_sql_token(&without_strings, keyword)
+        };
+        if hit {
             return Err(DataError::InvalidQuery(format!(
                 "SQL operation '{}' is not allowed in the data browser",
-                keyword.trim()
+                keyword
+            )));
+        }
+    }
+
+    // SECURITY: no regex operators.
+    //
+    // The denylist runs on string-stripped input, so a regex pattern — which
+    // lives entirely inside a string literal — is invisible to it.
+    // `1=1 and 'aaaaaaaaaaaaaaaaaaaa' regexp '(a+)+b'` strips to
+    // `1=1 and '' regexp ''` and passes every check. MariaDB's engine is PCRE,
+    // which backtracks, so that is the same CPU-burn primitive on the
+    // operator's database that the `benchmark(`/backtick fix closed, reached
+    // through a door the fix cannot see. Not fixable by inspecting the payload:
+    // the payload is opaque to us by construction.
+    for operator in ["regexp", "rlike"] {
+        if temps_query_postgres::contains_sql_token(&without_strings, operator) {
+            return Err(DataError::InvalidQuery(
+                "Regular-expression operators (REGEXP, RLIKE) are not allowed in the data \
+                 browser — use LIKE instead"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // SECURITY: no system-variable reads.
+    //
+    // `@@datadir`, `@@version`, `@@secure_file_priv` and friends need no
+    // parentheses, so the function-call guard never sees them, and they give
+    // blind boolean extraction of the server's configuration through an
+    // ordinary filter. Same for the parenless information functions.
+    if without_strings.contains("@@") {
+        return Err(DataError::InvalidQuery(
+            "System variables (@@...) are not allowed in the data browser".to_string(),
+        ));
+    }
+    for token in [
+        "current_user",
+        "session_user",
+        "system_user",
+        "current_role",
+    ] {
+        if temps_query_postgres::contains_sql_token(&without_strings, token) {
+            return Err(DataError::InvalidQuery(format!(
+                "'{token}' is not allowed in the data browser"
             )));
         }
     }
@@ -1198,6 +1291,20 @@ mod tests {
     }
 
     #[test]
+    fn where_clause_rejects_regex_and_system_variables() {
+        // The regex pattern hides inside a string literal, so the stripper
+        // removes it before any keyword check runs. MariaDB's PCRE backtracks.
+        assert_where_rejected("1=1 and 'aaaaaaaaaaaaaaaaaaaaaaaa' regexp '(a+)+b'");
+        assert_where_rejected("name rlike '(a+)+b'");
+        // System variables need no parens, so the function-call guard never
+        // sees them, and they leak server configuration a filter away.
+        assert_where_rejected("1=1 and @@datadir like 'a%'");
+        assert_where_rejected("@@version like '8%'");
+        assert_where_rejected("@@secure_file_priv is null");
+        assert_where_rejected("current_user like 'root%'");
+    }
+
+    #[test]
     fn where_clause_still_accepts_ordinary_filters() {
         // The structural checks must not break the filters this exists to run.
         // Grouping parens are preceded by whitespace or an operator, so they
@@ -1218,6 +1325,14 @@ mod tests {
             // Matching bare "sleep"/"benchmark" would reject these.
             "sleep_minutes > 30",
             "benchmark_id = 7",
+            // Substring matching on the denylist rejected both of these:
+            // `payload` contains `load `, `charset` contains `set `. Very
+            // ordinary column names, and the kind of false positive that gets a
+            // validator switched off rather than fixed.
+            "payload = 'x'",
+            "charset = 'utf8'",
+            "download_count > 3",
+            "offset_seconds = 1",
         ] {
             assert!(
                 validate_where_clause(clause).is_ok(),

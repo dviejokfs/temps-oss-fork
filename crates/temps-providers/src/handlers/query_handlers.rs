@@ -363,6 +363,40 @@ fn entity_names_are_user_data(service_type: &str) -> bool {
     )
 }
 
+/// Enforce the `ai_data_access` opt-in on an endpoint that returns *entity
+/// names*, for engines where those names are user data.
+///
+/// Shared by `list_entities` and `get_entity_info` so the pair cannot drift —
+/// which they had: both were allowlisted for the agent under one comment saying
+/// both were gated, and only one was. Factoring the decision into a single
+/// function is the point; two call sites implementing "the same" rule is how
+/// the gap appeared in the first place.
+async fn apply_entity_name_gate(
+    app_state: &AppState,
+    service_id: i32,
+    is_ai_call: bool,
+) -> Result<(), Problem> {
+    if !is_ai_call {
+        return Ok(());
+    }
+
+    let service = app_state
+        .external_service_manager
+        .get_service(service_id)
+        .await
+        .map_err(|e| {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Service Not Found")
+                .with_detail(e.to_string())
+        })?;
+
+    if entity_names_are_user_data(&service.service_type) {
+        enforce_ai_data_access(app_state, service_id, is_ai_call, "keys and object names").await?;
+    }
+
+    Ok(())
+}
+
 /// Resolve the service and enforce the per-service `ai_data_access` opt-in for
 /// agent-originated calls.
 ///
@@ -484,6 +518,15 @@ pub async fn read_entity_rows(
     axum::extract::Query(query): axum::extract::Query<ReadRowsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
+    // not *this* service. Without the tenancy check a caller scoped to project A
+    // can enumerate `service_id` and read a service linked only to project B —
+    // and for row data that is the whole database. The sibling write handler
+    // `set_ai_data_access` has always carried this, as does every service-keyed
+    // read in `metrics_handlers`; the data-browser reads were the outlier, which
+    // matters most for deployment tokens, whose project scope only takes effect
+    // inside this helper.
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     let is_ai_call = ai_call.is_some();
 
@@ -696,6 +739,15 @@ pub async fn check_explorer_support(
     Path(service_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
+    // not *this* service. Without the tenancy check a caller scoped to project A
+    // can enumerate `service_id` and read a service linked only to project B —
+    // and for row data that is the whole database. The sibling write handler
+    // `set_ai_data_access` has always carried this, as does every service-keyed
+    // read in `metrics_handlers`; the data-browser reads were the outlier, which
+    // matters most for deployment tokens, whose project scope only takes effect
+    // inside this helper.
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     // Get service configuration
     let service = app_state
@@ -971,6 +1023,15 @@ pub async fn list_root_containers(
     Path(service_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
+    // not *this* service. Without the tenancy check a caller scoped to project A
+    // can enumerate `service_id` and read a service linked only to project B —
+    // and for row data that is the whole database. The sibling write handler
+    // `set_ai_data_access` has always carried this, as does every service-keyed
+    // read in `metrics_handlers`; the data-browser reads were the outlier, which
+    // matters most for deployment tokens, whose project scope only takes effect
+    // inside this helper.
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     let path = ContainerPath::root();
     let containers = app_state
@@ -1009,6 +1070,15 @@ pub async fn list_containers_at_path(
     Path((service_id, path_str)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
+    // not *this* service. Without the tenancy check a caller scoped to project A
+    // can enumerate `service_id` and read a service linked only to project B —
+    // and for row data that is the whole database. The sibling write handler
+    // `set_ai_data_access` has always carried this, as does every service-keyed
+    // read in `metrics_handlers`; the data-browser reads were the outlier, which
+    // matters most for deployment tokens, whose project scope only takes effect
+    // inside this helper.
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     // Parse path from URL (segments separated by /)
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
@@ -1032,6 +1102,14 @@ pub async fn list_containers_at_path(
 #[utoipa::path(
     get,
     path = "/external-services/{service_id}/query/containers/{path}/info",
+    // Explicit id because the default derived from the function name collides
+    // with the Docker container endpoint's `get_container_info`. utoipa keys the
+    // document by operation_id, so one silently overwrote the other: the spec
+    // carried this handler under that name and the Docker one vanished, which
+    // meant the AI allowlist entry `get_container_info` granted the data browser
+    // rather than the Docker tool the comment there claimed. Naming this one
+    // explicitly lets both appear.
+    operation_id = "get_query_container_info",
     tag = "External Services - Query",
     responses(
         (status = 200, description = "Container information", body = ContainerResponse),
@@ -1048,6 +1126,15 @@ pub async fn get_container_info(
     Path((service_id, path_str)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
+    // not *this* service. Without the tenancy check a caller scoped to project A
+    // can enumerate `service_id` and read a service linked only to project B —
+    // and for row data that is the whole database. The sibling write handler
+    // `set_ai_data_access` has always carried this, as does every service-keyed
+    // read in `metrics_handlers`; the data-browser reads were the outlier, which
+    // matters most for deployment tokens, whose project scope only takes effect
+    // inside this helper.
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments);
@@ -1092,30 +1179,22 @@ pub async fn list_entities(
     axum::extract::Query(query): axum::extract::Query<ListEntitiesQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
+    // not *this* service. Without the tenancy check a caller scoped to project A
+    // can enumerate `service_id` and read a service linked only to project B —
+    // and for row data that is the whole database. The sibling write handler
+    // `set_ai_data_access` has always carried this, as does every service-keyed
+    // read in `metrics_handlers`; the data-browser reads were the outlier, which
+    // matters most for deployment tokens, whose project scope only takes effect
+    // inside this helper.
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     let is_ai_call = ai_call.is_some();
 
     // This operation is allowlisted for the agent as "schema shape only", which
     // is true of tables and collections but NOT of keys and object names — on
-    // Redis and S3 the entity name *is* user data. Gate those engines behind
-    // the same opt-in as row reads; leaving them open made this endpoint a way
-    // around it. See `entity_names_are_user_data`.
-    if is_ai_call {
-        let service = app_state
-            .external_service_manager
-            .get_service(service_id)
-            .await
-            .map_err(|e| {
-                temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("Service Not Found")
-                    .with_detail(e.to_string())
-            })?;
-
-        if entity_names_are_user_data(&service.service_type) {
-            enforce_ai_data_access(&app_state, service_id, is_ai_call, "keys and object names")
-                .await?;
-        }
-    }
+    // Redis and S3 the entity name *is* user data. See `apply_entity_name_gate`.
+    apply_entity_name_gate(&app_state, service_id, is_ai_call).await?;
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments);
@@ -1167,8 +1246,27 @@ pub async fn get_entity_info(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
     Path((service_id, path_str, entity)): Path<(i32, String, String)>,
+    ai_call: Option<axum::Extension<temps_core::ai_tool_call::AiToolCall>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
+    // not *this* service. Without the tenancy check a caller scoped to project A
+    // can enumerate `service_id` and read a service linked only to project B —
+    // and for row data that is the whole database. The sibling write handler
+    // `set_ai_data_access` has always carried this, as does every service-keyed
+    // read in `metrics_handlers`; the data-browser reads were the outlier, which
+    // matters most for deployment tokens, whose project scope only takes effect
+    // inside this helper.
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
+
+    // Same engine-dependent gate as `list_entities`. This endpoint was
+    // allowlisted for the agent alongside it, under a comment claiming both
+    // were gated — but only `list_entities` was. It leaks less than a row read,
+    // yet it is not nothing: on MongoDB the reported `fields` are inferred from
+    // an actual sampled document, so in a schemaless store those keys can be
+    // user-written, and on Redis/S3 a 200-vs-404 is an existence oracle for a
+    // guessed key or object name (`session:<token>`), plus TTL and etag.
+    apply_entity_name_gate(&app_state, service_id, ai_call.is_some()).await?;
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments.clone());
@@ -1241,6 +1339,15 @@ pub async fn query_data(
     Json(request): Json<QueryDataRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
+    // not *this* service. Without the tenancy check a caller scoped to project A
+    // can enumerate `service_id` and read a service linked only to project B —
+    // and for row data that is the whole database. The sibling write handler
+    // `set_ai_data_access` has always carried this, as does every service-keyed
+    // read in `metrics_handlers`; the data-browser reads were the outlier, which
+    // matters most for deployment tokens, whose project scope only takes effect
+    // inside this helper.
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments);
@@ -1337,6 +1444,15 @@ pub async fn download_object(
     Path((service_id, path_str, entity)): Path<(i32, String, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
+    // not *this* service. Without the tenancy check a caller scoped to project A
+    // can enumerate `service_id` and read a service linked only to project B —
+    // and for row data that is the whole database. The sibling write handler
+    // `set_ai_data_access` has always carried this, as does every service-keyed
+    // read in `metrics_handlers`; the data-browser reads were the outlier, which
+    // matters most for deployment tokens, whose project scope only takes effect
+    // inside this helper.
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     // Parse path
     let segments: Vec<&str> = if path_str.is_empty() {
@@ -1433,12 +1549,16 @@ pub async fn get_ai_data_access(
     State(app_state): State<Arc<AppState>>,
     Path(service_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Read side deliberately carries no `assert_service_owned_by_caller`,
-    // unlike `set_ai_data_access` below. It matches every other read in this
-    // module (explorer-support, containers, entities), and the response is a
-    // single boolean about the platform's own configuration — no tenant data.
-    // The write path is where widening access must be tenancy-checked.
     permission_guard!(auth, ExternalServicesRead);
+    // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
+    // not *this* service. Without the tenancy check a caller scoped to project A
+    // can enumerate `service_id` and read a service linked only to project B —
+    // and for row data that is the whole database. The sibling write handler
+    // `set_ai_data_access` has always carried this, as does every service-keyed
+    // read in `metrics_handlers`; the data-browser reads were the outlier, which
+    // matters most for deployment tokens, whose project scope only takes effect
+    // inside this helper.
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     let service = app_state
         .external_service_manager

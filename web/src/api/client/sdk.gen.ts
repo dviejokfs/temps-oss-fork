@@ -2686,7 +2686,7 @@ export const downloadObject = <ThrowOnError extends boolean = false>(options: Op
 /**
  * Get information about a specific container
  */
-export const getContainerInfo = <ThrowOnError extends boolean = false>(options: Options<GetContainerInfoData, ThrowOnError>): RequestResult<GetContainerInfoResponses, GetContainerInfoErrors, ThrowOnError> => (options.client ?? client).get<GetContainerInfoResponses, GetContainerInfoErrors, ThrowOnError>({
+export const getQueryContainerInfo = <ThrowOnError extends boolean = false>(options: Options<GetContainerInfoData, ThrowOnError>): RequestResult<GetContainerInfoResponses, GetContainerInfoErrors, ThrowOnError> => (options.client ?? client).get<GetContainerInfoResponses, GetContainerInfoErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/external-services/{service_id}/query/containers/{path}/info',
     ...options

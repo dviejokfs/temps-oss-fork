@@ -1546,12 +1546,14 @@ fn ai_read_allowlist() -> Vec<String> {
         "check_explorer_support",
         "list_root_containers",
         "list_containers_at_path",
-        // NOTE: the data browser's `get_container_info` is deliberately NOT
-        // listed — that operation_id already belongs to the Docker container
-        // endpoint above, and utoipa keys the index by operation_id, so the
-        // two collide. `list_containers_at_path` covers navigation without
-        // depending on which of the two wins. (Pre-existing collision; fixing
-        // it means renaming a published operation_id.)
+        // The data browser's container-info endpoint is now published as
+        // `get_query_container_info` (see its `operation_id` in
+        // temps-providers). It used to share `get_container_info` with the
+        // Docker container endpoint above, and since utoipa keys the document
+        // by operation_id one silently overwrote the other — the data browser
+        // won, so this allowlist granted the agent that endpoint while the
+        // comment here claimed the Docker one. Not listed: navigation is
+        // already covered by `list_containers_at_path`, and it is not needed.
         // Entity names. On SQL and MongoDB these are tables and collections —
         // developer-chosen names, no stored values, safe on the same footing as
         // the rest of this list. On Redis and S3 the entity name IS user data

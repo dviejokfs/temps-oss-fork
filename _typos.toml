@@ -15,6 +15,9 @@ unions = "unions"
 # AIMD = Additive Increase / Multiplicative Decrease (congestion-control term,
 # ADR-021). typos mis-corrects it to "AIMED".
 AIMD = "AIMD"
+# MongoDB query operator `$nin` ("not in"), in the data browser's filter
+# allowlist. typos reads it as a misspelling of "nine"/"min".
+nin = "nin"
 
 [default.extend-identifiers]
 # W3C traceparent spec example span-id used in test fixtures

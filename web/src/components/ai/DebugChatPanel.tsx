@@ -32,7 +32,10 @@ import {
   Wrench,
   X,
 } from 'lucide-react'
-import { untrustedMarkdownImage } from '@/components/markdown/untrustedImage'
+import {
+  untrustedMarkdownImage,
+  untrustedMarkdownLink,
+} from '@/components/markdown/untrusted'
 import { CopyButton } from '@/components/ui/copy-button'
 import { cn } from '@/lib/utils'
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -978,19 +981,6 @@ function TypingDots() {
 /** Open links (including `remark-gfm` autolinked bare URLs) in a new tab, styled
  *  as links. `rel="noopener noreferrer"` so the opened page can't access us. */
 const markdownComponents: Components = {
-  a({ node: _node, className, ...props }) {
-    return (
-      <a
-        {...props}
-        target="_blank"
-        rel="noopener noreferrer"
-        className={cn(
-          'font-medium text-primary underline underline-offset-2 hover:text-primary/80 break-all',
-          className
-        )}
-      />
-    )
-  },
   // Give horizontally-scrolling code blocks a thin, subtle scrollbar instead of
   // the chunky default OS bar over the dark code surface.
   pre({ node: _node, className, ...props }) {
@@ -999,6 +989,7 @@ const markdownComponents: Components = {
   // SECURITY: cross-origin images from model output never auto-load. Shared
   // with every other renderer of untrusted Markdown — see the module for why.
   ...untrustedMarkdownImage,
+  ...untrustedMarkdownLink,
 }
 
 /** Render one chunk of assistant prose as Markdown. */

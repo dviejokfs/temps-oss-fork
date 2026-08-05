@@ -58287,7 +58287,7 @@
           "External Services - Query"
         ],
         "summary": "Get information about a specific container",
-        "operationId": "get_container_info",
+        "operationId": "get_query_container_info",
         "parameters": [
           {
             "name": "service_id",

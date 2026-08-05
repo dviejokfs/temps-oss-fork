@@ -16,6 +16,16 @@ use tracing::{debug, error, warn};
 
 const FILTER_WHERE_PLACEHOLDER: &str = "status = 'active' AND created_at > '2025-01-01'";
 
+/// Server-side ceiling for the introspection paths that take no `QueryOptions`
+/// — `count` and the size/row-estimate lookups behind `get_entity_info`.
+///
+/// Those have no caller-supplied deadline to honour, but they are the paths a
+/// prompt-injected agent can call in bulk (`get_entity_info` is in the read
+/// allowlist), and `COUNT(*)` with a caller-supplied WHERE clause is a full
+/// scan. Ten seconds is far more than an honest count needs and short enough
+/// that a pile of them cannot hold the pool.
+const DEFAULT_COUNT_TIMEOUT_MS: u64 = 10_000;
+
 /// Escape a SQL identifier by doubling any internal double-quote characters.
 /// Prevents identifier injection when used inside `"..."` quoting.
 fn escape_ident(name: &str) -> String {
@@ -159,12 +169,30 @@ impl PostgresSource {
         // messages and to reject nonsense early.
         Self::validate_database_identifier(database)?;
 
-        let mut cfg = tokio_postgres::Config::new();
-        cfg.host(host)
-            .port(port)
-            .user(username)
-            .password(password)
-            .dbname(database);
+        // SECURITY: every TLS rung must carry `SslMode::Require`.
+        //
+        // tokio-postgres defaults to `SslMode::Prefer` (see `Config::default`),
+        // and under Prefer `connect_tls` returns `Ok(MaybeTlsStream::Raw)` — an
+        // ordinary cleartext socket — whenever the server answers anything but
+        // `S` to the SSLRequest. That made the previous version of this ladder
+        // inert: rung 1 "succeeded" over an unencrypted connection, logged
+        // "Connected to PostgreSQL with verified TLS", and rungs 2 and 3 never
+        // ran, so the `host_is_private` guard below was dead code. An on-path
+        // attacker forced it by answering `N` — an SSL-strip needing no
+        // certificate at all. Require makes a server that will not do TLS an
+        // error, which is what lets the explicit cleartext rung stay the only
+        // way to reach an unencrypted socket.
+        let tls_cfg = |ssl_mode| {
+            let mut cfg = tokio_postgres::Config::new();
+            cfg.host(host)
+                .port(port)
+                .user(username)
+                .password(password)
+                .dbname(database)
+                .ssl_mode(ssl_mode);
+            cfg
+        };
+        let cfg = tls_cfg(tokio_postgres::config::SslMode::Require);
 
         debug!(
             "Connecting to PostgreSQL: {}@{}:{}/{}",
@@ -181,66 +209,80 @@ impl PostgresSource {
         // for any observer. Nothing in the UI showed which of the three had
         // happened.
         //
-        // Now: verified TLS → self-signed TLS (Temps-managed clusters use
-        // self-signed certs, so this rung has to stay) → cleartext, and that
-        // last rung only where the traffic cannot leave the host or the private
-        // network. Each downgrade is logged with the reason.
+        // Now: verified TLS → self-signed TLS → cleartext. The last TWO rungs
+        // are restricted to private hosts. Rung 2 needs the restriction as much
+        // as rung 3 does: an active attacker never presents a properly-issued
+        // certificate, they present a self-signed one, so an unrestricted
+        // accept-anything rung hands over the password on exactly the same
+        // terms as cleartext — it just requires an active rather than a passive
+        // attacker. Temps-managed clusters use self-signed certs and live on
+        // loopback or the mesh, so gating rung 2 on the same predicate keeps
+        // them working while closing the public-internet case. Each downgrade
+        // logs which rung landed and why.
         let client = match connect_with_verified_tls(&cfg).await {
             Ok(client) => {
-                debug!("Connected to PostgreSQL with verified TLS");
+                debug!(host = %host, "Connected to PostgreSQL with verified TLS");
                 client
             }
-            Err(verified_err) => match Self::connect_with_tls(&cfg).await {
-                Ok(client) => {
-                    warn!(
-                        host = %host,
-                        "PostgreSQL certificate did not validate against the system roots ({}); \
-                         connected with an unverified (self-signed) certificate. Traffic is \
-                         encrypted but the server is NOT authenticated.",
-                        format_chain(&verified_err)
-                    );
-                    client
+            Err(verified_err) => {
+                // Both remaining rungs are restricted to private hosts, so the
+                // check happens once here rather than in each arm.
+                if !host_is_private(host).await {
+                    return Err(DataError::ConnectionFailed(format!(
+                        "PostgreSQL at '{host}' did not present a certificate that validates \
+                         against the system roots, and the host does not resolve to a private \
+                         network. Refusing to fall back to an unverified certificate or to \
+                         cleartext, because either would hand this service's password to whoever \
+                         answered. Install a valid certificate, or reach the database over a \
+                         private address or the Temps mesh. (error: {})",
+                        format_chain(&verified_err),
+                    )));
                 }
-                Err(tls_err) => {
-                    // Cleartext carries the password in the clear. Only
-                    // acceptable where the connection cannot leave the operator's
-                    // own host or private network.
-                    if !host_is_private(host) {
-                        return Err(DataError::ConnectionFailed(format!(
-                            "PostgreSQL at '{host}' refused TLS and is not on a private network, \
-                             so falling back to an unencrypted connection would send this \
-                             service's password across the network in cleartext. Refusing. \
-                             Enable TLS on the server, or reach it over a private address or the \
-                             Temps mesh. (verified TLS error: {}; self-signed TLS error: {})",
-                            format_chain(&verified_err),
-                            format_chain(&tls_err),
-                        )));
+
+                match Self::connect_with_tls(&cfg).await {
+                    Ok(client) => {
+                        warn!(
+                            host = %host,
+                            "PostgreSQL certificate did not validate against the system roots ({}); \
+                             connected with an unverified (self-signed) certificate. Traffic is \
+                             encrypted but the server is NOT authenticated. Permitted only because \
+                             the host is loopback or private.",
+                            format_chain(&verified_err)
+                        );
+                        client
                     }
+                    Err(tls_err) => {
+                        // Cleartext carries the password in the clear. Reached only
+                        // for a private host (checked above), and only with an
+                        // explicitly non-Require config so the downgrade is a
+                        // deliberate step rather than something `Prefer` did for us.
+                        warn!(
+                            host = %host,
+                            "PostgreSQL refused TLS ({}); falling back to an UNENCRYPTED connection. \
+                             Permitted only because the host is loopback or private.",
+                            format_chain(&tls_err)
+                        );
 
-                    warn!(
-                        host = %host,
-                        "PostgreSQL refused TLS ({}); falling back to an UNENCRYPTED connection. \
-                         Permitted only because the host is loopback or private.",
-                        format_chain(&tls_err)
-                    );
+                        let cfg = tls_cfg(tokio_postgres::config::SslMode::Disable);
 
-                    let (client, connection) = cfg.connect(NoTls).await.map_err(|e| {
-                        DataError::ConnectionFailed(format!(
-                            "PostgreSQL connection failed (TLS error: {}, plain error: {})",
-                            format_chain(&tls_err),
-                            format_chain(&e),
-                        ))
-                    })?;
+                        let (client, connection) = cfg.connect(NoTls).await.map_err(|e| {
+                            DataError::ConnectionFailed(format!(
+                                "PostgreSQL connection failed (TLS error: {}, plain error: {})",
+                                format_chain(&tls_err),
+                                format_chain(&e),
+                            ))
+                        })?;
 
-                    tokio::spawn(async move {
-                        if let Err(e) = connection.await {
-                            error!("PostgreSQL connection error: {}", e);
-                        }
-                    });
+                        tokio::spawn(async move {
+                            if let Err(e) = connection.await {
+                                error!("PostgreSQL connection error: {}", e);
+                            }
+                        });
 
-                    client
+                        client
+                    }
                 }
-            },
+            }
         };
 
         debug!(
@@ -383,6 +425,44 @@ pub fn reject_subqueries_and_function_calls(without_strings: &str) -> Result<()>
     Ok(())
 }
 
+/// Whether `token` appears in `sql` as a whole SQL token.
+///
+/// Shared by the PostgreSQL and MariaDB denylists, which previously used a raw
+/// `contains(" keyword ")`. Substring matching produced false *rejections* on
+/// ordinary columns — `payload = 'x'` matched `"load "`, `charset = 'utf8'`
+/// matched `"set "`, and any Postgres column literally named `commit`, `update`
+/// or `copy` was unfilterable. That is not a cosmetic problem: a validator that
+/// blocks legitimate queries is a validator someone eventually switches off.
+///
+/// Expects already-lowercased, whitespace-normalised, string-stripped input.
+/// A token boundary is anything that cannot continue an identifier, matching
+/// the rule `starts_with_sql_keyword` uses at the other end.
+pub fn contains_sql_token(sql: &str, token: &str) -> bool {
+    let is_ident_char =
+        |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii();
+
+    let mut from = 0;
+    while let Some(found) = sql[from..].find(token) {
+        let start = from + found;
+        let end = start + token.len();
+
+        let before_ok = sql[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c));
+        let after_ok = sql[end..].chars().next().is_none_or(|c| !is_ident_char(c));
+
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + token.len().max(1);
+        if from >= sql.len() {
+            break;
+        }
+    }
+    false
+}
+
 /// Collapse every run of whitespace to a single ASCII space.
 ///
 /// SQL lexers treat space, tab, newline, carriage return, form feed and
@@ -428,47 +508,77 @@ pub async fn connect_with_self_signed_tls(
 /// cleartext there leaks nothing new. A public hostname is the opposite case:
 /// the password would cross the open internet in the clear.
 ///
-/// Bare hostnames with no dot (`temps-pg-42`, `localhost`) are Docker/service
-/// names that cannot resolve publicly, so they count as private. Anything that
-/// looks like a public FQDN does not — when in doubt this returns false,
-/// because the cost of being wrong in that direction is a refused connection
-/// with a clear explanation, and in the other direction it is a leaked
-/// credential.
-fn host_is_private(host: &str) -> bool {
+/// SECURITY: this resolves the host and classifies the resulting addresses. It
+/// deliberately does NOT classify the hostname string.
+///
+/// Classifying the string was wrong in a way that inverted the guard. A host of
+/// `134744072` is not dotted-quad, so `IpAddr::parse` rejects it, and the old
+/// "no dot means it's a container name" rule then called it private — but
+/// `getaddrinfo`/`inet_aton` accepts the integer form and resolves it to
+/// `8.8.8.8`. Same for `0x08080808`. Someone with `ExternalServicesWrite` but
+/// no credential-reveal rights could set a service host to that, force TLS to
+/// fail, and collect the password at a listener they control. A bare
+/// single-label name is also not reliably private: it resolves through the
+/// resolver's DNS search domain, which need not be.
+///
+/// Every resolved address must be private — one public address in the set is
+/// enough to refuse, since we do not control which the driver picks. Resolution
+/// failure is also a refusal: this decides whether a password may cross the
+/// network in cleartext, so the unknown case has to fail closed.
+async fn host_is_private(host: &str) -> bool {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
 
     if host.is_empty() {
         return false;
     }
 
-    // A unix socket path is local by construction.
+    // A unix socket path never touches a network.
     if host.starts_with('/') {
         return true;
     }
 
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    // Unique local (fc00::/7) and link-local (fe80::/10).
-                    || (v6.segments()[0] & 0xfe00) == 0xfc00
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
-            }
-        };
+    // Port is irrelevant to the classification; `lookup_host` needs one.
+    let Ok(addrs) = tokio::net::lookup_host((host, 5432u16)).await else {
+        return false;
+    };
+
+    let mut saw_any = false;
+    for addr in addrs {
+        saw_any = true;
+        if !ip_is_private(addr.ip()) {
+            return false;
+        }
     }
 
-    // Not an IP: a single-label name (no dot) is a container/service name and
-    // is not publicly resolvable. `.localhost` and `.internal` are reserved for
-    // exactly this purpose.
-    let lower = host.to_ascii_lowercase();
-    !lower.contains('.')
-        || lower.ends_with(".localhost")
-        || lower.ends_with(".internal")
-        || lower.ends_with(".local")
+    saw_any
+}
+
+/// Whether an address is one the operator's own machine or private network.
+///
+/// Split out from [`host_is_private`] so the classification itself is
+/// synchronous and unit-testable without a resolver.
+fn ip_is_private(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                // Carrier-grade NAT (100.64.0.0/10) — Tailscale and several
+                // mesh VPNs hand out addresses here.
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // Unique local (fc00::/7) and link-local (fe80::/10).
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // IPv4-mapped: classify by the embedded v4 address rather than
+                // treating ::ffff:8.8.8.8 as an opaque v6 address.
+                || v6.to_ipv4_mapped().is_some_and(|v4| ip_is_private(v4.into()))
+        }
+    }
 }
 
 /// Open a client with genuine certificate verification against the webpki root
@@ -930,11 +1040,65 @@ impl PostgresSource {
             " into ",
         ];
 
+        // Match on token boundaries, not raw substrings. The trailing space in
+        // each entry was doing the boundary work, badly: it made any column
+        // whose name *ends* with a keyword unfilterable (`payload` contains
+        // `load `... once the following space is counted) while missing the
+        // keyword at end-of-input entirely.
         for keyword in &dangerous_keywords {
-            if without_strings.contains(keyword) {
+            if contains_sql_token(&without_strings, keyword.trim()) {
                 return Err(DataError::InvalidQuery(format!(
                     "SQL operation '{}' is not allowed in the data browser",
                     keyword.trim()
+                )));
+            }
+        }
+
+        // SECURITY: no regex operators.
+        //
+        // The denylist above runs on string-stripped input, so a regex pattern
+        // — which lives entirely inside a string literal — is invisible to it.
+        // `1=1 AND 'aaaaaaaaaaaaaaaaaaaaaaaa' ~ '^(a+)+$'` strips to
+        // `1=1 and '' ~ ''` and passes everything. PostgreSQL's regex engine is
+        // a backtracking NFA, so that is catastrophic backtracking: the same
+        // CPU-burn primitive on the operator's database that the function-call
+        // guard exists to prevent, reached through a door the guard cannot see.
+        //
+        // Not fixable by pattern-matching the payload, because the payload is
+        // opaque to us by construction. Reject the operators instead — LIKE and
+        // ILIKE cover what a data browser filter legitimately needs.
+        for operator in ["~", "!~"] {
+            if without_strings.contains(operator) {
+                return Err(DataError::InvalidQuery(
+                    "Regular-expression operators (~, ~*, !~, !~*) are not allowed in the data \
+                     browser — use LIKE or ILIKE instead"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // SECURITY: no parenless information functions.
+        //
+        // The function-call guard keys on an identifier immediately before `(`,
+        // so PostgreSQL's niladic-callable functions — spelled without parens —
+        // walk straight past it, as does a `::regclass` cast. None of these are
+        // data theft on their own, but they give blind boolean extraction of
+        // the connection user, schema and catalog, plus a relation-existence
+        // oracle whose error text this API returns verbatim. A data-browser
+        // filter has no legitimate use for any of them.
+        const INFORMATION_TOKENS: [&str; 7] = [
+            "current_user",
+            "session_user",
+            "current_role",
+            "current_catalog",
+            "current_schema",
+            "current_database",
+            "regclass",
+        ];
+        for token in INFORMATION_TOKENS {
+            if contains_sql_token(&without_strings, token) {
+                return Err(DataError::InvalidQuery(format!(
+                    "'{token}' is not allowed in the data browser"
                 )));
             }
         }
@@ -1684,6 +1848,19 @@ impl Queryable for PostgresSource {
 
         // Add ORDER BY
         if let Some(sort_by) = &options.sort_by {
+            // SECURITY: trim ONCE, then validate and quote the same value.
+            //
+            // `validate_sort_field` trims internally, but the quoting decision
+            // below used the raw string. A leading space therefore split them:
+            // ` "a ASC,1 FROM pg_shadow--" ` validated as an already-quoted
+            // identifier, but `starts_with('"')` was false on the untrimmed
+            // value, so it got wrapped again and the payload landed *outside*
+            // any quote pair, lexed as SQL by the server. No working exploit was
+            // demonstrated — the double-wrap leaves unresolvable identifiers on
+            // either side — but a validator and its emitter disagreeing about
+            // the value on a raw-concatenation path is not something to leave
+            // resting on that.
+            let sort_by = sort_by.trim();
             Self::validate_sort_field(sort_by)?;
             let sort_order = match options.sort_order.as_deref() {
                 Some("desc") | Some("DESC") => "DESC",
@@ -1826,6 +2003,23 @@ impl Queryable for PostgresSource {
 
         let client = &self.client;
 
+        // SECURITY: bound this the same way `query` is bounded.
+        //
+        // The timeout work originally covered the row-reading path only, which
+        // left the more expensive operation unbounded: `COUNT(*)` is a full
+        // scan on PostgreSQL, it takes a caller-supplied WHERE clause, and it is
+        // reached from `get_entity_info` — an endpoint the AI agent can call.
+        // "Check the row count of every table" is then a denial of service
+        // against the customer's production database with nothing to stop it.
+        if let Err(e) = client
+            .batch_execute(&format!(
+                "SET statement_timeout = {DEFAULT_COUNT_TIMEOUT_MS}"
+            ))
+            .await
+        {
+            warn!("Failed to set statement_timeout for data browser count: {e}");
+        }
+
         let row = client
             .query_one(&sql, &[])
             .await
@@ -1949,50 +2143,132 @@ mod tests {
     };
 
     #[test]
-    fn host_is_private_allows_local_and_mesh_destinations() {
+    fn ip_is_private_allows_local_and_mesh_addresses() {
         // These are where a Temps-managed database actually lives: a container
         // on the same host, or a peer on the private mesh. Cleartext there
         // never leaves infrastructure the operator controls, so the fallback
         // must keep working — refusing these would break every existing
         // self-hosted deployment whose Postgres has no TLS.
-        for host in [
+        for ip in [
             "127.0.0.1",
             "::1",
-            "localhost",
-            "temps-pg-42",
             "10.0.0.5",
             "172.16.4.9",
             "192.168.1.20",
             "fd00::1",
-            "db.internal",
-            "postgres.localhost",
-            "/var/run/postgresql",
+            "169.254.1.1",
+            // Carrier-grade NAT — Tailscale and similar meshes live here.
+            "100.64.0.1",
+            // IPv4-mapped private address must classify by the embedded v4.
+            "::ffff:10.0.0.5",
         ] {
             assert!(
-                host_is_private(host),
-                "should be treated as private: {host}"
+                ip_is_private(ip.parse().expect("test address should parse")),
+                "should be treated as private: {ip}"
             );
         }
     }
 
     #[test]
-    fn host_is_private_rejects_public_destinations() {
-        // Falling back to cleartext for these would put the service's admin
-        // password on the open internet. The connection is refused with an
-        // explanation instead.
-        for host in [
-            "db.example.com",
-            "evil.tld",
+    fn ip_is_private_rejects_public_addresses() {
+        // Falling back to an unverified certificate or to cleartext for these
+        // would put the service's admin password on the open internet.
+        for ip in [
             "203.0.113.10",
             "8.8.8.8",
             "2606:4700:4700::1111",
-            "",
+            // The integer form of 8.8.8.8 resolves publicly; classifying the
+            // *string* used to call it private because it has no dot.
+            "::ffff:8.8.8.8",
         ] {
             assert!(
-                !host_is_private(host),
-                "should NOT be treated as private: {host}"
+                !ip_is_private(ip.parse().expect("test address should parse")),
+                "should NOT be treated as private: {ip}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn host_is_private_resolves_before_classifying() {
+        // Loopback and unix sockets stay private...
+        assert!(host_is_private("127.0.0.1").await);
+        assert!(host_is_private("localhost").await);
+        assert!(host_is_private("/var/run/postgresql").await);
+
+        // ...and the numeric-IPv4 forms that defeated string classification are
+        // now resolved and rejected. `134744072` == 0x08080808 == 8.8.8.8:
+        // `IpAddr::parse` rejects it, so the old "no dot means container name"
+        // rule called it private, while getaddrinfo resolves it publicly.
+        assert!(!host_is_private("134744072").await);
+        assert!(!host_is_private("0x08080808").await);
+
+        // Unresolvable is a refusal, not a pass: this decides whether a
+        // password may cross the network in cleartext.
+        assert!(!host_is_private("no-such-host.invalid").await);
+        assert!(!host_is_private("").await);
+    }
+
+    #[test]
+    fn validate_sql_rejects_regex_operators() {
+        // The pattern lives entirely inside a string literal, so the stripper
+        // removes it and every keyword check sees `1=1 and '' ~ ''`. PostgreSQL's
+        // regex engine backtracks, so this is catastrophic backtracking — the
+        // same CPU burn the function-call guard exists to stop, through a door
+        // the guard cannot see.
+        assert!(PostgresSource::validate_sql(
+            "1=1 AND 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ~ '^(a+)+$'"
+        )
+        .is_err());
+        assert!(PostgresSource::validate_sql("name !~ 'x'").is_err());
+        assert!(PostgresSource::validate_sql("name ~* 'x'").is_err());
+    }
+
+    #[test]
+    fn validate_sql_rejects_parenless_information_functions() {
+        // The function-call guard keys on an identifier before `(`, so
+        // niladic-callable functions walk straight past it and give blind
+        // boolean extraction through an ordinary filter.
+        for clause in [
+            "1=1 AND current_user = 'postgres'",
+            "1=1 AND current_schema = 'public'",
+            "1=1 AND session_user like 'a%'",
+            "'pg_shadow'::regclass::text = 'x'",
+        ] {
+            assert!(
+                PostgresSource::validate_sql(clause).is_err(),
+                "should have been rejected: {clause}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_sql_still_accepts_columns_containing_keywords() {
+        // The denylist used raw substring matching, so any column whose name
+        // merely contained a keyword was unfilterable. A validator that blocks
+        // legitimate queries is a validator someone eventually switches off.
+        for clause in [
+            "payload = 'x'",
+            "updated_at > '2025-01-01'",
+            "deleted_at IS NULL",
+            "copy_count > 2",
+            "created_by = 'me' AND status = 'active'",
+        ] {
+            assert!(
+                PostgresSource::validate_sql(clause).is_ok(),
+                "should have been accepted: {clause}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_sql_token_matches_only_whole_tokens() {
+        assert!(contains_sql_token("a union b", "union"));
+        assert!(contains_sql_token("union b", "union"));
+        assert!(contains_sql_token("a union", "union"));
+        // Not a token: embedded in a longer identifier.
+        assert!(!contains_sql_token("reunion = 1", "union"));
+        assert!(!contains_sql_token("union_id = 1", "union"));
+        assert!(!contains_sql_token("payload = 1", "load"));
     }
 
     #[test]
@@ -2331,6 +2607,103 @@ mod tests {
     fn test_filter_placeholder_obeys_no_function_call_contract() {
         assert_sql_allowed(FILTER_WHERE_PLACEHOLDER);
         assert_sql_rejected("created_at > NOW() - INTERVAL '7 days'");
+    }
+
+    #[tokio::test]
+    async fn verified_tls_rung_refuses_a_server_that_does_not_offer_tls() {
+        // THE regression test for the inert TLS ladder.
+        //
+        // tokio-postgres defaults to `SslMode::Prefer`, under which
+        // `connect_tls` returns `Ok(MaybeTlsStream::Raw)` — an ordinary
+        // cleartext socket — when the server answers anything but `S` to the
+        // SSLRequest. So the "verified TLS" rung used to SUCCEED against a
+        // plaintext server, log that it had connected with verified TLS, and
+        // leave the two lower rungs (and with them the `host_is_private`
+        // cleartext guard) unreachable. An on-path attacker forced that by
+        // answering `N`: an SSL-strip requiring no certificate.
+        //
+        // The stock `postgres` image ships with SSL off, so it answers `N` —
+        // exactly the shape of the attack. Rung 1 must now fail here. No unit
+        // test can show this: it is a property of the wire handshake.
+        let container = match GenericImage::new("postgres", "18-alpine")
+            .with_exposed_port(ContainerPort::Tcp(5432))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!("Docker unavailable; skipping PostgreSQL TLS regression test: {error}");
+                return;
+            }
+        };
+
+        let host = container
+            .get_host()
+            .await
+            .expect("started PostgreSQL container must expose its host")
+            .to_string();
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("started PostgreSQL container must expose port 5432");
+
+        let mut cfg = tokio_postgres::Config::new();
+        cfg.host(&host)
+            .port(port)
+            .user("postgres")
+            .dbname("postgres")
+            .ssl_mode(tokio_postgres::config::SslMode::Require);
+
+        // Retry while the server finishes coming up, so a slow start is not
+        // mistaken for the TLS refusal we are actually asserting.
+        let mut last_err = None;
+        for _ in 0..10 {
+            match connect_with_verified_tls(&cfg).await {
+                Ok(_) => panic!(
+                    "SECURITY REGRESSION: the verified-TLS rung connected to a server with TLS \
+                     disabled. That means SslMode is not Require and the connection is cleartext \
+                     while reporting itself as verified — the lower rungs, including the \
+                     host_is_private guard, become unreachable."
+                ),
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+
+        let err = last_err.expect("loop must record an error");
+        assert!(
+            err.contains("tls") || err.contains("TLS") || err.contains("does not support"),
+            "expected a TLS-refusal error from the verified rung, got: {err}"
+        );
+
+        // And the ladder as a whole still works for this host, because 127.0.0.1
+        // is private: it falls through to the explicit cleartext rung. Without
+        // this half, "refuse TLS-less servers" would have broken every
+        // self-hosted deployment whose Postgres has no certificate.
+        let source = {
+            let mut connected = None;
+            for _ in 0..10 {
+                match PostgresSource::connect(&host, port, "postgres", "", "postgres").await {
+                    Ok(source) => {
+                        connected = Some(source);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+                }
+            }
+            connected.expect(
+                "the ladder must still reach a private, TLS-less PostgreSQL via the cleartext rung",
+            )
+        };
+        drop(source);
     }
 
     #[tokio::test]

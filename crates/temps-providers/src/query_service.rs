@@ -839,12 +839,30 @@ impl QueryService {
         let database = container_path.segments[0].clone();
         let path_clone = container_path.clone();
         let entity_name = entity_name.to_string();
-        self.with_connection_retry(service_id, &database, move |conn| {
+
+        // SECURITY / AVAILABILITY: bound this like `query_data`.
+        //
+        // The deadline originally covered the row path only, which left the
+        // more expensive one open: `get_entity_info` falls through to a full
+        // `COUNT(*)` on several backends (every view, and any table whose stats
+        // were never gathered), and it is in the AI read allowlist. "Check the
+        // row count of every table" would otherwise pin a connection per call
+        // with nothing to stop it.
+        let work = self.with_connection_retry(service_id, &database, move |conn| {
             let path_clone = path_clone.clone();
             let entity_name = entity_name.clone();
             async move { conn.get_entity_info(&path_clone, &entity_name).await }
-        })
+        });
+
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(DEFAULT_QUERY_TIMEOUT_MS),
+            work,
+        )
         .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(DataError::QueryTimeout(DEFAULT_QUERY_TIMEOUT_MS)),
+        }
     }
 
     /// Query data from an entity

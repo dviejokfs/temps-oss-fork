@@ -181,6 +181,19 @@ export function ServiceDataBrowser() {
 
   // Pagination state
   const [page, setPage] = useState(1)
+  /**
+   * Row offset of the current page.
+   *
+   * Deliberately NOT derived as `(page - 1) * pageSize`. The server drops rows
+   * from a response to stay inside a byte budget when a table holds large
+   * values, so a page can return fewer rows than requested while more remain at
+   * that offset. Stepping by `pageSize` would then jump straight over them —
+   * silently, since the row count still looks like a normal short last page.
+   * Tracking the offset explicitly and advancing it by the rows actually
+   * received is what the CLI does, and it means a truncated page costs an extra
+   * click rather than losing data.
+   */
+  const [dataOffset, setDataOffset] = useState(0)
   const pageSize = 20
 
   // Data table filter and sort state
@@ -324,6 +337,15 @@ export function ServiceDataBrowser() {
   }
 
   // Apply filter handler
+  // Page 1 is always offset 0. Every other reset path in this file already
+  // calls `setPage(1)` (filter change, entity change, sort change, tab
+  // restore), so anchoring the offset to that here keeps the two in step
+  // without threading a second setter through nine call sites — and makes it
+  // impossible for a future reset to remember to reset one but not the other.
+  useEffect(() => {
+    if (page === 1) setDataOffset(0)
+  }, [page])
+
   const handleApplyFilter = () => {
     // If we have filter_schema, send the form data as JSON object
     const nextFilter = explorerSupport?.filter_schema
@@ -911,7 +933,7 @@ export function ServiceDataBrowser() {
       if (!isObjectStore()) {
         const queryRequest: QueryDataRequest = {
           limit: pageSize,
-          offset: (page - 1) * pageSize,
+          offset: dataOffset,
           sort_by: effectiveSortField || undefined,
           sort_order: effectiveSortField ? dataSortOrder : undefined,
           filters: dataFilter || undefined,
@@ -1974,7 +1996,23 @@ export function ServiceDataBrowser() {
               queryError={queryEntityData.error}
               page={page}
               pageSize={pageSize}
+              rowOffset={dataOffset}
               onPageChange={(p) => {
+                // Advance by the rows actually received, not by pageSize. A
+                // byte-truncated page returns fewer rows than requested while
+                // more remain at this offset; stepping by pageSize would skip
+                // them without a trace. Going back steps by pageSize, which can
+                // re-show a few rows after a truncated page — harmless, whereas
+                // the other direction loses data.
+                setDataOffset((prev) => {
+                  if (p <= 1) return 0
+                  if (p > page) {
+                    return (
+                      prev + (queryEntityData.data?.returned_count ?? pageSize)
+                    )
+                  }
+                  return Math.max(0, prev - pageSize)
+                })
                 setPage(p)
                 commitActiveTab({ page: p })
               }}
@@ -2017,7 +2055,7 @@ export function ServiceDataBrowser() {
                     },
                     body: {
                       limit: pageSize,
-                      offset: (page - 1) * pageSize,
+                      offset: dataOffset,
                       sort_by: effectiveSortField || undefined,
                       sort_order: effectiveSortField ? dataSortOrder : undefined,
                       filters: dataFilter || undefined,
@@ -3409,6 +3447,7 @@ function EntityDataView({
   queryError,
   page,
   pageSize,
+  rowOffset,
   onPageChange,
   dataFilterInput,
   onDataFilterInputChange,
@@ -3438,6 +3477,9 @@ function EntityDataView({
   queryError: any
   page: number
   pageSize: number
+  /** Row offset of the current page; see `dataOffset` for why this is not
+   *  derived from `page * pageSize`. */
+  rowOffset: number
   onPageChange: (page: number) => void
   dataFilterInput: string
   onDataFilterInputChange: (filter: string) => void
@@ -4097,7 +4139,7 @@ function EntityDataView({
                         {detailRowIndex !== null && (
                           <>
                             {' · row '}
-                            {(page - 1) * pageSize + detailRowIndex + 1}
+                            {rowOffset + detailRowIndex + 1}
                           </>
                         )}
                       </SheetDescription>
@@ -4165,8 +4207,8 @@ function EntityDataView({
                 <div className="flex items-center justify-between mt-4">
                   <div className="text-sm text-muted-foreground flex items-center gap-2">
                     <span>
-                      Page {page} • Rows {(page - 1) * pageSize + 1} -{' '}
-                      {(page - 1) * pageSize + queryResult.returned_count}
+                      Page {page} • Rows {rowOffset + 1} -{' '}
+                      {rowOffset + queryResult.returned_count}
                     </span>
                     {appliedFilter !== undefined && (
                       <Badge variant="secondary" className="text-xs">

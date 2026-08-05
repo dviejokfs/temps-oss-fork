@@ -10,7 +10,10 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
-import { untrustedMarkdownImage } from '@/components/markdown/untrustedImage'
+import {
+  untrustedMarkdownImage,
+  untrustedMarkdownLink,
+} from '@/components/markdown/untrusted'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -205,7 +208,11 @@ function Markdown({ children }: { children: string }) {
     <div className={proseClasses}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        components={{ pre: MarkdownPre, ...untrustedMarkdownImage }}
+        components={{
+          pre: MarkdownPre,
+          ...untrustedMarkdownImage,
+          ...untrustedMarkdownLink,
+        }}
       >
         {children}
       </ReactMarkdown>
