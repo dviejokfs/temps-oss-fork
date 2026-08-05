@@ -1044,8 +1044,12 @@ pub async fn query_data(
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments);
 
+    // Same ceiling as the GET handler. `dc816e1c` claimed to clamp "every
+    // caller" but only touched `read_entity_rows`, leaving this POST — on the
+    // identical route — able to materialise a whole table into a Vec<DataRow>
+    // via {"limit": 100000000}.
     let options = QueryOptions {
-        limit: Some(request.limit),
+        limit: Some(effective_row_limit(request.limit, false)),
         offset: Some(request.offset),
         cursor: None,
         sort_by: request.sort_by,

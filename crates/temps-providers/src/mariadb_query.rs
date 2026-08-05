@@ -833,13 +833,33 @@ fn normalize_sort_field(sort_by: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
-fn strip_sql_string_literals(sql: &str) -> String {
+fn strip_sql_string_literals(sql: &str) -> Result<String> {
     let mut result = String::with_capacity(sql.len());
     let mut in_string = false;
     let mut chars = sql.chars().peekable();
 
     while let Some(c) = chars.next() {
         if in_string {
+            // SECURITY: MySQL/MariaDB honour backslash escapes inside string
+            // literals unless NO_BACKSLASH_ESCAPES is set, and the server's
+            // sql_mode is not knowable from here. This stripper only
+            // understood the doubled-quote form, so `'\''` desynchronised it
+            // from the server: it read the escaped quote as the first half of
+            // a `''` pair, stayed "inside" the string, and discarded the rest
+            // of the clause — including the payload. Every downstream check
+            // then ran against a sanitised remainder and passed.
+            //
+            //   1='\'' union select 1 from mysql.user where 'a'='a'
+            //
+            // Rather than emulate a mode we cannot observe, refuse the input.
+            // A legitimate data-browser filter has no need of one.
+            if c == '\\' {
+                return Err(DataError::InvalidQuery(
+                    "Backslash escapes are not allowed inside string literals in the data \
+                     browser filter"
+                        .to_string(),
+                ));
+            }
             if c == '\'' {
                 if chars.peek() == Some(&'\'') {
                     chars.next();
@@ -856,7 +876,13 @@ fn strip_sql_string_literals(sql: &str) -> String {
         }
     }
 
-    result
+    if in_string {
+        return Err(DataError::InvalidQuery(
+            "Unterminated string literal in the data browser filter".to_string(),
+        ));
+    }
+
+    Ok(result)
 }
 
 fn validate_where_clause(sql: &str) -> Result<()> {
@@ -873,50 +899,12 @@ fn validate_where_clause(sql: &str) -> Result<()> {
     // not enumerate (\r, \f, \v — all whitespace to MySQL's lexer) walked
     // straight past it.
     let without_strings =
-        temps_query_postgres::normalize_sql_whitespace(&strip_sql_string_literals(&sql_lower));
+        temps_query_postgres::normalize_sql_whitespace(&strip_sql_string_literals(&sql_lower)?);
 
     if without_strings.contains(';') {
         return Err(DataError::InvalidQuery(
             "Multiple SQL statements are not allowed".to_string(),
         ));
-    }
-
-    // STRUCTURAL CHECKS.
-    //
-    // This validator was a pure denylist while the Postgres one also rejects
-    // subqueries and function calls. `select` is not a keyword you can simply
-    // ban here (it appears in legitimate-looking text), so without these a
-    // filter like
-    //
-    //     1 = (SELECT LENGTH(authentication_string) FROM mysql.user LIMIT 1)
-    //
-    // gave blind extraction of any table the connection user could read, and
-    // `extractvalue(1, concat(0x7e, (select …)))` returned the value directly
-    // in the error body. Both are structural, not lexical.
-    if without_strings.contains('(') {
-        // Any parenthesis preceded by an identifier character is a function
-        // call; a bare `(` opening a subquery is caught by the `select` check
-        // that follows. Grouping parens like `(a = 1 or b = 2)` are preceded
-        // by whitespace or an operator, so they still pass.
-        let bytes = without_strings.as_bytes();
-        for (idx, &b) in bytes.iter().enumerate() {
-            if b != b'(' || idx == 0 {
-                continue;
-            }
-            let prev = bytes[idx - 1];
-            if prev.is_ascii_alphanumeric() || prev == b'_' {
-                return Err(DataError::InvalidQuery(
-                    "Function calls are not allowed in the data browser filter".to_string(),
-                ));
-            }
-        }
-
-        // A parenthesised SELECT is a subquery regardless of spacing.
-        if without_strings.contains("(select") || without_strings.contains("( select") {
-            return Err(DataError::InvalidQuery(
-                "Subqueries are not allowed in the data browser filter".to_string(),
-            ));
-        }
     }
 
     if without_strings.contains("--")
@@ -927,6 +915,14 @@ fn validate_where_clause(sql: &str) -> Result<()> {
             "SQL comments are not allowed in the data browser".to_string(),
         ));
     }
+
+    // STRUCTURAL CHECKS — shared with the PostgreSQL validator rather than
+    // reimplemented. The local copy drifted: it inspected only the byte
+    // immediately before `(` (so `sleep (5)` and `extractvalue (1, user ())`
+    // passed) and treated `select` as the only subquery starter (so
+    // `id IN (TABLE mysql.user)` passed on MySQL 8.0.19+, which this backend
+    // also serves). One implementation, one set of tests.
+    temps_query_postgres::reject_subqueries_and_function_calls(&without_strings)?;
 
     let dangerous_keywords = [
         "drop ",
@@ -989,6 +985,38 @@ mod tests {
             validate_where_clause(clause).is_err(),
             "expected rejection: {clause}"
         );
+    }
+
+    #[test]
+    fn where_clause_rejects_backslash_escaped_quote() {
+        // The stripper understood only the doubled-quote escape, so a
+        // backslash-escaped quote desynchronised it from the server: it read
+        // the escape as the first half of a `''` pair, stayed inside the
+        // string, and discarded the payload. Every later check then ran on a
+        // sanitised remainder and passed.
+        assert_where_rejected(r"1='\'' union select 1 from mysql.user where 'a'='a'");
+        assert_where_rejected(r"name = 'a\' or 1=1 -- '");
+        // An unterminated literal is equally untrustworthy.
+        assert_where_rejected("name = 'unterminated");
+    }
+
+    #[test]
+    fn where_clause_rejects_function_calls_with_space_before_paren() {
+        // The local check looked only at the byte immediately before `(`, so a
+        // single space defeated it. MySQL accepts `sleep (5)` for every
+        // function that isn't also a parser keyword.
+        assert_where_rejected("1=1 or sleep (5)");
+        assert_where_rejected("extractvalue (1, user ())");
+        assert_where_rejected("updatexml (1, concat (0x7e, version ()), 1)");
+    }
+
+    #[test]
+    fn where_clause_rejects_non_select_query_expressions() {
+        // MySQL 8.0.19+ accepts TABLE and VALUES in subquery position, and
+        // this backend serves MySQL images too.
+        assert_where_rejected("id in (table mysql.user)");
+        assert_where_rejected("id in (values row(1))");
+        assert_where_rejected("id = (with x as (select 1) select * from x)");
     }
 
     #[test]

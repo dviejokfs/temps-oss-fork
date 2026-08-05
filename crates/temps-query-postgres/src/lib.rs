@@ -70,18 +70,22 @@ pub struct PostgresSource {
     database_name: String,
 }
 
-impl PostgresSource {
-    fn starts_with_sql_keyword(input: &str, keyword: &str) -> bool {
-        let Some(rest) = input.trim_start().strip_prefix(keyword) else {
-            return false;
-        };
+/// True when `input` begins with `keyword` on a token boundary.
+///
+/// Free function so the shared structural checks below can use it without a
+/// `PostgresSource`.
+fn starts_with_sql_keyword(input: &str, keyword: &str) -> bool {
+    let Some(rest) = input.trim_start().strip_prefix(keyword) else {
+        return false;
+    };
 
-        match rest.chars().next() {
-            None => true,
-            Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()),
-        }
+    match rest.chars().next() {
+        None => true,
+        Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()),
     }
+}
 
+impl PostgresSource {
     /// Reject a database name that isn't a plausible PostgreSQL identifier.
     ///
     /// The typed `Config` above already makes injection impossible; this
@@ -239,6 +243,89 @@ fn format_chain<E: std::error::Error>(err: &E) -> String {
         cause = c.source();
     }
     out
+}
+
+/// Reject subqueries and function-call syntax in an already string-stripped,
+/// whitespace-normalised, lower-cased SQL fragment.
+///
+/// Shared by the PostgreSQL and MariaDB filter validators. It lives here, and
+/// is called rather than copied, because the MariaDB backend previously kept a
+/// hand-rolled variant that drifted: it looked only at the byte immediately
+/// before `(` (so `sleep (5)` passed) and only checked `select` as a subquery
+/// starter (so `IN (TABLE mysql.user)` passed on MySQL 8.0.19+). One
+/// implementation, one set of tests, no drift.
+pub fn reject_subqueries_and_function_calls(without_strings: &str) -> Result<()> {
+    if without_strings.contains('(') {
+        // PostgreSQL query expressions can start with SELECT, TABLE,
+        // VALUES, or WITH. `IN (TABLE private_ids)` is a valid subquery and
+        // must not be mistaken for a simple IN-list. Check every opening
+        // parenthesis because query expressions can be nested in grouping
+        // parentheses. Keyword boundaries avoid rejecting quoted columns
+        // such as `"table"` or identifiers such as `selected_id`.
+        const QUERY_EXPRESSION_STARTERS: [&str; 4] = ["select", "table", "values", "with"];
+        let paren_starts_query_expression = without_strings.match_indices('(').any(|(idx, _)| {
+            let after_paren = &without_strings[idx + 1..];
+            QUERY_EXPRESSION_STARTERS
+                .iter()
+                .any(|keyword| starts_with_sql_keyword(after_paren, keyword))
+        });
+        if paren_starts_query_expression {
+            return Err(DataError::InvalidQuery(
+                "Subqueries are not allowed in the data browser".to_string(),
+            ));
+        }
+
+        // Block function-call syntax. A keyword denylist cannot be complete:
+        // data-returning functions such as query_to_xml/database_to_xml/
+        // table_to_xml take their SQL payload as a *string literal*, which is
+        // stripped before the denylist runs, so `1=1 AND query_to_xml('select
+        // ... from users', true, false, '') IS NOT NULL` slips through and
+        // exfiltrates other tables. Reject any identifier immediately
+        // preceding `(` (i.e. a function call); only grouping parens and
+        // `IN (...)`/`AND (...)`/`OR (...)`/`NOT (...)` are permitted. This
+        // blocks explicit function-call syntax; PostgreSQL operators and
+        // casts remain available to ordinary WHERE expressions.
+        const PAREN_ALLOWED_PREFIXES: [&str; 4] = ["in", "and", "or", "not"];
+        for (idx, _) in without_strings.match_indices('(') {
+            let preceding = without_strings[..idx].trim_end();
+
+            // A closing double quote immediately before `(` terminates a
+            // quoted PostgreSQL identifier. A closing single quote can
+            // occur here after string stripping when a Unicode-escaped
+            // identifier uses PostgreSQL's optional `UESCAPE 'x'` clause.
+            // Both forms are function calls. Do not allow quoted versions
+            // of IN/AND/OR/NOT: quoted names are identifiers, never SQL
+            // keywords.
+            if matches!(preceding.chars().last(), Some('"' | '\'')) {
+                return Err(DataError::InvalidQuery(
+                    "Function calls are not allowed in the data browser".to_string(),
+                ));
+            }
+
+            // PostgreSQL permits `$` and non-ASCII characters in unquoted
+            // identifier continuations. Include them here so identifiers
+            // such as `evil$function(...)` and `fünction(...)` cannot evade
+            // the function-call check.
+            let ident_rev: String = preceding
+                .chars()
+                .rev()
+                .take_while(|c| {
+                    c.is_ascii_alphanumeric() || *c == '_' || *c == '$' || !c.is_ascii()
+                })
+                .collect();
+            let ident: String = ident_rev.chars().rev().collect();
+            let before_ident = preceding[..preceding.len() - ident.len()].trim_end();
+            let is_qualified = before_ident.ends_with('.');
+            if !ident.is_empty()
+                && (is_qualified || !PAREN_ALLOWED_PREFIXES.contains(&ident.as_str()))
+            {
+                return Err(DataError::InvalidQuery(
+                    "Function calls are not allowed in the data browser".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Collapse every run of whitespace to a single ASCII space.
@@ -557,10 +644,18 @@ impl PostgresSource {
             ));
         }
 
-        // Allow double-quoted identifiers
-        if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        // Allow double-quoted identifiers.
+        //
+        // The length guard is load-bearing: for the single character `"` both
+        // `starts_with` and `ends_with` are true, so the slice below became
+        // `&s[1..0]` and panicked — a remote panic reachable from
+        // `?sort_by=%22` with only ExternalServicesRead, and from the agent's
+        // --sort_by flag, making it prompt-injectable.
+        if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
             let inner = &trimmed[1..trimmed.len() - 1];
-            if inner.contains('"') {
+            // PostgreSQL has no zero-length delimited identifier, so `""`
+            // could only ever reach the server as a syntax error.
+            if inner.is_empty() || inner.contains('"') {
                 return Err(DataError::InvalidQuery(
                     "Sort field identifier contains invalid characters".to_string(),
                 ));
@@ -627,77 +722,7 @@ impl PostgresSource {
         }
 
         // Prevent subqueries through every parenthesized PostgreSQL query form.
-        if without_strings.contains('(') {
-            // PostgreSQL query expressions can start with SELECT, TABLE,
-            // VALUES, or WITH. `IN (TABLE private_ids)` is a valid subquery and
-            // must not be mistaken for a simple IN-list. Check every opening
-            // parenthesis because query expressions can be nested in grouping
-            // parentheses. Keyword boundaries avoid rejecting quoted columns
-            // such as `"table"` or identifiers such as `selected_id`.
-            const QUERY_EXPRESSION_STARTERS: [&str; 4] = ["select", "table", "values", "with"];
-            let paren_starts_query_expression =
-                without_strings.match_indices('(').any(|(idx, _)| {
-                    let after_paren = &without_strings[idx + 1..];
-                    QUERY_EXPRESSION_STARTERS
-                        .iter()
-                        .any(|keyword| Self::starts_with_sql_keyword(after_paren, keyword))
-                });
-            if paren_starts_query_expression {
-                return Err(DataError::InvalidQuery(
-                    "Subqueries are not allowed in the data browser".to_string(),
-                ));
-            }
-
-            // Block function-call syntax. A keyword denylist cannot be complete:
-            // data-returning functions such as query_to_xml/database_to_xml/
-            // table_to_xml take their SQL payload as a *string literal*, which is
-            // stripped before the denylist runs, so `1=1 AND query_to_xml('select
-            // ... from users', true, false, '') IS NOT NULL` slips through and
-            // exfiltrates other tables. Reject any identifier immediately
-            // preceding `(` (i.e. a function call); only grouping parens and
-            // `IN (...)`/`AND (...)`/`OR (...)`/`NOT (...)` are permitted. This
-            // blocks explicit function-call syntax; PostgreSQL operators and
-            // casts remain available to ordinary WHERE expressions.
-            const PAREN_ALLOWED_PREFIXES: [&str; 4] = ["in", "and", "or", "not"];
-            for (idx, _) in without_strings.match_indices('(') {
-                let preceding = without_strings[..idx].trim_end();
-
-                // A closing double quote immediately before `(` terminates a
-                // quoted PostgreSQL identifier. A closing single quote can
-                // occur here after string stripping when a Unicode-escaped
-                // identifier uses PostgreSQL's optional `UESCAPE 'x'` clause.
-                // Both forms are function calls. Do not allow quoted versions
-                // of IN/AND/OR/NOT: quoted names are identifiers, never SQL
-                // keywords.
-                if matches!(preceding.chars().last(), Some('"' | '\'')) {
-                    return Err(DataError::InvalidQuery(
-                        "Function calls are not allowed in the data browser".to_string(),
-                    ));
-                }
-
-                // PostgreSQL permits `$` and non-ASCII characters in unquoted
-                // identifier continuations. Include them here so identifiers
-                // such as `evil$function(...)` and `fünction(...)` cannot evade
-                // the function-call check.
-                let ident_rev: String = preceding
-                    .chars()
-                    .rev()
-                    .take_while(|c| {
-                        c.is_ascii_alphanumeric() || *c == '_' || *c == '$' || !c.is_ascii()
-                    })
-                    .collect();
-                let ident: String = ident_rev.chars().rev().collect();
-                let before_ident = preceding[..preceding.len() - ident.len()].trim_end();
-                let is_qualified = before_ident.ends_with('.');
-                if !ident.is_empty()
-                    && (is_qualified || !PAREN_ALLOWED_PREFIXES.contains(&ident.as_str()))
-                {
-                    return Err(DataError::InvalidQuery(
-                        "Function calls are not allowed in the data browser".to_string(),
-                    ));
-                }
-            }
-        }
+        reject_subqueries_and_function_calls(&without_strings)?;
 
         // Block SQL comments which can be used to hide attack payloads
         if without_strings.contains("--") || without_strings.contains("/*") {
@@ -1865,6 +1890,19 @@ mod tests {
         assert_sql_rejected("false UNION \r\n\t SELECT usename FROM pg_shadow");
         assert_sql_rejected("1=1 INTERSECT\rSELECT 1");
         assert_sql_rejected("1=1 EXCEPT\rSELECT 1");
+    }
+
+    #[test]
+    fn validate_sort_field_does_not_panic_on_a_lone_quote() {
+        // `"` satisfies both starts_with('"') and ends_with('"'), so the
+        // quoted-identifier branch sliced &s[1..0] and panicked. Reachable via
+        // ?sort_by=%22 with only ExternalServicesRead, and via the agent's
+        // --sort_by flag, which makes it prompt-injectable.
+        assert!(PostgresSource::validate_sort_field("\"").is_err());
+        assert!(PostgresSource::validate_sort_field("\"\"").is_err());
+        // Ordinary identifiers, quoted and bare, still validate.
+        assert!(PostgresSource::validate_sort_field("\"created_at\"").is_ok());
+        assert!(PostgresSource::validate_sort_field("created_at").is_ok());
     }
 
     #[test]
