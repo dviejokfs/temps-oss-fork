@@ -183,14 +183,7 @@ impl PostgresSource {
         // error, which is what lets the explicit cleartext rung stay the only
         // way to reach an unencrypted socket.
         let tls_cfg = |ssl_mode| {
-            let mut cfg = tokio_postgres::Config::new();
-            cfg.host(host)
-                .port(port)
-                .user(username)
-                .password(password)
-                .dbname(database)
-                .ssl_mode(ssl_mode);
-            cfg
+            connect_config_with_ssl_mode(host, port, username, password, database, ssl_mode)
         };
         let cfg = tls_cfg(tokio_postgres::config::SslMode::Require);
 
@@ -437,6 +430,51 @@ pub fn reject_subqueries_and_function_calls(without_strings: &str) -> Result<()>
 /// Expects already-lowercased, whitespace-normalised, string-stripped input.
 /// A token boundary is anything that cannot continue an identifier, matching
 /// the rule `starts_with_sql_keyword` uses at the other end.
+/// Build the connection config for a given SSL mode.
+///
+/// Named rather than inlined so the TLS regression test can assert against the
+/// *production* config instead of a hand-rolled copy — the first version of
+/// that test built its own and therefore could not observe `.ssl_mode(...)`
+/// being removed from the real path.
+fn connect_config_with_ssl_mode(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    database: &str,
+    ssl_mode: tokio_postgres::config::SslMode,
+) -> tokio_postgres::Config {
+    let mut cfg = tokio_postgres::Config::new();
+    cfg.host(host)
+        .port(port)
+        .user(username)
+        .password(password)
+        .dbname(database)
+        .ssl_mode(ssl_mode);
+    cfg
+}
+
+/// The config the TLS ladder's first rung uses. Test-facing wrapper over
+/// [`connect_config_with_ssl_mode`] so a test cannot accidentally assert
+/// against a different SSL mode than production uses.
+#[cfg(test)]
+fn connect_config_for(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    database: &str,
+) -> tokio_postgres::Config {
+    connect_config_with_ssl_mode(
+        host,
+        port,
+        username,
+        password,
+        database,
+        tokio_postgres::config::SslMode::Require,
+    )
+}
+
 pub fn contains_sql_token(sql: &str, token: &str) -> bool {
     let is_ident_char =
         |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii();
@@ -446,10 +484,28 @@ pub fn contains_sql_token(sql: &str, token: &str) -> bool {
         let start = from + found;
         let end = start + token.len();
 
-        let before_ok = sql[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !is_ident_char(c));
+        // SECURITY: a numeric literal does not extend into the keyword after it.
+        //
+        // Digits are identifier *continuation* characters but cannot *start* an
+        // identifier, so a run like `1e0` before `union` is a number and the
+        // keyword after it is a separate token — which is exactly how MySQL's
+        // and pre-15 PostgreSQL's lexers read `1e0union select ...`. Testing
+        // only the single preceding character missed that, and because the old
+        // `contains("union ")` form did catch it, switching to token matching
+        // reopened a UNION injection. Walk the whole preceding identifier run
+        // and treat it as a boundary when it cannot be an identifier at all.
+        let mut preceding = sql[..start].chars().rev().take_while(|c| is_ident_char(*c));
+        let before_ok = match preceding.next() {
+            // Nothing identifier-ish before the token: a clean boundary.
+            None => true,
+            // Something is there. It is only a real identifier if the run's
+            // FIRST character could start one; `preceding` is reversed, so the
+            // run's first character is whatever it yields last.
+            Some(nearest) => {
+                let first = preceding.last().unwrap_or(nearest);
+                first.is_ascii_digit()
+            }
+        };
         let after_ok = sql[end..].chars().next().is_none_or(|c| !is_ident_char(c));
 
         if before_ok && after_ok {
@@ -1067,14 +1123,16 @@ impl PostgresSource {
         // Not fixable by pattern-matching the payload, because the payload is
         // opaque to us by construction. Reject the operators instead — LIKE and
         // ILIKE cover what a data browser filter legitimately needs.
-        for operator in ["~", "!~"] {
-            if without_strings.contains(operator) {
-                return Err(DataError::InvalidQuery(
-                    "Regular-expression operators (~, ~*, !~, !~*) are not allowed in the data \
-                     browser — use LIKE or ILIKE instead"
-                        .to_string(),
-                ));
-            }
+        // A bare `~` covers ~, ~*, !~, !~* and ~~ in one test. `SIMILAR TO` is a
+        // separate spelling that PostgreSQL translates into the SAME
+        // backtracking engine, so rejecting only the operator forms left the
+        // ReDoS this check exists to stop wide open under a different name.
+        if without_strings.contains('~') || contains_sql_token(&without_strings, "similar") {
+            return Err(DataError::InvalidQuery(
+                "Regular-expression matching (~, ~*, !~, !~*, SIMILAR TO) is not allowed in the \
+                 data browser — use LIKE or ILIKE instead"
+                    .to_string(),
+            ));
         }
 
         // SECURITY: no parenless information functions.
@@ -1086,14 +1144,29 @@ impl PostgresSource {
         // the connection user, schema and catalog, plus a relation-existence
         // oracle whose error text this API returns verbatim. A data-browser
         // filter has no legitimate use for any of them.
-        const INFORMATION_TOKENS: [&str; 7] = [
+        const INFORMATION_TOKENS: [&str; 15] = [
             "current_user",
             "session_user",
             "current_role",
             "current_catalog",
             "current_schema",
             "current_database",
+            // Bare `USER` is a reserved niladic keyword equivalent to
+            // CURRENT_USER, so denying only the `current_` spelling left the
+            // same blind-extraction oracle open under a shorter name.
+            "user",
+            // Every `reg*` cast is a catalog-existence oracle — the cast either
+            // resolves or raises an error naming what was missing, and this API
+            // returns that error text verbatim. Denying only `regclass` covered
+            // one of seven.
             "regclass",
+            "regrole",
+            "regnamespace",
+            "regtype",
+            "regproc",
+            "regprocedure",
+            "regoper",
+            "regconfig",
         ];
         for token in INFORMATION_TOKENS {
             if contains_sql_token(&without_strings, token) {
@@ -2272,6 +2345,34 @@ mod tests {
     }
 
     #[test]
+    fn contains_sql_token_treats_numeric_literals_as_boundaries() {
+        // A keyword abutting the tail of a numeric literal is a SEPARATE token
+        // to the server's lexer: MySQL and pre-15 PostgreSQL both read
+        // `1e0union select ...` as `1e0` followed by `UNION`. Digits are
+        // identifier continuation characters but cannot start an identifier, so
+        // checking only the single preceding character called this a
+        // non-boundary and let the injection through — a regression against the
+        // old `contains("union ")` form, which caught it.
+        assert!(contains_sql_token("1e0union select 1,2,3", "union"));
+        assert!(contains_sql_token("1.0union select 1", "union"));
+        assert!(contains_sql_token("0x1union select 1", "union"));
+        assert!(contains_sql_token("id=1union select 1", "union"));
+
+        // Still not a match when the run really is an identifier: it starts
+        // with a letter or underscore, so the keyword is part of the name.
+        assert!(!contains_sql_token("a1union = 1", "union"));
+        assert!(!contains_sql_token("_1union = 1", "union"));
+        assert!(!contains_sql_token("col2payload = 1", "load"));
+    }
+
+    #[test]
+    fn validate_sql_rejects_numeric_prefixed_union() {
+        // End-to-end form of the above, through the real validator.
+        assert!(PostgresSource::validate_sql("1e0union all select 1,2,3").is_err());
+        assert!(PostgresSource::validate_sql("id=1.0union select 1").is_err());
+    }
+
+    #[test]
     fn test_pg_type_mapping() {
         assert_eq!(PostgresSource::map_pg_type("integer"), FieldType::Int32);
         assert_eq!(PostgresSource::map_pg_type("bigint"), FieldType::Int64);
@@ -2653,12 +2754,15 @@ mod tests {
             .await
             .expect("started PostgreSQL container must expose port 5432");
 
-        let mut cfg = tokio_postgres::Config::new();
-        cfg.host(&host)
-            .port(port)
-            .user("postgres")
-            .dbname("postgres")
-            .ssl_mode(tokio_postgres::config::SslMode::Require);
+        // Build the config the way `PostgresSource::connect` does, by calling
+        // the same helper it calls, rather than hand-rolling one here.
+        //
+        // The first version of this test built its own config with
+        // `.ssl_mode(Require)` — which meant deleting `.ssl_mode(...)` from the
+        // production path left the test still passing, since it was asserting
+        // against its own copy. A regression test that cannot observe the
+        // regression is worse than none: it reports safety it never checked.
+        let cfg = connect_config_for(&host, port, "postgres", "", "postgres");
 
         // Retry while the server finishes coming up, so a slow start is not
         // mistaken for the TLS refusal we are actually asserting.

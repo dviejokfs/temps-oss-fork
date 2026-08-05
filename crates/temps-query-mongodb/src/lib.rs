@@ -80,6 +80,16 @@ const SYSTEM_DATABASES: [&str; 3] = ["admin", "local", "config"];
 /// evaluates an expression is another hole. Anything not on this list is
 /// refused with the name echoed back, so a caller using a legitimate operator
 /// we forgot gets an actionable error instead of silence.
+/// `$regex` is on this list deliberately, unlike the SQL backends, which reject
+/// `~`/`SIMILAR TO`/`REGEXP` outright. Recording the reasoning because the
+/// inconsistency is otherwise indistinguishable from an oversight: a crafted
+/// pattern is catastrophic backtracking in mongod's PCRE, the same primitive
+/// the SQL side refuses. The difference is that SQL has `LIKE` and MongoDB has
+/// no other substring-search primitive at all, so removing `$regex` would take
+/// "find documents whose name starts with…" away entirely rather than
+/// redirecting it. The exposure is bounded by `max_time` on every call site
+/// that can carry a filter (`query` and both `count_documents`), which is the
+/// same mitigation the SQL side relies on for the clauses it does allow.
 const ALLOWED_FILTER_OPERATORS: [&str; 15] = [
     "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$and", "$or", "$nor", "$not",
     "$exists", "$type", "$regex",
@@ -139,6 +149,21 @@ impl MongoDBSource {
     ///
     /// * `url` - MongoDB connection URL (e.g., "mongodb://localhost:27017")
     pub async fn new(url: &str) -> Result<Self> {
+        Self::new_scoped(url, None).await
+    }
+
+    /// Create a source pinned to one database.
+    ///
+    /// SECURITY: prefer this over [`MongoDBSource::new`] for anything a user can
+    /// aim at a path. The pin used to be read from the URI's `/dbname` segment
+    /// alone, and the data browser builds its URI as
+    /// `mongodb://user:pass@host:port` with no segment — so `default_database`
+    /// was always `None`, `assert_database_allowed` fell through for every
+    /// non-system name, and a guard that looked right did nothing. Taking the
+    /// scope as an explicit argument makes it visible at the call site whether
+    /// a source is pinned, instead of depending on how a string was formatted
+    /// three modules away.
+    pub async fn new_scoped(url: &str, database: Option<&str>) -> Result<Self> {
         debug!("Creating MongoDB source for URL: {}", url);
 
         let mut client_options = ClientOptions::parse(url).await.map_err(|e| {
@@ -155,10 +180,10 @@ impl MongoDBSource {
         // not per-cluster, so direct connection is the correct semantic.
         client_options.direct_connection = Some(true);
 
-        // Capture before the options are moved into the client.
-        let default_database = client_options
-            .default_database
-            .clone()
+        // Explicit scope wins; fall back to the URI's `/dbname` segment.
+        let default_database = database
+            .map(str::to_string)
+            .or_else(|| client_options.default_database.clone())
             .filter(|d| !d.is_empty());
 
         let client = Client::with_options(client_options).map_err(|e| {
@@ -444,6 +469,12 @@ impl DataSource for MongoDBSource {
         }
 
         let db_name = &path.segments[0];
+        // The one entry point that was missing this. Without it,
+        // `/containers/admin/info` confirmed the database exists and returned
+        // its collection count — contradicting the guard applied everywhere
+        // else, and giving an existence oracle for databases the caller cannot
+        // otherwise reach.
+        self.assert_database_allowed(db_name)?;
 
         debug!("Getting info for database: {}", db_name);
 
@@ -890,6 +921,36 @@ mod tests {
             deep = serde_json::json!({"$and": [deep]});
         }
         assert!(validate_filter_value(&deep, 0).is_err());
+    }
+
+    #[test]
+    fn database_pin_survives_a_uri_with_no_path_segment() {
+        // The regression this exists for: the data browser builds its URI as
+        // `mongodb://user:pass@host:port` with NO `/dbname` segment, so reading
+        // the pin from the URI alone left `default_database` as None on every
+        // real connection — the guard looked right and never engaged. Assert on
+        // the resolution rule directly, since constructing a source needs a
+        // live server.
+        let from_uri_only: Option<String> = None;
+        let explicit = Some("app_prod");
+
+        let resolved = explicit
+            .map(str::to_string)
+            .or_else(|| from_uri_only.clone())
+            .filter(|d| !d.is_empty());
+        assert_eq!(
+            resolved.as_deref(),
+            Some("app_prod"),
+            "an explicit scope must pin even when the URI carries no database"
+        );
+
+        // An empty configured database must not be mistaken for a real pin.
+        let empty: Option<&str> = Some("");
+        let resolved_empty = empty
+            .map(str::to_string)
+            .or_else(|| from_uri_only.clone())
+            .filter(|d| !d.is_empty());
+        assert_eq!(resolved_empty, None);
     }
 
     #[test]

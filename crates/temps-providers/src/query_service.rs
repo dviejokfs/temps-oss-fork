@@ -383,11 +383,22 @@ impl QueryService {
                     )
                 };
 
-                // Create MongoDB source
-                let mongodb_source = MongoDBSource::new(&connection_string).await.map_err(|e| {
-                    error!("Failed to connect to MongoDB service {}: {}", service_id, e);
-                    e
-                })?;
+                // Create MongoDB source, pinned to the service's configured
+                // database.
+                //
+                // SECURITY: the pin must be passed explicitly. The URI built
+                // above deliberately carries no `/dbname` segment, so relying on
+                // the driver to infer the scope left `MongoDBSource` unpinned
+                // and its database guard inert — every non-system database on
+                // the server stayed reachable through path segment 0. This
+                // matches what the Postgres and MariaDB backends enforce.
+                let mongodb_source =
+                    MongoDBSource::new_scoped(&connection_string, Some(config.database.as_str()))
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to connect to MongoDB service {}: {}", service_id, e);
+                            e
+                        })?;
 
                 Arc::new(mongodb_source)
             }

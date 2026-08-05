@@ -398,6 +398,14 @@ export function ServiceDataBrowser() {
     setDataSortField(nextSortField)
     setDataSortOrder(nextSortOrder)
     setPage(nextPage)
+    // Restoring a tab is the one path that sets a page other than 1, so the
+    // `page === 1` reset effect does not cover it. Without this, reopening a
+    // tab saved at page 5 kept whatever offset the previous tab left behind and
+    // the header labelled unrelated rows "Page 5 • Rows 1–20" — the same
+    // silently-wrong-data failure the paging fix exists to remove. Uniform
+    // pages are the right assumption *here*, because a restore has no earlier
+    // response to have been truncated.
+    setDataOffset((nextPage - 1) * pageSize)
 
     if (opts?.commitToActiveTab !== false) {
       commitActiveTab({
