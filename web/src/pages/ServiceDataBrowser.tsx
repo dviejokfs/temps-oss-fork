@@ -35,7 +35,23 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet'
 import { Label } from '@/components/ui/label'
 import {
   Select,
@@ -76,7 +92,9 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Columns3,
   Command as CommandIcon,
+  Copy,
   Download,
   Eye,
   Database,
@@ -1399,7 +1417,6 @@ export function ServiceDataBrowser() {
           {/* Main content skeleton */}
           <div
             className="flex-1 flex flex-col min-w-0 px-4 md:px-0"
-            style={{ height: 'calc(100vh - 180px)' }}
           >
             <div className="flex-1 overflow-y-auto space-y-6 pt-2">
               {/* Entity info card */}
@@ -1831,11 +1848,15 @@ export function ServiceDataBrowser() {
           />
         )}
 
-        {/* Main content */}
-        <div
-          className="flex-1 flex flex-col min-w-0 px-4 md:px-0"
-          style={{ height: 'calc(100vh - 180px)' }}
-        >
+        {/* Main content.
+            `min-h-0` rather than a hardcoded `calc(100vh - 180px)`: the magic
+            number assumed a fixed header height, so it drifted whenever the
+            header wrapped (long service name, mobile) and left the pane either
+            clipped or overflowing the viewport. With min-h-0 the flex child
+            can shrink below its content, which is what lets the inner
+            `overflow-y-auto` own the scroll — and lets the tree rail scroll
+            independently of it. */}
+        <div className="flex min-h-0 flex-1 flex-col min-w-0 px-4 md:px-0">
           <DataBrowserTabs
             tabs={tabs}
             activeTabId={activeTabId}
@@ -3161,6 +3182,45 @@ function EntityDataView({
   entityName: string
 }) {
   const [showSchema, setShowSchema] = useState(false)
+
+  // Column visibility. Wide tables (30+ columns) forced horizontal scrolling
+  // to read anything, so the operator picks what matters. Keyed by field name
+  // and reset when the entity changes, since column names don't carry over.
+  const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set())
+  useEffect(() => {
+    setHiddenColumns(new Set())
+  }, [entityInfo?.entity])
+
+  const allFields: FieldResponse[] = queryResult?.fields ?? []
+  const visibleFields = allFields.filter((f) => !hiddenColumns.has(f.name))
+
+  const toggleColumn = (name: string) => {
+    setHiddenColumns((prev) => {
+      const next = new Set(prev)
+      if (next.has(name)) {
+        next.delete(name)
+      } else {
+        // Never hide the last column — an empty table is a dead end with no
+        // affordance to recover from.
+        if (allFields.length - next.size <= 1) return prev
+        next.add(name)
+      }
+      return next
+    })
+  }
+
+  // Row detail. The index is into the current page's rows; cleared whenever a
+  // new result set arrives so a stale index can't point at a different row.
+  const [detailRowIndex, setDetailRowIndex] = useState<number | null>(null)
+  useEffect(() => {
+    setDetailRowIndex(null)
+  }, [queryResult])
+  const detailRow =
+    detailRowIndex !== null
+      ? ((queryResult?.rows?.[detailRowIndex] as
+          | Record<string, unknown>
+          | undefined) ?? null)
+      : null
   const [isFilterExpanded, setIsFilterExpanded] = useState(false)
   const [isDownloading, setIsDownloading] = useState(false)
 
@@ -3522,6 +3582,50 @@ function EntityDataView({
                     filtered
                   </span>
                 )}
+                {allFields.length > 1 && (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="outline" size="sm">
+                        <Columns3 className="size-4" />
+                        Columns
+                        {hiddenColumns.size > 0 && (
+                          <span className="tabular-nums text-muted-foreground">
+                            {visibleFields.length}/{allFields.length}
+                          </span>
+                        )}
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent
+                      align="start"
+                      className="max-h-80 w-56 overflow-y-auto"
+                    >
+                      <DropdownMenuLabel>Visible columns</DropdownMenuLabel>
+                      <DropdownMenuSeparator />
+                      {allFields.map((field) => (
+                        <DropdownMenuCheckboxItem
+                          key={field.name}
+                          checked={!hiddenColumns.has(field.name)}
+                          onCheckedChange={() => toggleColumn(field.name)}
+                          onSelect={(e) => e.preventDefault()}
+                        >
+                          <span className="truncate font-mono text-xs">
+                            {field.name}
+                          </span>
+                        </DropdownMenuCheckboxItem>
+                      ))}
+                      {hiddenColumns.size > 0 && (
+                        <>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            onSelect={() => setHiddenColumns(new Set())}
+                          >
+                            Show all
+                          </DropdownMenuItem>
+                        </>
+                      )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                )}
               </div>
               {queryLoading && (
                 <div className="flex items-center gap-2 text-sm/6 text-muted-foreground">
@@ -3618,7 +3722,7 @@ function EntityDataView({
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b bg-muted/50">
-                        {queryResult.fields?.map((field: FieldResponse) => (
+                        {visibleFields.map((field: FieldResponse) => (
                           <th
                             key={field.name}
                             className="text-left p-3 font-medium whitespace-nowrap"
@@ -3648,7 +3752,7 @@ function EntityDataView({
                           key={rowIndex}
                           className="border-b last:border-0 hover:bg-muted/30"
                         >
-                          {queryResult.fields?.map((field: FieldResponse) => (
+                          {visibleFields.map((field: FieldResponse) => (
                             <td
                               key={field.name}
                               className="p-3 align-middle"
@@ -3657,6 +3761,10 @@ function EntityDataView({
                                 value={row[field.name]}
                                 fieldType={field.field_type}
                                 fieldName={field.name}
+                                // Expanding a JSON cell used to open a panel
+                                // containing only that value, so you lost which
+                                // row it came from. Now it opens the whole row.
+                                onExpand={() => setDetailRowIndex(rowIndex)}
                               />
                             </td>
                           ))}
@@ -3665,6 +3773,88 @@ function EntityDataView({
                     </tbody>
                   </table>
                 </div>
+
+                {/* Row detail. Opening a JSON cell previously showed that
+                    value alone, stripped of the row it came from. This shows
+                    every field — including columns hidden from the table — so
+                    expanding a blob doesn't cost you the context around it. */}
+                <Sheet
+                  open={detailRow !== null}
+                  onOpenChange={(open) => {
+                    if (!open) setDetailRowIndex(null)
+                  }}
+                >
+                  <SheetContent className="w-full overflow-y-auto sm:max-w-xl">
+                    <SheetHeader>
+                      <SheetTitle>Row detail</SheetTitle>
+                      <SheetDescription>
+                        {entityInfo?.entity}
+                        {detailRowIndex !== null && (
+                          <>
+                            {' · row '}
+                            {(page - 1) * pageSize + detailRowIndex + 1}
+                          </>
+                        )}
+                      </SheetDescription>
+                    </SheetHeader>
+
+                    <dl className="mt-4 divide-y divide-border/60">
+                      {allFields.map((field) => {
+                        const raw = detailRow?.[field.name]
+                        const isStructured =
+                          raw !== null &&
+                          raw !== undefined &&
+                          typeof raw === 'object'
+                        const text = isStructured
+                          ? JSON.stringify(raw, null, 2)
+                          : String(raw ?? '')
+                        return (
+                          <div key={field.name} className="py-3">
+                            <dt className="flex items-baseline justify-between gap-2">
+                              <span className="font-mono text-xs font-medium">
+                                {field.name}
+                              </span>
+                              <span className="shrink-0 text-xs text-muted-foreground">
+                                {field.field_type}
+                                {hiddenColumns.has(field.name) && ' · hidden'}
+                              </span>
+                            </dt>
+                            <dd className="mt-1">
+                              {raw === null || raw === undefined ? (
+                                <span className="text-sm/6 italic text-muted-foreground">
+                                  null
+                                </span>
+                              ) : isStructured ? (
+                                <pre className="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap break-all">
+                                  {text}
+                                </pre>
+                              ) : (
+                                <span className="font-mono text-xs break-all">
+                                  {text}
+                                </span>
+                              )}
+                            </dd>
+                          </div>
+                        )
+                      })}
+                    </dl>
+
+                    <div className="mt-4 flex justify-end">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          navigator.clipboard.writeText(
+                            JSON.stringify(detailRow ?? {}, null, 2)
+                          )
+                        }
+                      >
+                        <Copy className="size-4" />
+                        Copy row as JSON
+                      </Button>
+                    </div>
+                  </SheetContent>
+                </Sheet>
 
                 {/* Pagination */}
                 <div className="flex items-center justify-between mt-4">
