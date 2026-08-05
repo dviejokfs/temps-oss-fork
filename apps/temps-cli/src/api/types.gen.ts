@@ -12696,6 +12696,12 @@ export type QueryDataResponse = {
      * Total number of rows matching the query (before limit/offset)
      */
     total_count: number;
+    /**
+     * Whether rows were dropped from this response to stay inside the byte budget.
+     *
+     * `returned_count` is always the number of rows actually present, so a truncated page is still internally consistent — but a caller comparing it against the requested limit would otherwise conclude the table simply ended. Reported explicitly so a partial page is never mistaken for a complete one, by a human, a script, or a model reading a tool result.
+     */
+    truncated: boolean;
 };
 
 export type QuotaResponse = {

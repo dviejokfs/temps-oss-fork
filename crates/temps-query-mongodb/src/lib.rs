@@ -462,12 +462,22 @@ impl temps_query::Queryable for MongoDBSource {
 
         let start_time = std::time::Instant::now();
 
+        // SECURITY / AVAILABILITY: bound the operation server-side.
+        //
+        // Dropping the future when the caller's deadline fires abandons the
+        // cursor but does not stop the server from doing the work — `maxTimeMS`
+        // is what makes mongod give up. Relevant here because `skip` is
+        // caller-supplied and its cost is O(skip): the server walks and discards
+        // every skipped document regardless of `limit`.
+        let max_time = std::time::Duration::from_millis(options.timeout_ms.unwrap_or(30_000));
+
         // Execute query
         let mut cursor = collection
             .find(filter_doc.clone())
             .sort(sort_doc)
             .limit(limit)
             .skip(skip)
+            .max_time(max_time)
             .await
             .map_err(|e| {
                 error!("MongoDB query failed: {}", e);

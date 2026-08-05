@@ -8,7 +8,7 @@ use temps_query::{
     DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType,
     Introspect, QueryOptions, QueryResult, QuerySchemaProvider, QueryStats, Queryable, Result,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 pub struct MariaDbSource {
     pool: MySqlPool,
@@ -607,15 +607,61 @@ impl Queryable for MariaDbSource {
 
         debug!("Executing MariaDB query: {}", sql);
 
+        // SECURITY / AVAILABILITY: bound the query server-side.
+        //
+        // The caller's tokio deadline frees the control-plane task, but dropping
+        // the future does not stop the server: it keeps executing and keeps
+        // holding its share of the operator's database. That matters here
+        // because this backend accepts a caller-supplied WHERE clause and a
+        // caller-supplied OFFSET, whose cost is O(offset) regardless of LIMIT.
+        //
+        // The knob is spelled differently on the two engines this backend serves
+        // — MySQL 5.7.8+ has `max_execution_time` (milliseconds), MariaDB has
+        // `max_statement_time` (seconds, fractional) — and setting the one the
+        // server does not know is an error. Try both and keep whichever lands.
+        // Both statements must run on the SAME pooled connection as the query,
+        // hence the explicit acquire; a session variable set on some other
+        // connection in the pool would bound some other request.
+        let timeout_ms = options.timeout_ms.unwrap_or(30_000);
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            DataError::ConnectionFailed(format!(
+                "Failed to acquire a MariaDB connection for query on {}.{}: {}",
+                database_name, entity_name, e
+            ))
+        })?;
+
+        let mysql_set = sqlx::query(&format!("SET SESSION max_execution_time = {timeout_ms}"))
+            .execute(&mut *conn)
+            .await
+            .is_ok();
+        let mariadb_set = sqlx::query(&format!(
+            "SET SESSION max_statement_time = {}",
+            timeout_ms as f64 / 1000.0
+        ))
+        .execute(&mut *conn)
+        .await
+        .is_ok();
+        if !mysql_set && !mariadb_set {
+            // Neither knob exists on this server, so only the outer deadline
+            // bounds this query. Say so — an operator staring at a slow database
+            // needs to know the server-side ceiling is not in effect.
+            warn!(
+                database = %database_name,
+                "Neither max_execution_time nor max_statement_time is supported by this server; \
+                 data browser queries are bounded only by the control-plane deadline"
+            );
+        }
+
         let rows = sqlx::query(&sql)
             .bind(limit as i64)
             .bind(offset as i64)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| {
                 error!("MariaDB query failed: {}", e);
                 DataError::QueryFailed(format!("{}\n\nQuery: {}", e, sql))
             })?;
+        drop(conn);
 
         let data_rows: Result<Vec<DataRow>> = rows.iter().map(Self::row_to_datarow).collect();
         let data_rows = data_rows?;
@@ -839,6 +885,72 @@ fn strip_sql_string_literals(sql: &str) -> Result<String> {
     let mut chars = sql.chars().peekable();
 
     while let Some(c) = chars.next() {
+        // SECURITY: backtick-quoted identifiers must be normalised before the
+        // shared structural check runs, and they must collapse to the *same*
+        // placeholder the PostgreSQL stripper emits for `"..."`.
+        //
+        // `reject_subqueries_and_function_calls` was written against PostgreSQL
+        // lexing: it recognises a function call either by a quote character
+        // (`"` or `'`) immediately before `(`, or by walking back over
+        // identifier characters. A backtick is neither — it is not a quote it
+        // knows about, and it terminates the identifier walk — so the guard saw
+        // an empty identifier before the paren and allowed the call through.
+        // The `sleep(`/`benchmark(` denylist entries missed it independently,
+        // because a backticked call contains "sleep`(" rather than "sleep(".
+        // One character defeated both layers, yielding a CPU/connection-hold
+        // primitive on the operator's database reachable from the agent's
+        // documented `--filter`.
+        //
+        // Emitting `""` means `` `benchmark`(...) `` reaches the shared check as
+        // `""(...)`, which it already rejects as a quoted function call. A
+        // backtick-quoted identifier in ordinary use (`` `order` = 1 ``) becomes
+        // `"" = 1` and still validates. Only the validator sees this rewrite;
+        // the server is always sent the caller's original text.
+        if c == '`' && !in_string {
+            let mut terminated = false;
+            while let Some(inner) = chars.next() {
+                if inner == '`' {
+                    // MySQL escapes a literal backtick inside a quoted
+                    // identifier by doubling it.
+                    if chars.peek() == Some(&'`') {
+                        chars.next();
+                        continue;
+                    }
+                    terminated = true;
+                    break;
+                }
+            }
+            if !terminated {
+                return Err(DataError::InvalidQuery(
+                    "Unterminated backtick-quoted identifier in the data browser filter"
+                        .to_string(),
+                ));
+            }
+            result.push_str("\"\"");
+            continue;
+        }
+
+        // SECURITY: refuse double quotes rather than guess what they mean.
+        //
+        // Under MySQL/MariaDB's default sql_mode `"..."` is a *string literal*;
+        // under ANSI_QUOTES it is a quoted identifier. The server's mode is not
+        // knowable from here, and the two readings disagree about where the
+        // literal ends — so any stripper that picks one desynchronises from the
+        // server whenever the other applies. That is exactly the class of bug
+        // the backslash rule below was added for: the stripper swallows a span
+        // the server executes, and every later check runs on a sanitised
+        // remainder.
+        //
+        // Single quotes delimit strings in both modes and backticks delimit
+        // identifiers in both modes, so a legitimate filter never needs `"`.
+        if c == '"' && !in_string {
+            return Err(DataError::InvalidQuery(
+                "Double quotes are not allowed in the data browser filter — use single quotes \
+                 for string values and backticks for identifiers"
+                    .to_string(),
+            ));
+        }
+
         if in_string {
             // SECURITY: MySQL/MariaDB honour backslash escapes inside string
             // literals unless NO_BACKSLASH_ESCAPES is set, and the server's
@@ -940,6 +1052,12 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         "union ",
         "intersect ",
         "except ",
+        // These two keep the paren attached deliberately. The real guard for
+        // function calls is the structural check above, which rejects *any*
+        // identifier before `(` — including the backtick-quoted form, now that
+        // the stripper normalises it. Matching bare "sleep"/"benchmark" here
+        // would add nothing the structural check does not already catch, while
+        // rejecting ordinary columns like `sleep_minutes` or `benchmark_id`.
         "sleep(",
         "benchmark(",
         "load_file",
@@ -1049,6 +1167,37 @@ mod tests {
     }
 
     #[test]
+    fn where_clause_rejects_backtick_quoted_function_calls() {
+        // A backtick defeated BOTH layers at once. The shared structural check
+        // recognises a function call by a quote character (`"`/`'`) before `(`
+        // or by walking back over identifier characters; a backtick is neither,
+        // so it saw an empty identifier and allowed the call. The denylist
+        // missed it independently because the text contains "sleep`(" rather
+        // than the "sleep(" it matches on. `benchmark` in particular is a CPU
+        // burn on the operator's own database, reachable from `--filter` and so
+        // prompt-injectable.
+        assert_where_rejected("1=1 and `sleep`(5)");
+        assert_where_rejected("1=1 and `benchmark`(50000000, sha1('x'))");
+        assert_where_rejected("`extractvalue`(1, `user`())");
+        // Qualified and spaced variants of the same trick.
+        assert_where_rejected("1=1 and `mysql`.`sleep` (5)");
+        // An unterminated identifier is as untrustworthy as an unterminated
+        // string: we cannot know where the server thinks it ends.
+        assert_where_rejected("`unterminated");
+    }
+
+    #[test]
+    fn where_clause_rejects_double_quotes() {
+        // Under default sql_mode `"..."` is a string literal; under ANSI_QUOTES
+        // it is an identifier. The stripper cannot observe the mode, and the
+        // two readings disagree about where the span ends — the same
+        // stripper/server desync the backslash rule above exists to prevent,
+        // reached through a different quote character.
+        assert_where_rejected(r#"name = "value""#);
+        assert_where_rejected(r#"1=1 or "it's" = 'x'"#);
+    }
+
+    #[test]
     fn where_clause_still_accepts_ordinary_filters() {
         // The structural checks must not break the filters this exists to run.
         // Grouping parens are preceded by whitespace or an operator, so they
@@ -1060,6 +1209,15 @@ mod tests {
             "name LIKE '%test%'",
             "id IN (1, 2, 3)",
             "created_at BETWEEN '2025-01-01' AND '2025-02-01'",
+            // Backtick-quoted identifiers are ordinary MySQL and must survive
+            // normalisation — including reserved words, which are the whole
+            // reason the quoting exists.
+            "`order` = 1",
+            "`user`.`status` = 'active' AND `order` > 2",
+            // Columns whose names merely contain a denylisted function name.
+            // Matching bare "sleep"/"benchmark" would reject these.
+            "sleep_minutes > 30",
+            "benchmark_id = 7",
         ] {
             assert!(
                 validate_where_clause(clause).is_ok(),

@@ -23,7 +23,18 @@ fn escape_ident(name: &str) -> String {
 }
 
 /// A certificate verifier that accepts all server certificates (including self-signed).
-/// Used for connecting to PostgreSQL clusters with `--ssl-self-signed` certificates.
+///
+/// SECURITY: this verifies nothing — with it, TLS gives encryption against a
+/// passive observer and no protection at all against an active one, who can
+/// present any certificate and receive this service's admin password. It exists
+/// because Temps-managed PostgreSQL clusters are brought up with self-signed
+/// certificates that no root store can validate.
+///
+/// It is therefore the *second* thing tried, not the first: [`connect_with_tls`]
+/// attempts real verification against the webpki roots and only falls back here
+/// when that fails, so any server presenting a properly-issued certificate —
+/// every managed provider, anything reached over the public internet — is now
+/// genuinely authenticated. Do not call this path directly.
 #[derive(Debug)]
 struct AcceptAllVerifier;
 
@@ -160,32 +171,76 @@ impl PostgresSource {
             username, host, port, database
         );
 
-        let client = match Self::connect_with_tls(&cfg).await {
+        // SECURITY: try genuine certificate verification first, and only give
+        // up one rung at a time.
+        //
+        // This used to go straight to `AcceptAllVerifier` and then, on any
+        // failure at all, silently to cleartext. Both steps sent this service's
+        // admin password to whoever answered: accept-all authenticates nothing,
+        // and the plaintext fallback put the password on the wire in the clear
+        // for any observer. Nothing in the UI showed which of the three had
+        // happened.
+        //
+        // Now: verified TLS → self-signed TLS (Temps-managed clusters use
+        // self-signed certs, so this rung has to stay) → cleartext, and that
+        // last rung only where the traffic cannot leave the host or the private
+        // network. Each downgrade is logged with the reason.
+        let client = match connect_with_verified_tls(&cfg).await {
             Ok(client) => {
-                debug!("Connected to PostgreSQL with TLS");
+                debug!("Connected to PostgreSQL with verified TLS");
                 client
             }
-            Err(tls_err) => {
-                warn!(
-                    "TLS connection failed, falling back to plain connection: {}",
-                    format_chain(&tls_err)
-                );
-                let (client, connection) = cfg.connect(NoTls).await.map_err(|e| {
-                    DataError::ConnectionFailed(format!(
-                        "PostgreSQL connection failed (TLS error: {}, plain error: {})",
-                        format_chain(&tls_err),
-                        format_chain(&e),
-                    ))
-                })?;
-
-                tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        error!("PostgreSQL connection error: {}", e);
+            Err(verified_err) => match Self::connect_with_tls(&cfg).await {
+                Ok(client) => {
+                    warn!(
+                        host = %host,
+                        "PostgreSQL certificate did not validate against the system roots ({}); \
+                         connected with an unverified (self-signed) certificate. Traffic is \
+                         encrypted but the server is NOT authenticated.",
+                        format_chain(&verified_err)
+                    );
+                    client
+                }
+                Err(tls_err) => {
+                    // Cleartext carries the password in the clear. Only
+                    // acceptable where the connection cannot leave the operator's
+                    // own host or private network.
+                    if !host_is_private(host) {
+                        return Err(DataError::ConnectionFailed(format!(
+                            "PostgreSQL at '{host}' refused TLS and is not on a private network, \
+                             so falling back to an unencrypted connection would send this \
+                             service's password across the network in cleartext. Refusing. \
+                             Enable TLS on the server, or reach it over a private address or the \
+                             Temps mesh. (verified TLS error: {}; self-signed TLS error: {})",
+                            format_chain(&verified_err),
+                            format_chain(&tls_err),
+                        )));
                     }
-                });
 
-                client
-            }
+                    warn!(
+                        host = %host,
+                        "PostgreSQL refused TLS ({}); falling back to an UNENCRYPTED connection. \
+                         Permitted only because the host is loopback or private.",
+                        format_chain(&tls_err)
+                    );
+
+                    let (client, connection) = cfg.connect(NoTls).await.map_err(|e| {
+                        DataError::ConnectionFailed(format!(
+                            "PostgreSQL connection failed (TLS error: {}, plain error: {})",
+                            format_chain(&tls_err),
+                            format_chain(&e),
+                        ))
+                    })?;
+
+                    tokio::spawn(async move {
+                        if let Err(e) = connection.await {
+                            error!("PostgreSQL connection error: {}", e);
+                        }
+                    });
+
+                    client
+                }
+            },
         };
 
         debug!(
@@ -364,6 +419,91 @@ pub async fn connect_with_self_signed_tls(
 /// Preferred whenever any component of the connection is caller-supplied: a
 /// `Config` carries values, so nothing in it can be mistaken for connection
 /// syntax the way an interpolated keyword/value string can.
+/// Whether cleartext to this host stays inside the operator's own machine or
+/// private network.
+///
+/// Used to decide whether an unencrypted fallback is tolerable. A Temps-managed
+/// database is a container on the same host, or a peer on the WireGuard mesh —
+/// its traffic never touches a network the operator does not control, so
+/// cleartext there leaks nothing new. A public hostname is the opposite case:
+/// the password would cross the open internet in the clear.
+///
+/// Bare hostnames with no dot (`temps-pg-42`, `localhost`) are Docker/service
+/// names that cannot resolve publicly, so they count as private. Anything that
+/// looks like a public FQDN does not — when in doubt this returns false,
+/// because the cost of being wrong in that direction is a refused connection
+/// with a clear explanation, and in the other direction it is a leaked
+/// credential.
+fn host_is_private(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+
+    if host.is_empty() {
+        return false;
+    }
+
+    // A unix socket path is local by construction.
+    if host.starts_with('/') {
+        return true;
+    }
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    // Unique local (fc00::/7) and link-local (fe80::/10).
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+    }
+
+    // Not an IP: a single-label name (no dot) is a container/service name and
+    // is not publicly resolvable. `.localhost` and `.internal` are reserved for
+    // exactly this purpose.
+    let lower = host.to_ascii_lowercase();
+    !lower.contains('.')
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".internal")
+        || lower.ends_with(".local")
+}
+
+/// Open a client with genuine certificate verification against the webpki root
+/// store.
+///
+/// This is the rung above [`connect_with_self_signed_tls_config`]: a server
+/// presenting a properly-issued certificate is authenticated here, so an active
+/// attacker on the path cannot substitute their own and collect the password.
+/// Only when this fails does the caller drop to the accept-anything verifier
+/// that Temps-managed self-signed clusters need.
+async fn connect_with_verified_tls(
+    config: &tokio_postgres::Config,
+) -> std::result::Result<Client, tokio_postgres::Error> {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let rustls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let tls = MakeRustlsConnect::new(rustls_config);
+    let (client, connection) = config.connect(tls).await?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            error!("PostgreSQL TLS connection error: {}", e);
+        }
+    });
+
+    Ok(client)
+}
+
 pub async fn connect_with_self_signed_tls_config(
     config: &tokio_postgres::Config,
 ) -> std::result::Result<Client, tokio_postgres::Error> {
@@ -1570,6 +1710,31 @@ impl Queryable for PostgresSource {
         // as defense-in-depth.
         let client = &self.client;
 
+        // SECURITY / AVAILABILITY: bound the query server-side before running it.
+        //
+        // The caller's tokio deadline frees the control-plane task, but dropping
+        // the future does not stop PostgreSQL: the backend keeps executing and
+        // keeps holding its share of the operator's database until it finishes.
+        // `statement_timeout` is what actually cancels it. This matters most for
+        // the two cheapest ways to build an expensive query here — a filter that
+        // forces a sequential scan, and a large OFFSET, whose cost is O(offset)
+        // and therefore unaffected by the LIMIT clamp above.
+        //
+        // Set on the session rather than in a transaction because this client is
+        // reused: every later query on this connection inherits the ceiling,
+        // which is the behaviour we want for a browser. The value is a u64 we
+        // computed, never caller text, so it cannot carry SQL.
+        let timeout_ms = options.timeout_ms.unwrap_or(30_000);
+        if let Err(e) = client
+            .batch_execute(&format!("SET statement_timeout = {timeout_ms}"))
+            .await
+        {
+            // Not fatal on its own — the outer deadline still bounds the
+            // request — but it means this query is unbounded server-side, which
+            // an operator debugging a slow database needs to be able to see.
+            warn!("Failed to set statement_timeout for data browser query: {e}");
+        }
+
         let rows = client.query(&sql, &[]).await.map_err(|e| {
             error!("PostgreSQL query failed: {}", e);
             error!("Failed SQL: {}", sql);
@@ -1782,6 +1947,53 @@ mod tests {
         runners::AsyncRunner,
         GenericImage, ImageExt,
     };
+
+    #[test]
+    fn host_is_private_allows_local_and_mesh_destinations() {
+        // These are where a Temps-managed database actually lives: a container
+        // on the same host, or a peer on the private mesh. Cleartext there
+        // never leaves infrastructure the operator controls, so the fallback
+        // must keep working — refusing these would break every existing
+        // self-hosted deployment whose Postgres has no TLS.
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "temps-pg-42",
+            "10.0.0.5",
+            "172.16.4.9",
+            "192.168.1.20",
+            "fd00::1",
+            "db.internal",
+            "postgres.localhost",
+            "/var/run/postgresql",
+        ] {
+            assert!(
+                host_is_private(host),
+                "should be treated as private: {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_is_private_rejects_public_destinations() {
+        // Falling back to cleartext for these would put the service's admin
+        // password on the open internet. The connection is refused with an
+        // explanation instead.
+        for host in [
+            "db.example.com",
+            "evil.tld",
+            "203.0.113.10",
+            "8.8.8.8",
+            "2606:4700:4700::1111",
+            "",
+        ] {
+            assert!(
+                !host_is_private(host),
+                "should NOT be treated as private: {host}"
+            );
+        }
+    }
 
     #[test]
     fn test_pg_type_mapping() {

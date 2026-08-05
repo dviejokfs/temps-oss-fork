@@ -1545,6 +1545,14 @@ fn ai_read_allowlist() -> Vec<String> {
         // two collide. `list_containers_at_path` covers navigation without
         // depending on which of the two wins. (Pre-existing collision; fixing
         // it means renaming a published operation_id.)
+        // Entity names. On SQL and MongoDB these are tables and collections —
+        // developer-chosen names, no stored values, safe on the same footing as
+        // the rest of this list. On Redis and S3 the entity name IS user data
+        // (keys embed session tokens and emails; object names are user-supplied
+        // filenames), so for those engines the handler gates this behind the
+        // same `ai_data_access` opt-in as row reads. Allowlisting it here only
+        // makes the endpoint reachable. See `entity_names_are_user_data` in
+        // temps-providers.
         "list_entities",
         "get_entity_info",
         // Row CONTENTS. Unlike every other entry here, this one *can* return

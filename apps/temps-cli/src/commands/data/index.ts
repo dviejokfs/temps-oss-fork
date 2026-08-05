@@ -491,6 +491,19 @@ async function rowsCmd(
 
   const offset = options.offset ? Number(options.offset) : 0
   const shown = offset + rows.length
+
+  // The server drops rows to stay inside a response byte budget when a table
+  // holds large values (blobs, big JSON). Say so explicitly: without this the
+  // short page is indistinguishable from having reached the end of the table,
+  // and a script paging on `rows.length < limit` would stop early and silently
+  // miss data.
+  if (result?.truncated) {
+    warning(
+      `Response was truncated to stay within the size limit — ${rows.length} row(s) shown, and there are more at this offset.`,
+    )
+    warning(`Narrow the columns with a filter, or continue with --offset ${shown}.`)
+  }
+
   if (result?.total_count !== undefined && shown < result.total_count) {
     info(`Showing ${offset + 1}–${shown} of ${result.total_count}. Next: --offset ${shown}`)
   }

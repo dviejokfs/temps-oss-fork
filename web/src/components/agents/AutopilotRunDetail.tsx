@@ -10,6 +10,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
+import { untrustedMarkdownImage } from '@/components/markdown/untrustedImage'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -191,13 +192,20 @@ function MarkdownPre({ children }: { children?: ReactNode }) {
 
 /** Render markdown content using prose styles. Fenced code blocks are routed
  *  to the shared CodeBlock via the `pre` component override; inline code keeps
- *  the prose styling (react-markdown only wraps fences in `<pre>`). */
+ *  the prose styling (react-markdown only wraps fences in `<pre>`).
+ *
+ *  SECURITY: this renders agent transcripts — assistant prose *and* tool
+ *  results carrying file contents, command output and fetched pages. That is
+ *  untrusted input in exactly the sense the chat console's override was added
+ *  for, and this view is the worse of the two surfaces because it renders on
+ *  page load rather than in response to a user message. Hence
+ *  `untrustedMarkdownImage`. */
 function Markdown({ children }: { children: string }) {
   return (
     <div className={proseClasses}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        components={{ pre: MarkdownPre }}
+        components={{ pre: MarkdownPre, ...untrustedMarkdownImage }}
       >
         {children}
       </ReactMarkdown>

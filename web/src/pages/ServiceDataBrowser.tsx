@@ -87,6 +87,7 @@ import {
   ArrowLeft,
   ArrowUpDown,
   Bookmark,
+  AlertTriangle,
   Box,
   Calendar,
   Check,
@@ -4172,6 +4173,20 @@ function EntityDataView({
                         Filtered
                       </Badge>
                     )}
+                    {/* The server drops rows to stay inside a response size
+                        budget when a table holds large values (blobs, big
+                        JSON). Say so: a short page is otherwise indistinguish-
+                        able from having reached the end of the table. */}
+                    {queryResult.truncated && (
+                      <Badge
+                        variant="outline"
+                        className="text-xs gap-1 border-amber-500/50 text-amber-600 dark:text-amber-400"
+                        title="This page was shortened to stay within the response size limit. There are more rows at this offset — deselect large columns to fit more per page."
+                      >
+                        <AlertTriangle className="size-3" />
+                        Shortened to fit
+                      </Badge>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <Button
@@ -4185,8 +4200,14 @@ function EntityDataView({
                     <Button
                       variant="outline"
                       size="sm"
+                      // A byte-truncated page returns fewer rows than asked for
+                      // while there is still more data, so `returned_count <
+                      // pageSize` alone would disable Next and strand the user
+                      // partway through the table with no way forward.
                       disabled={
-                        !queryResult || queryResult.returned_count < pageSize
+                        !queryResult ||
+                        (queryResult.returned_count < pageSize &&
+                          !queryResult.truncated)
                       }
                       onClick={() => onPageChange(page + 1)}
                     >

@@ -12,7 +12,7 @@ use temps_core::problemdetails::Problem;
 use temps_query::{ContainerInfo, ContainerPath, EntityInfo, QueryOptions};
 use utoipa::ToSchema;
 
-use super::audit::AiDataAccessChangedAudit;
+use super::audit::{AiDataAccessChangedAudit, AiRowsReadAudit};
 use super::types::AppState;
 
 // ============================================================================
@@ -251,6 +251,85 @@ fn effective_row_limit(requested: usize, is_ai_call: bool) -> usize {
     requested.min(ceiling)
 }
 
+/// Hard ceiling on `offset`.
+///
+/// The row clamp bounds what we *return*; it does nothing about what the engine
+/// has to do to get there. Every backend here implements offset by generating
+/// and discarding the preceding rows, so the cost is O(offset) and a request
+/// like `?offset=999999999` is expensive no matter how small `limit` is — the
+/// classic deep-pagination denial of service, aimed at the operator's own
+/// production database.
+///
+/// A million rows is past the point where offset paging is the wrong tool
+/// anyway: a caller that needs to go deeper wants a cursor or a filter on an
+/// indexed column, both of which this API already supports.
+const MAX_OFFSET: usize = 1_000_000;
+
+/// Resolve the effective row offset for a request.
+fn effective_row_offset(requested: usize) -> usize {
+    requested.min(MAX_OFFSET)
+}
+
+/// Byte budget for a single rows response.
+///
+/// [`MAX_ROWS`] bounds the row *count*, which silently assumes rows are small.
+/// They need not be: a `bytea`/`blob`/`jsonb` column holding an uploaded file,
+/// a session blob or a base64 avatar is megabytes on its own, so 1000 of them
+/// is gigabytes materialised into a `Vec<DataRow>` and then serialised to JSON
+/// — the same OOM on the 3 vCPU / 4 GB reference box that the row clamp exists
+/// to prevent, reached along the axis the row clamp does not measure.
+///
+/// 8 MiB is comfortably above any honest page of tabular data and well below
+/// what hurts the box.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Byte budget for an agent-originated response.
+///
+/// Tighter than the human ceiling for a different reason: the tool caller
+/// truncates oversized bodies, and a truncated tool result is a silently
+/// partial answer the model cannot reason about — the exact failure
+/// [`AI_MAX_ROWS`] was introduced to avoid. Clamping rows alone did not achieve
+/// that, because 100 fat rows still blow the caller's cap; budgeting bytes here
+/// means the response is always well-formed and the agent is told, in-band,
+/// that there is more.
+const AI_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+
+/// Serialise rows, stopping before the response exceeds `budget` bytes.
+///
+/// Returns the rows that fit and whether anything was dropped. Truncating here
+/// rather than letting a downstream layer cut the body in half keeps every
+/// response valid JSON, and the caller reports the truncation explicitly so a
+/// partial page is never mistaken for a complete one — by a human reading the
+/// console, by a script reading the CLI, or by a model reading a tool result.
+fn take_rows_within_budget(
+    rows: Vec<temps_query::DataRow>,
+    budget: usize,
+) -> (Vec<serde_json::Value>, bool) {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut used = 0usize;
+    let mut truncated = false;
+
+    for row in rows {
+        let value = serde_json::to_value(row).unwrap_or_default();
+        // Cheap proxy for the serialised size. Exact to within the separators
+        // the array itself adds, which is far inside the slack in the budget.
+        let size = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
+
+        // Always emit at least one row. A single row larger than the whole
+        // budget would otherwise produce an empty page that looks like "no
+        // results" and cannot be paged past.
+        if !out.is_empty() && used + size > budget {
+            truncated = true;
+            break;
+        }
+
+        used += size;
+        out.push(value);
+    }
+
+    (out, truncated)
+}
+
 /// Whether an agent-originated request may read this service's rows.
 ///
 /// Pure so the gate can be tested without standing up an `AppState`; this is
@@ -258,6 +337,82 @@ fn effective_row_limit(requested: usize, is_ai_call: bool) -> usize {
 /// provider, so it must not be exercised only through integration paths.
 fn ai_may_read_rows(is_ai_call: bool, service_ai_data_access: bool) -> bool {
     !is_ai_call || service_ai_data_access
+}
+
+/// Whether this engine's *entity names* are schema shape or stored user data.
+///
+/// The allowlist below draws the line this module's AI gating depends on:
+/// schema navigation is open to the agent, row contents are opt-in. For
+/// relational and document stores an entity is a table or collection — a name
+/// the developer chose, carrying nothing a user typed. For key-value and object
+/// stores the entity *is* the datum: Redis `list_entities` returns keys, which
+/// routinely embed session tokens, emails and user IDs (`session:<token>`,
+/// `ratelimit:<email>`), and S3 returns object names, which are user-supplied
+/// filenames (`invoices/acme-corp-2026-q1.pdf`). Enumerating those is a row
+/// read in all but name, so it belongs behind the same opt-in — otherwise an
+/// operator who deliberately left row access off still leaks the contents of
+/// their cache and bucket to the model.
+///
+/// Unknown engines are treated as data-bearing. A backend added later is gated
+/// until somebody has actually reasoned about what its entity names contain,
+/// which is the same secure-by-default posture the AI operation allowlist uses.
+fn entity_names_are_user_data(service_type: &str) -> bool {
+    !matches!(
+        service_type.trim().to_ascii_lowercase().as_str(),
+        "postgres" | "postgresql" | "mysql" | "mariadb" | "mongodb"
+    )
+}
+
+/// Resolve the service and enforce the per-service `ai_data_access` opt-in for
+/// agent-originated calls.
+///
+/// Shared by [`read_entity_rows`] and [`list_entities`] so the two cannot
+/// drift: the row endpoint and the key/object enumeration endpoint expose the
+/// same class of data on key-value and object stores, and gating only one of
+/// them leaves the other as a way around the opt-in.
+///
+/// A no-op for human callers — their authorization is `ExternalServicesRead`,
+/// checked by the caller before this runs.
+///
+/// Returns the service name for an agent call that passed the gate, so the
+/// caller can name the service in the audit record without a second lookup.
+async fn enforce_ai_data_access(
+    app_state: &AppState,
+    service_id: i32,
+    is_ai_call: bool,
+    what: &str,
+) -> Result<Option<String>, Problem> {
+    if !is_ai_call {
+        return Ok(None);
+    }
+
+    let service = app_state
+        .external_service_manager
+        .get_service(service_id)
+        .await
+        .map_err(|e| {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Service Not Found")
+                .with_detail(e.to_string())
+        })?;
+
+    if ai_may_read_rows(is_ai_call, service.ai_data_access) {
+        return Ok(Some(service.name.clone()));
+    }
+
+    Err(temps_core::problemdetails::new(StatusCode::FORBIDDEN)
+        .with_title("AI Data Access Not Enabled")
+        .with_detail(format!(
+            "Reading {what} from service '{}' (id {}) is not enabled for the AI assistant. \
+             Container and schema names are still readable. An operator can turn data access on \
+             under Settings → AI data access on the service page; it is off by default because \
+             this data can contain password hashes, tokens and personal information that would be \
+             sent to the configured AI provider.",
+            service.name, service_id
+        ))
+        .with_value("service_id", service_id)
+        .with_value("service_name", service.name.clone())
+        .with_value("setup_path", format!("/storage/{service_id}")))
 }
 
 /// Parse the `filter` query-string parameter into the backend-specific JSON
@@ -325,6 +480,7 @@ pub async fn read_entity_rows(
     State(app_state): State<Arc<AppState>>,
     Path((service_id, path_str, entity)): Path<(i32, String, String)>,
     ai_call: Option<axum::Extension<temps_core::ai_tool_call::AiToolCall>>,
+    axum::Extension(metadata): axum::Extension<temps_core::RequestMetadata>,
     axum::extract::Query(query): axum::extract::Query<ReadRowsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
@@ -345,33 +501,8 @@ pub async fn read_entity_rows(
     // projects, so there is no single owning project to scope to, and the
     // `ai_data_access` opt-in below is the intended boundary — an operator
     // enables row access per service, whatever project the chat is about.
-    if is_ai_call {
-        let service = app_state
-            .external_service_manager
-            .get_service(service_id)
-            .await
-            .map_err(|e| {
-                temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("Service Not Found")
-                    .with_detail(e.to_string())
-            })?;
-
-        if !ai_may_read_rows(is_ai_call, service.ai_data_access) {
-            return Err(temps_core::problemdetails::new(StatusCode::FORBIDDEN)
-                .with_title("AI Data Access Not Enabled")
-                .with_detail(format!(
-                    "Reading row data from service '{}' (id {}) is not enabled for the AI \
-                     assistant. Table and column names are still readable. An operator can turn \
-                     row access on under Settings → AI data access on the service page; it is off \
-                     by default because rows can contain password hashes, tokens and personal \
-                     data that would be sent to the configured AI provider.",
-                    service.name, service_id
-                ))
-                .with_value("service_id", service_id)
-                .with_value("service_name", service.name.clone())
-                .with_value("setup_path", format!("/storage/{service_id}")));
-        }
-    }
+    let ai_service_name =
+        enforce_ai_data_access(&app_state, service_id, is_ai_call, "row data").await?;
 
     let filter_schema = app_state
         .query_service
@@ -387,11 +518,11 @@ pub async fn read_entity_rows(
 
     let options = QueryOptions {
         limit: Some(limit),
-        offset: Some(query.offset),
+        offset: Some(effective_row_offset(query.offset)),
         cursor: None,
         sort_by: query.sort_by,
         sort_order: query.sort_order,
-        timeout_ms: None,
+        timeout_ms: Some(crate::query_service::effective_timeout_ms(None)),
         include_nulls: true,
     };
 
@@ -406,6 +537,9 @@ pub async fn read_entity_rows(
                     (StatusCode::BAD_REQUEST, "Invalid Query")
                 }
                 temps_query::DataError::NotFound(_) => (StatusCode::NOT_FOUND, "Not Found"),
+                temps_query::DataError::QueryTimeout(_) => {
+                    (StatusCode::GATEWAY_TIMEOUT, "Query Timed Out")
+                }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "Query Error"),
             };
 
@@ -414,25 +548,57 @@ pub async fn read_entity_rows(
                 .with_detail(e.to_string())
         })?;
 
+    let total_count = result.stats.total_rows.unwrap_or(result.stats.row_count) as u64;
+    let execution_time_ms = result.stats.execution_ms;
+    let fields: Vec<FieldResponse> = result
+        .schema
+        .fields
+        .iter()
+        .map(|f| FieldResponse {
+            name: f.name.clone(),
+            field_type: format!("{:?}", f.field_type),
+            nullable: f.nullable,
+        })
+        .collect();
+
+    let budget = if is_ai_call {
+        AI_MAX_RESPONSE_BYTES
+    } else {
+        MAX_RESPONSE_BYTES
+    };
+    let (rows, truncated) = take_rows_within_budget(result.rows, budget);
+
+    // Record what the model actually read. The `ai_data_access` toggle is
+    // audited, but that only says the door was opened; this says what went
+    // through it. Location and shape only — never the values, or the audit log
+    // becomes a second copy of the same secrets.
+    if let Some(service_name) = ai_service_name {
+        let audit = AiRowsReadAudit {
+            context: temps_core::audit::AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            service_id,
+            service_name,
+            container_path: path_str.clone(),
+            entity: entity.clone(),
+            returned_rows: rows.len(),
+            truncated,
+            filter: query.filter.clone(),
+        };
+        if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+            tracing::error!(service_id, error = %e, "Failed to write AI row-read audit log");
+        }
+    }
+
     let response = QueryDataResponse {
-        fields: result
-            .schema
-            .fields
-            .iter()
-            .map(|f| FieldResponse {
-                name: f.name.clone(),
-                field_type: format!("{:?}", f.field_type),
-                nullable: f.nullable,
-            })
-            .collect(),
-        rows: result
-            .rows
-            .into_iter()
-            .map(|row| serde_json::to_value(row).unwrap_or_default())
-            .collect(),
-        total_count: result.stats.total_rows.unwrap_or(result.stats.row_count) as u64,
-        returned_count: result.stats.row_count,
-        execution_time_ms: result.stats.execution_ms,
+        fields,
+        returned_count: rows.len(),
+        rows,
+        total_count,
+        execution_time_ms,
+        truncated,
     };
 
     Ok(Json(response))
@@ -494,6 +660,16 @@ pub struct QueryDataResponse {
     /// Query execution time in milliseconds
     #[schema(example = 45)]
     pub execution_time_ms: u64,
+    /// Whether rows were dropped from this response to stay inside the byte
+    /// budget.
+    ///
+    /// `returned_count` is always the number of rows actually present, so a
+    /// truncated page is still internally consistent — but a caller comparing
+    /// it against the requested limit would otherwise conclude the table simply
+    /// ended. Reported explicitly so a partial page is never mistaken for a
+    /// complete one, by a human, a script, or a model reading a tool result.
+    #[schema(example = false)]
+    pub truncated: bool,
 }
 
 // ============================================================================
@@ -912,9 +1088,34 @@ pub async fn list_entities(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
     Path((service_id, path_str)): Path<(i32, String)>,
+    ai_call: Option<axum::Extension<temps_core::ai_tool_call::AiToolCall>>,
     axum::extract::Query(query): axum::extract::Query<ListEntitiesQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+
+    let is_ai_call = ai_call.is_some();
+
+    // This operation is allowlisted for the agent as "schema shape only", which
+    // is true of tables and collections but NOT of keys and object names — on
+    // Redis and S3 the entity name *is* user data. Gate those engines behind
+    // the same opt-in as row reads; leaving them open made this endpoint a way
+    // around it. See `entity_names_are_user_data`.
+    if is_ai_call {
+        let service = app_state
+            .external_service_manager
+            .get_service(service_id)
+            .await
+            .map_err(|e| {
+                temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Service Not Found")
+                    .with_detail(e.to_string())
+            })?;
+
+        if entity_names_are_user_data(&service.service_type) {
+            enforce_ai_data_access(&app_state, service_id, is_ai_call, "keys and object names")
+                .await?;
+        }
+    }
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments);
@@ -1050,11 +1251,11 @@ pub async fn query_data(
     // via {"limit": 100000000}.
     let options = QueryOptions {
         limit: Some(effective_row_limit(request.limit, false)),
-        offset: Some(request.offset),
+        offset: Some(effective_row_offset(request.offset)),
         cursor: None,
         sort_by: request.sort_by,
         sort_order: request.sort_order,
-        timeout_ms: None,
+        timeout_ms: Some(crate::query_service::effective_timeout_ms(None)),
         include_nulls: true,
     };
 
@@ -1073,6 +1274,9 @@ pub async fn query_data(
                     (StatusCode::BAD_REQUEST, "Invalid Query")
                 }
                 temps_query::DataError::NotFound(_) => (StatusCode::NOT_FOUND, "Not Found"),
+                temps_query::DataError::QueryTimeout(_) => {
+                    (StatusCode::GATEWAY_TIMEOUT, "Query Timed Out")
+                }
                 _ => {
                     // Other errors are server errors
                     (StatusCode::INTERNAL_SERVER_ERROR, "Query Error")
@@ -1084,25 +1288,30 @@ pub async fn query_data(
                 .with_detail(e.to_string()) // Use to_string() instead of format! to avoid extra nesting
         })?;
 
+    let total_count = result.stats.total_rows.unwrap_or(result.stats.row_count) as u64;
+    let execution_time_ms = result.stats.execution_ms;
+    let fields: Vec<FieldResponse> = result
+        .schema
+        .fields
+        .into_iter()
+        .map(|f| FieldResponse {
+            name: f.name,
+            field_type: format!("{:?}", f.field_type),
+            nullable: f.nullable,
+        })
+        .collect();
+
+    // This route is not reachable by the agent (it is absent from the write
+    // allowlist), so the human budget always applies.
+    let (rows, truncated) = take_rows_within_budget(result.rows, MAX_RESPONSE_BYTES);
+
     let response = QueryDataResponse {
-        fields: result
-            .schema
-            .fields
-            .into_iter()
-            .map(|f| FieldResponse {
-                name: f.name,
-                field_type: format!("{:?}", f.field_type),
-                nullable: f.nullable,
-            })
-            .collect(),
-        rows: result
-            .rows
-            .into_iter()
-            .map(|row| serde_json::to_value(row).unwrap_or_default())
-            .collect(),
-        total_count: result.stats.total_rows.unwrap_or(result.stats.row_count) as u64,
-        returned_count: result.stats.row_count,
-        execution_time_ms: result.stats.execution_ms,
+        fields,
+        returned_count: rows.len(),
+        rows,
+        total_count,
+        execution_time_ms,
+        truncated,
     };
 
     Ok(Json(response))
@@ -1424,6 +1633,100 @@ mod tests {
         // change who can browse their own data.
         assert!(ai_may_read_rows(false, false));
         assert!(ai_may_read_rows(false, true));
+    }
+
+    #[test]
+    fn effective_row_offset_clamps_deep_pagination() {
+        // The row clamp bounds what comes back; it does nothing about what the
+        // engine does to get there. Offset cost is O(offset) in every backend
+        // here, so `?limit=1&offset=999999999` is expensive precisely because
+        // the limit is small enough to look harmless.
+        assert_eq!(effective_row_offset(999_999_999), MAX_OFFSET);
+        assert_eq!(effective_row_offset(usize::MAX), MAX_OFFSET);
+    }
+
+    #[test]
+    fn effective_row_offset_leaves_real_paging_alone() {
+        assert_eq!(effective_row_offset(0), 0);
+        assert_eq!(effective_row_offset(500), 500);
+        assert_eq!(effective_row_offset(MAX_OFFSET), MAX_OFFSET);
+    }
+
+    fn row_of_size(bytes: usize) -> temps_query::DataRow {
+        let mut row = temps_query::DataRow::new();
+        row.insert("blob".to_string(), serde_json::json!("x".repeat(bytes)));
+        row
+    }
+
+    #[test]
+    fn take_rows_within_budget_stops_before_blowing_the_budget() {
+        // MAX_ROWS assumes rows are small. A bytea/jsonb column holding an
+        // upload or a session blob is megabytes on its own, so a page of them
+        // is the same OOM the row clamp exists to prevent, reached along the
+        // axis the row clamp does not measure.
+        let rows: Vec<_> = (0..10).map(|_| row_of_size(1000)).collect();
+        let (kept, truncated) = take_rows_within_budget(rows, 3_000);
+
+        assert!(truncated, "should have reported truncation");
+        assert!(kept.len() < 10, "should have dropped rows");
+        assert!(!kept.is_empty(), "should have kept what fit");
+    }
+
+    #[test]
+    fn take_rows_within_budget_reports_complete_pages_as_complete() {
+        // `truncated` drives whether a caller believes the table ended here, so
+        // a false positive is as bad as a false negative.
+        let rows: Vec<_> = (0..3).map(|_| row_of_size(10)).collect();
+        let (kept, truncated) = take_rows_within_budget(rows, MAX_RESPONSE_BYTES);
+
+        assert_eq!(kept.len(), 3);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn take_rows_within_budget_always_emits_at_least_one_row() {
+        // A single row bigger than the entire budget must not produce an empty
+        // page: that reads as "no results", and no amount of paging gets past
+        // it. Emit the one row and flag truncation instead.
+        let (kept, _) = take_rows_within_budget(vec![row_of_size(4096)], 16);
+
+        assert_eq!(kept.len(), 1, "must not return an unpageable empty page");
+    }
+
+    #[test]
+    fn entity_names_are_user_data_for_key_value_and_object_stores() {
+        // `list_entities` is allowlisted for the agent as schema navigation.
+        // That framing only holds where an entity is a table or collection. On
+        // Redis the entity is a KEY (`session:<token>`, `ratelimit:<email>`)
+        // and on S3 it is an object name (a user-supplied filename), so
+        // enumerating them is a row read wearing a different hat — and left
+        // ungated it was a way around the `ai_data_access` opt-in entirely.
+        assert!(entity_names_are_user_data("redis"));
+        assert!(entity_names_are_user_data("s3"));
+        assert!(entity_names_are_user_data("rustfs"));
+    }
+
+    #[test]
+    fn entity_names_are_schema_for_relational_and_document_stores() {
+        // Table and collection names are chosen by the developer, not typed by
+        // an end user. Gating these would break the navigation the agent needs
+        // to resolve "the users table in the landing database" to a path.
+        assert!(!entity_names_are_user_data("postgres"));
+        assert!(!entity_names_are_user_data("mariadb"));
+        assert!(!entity_names_are_user_data("mysql"));
+        assert!(!entity_names_are_user_data("mongodb"));
+        // Casing and stray whitespace must not open the gate.
+        assert!(!entity_names_are_user_data("  PostgreSQL "));
+    }
+
+    #[test]
+    fn entity_names_are_user_data_defaults_closed_for_unknown_engines() {
+        // Secure-by-default: a backend added later is gated until someone has
+        // reasoned about what its entity names actually contain. The failure
+        // mode of guessing wrong in the other direction is silent data leakage
+        // to a third-party model provider.
+        assert!(entity_names_are_user_data("some-future-engine"));
+        assert!(entity_names_are_user_data(""));
     }
 
     #[test]
