@@ -1009,6 +1009,11 @@ export type AppSettings = {
      */
     build_limits?: BuildLimitsSettings;
     /**
+     * Managed control-plane connection. Credentials are deliberately not
+     * stored here; they live in the owner-only cloud-link state file.
+     */
+    cloud?: CloudSettings;
+    /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). Off by
      * default — see `ClusterDnsSettings` for the incident background and
      * trade-offs. Must be explicitly enabled by operators who need
@@ -2121,10 +2126,36 @@ export type CliLoginRequest = {
     username: string;
 };
 
+export type CloudCapability = {
+    configured: boolean;
+    reason?: string | null;
+    setup_path: string;
+};
+
 /**
  * Cloud provider detected from node metadata
  */
 export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'hetzner' | 'digitalocean' | 'other';
+
+/**
+ * Non-secret managed control-plane settings stored with application settings.
+ */
+export type CloudSettings = {
+    /**
+     * HTTPS origin used for enrollment and telemetry mirroring.
+     */
+    backend_url?: string;
+};
+
+export type CloudStatus = {
+    backend_url: string;
+    health: string;
+    health_message: string;
+    instance_id?: string | null;
+    spooled_spans: number;
+    status: string;
+    status_message: string;
+};
 
 /**
  * Configuration for a Cloudflare Email Sending notification provider.
@@ -4738,6 +4769,19 @@ export type DeploymentMetadata = {
      */
     rolledBackFromId?: number | null;
     /**
+     * Uploaded source archive content type.
+     */
+    sourceBundleContentType?: string | null;
+    /**
+     * Uploaded source archive ID. Source archives are extracted before the
+     * regular preset build pipeline and do not require Git metadata.
+     */
+    sourceBundleId?: number | null;
+    /**
+     * Uploaded source archive path in the Temps data directory.
+     */
+    sourceBundlePath?: string | null;
+    /**
      * Static bundle content type (for proper extraction: application/gzip or application/zip)
      */
     staticBundleContentType?: string | null;
@@ -5999,6 +6043,10 @@ export type EnrichVisitorResponse = {
     message: string;
     success: boolean;
     visitor_id: string;
+};
+
+export type EnrollCloudRequest = {
+    enrollment_code: string;
 };
 
 export type EnrollmentTokenInfo = {
@@ -24071,6 +24119,58 @@ export type BlobHeadResponses = {
      */
     200: unknown;
 };
+
+export type DisconnectCloudData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud';
+};
+
+export type DisconnectCloudResponses = {
+    200: CloudStatus;
+};
+
+export type DisconnectCloudResponse = DisconnectCloudResponses[keyof DisconnectCloudResponses];
+
+export type GetCloudCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/capability';
+};
+
+export type GetCloudCapabilityResponses = {
+    200: CloudCapability;
+};
+
+export type GetCloudCapabilityResponse = GetCloudCapabilityResponses[keyof GetCloudCapabilityResponses];
+
+export type EnrollCloudData = {
+    body: EnrollCloudRequest;
+    path?: never;
+    query?: never;
+    url: '/cloud/enroll';
+};
+
+export type EnrollCloudResponses = {
+    200: CloudStatus;
+};
+
+export type EnrollCloudResponse = EnrollCloudResponses[keyof EnrollCloudResponses];
+
+export type GetCloudStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/status';
+};
+
+export type GetCloudStatusResponses = {
+    200: CloudStatus;
+};
+
+export type GetCloudStatusResponse = GetCloudStatusResponses[keyof GetCloudStatusResponses];
 
 export type GetDashboardProjectsAnalyticsData = {
     body?: never;

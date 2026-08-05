@@ -41,6 +41,7 @@ pub struct OtelService {
     /// [`DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS`] when overridden via
     /// `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`).
     ingest_permit_limit: usize,
+    cloud_link: Option<Arc<temps_cloud_client::CloudLink>>,
     stats: PipelineStatsAtomic,
 }
 
@@ -61,6 +62,23 @@ pub const DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS: usize = 64;
 const SERVICE_INGEST_MAX_REQUESTS: u32 = 600;
 /// Sliding window for the service ingest limiter.
 const SERVICE_INGEST_WINDOW: Duration = Duration::from_secs(60);
+
+fn cloud_span(span: &SpanRecord) -> temps_cloud_protocol::SpanRecord {
+    temps_cloud_protocol::SpanRecord {
+        trace_id: span.trace_id.clone(),
+        span_id: span.span_id.clone(),
+        // Span names are application-controlled too. Instrumentation may put
+        // raw URLs, SQL, email addresses or identifiers here, so the safe
+        // continuous projection uses a neutral operation label.
+        name: "span".to_string(),
+        ts_millis: span.start_time.timestamp_millis(),
+        duration_ms: span.duration_ms,
+        // Default-deny at the OSS boundary. Arbitrary span attributes
+        // routinely contain headers, SQL, user identifiers and other
+        // application data.
+        attributes: Default::default(),
+    }
+}
 
 /// Atomic counters for pipeline observability.
 struct PipelineStatsAtomic {
@@ -113,8 +131,16 @@ impl OtelService {
             quota_cache: Arc::new(QuotaCache::new(QUOTA_CACHE_TTL)),
             ingest_semaphore: Arc::new(Semaphore::new(max_concurrent_ingest_requests)),
             ingest_permit_limit: max_concurrent_ingest_requests,
+            cloud_link: None,
             stats: PipelineStatsAtomic::default(),
         }
+    }
+
+    /// Attach the optional managed telemetry mirror. The mirror is offered
+    /// spans only after local durable storage succeeds.
+    pub fn with_cloud_link(mut self, cloud_link: Arc<temps_cloud_client::CloudLink>) -> Self {
+        self.cloud_link = Some(cloud_link);
+        self
     }
 
     /// Acquire an ingest slot without queueing more work in memory.
@@ -246,9 +272,17 @@ impl OtelService {
             return Ok(0);
         }
 
+        let mirror = self.cloud_link.as_ref().and_then(|link| {
+            link.is_linked()
+                .then(|| spans.iter().map(cloud_span).collect::<Vec<_>>())
+        });
+
         match self.storage.store_spans(spans).await {
             Ok(stored) => {
                 self.stats.spans_stored.fetch_add(stored, Ordering::Relaxed);
+                if let (Some(link), Some(mirror)) = (&self.cloud_link, mirror) {
+                    link.record(mirror);
+                }
                 Ok(stored)
             }
             Err(e) => {
@@ -484,6 +518,24 @@ mod tests {
     use crate::test_support::{self, MockOtelStorage};
     use std::time::Duration;
 
+    fn linked_cloud() -> (tempfile::TempDir, Arc<temps_cloud_client::CloudLink>) {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("cloud-link/state.json");
+        temps_cloud_client::EnrollmentState {
+            instance_id: uuid::Uuid::new_v4(),
+            base_url: "https://cloud.test/".to_string(),
+            token: Some("instance-token".to_string()),
+            tenant_id: Some(uuid::Uuid::new_v4()),
+        }
+        .save(&state_path)
+        .unwrap();
+        let link = Arc::new(temps_cloud_client::CloudLink::load(
+            directory.path().to_path_buf(),
+            "test",
+        ));
+        (directory, link)
+    }
+
     fn make_service(storage: MockOtelStorage) -> (OtelService, MockOtelStorage) {
         let storage_clone = storage.clone();
         let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
@@ -521,6 +573,41 @@ mod tests {
         let stats = svc.pipeline_stats();
         assert_eq!(stats.spans_received, 4);
         assert_eq!(stats.spans_stored, 4);
+    }
+
+    #[tokio::test]
+    async fn successful_local_ingest_offers_spans_to_the_cloud_mirror() {
+        let mock = MockOtelStorage::new();
+        let (svc, _) = make_service(mock);
+        let (_directory, link) = linked_cloud();
+        let svc = svc.with_cloud_link(link.clone());
+        let (_, encoded) = test_support::build_sample_trace_tree();
+        let spans = decode::decode_traces_request(&encoded, 1, None).unwrap();
+
+        svc.ingest_spans(spans).await.unwrap();
+
+        assert_eq!(link.spooled(), 4);
+    }
+
+    #[test]
+    fn cloud_mirror_strips_application_controlled_names_and_attributes() {
+        let (_, encoded) = test_support::build_sample_trace_tree();
+        let mut spans = decode::decode_traces_request(&encoded, 1, None).unwrap();
+        spans[0].attributes.insert(
+            "http.request.header.authorization".into(),
+            "Bearer must-not-leave".into(),
+        );
+        spans[0].name = "SELECT * FROM users WHERE email='secret@example.com'".into();
+
+        let mirrored = cloud_span(&spans[0]);
+
+        assert!(mirrored.attributes.is_empty());
+        assert_eq!(mirrored.trace_id, spans[0].trace_id);
+        assert_eq!(mirrored.span_id, spans[0].span_id);
+        assert_eq!(mirrored.name, "span");
+        let serialized = serde_json::to_string(&mirrored).unwrap();
+        assert!(!serialized.contains("secret@example.com"));
+        assert!(!serialized.contains("must-not-leave"));
     }
 
     #[tokio::test]
@@ -583,6 +670,21 @@ mod tests {
         let stats = svc.pipeline_stats();
         assert_eq!(stats.spans_received, 1);
         assert!(stats.spans_dropped > 0 || stats.ingest_errors > 0);
+    }
+
+    #[tokio::test]
+    async fn failed_local_ingest_never_offers_spans_to_the_cloud_mirror() {
+        let mock = MockOtelStorage::new();
+        *mock.fail_store_spans.lock().unwrap() = Some("disk full".into());
+        let (svc, _) = make_service(mock);
+        let (_directory, link) = linked_cloud();
+        let svc = svc.with_cloud_link(link.clone());
+        let (_, encoded) = test_support::build_sample_trace_tree();
+        let spans = decode::decode_traces_request(&encoded, 1, None).unwrap();
+
+        assert!(svc.ingest_spans(spans).await.is_err());
+
+        assert_eq!(link.spooled(), 0, "local storage must succeed first");
     }
 
     #[tokio::test]

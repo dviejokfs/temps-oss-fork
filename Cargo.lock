@@ -10636,6 +10636,7 @@ dependencies = [
  "temps-auth",
  "temps-backup",
  "temps-blob",
+ "temps-cloud",
  "temps-config",
  "temps-core",
  "temps-database",
@@ -10693,6 +10694,26 @@ dependencies = [
  "utoipa-swagger-ui",
  "uuid",
  "x509-parser",
+]
+
+[[package]]
+name = "temps-cloud"
+version = "0.1.0-beta.55"
+dependencies = [
+ "anyhow",
+ "axum",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "temps-auth",
+ "temps-cloud-client",
+ "temps-config",
+ "temps-core",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]
@@ -12018,8 +12039,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "temps-ai",
  "temps-auth",
+ "temps-cloud-client",
+ "temps-cloud-protocol",
  "temps-config",
  "temps-core",
  "temps-database",

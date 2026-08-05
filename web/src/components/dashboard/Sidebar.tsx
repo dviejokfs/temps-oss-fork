@@ -187,6 +187,7 @@ const settingsGroups: SettingsGroupDef[] = [
       { title: 'Platform', url: '/settings', icon: Settings2 },
       { title: 'AI Providers', url: '/settings/ai-providers', icon: Sparkles },
       { title: 'Notifications', url: '/settings/notifications', icon: Bell },
+      { title: 'Temps Cloud', url: '/settings/cloud', icon: Cloud },
     ],
   },
   {

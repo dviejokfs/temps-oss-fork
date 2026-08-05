@@ -15,8 +15,9 @@
 //! silently... no: the worst it can do is *count a drop the operator can see*.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
+use tokio::sync::mpsc;
 
 use temps_cloud_protocol::SpanRecord;
 use uuid::Uuid;
@@ -28,6 +29,9 @@ use crate::{BackendUrl, CloudClient, CloudError};
 
 /// Spans per shipment. Small enough that one failure loses little progress.
 const BATCH_SIZE: usize = 500;
+/// Number of producer batches accepted before the mirror starts shedding load.
+/// The local telemetry store remains authoritative and is never affected.
+const INCOMING_BATCH_CAPACITY: usize = 8;
 
 /// What a flush attempt did. Returned so a caller can log or schedule backoff.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,8 +61,18 @@ struct PendingSubmission {
     spans: Vec<SpanRecord>,
 }
 
+struct IncomingBatch {
+    generation: u64,
+    spans: Vec<SpanRecord>,
+}
+
 pub struct CloudLink {
     state: RwLock<Option<EnrollmentState>>,
+    incoming_tx: mpsc::Sender<IncomingBatch>,
+    incoming_rx: Mutex<mpsc::Receiver<IncomingBatch>>,
+    incoming_spans: AtomicUsize,
+    incoming_dropped: AtomicU64,
+    linked: AtomicBool,
     spool: Mutex<Spool>,
     /// The active submission stays here until a matching full acknowledgement
     /// arrives, preserving its id across retries.
@@ -103,9 +117,16 @@ impl CloudLink {
             tracing::error!(error = %e, "link state unreadable; treating as unlinked");
             None
         });
+        let linked = state.as_ref().is_some_and(EnrollmentState::is_linked);
+        let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_BATCH_CAPACITY);
 
         Self {
             state: RwLock::new(state),
+            incoming_tx,
+            incoming_rx: Mutex::new(incoming_rx),
+            incoming_spans: AtomicUsize::new(0),
+            incoming_dropped: AtomicU64::new(0),
+            linked: AtomicBool::new(linked),
             spool: Mutex::new(Spool::with_default_capacity()),
             pending: Mutex::new(None),
             health: RwLock::new(MirrorHealth::Healthy),
@@ -148,6 +169,18 @@ impl CloudLink {
     }
 
     pub fn health(&self) -> MirrorHealth {
+        let spool_dropped = self
+            .spool
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .dropped();
+        let dropped = spool_dropped.saturating_add(self.incoming_dropped.load(Ordering::Relaxed));
+        if dropped > 0 {
+            return MirrorHealth::Dropping {
+                spooled: self.spooled(),
+                dropped,
+            };
+        }
         self.health
             .read()
             .unwrap_or_else(|p| p.into_inner())
@@ -162,10 +195,24 @@ impl CloudLink {
             .map(|s| s.instance_id)
     }
 
+    /// Lock-free fast-path hint for telemetry producers. Enrollment can race
+    /// with an offer; generation tagging prevents a raced batch crossing links.
+    pub fn is_linked(&self) -> bool {
+        self.linked.load(Ordering::Acquire)
+    }
+
     /// Point this instance at a backend without linking it yet.
     pub fn configure(&self, backend: BackendUrl) -> Result<(), crate::state::StateError> {
         let mut guard = self.state.write().unwrap_or_else(|p| p.into_inner());
         let next_url = backend.as_str().to_string();
+        if let Some(existing) = guard.as_ref() {
+            if existing.is_linked() && existing.base_url != next_url {
+                return Err(crate::state::StateError::BackendChangeRequiresDisconnect {
+                    current: existing.base_url.clone(),
+                    requested: next_url,
+                });
+            }
+        }
         let mut changed_origin = false;
         let next = match guard.as_ref() {
             Some(existing) => {
@@ -184,6 +231,7 @@ impl CloudLink {
         };
         next.save(&self.state_path)?;
         if changed_origin {
+            self.linked.store(false, Ordering::Release);
             self.spool
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -197,6 +245,10 @@ impl CloudLink {
         }
         *guard = Some(next);
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.linked.store(
+            guard.as_ref().is_some_and(EnrollmentState::is_linked),
+            Ordering::Release,
+        );
         Ok(())
     }
 
@@ -242,14 +294,32 @@ impl CloudLink {
             })?;
         *guard = Some(next);
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.linked.store(true, Ordering::Release);
         self.credential_rejected.store(false, Ordering::SeqCst);
         *self.health.write().unwrap_or_else(|p| p.into_inner()) = MirrorHealth::Healthy;
         Ok(())
     }
 
+    /// Revoke the active credential at its issuing backend.
+    ///
+    /// This deliberately leaves local state untouched. The caller may only
+    /// remove the local credential after this succeeds, or after the backend
+    /// confirms that the credential is already invalid.
+    pub async fn revoke(&self) -> Result<(), CloudError> {
+        let (base_url, token) = {
+            let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
+            let state = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
+            let token = state.token.clone().ok_or(CloudError::NotEnrolled)?;
+            (state.base_url.clone(), token)
+        };
+        let backend = self.parse_backend(&base_url)?;
+        CloudClient::new(backend)?.revoke(&token).await
+    }
+
     /// Forget the credential. Keeps the instance identity so re-linking later
     /// reattaches to the same record.
     pub fn disconnect(&self) -> Result<(), crate::state::StateError> {
+        self.linked.store(false, Ordering::Release);
         let mut guard = self.state.write().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = guard.as_mut() {
             let mut next = s.clone();
@@ -277,23 +347,27 @@ impl CloudLink {
     /// that does not exist would burn memory to no purpose. Telemetry is still
     /// stored locally by the instance itself — that path is untouched.
     pub fn record(&self, spans: Vec<SpanRecord>) {
-        let state = self.state.read().unwrap_or_else(|p| p.into_inner());
-        if !state.as_ref().is_some_and(|s| s.is_linked()) {
+        if spans.is_empty() || !self.linked.load(Ordering::Acquire) {
             return;
         }
-        let mut spool = self.spool.lock().unwrap_or_else(|p| p.into_inner());
-        spool.push(spans);
-
-        if spool.dropped() > 0 {
-            *self.health.write().unwrap_or_else(|p| p.into_inner()) = MirrorHealth::Dropping {
-                spooled: spool.len(),
-                dropped: spool.dropped(),
-            };
+        let count = spans.len();
+        self.incoming_spans.fetch_add(count, Ordering::Relaxed);
+        let batch = IncomingBatch {
+            generation: self.generation.load(Ordering::Acquire),
+            spans,
+        };
+        if let Err(error) = self.incoming_tx.try_send(batch) {
+            let dropped = error.into_inner().spans.len();
+            self.incoming_spans.fetch_sub(dropped, Ordering::Relaxed);
+            self.incoming_dropped
+                .fetch_add(dropped as u64, Ordering::Relaxed);
         }
-        drop(state);
     }
 
     pub fn spooled(&self) -> usize {
+        // Status reads are off the ingest path and may opportunistically move
+        // accepted producer batches into the bounded spool for an exact count.
+        self.drain_incoming();
         let queued = self.spool.lock().unwrap_or_else(|p| p.into_inner()).len();
         let pending = self
             .pending
@@ -301,12 +375,26 @@ impl CloudLink {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .map_or(0, |batch| batch.spans.len());
-        queued + pending
+        self.incoming_spans.load(Ordering::Relaxed) + queued + pending
+    }
+
+    fn drain_incoming(&self) {
+        let current_generation = self.generation.load(Ordering::Acquire);
+        let mut receiver = self.incoming_rx.lock().unwrap_or_else(|p| p.into_inner());
+        let mut spool = self.spool.lock().unwrap_or_else(|p| p.into_inner());
+        while let Ok(batch) = receiver.try_recv() {
+            self.incoming_spans
+                .fetch_sub(batch.spans.len(), Ordering::Relaxed);
+            if batch.generation == current_generation && self.linked.load(Ordering::Acquire) {
+                spool.push(batch.spans);
+            }
+        }
     }
 
     /// Ship one batch. Called on an interval by a background task.
     pub async fn flush(&self) -> FlushOutcome {
         let _flush = self.flush_lock.lock().await;
+        self.drain_incoming();
         let (base_url, token, generation) = {
             let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
             match guard.as_ref() {
@@ -394,7 +482,9 @@ impl CloudLink {
                 }
                 let spool = self.spool.lock().unwrap_or_else(|p| p.into_inner());
                 let spooled = spool.len() + count;
-                let dropped = spool.dropped();
+                let dropped = spool
+                    .dropped()
+                    .saturating_add(self.incoming_dropped.load(Ordering::Relaxed));
 
                 *self.health.write().unwrap_or_else(|p| p.into_inner()) = if dropped > 0 {
                     MirrorHealth::Dropping { spooled, dropped }

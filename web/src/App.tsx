@@ -257,6 +257,11 @@ const DockerRegistryPage = lazy(() =>
     default: m.DockerRegistryPage,
   }))
 )
+const CloudSettingsPage = lazy(() =>
+  import('./pages/settings/CloudSettingsPage').then((m) => ({
+    default: m.CloudSettingsPage,
+  }))
+)
 const SecurityPage = lazy(() =>
   import('./pages/settings/SecurityPage').then((m) => ({
     default: m.SecurityPage,
@@ -545,7 +550,8 @@ const FullAppRoutes = () => {
                   <Route path="rate-limiting" element={<RateLimitingPage />} />
                   <Route path="disk-monitoring" element={<DiskMonitoringPage />} />
                   <Route path="build-limits" element={<BuildLimitsPage />} />
-                  <Route path="metrics-monitoring" element={<MetricsMonitoringPage />} />
+            <Route path="metrics-monitoring" element={<MetricsMonitoringPage />} />
+            <Route path="cloud" element={<CloudSettingsPage />} />
                   <Route path="nodes" element={<NodesPage />} />
                   <Route path="nodes/:nodeId" element={<NodeDetailPage />} />
                   <Route path="plugins" element={<PluginsPage />} />

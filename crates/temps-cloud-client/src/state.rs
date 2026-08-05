@@ -13,6 +13,9 @@ use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum StateError {
+    #[error("Disconnect from {current} before changing the managed backend to {requested}")]
+    BackendChangeRequiresDisconnect { current: String, requested: String },
+
     #[error("Failed to read link state at {path}: {reason}")]
     Read { path: String, reason: String },
 

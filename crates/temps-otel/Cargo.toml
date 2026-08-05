@@ -18,6 +18,8 @@ temps-deployer = { path = "../temps-deployer" }
 temps-auth = { path = "../temps-auth" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
+temps-cloud-client = { path = "../temps-cloud-client" }
+temps-cloud-protocol = { path = "../temps-cloud-protocol" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -91,3 +93,4 @@ anyhow = { workspace = true }
 # `http_wait_plain` enables the HTTP /ping readiness wait — the clickhouse-server
 # image never logs "Ready for connections" to stdout/stderr, only to its log file.
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
+tempfile.workspace = true

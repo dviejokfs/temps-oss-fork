@@ -219,6 +219,41 @@ impl CloudClient {
         Err(CloudError::EnrollmentRefused { detail })
     }
 
+    /// Revoke an instance credential before removing the local copy.
+    pub async fn revoke(&self, token: &str) -> Result<(), CloudError> {
+        let res = self
+            .http
+            .post(self.backend.endpoint("/v1/revoke"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| CloudError::Unreachable {
+                reason: e.to_string(),
+                spooled_bytes: 0,
+            })?;
+
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        match status.as_u16() {
+            401 | 403 => Err(CloudError::CredentialRejected),
+            429 | 500..=599 => Err(CloudError::Unreachable {
+                reason: format!("backend returned {status}"),
+                spooled_bytes: 0,
+            }),
+            _ => {
+                let detail = res
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|value| value["detail"].as_str().map(String::from))
+                    .unwrap_or_else(|| format!("backend returned {status}"));
+                Err(CloudError::Rejected { detail })
+            }
+        }
+    }
+
     /// Mirror a batch of spans. Never called on a request path.
     pub async fn ship(
         &self,

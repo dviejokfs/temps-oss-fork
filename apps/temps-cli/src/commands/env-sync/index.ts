@@ -102,11 +102,12 @@ async function pull(
   // Generate .env content
   const envContent = filteredVars
     .map(v => {
-      const escapedValue = v.value.includes('\n') || v.value.includes('"')
-        ? `"${v.value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
-        : v.value.includes(' ') || v.value.includes('#')
-          ? `"${v.value}"`
-          : v.value
+      const value = v.value ?? ''
+      const escapedValue = value.includes('\n') || value.includes('"')
+        ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
+        : value.includes(' ') || value.includes('#')
+          ? `"${value}"`
+          : value
       return `${v.key}=${escapedValue}`
     })
     .join('\n')

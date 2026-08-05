@@ -4,10 +4,12 @@
 //! sentence naming what is wrong and what to do about it — never a spinner,
 //! never a silent absence, and never a bare boolean the UI has to interpret.
 
+use serde::Serialize;
 use temps_cloud_protocol::Unavailable;
 
 /// Whether this instance is linked to a managed account.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum LinkStatus {
     /// No backend configured. The UI should offer to connect one rather than
     /// hiding the feature — an unconfigured capability must onboard, not vanish.
@@ -54,7 +56,8 @@ impl LinkStatus {
 }
 
 /// How the mirror is doing, independent of whether the link is valid.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum MirrorHealth {
     /// Everything shipped.
     Healthy,

@@ -11,10 +11,17 @@ import {
   keyValue,
   error as errorOutput,
 } from '../../ui/output.js'
-import { startSpinner, succeedSpinner, failSpinner, updateSpinner } from '../../ui/spinner.js'
+import { startSpinner, succeedSpinner, failSpinner, updateSpinner, withSpinner } from '../../ui/spinner.js'
 import { getCloudUrl, cloudFetch, isCloudAuthenticated } from '../../lib/cloud-client.js'
 import { registerCloudVpsCommands } from './vps.js'
 import { registerCloudBillingCommands } from './billing.js'
+import { requireAuth } from '../../config/store.js'
+import { client, getErrorMessage, setupClient } from '../../lib/api-client.js'
+import {
+  disconnectCloud as disconnectInstance,
+  enrollCloud as enrollInstance,
+  getCloudStatus as getInstanceCloudStatus,
+} from '../../api/sdk.gen.js'
 
 interface DeviceCodeResponse {
   device_code: string
@@ -222,6 +229,54 @@ async function cloudWhoami(): Promise<void> {
   newline()
 }
 
+async function instanceStatus(options: { json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+  const result = await withSpinner('Reading Temps Cloud link...', async () => {
+    const { data, error } = await getInstanceCloudStatus({ client })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+  if (!result) return
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
+    return
+  }
+  newline()
+  header(`${icons.globe} Instance Cloud Link`)
+  keyValue('Status', result.status.replaceAll('_', ' '))
+  keyValue('Health', result.health.replaceAll('_', ' '))
+  keyValue('Instance', result.instance_id ?? 'not enrolled')
+  keyValue('Buffered spans', result.spooled_spans)
+  info(result.status_message)
+  if (result.health !== 'healthy') info(result.health_message)
+  newline()
+}
+
+async function connectInstance(options: { code: string }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+  const result = await withSpinner('Connecting this instance...', async () => {
+    const { data, error } = await enrollInstance({
+      client,
+      body: { enrollment_code: options.code },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+  if (result) info(`Connected. ${result.status_message}`)
+}
+
+async function disconnectCurrentInstance(): Promise<void> {
+  await requireAuth()
+  await setupClient()
+  await withSpinner('Disconnecting this instance...', async () => {
+    const { error } = await disconnectInstance({ client })
+    if (error) throw new Error(getErrorMessage(error))
+  })
+  info('Instance disconnected from Temps Cloud')
+}
+
 export function registerCloudCommands(program: Command): void {
   const cloud = program
     .command('cloud')
@@ -241,6 +296,23 @@ export function registerCloudCommands(program: Command): void {
     .command('whoami')
     .description('Show current Temps Cloud account')
     .action(cloudWhoami)
+
+  cloud
+    .command('status')
+    .description('Show this self-hosted instance\'s Temps Cloud link')
+    .option('--json', 'Output JSON')
+    .action(instanceStatus)
+
+  cloud
+    .command('connect')
+    .description('Connect this self-hosted instance using an enrollment code')
+    .requiredOption('--code <code>', 'Single-use enrollment code from Temps Cloud')
+    .action(connectInstance)
+
+  cloud
+    .command('disconnect')
+    .description('Disconnect this self-hosted instance from Temps Cloud')
+    .action(disconnectCurrentInstance)
 
   registerCloudVpsCommands(cloud)
   registerCloudBillingCommands(cloud)

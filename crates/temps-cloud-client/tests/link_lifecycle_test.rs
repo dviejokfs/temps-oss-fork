@@ -23,6 +23,7 @@ struct Stub {
     received: Arc<AtomicUsize>,
     submissions: Arc<Mutex<Vec<Uuid>>>,
     enroll_delay_ms: Arc<AtomicU64>,
+    revoked: Arc<AtomicUsize>,
 }
 
 async fn serve(stub: Stub) -> String {
@@ -68,6 +69,19 @@ async fn serve(stub: Stub) -> String {
                     )
                 },
             ),
+        )
+        .route(
+            "/v1/revoke",
+            post(|State(s): State<Stub>| async move {
+                let code = s.status.load(Ordering::SeqCst);
+                if code == 200 {
+                    s.revoked.fetch_add(1, Ordering::SeqCst);
+                }
+                (
+                    axum::http::StatusCode::from_u16(code).unwrap(),
+                    Json(serde_json::json!({"detail": "stub revoke"})),
+                )
+            }),
         )
         .with_state(stub);
 
@@ -153,6 +167,34 @@ async fn the_full_lifecycle_configure_enroll_record_flush() {
     assert_eq!(stub.received.load(Ordering::SeqCst), 3);
     assert_eq!(l.spooled(), 0);
     assert_eq!(l.health(), MirrorHealth::Healthy);
+}
+
+#[tokio::test]
+async fn a_saturated_ingest_queue_drops_only_the_mirror_and_reports_it() {
+    let d = tempfile::tempdir().unwrap();
+    let url = serve(Stub {
+        status: Arc::new(AtomicU16::new(200)),
+        ..Default::default()
+    })
+    .await;
+
+    let link = link(&d);
+    link.configure(backend(&url)).unwrap();
+    link.enroll("abcd-2345").await.unwrap();
+
+    for _ in 0..9 {
+        link.record(spans(1));
+    }
+
+    assert_eq!(link.spooled(), 8, "the producer queue must stay bounded");
+    assert_eq!(
+        link.health(),
+        MirrorHealth::Dropping {
+            spooled: 8,
+            dropped: 1,
+        },
+        "mirror pressure must be visible without affecting local ingest"
+    );
 }
 
 #[tokio::test]
@@ -265,7 +307,7 @@ async fn an_outage_buffers_and_a_recovery_drains_without_loss() {
 }
 
 #[tokio::test]
-async fn changing_backend_origin_revokes_the_existing_credential() {
+async fn changing_backend_origin_requires_remote_disconnect_first() {
     let d = tempfile::tempdir().unwrap();
     let first = serve(Stub {
         status: Arc::new(AtomicU16::new(200)),
@@ -285,16 +327,15 @@ async fn changing_backend_origin_revokes_the_existing_credential() {
     l.record(spans(2));
     assert_eq!(l.spooled(), 2);
 
-    l.configure(backend(&second)).unwrap();
+    let error = l.configure(backend(&second)).unwrap_err().to_string();
 
-    assert!(matches!(l.status(), LinkStatus::AwaitingEnrollment { .. }));
+    assert!(error.contains("Disconnect"), "unexpected error: {error}");
+    assert!(matches!(l.status(), LinkStatus::Linked { .. }));
     assert_eq!(
         l.spooled(),
-        0,
-        "telemetry buffered for one origin must not cross to another"
+        2,
+        "a refused origin change must retain the active link's telemetry"
     );
-    l.record(spans(1));
-    assert_eq!(l.flush().await, FlushOutcome::NotLinked);
 }
 
 #[tokio::test]
@@ -353,11 +394,11 @@ async fn the_credential_survives_a_restart() {
 #[tokio::test]
 async fn disconnecting_clears_the_credential_but_keeps_the_identity() {
     let d = tempfile::tempdir().unwrap();
-    let url = serve(Stub {
+    let stub = Stub {
         status: Arc::new(AtomicU16::new(200)),
         ..Default::default()
-    })
-    .await;
+    };
+    let url = serve(stub.clone()).await;
 
     let l = link(&d);
     l.configure(backend(&url)).unwrap();
@@ -365,8 +406,10 @@ async fn disconnecting_clears_the_credential_but_keeps_the_identity() {
     let id = l.instance_id().unwrap();
     l.record(spans(5));
 
+    l.revoke().await.unwrap();
     l.disconnect().unwrap();
 
+    assert_eq!(stub.revoked.load(Ordering::SeqCst), 1);
     assert!(matches!(l.status(), LinkStatus::AwaitingEnrollment { .. }));
     assert_eq!(
         l.spooled(),
@@ -374,6 +417,25 @@ async fn disconnecting_clears_the_credential_but_keeps_the_identity() {
         "buffered data for a severed link is pointless"
     );
     assert_eq!(l.instance_id().unwrap(), id, "re-linking must reattach");
+}
+
+#[tokio::test]
+async fn failed_remote_revocation_keeps_the_local_link() {
+    let d = tempfile::tempdir().unwrap();
+    let stub = Stub {
+        status: Arc::new(AtomicU16::new(200)),
+        ..Default::default()
+    };
+    let url = serve(stub.clone()).await;
+    let link = link(&d);
+    link.configure(backend(&url)).unwrap();
+    link.enroll("abcd-2345").await.unwrap();
+
+    stub.status.store(503, Ordering::SeqCst);
+    assert!(link.revoke().await.is_err());
+
+    assert!(matches!(link.status(), LinkStatus::Linked { .. }));
+    assert_eq!(stub.revoked.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

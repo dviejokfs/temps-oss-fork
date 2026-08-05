@@ -23,6 +23,10 @@ pub struct AppSettings {
     /// disables DNS record sync regardless of per-domain opt-in.
     pub edge_target: Option<String>,
 
+    /// Managed control-plane connection. Credentials are deliberately not
+    /// stored here; they live in the owner-only cloud-link state file.
+    pub cloud: CloudSettings,
+
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
 
@@ -133,6 +137,22 @@ pub struct AppSettings {
     /// accidentally overwrite the self-recorded value.
     #[serde(default)]
     pub console_version: Option<String>,
+}
+
+/// Non-secret managed control-plane settings stored with application settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct CloudSettings {
+    /// HTTPS origin used for enrollment and telemetry mirroring.
+    pub backend_url: String,
+}
+
+impl Default for CloudSettings {
+    fn default() -> Self {
+        Self {
+            backend_url: "https://app.temps.sh".to_string(),
+        }
+    }
 }
 
 /// Cluster-DNS resolver settings (ADR-024, experimental beta).
@@ -883,6 +903,7 @@ impl Default for AppSettings {
             internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             edge_target: None,
+            cloud: CloudSettings::default(),
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
             dns_provider: DnsProviderSettings::default(),

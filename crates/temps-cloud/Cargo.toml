@@ -1,0 +1,25 @@
+[package]
+name = "temps-cloud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host integration for the optional Temps managed control plane."
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-cloud-client = { path = "../temps-cloud-client" }
+temps-config = { path = "../temps-config" }
+temps-core = { path = "../temps-core" }
+
+anyhow.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+utoipa.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

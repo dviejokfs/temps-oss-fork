@@ -41,6 +41,7 @@ temps-backup = { path = "../temps-backup" }
 temps-revenue = { path = "../temps-revenue" }
 temps-observability = { path = "../temps-observability" }
 temps-config = { path = "../temps-config" }
+temps-cloud = { path = "../temps-cloud" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }

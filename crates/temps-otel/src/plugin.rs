@@ -476,12 +476,15 @@ impl TempsPlugin for OtelPlugin {
             ));
 
             // Create the main OTel service
-            let otel_service = Arc::new(OtelService::new(
-                storage.clone(),
-                auth_service,
-                rate_limiter,
-                config.max_concurrent_ingest_requests,
-            ));
+            let otel_service = Arc::new(
+                OtelService::new(
+                    storage.clone(),
+                    auth_service,
+                    rate_limiter,
+                    config.max_concurrent_ingest_requests,
+                )
+                .with_cloud_link(context.require_service::<temps_cloud_client::CloudLink>()),
+            );
             context.register_service(otel_service.clone());
             // Also expose the same service behind the storage-agnostic read
             // contract so read-only consumers (e.g. the AI debugging chat in
