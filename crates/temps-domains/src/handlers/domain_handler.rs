@@ -1863,6 +1863,7 @@ async fn setup_dns_challenge(
     Json(request): Json<SetupDnsChallengeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DomainsWrite);
+    permission_guard!(auth, DnsProvidersWrite);
 
     // Check if DNS provider service is available
     let dns_provider_service = app_state.dns_provider_service.as_ref().ok_or_else(|| {
@@ -1954,6 +1955,47 @@ async fn setup_dns_challenge(
                 .build()
         })?;
 
+    // This governance check intentionally precedes zone lookup and provider-client
+    // construction, which decrypts credentials and can initiate external calls.
+    ensure_dns_provider_active(&dns_provider, &domain.domain, domain_id)?;
+
+    let managed_domain = dns_provider_service
+        .find_verified_zone_for_provider(request.dns_provider_id, &domain.domain)
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to find a verified DNS zone for domain {} and provider {}: {}",
+                domain.domain, request.dns_provider_id, e
+            );
+            match e {
+                temps_dns::errors::DnsError::AmbiguousManagedDomain { .. } => {
+                    ErrorBuilder::new(StatusCode::CONFLICT)
+                        .title("Ambiguous Managed DNS Zone")
+                        .detail(format!(
+                            "Multiple verified managed DNS zones match domain {} for provider {}. Remove the duplicate managed-domain entries and retry.",
+                            domain.domain, request.dns_provider_id
+                        ))
+                        .build()
+                }
+                _ => ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .title("DNS Zone Lookup Failed")
+                    .detail(format!(
+                        "Failed to verify that DNS provider {} manages domain {}",
+                        request.dns_provider_id, domain.domain
+                    ))
+                    .build(),
+            }
+        })?
+        .ok_or_else(|| {
+            ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("DNS Provider Does Not Manage Domain")
+                .detail(format!(
+                    "DNS provider {} has no verified zone covering domain {}",
+                    request.dns_provider_id, domain.domain
+                ))
+                .build()
+        })?;
+
     // Create DNS provider instance
     let provider_instance = dns_provider_service
         .create_provider_instance(&dns_provider)
@@ -1965,8 +2007,7 @@ async fn setup_dns_challenge(
                 .build()
         })?;
 
-    // Extract the base domain for the DNS provider
-    let base_domain = extract_base_domain(&domain.domain);
+    let authoritative_zone = managed_domain.domain;
 
     info!(
         "Setting up {} DNS TXT record(s) for {} using provider {}",
@@ -1975,8 +2016,12 @@ async fn setup_dns_challenge(
         dns_provider.name
     );
 
-    let (results, records_created) =
-        setup_dns_txt_records(provider_instance.as_ref(), &base_domain, &dns_txt_records).await;
+    let (results, records_created) = setup_dns_txt_records(
+        provider_instance.as_ref(),
+        &authoritative_zone,
+        &dns_txt_records,
+    )
+    .await;
 
     let total_records = dns_txt_records.len() as u32;
     let all_success = records_created == total_records;
@@ -2020,17 +2065,22 @@ async fn setup_dns_challenge(
     Ok(Json(response))
 }
 
-/// Extract the base domain from a full domain name (e.g., "sub.example.com" -> "example.com")
-pub(crate) fn extract_base_domain(domain: &str) -> String {
-    // Handle wildcard domains
-    let domain = domain.strip_prefix("*.").unwrap_or(domain);
-
-    let parts: Vec<&str> = domain.split('.').collect();
-    if parts.len() >= 2 {
-        parts[parts.len() - 2..].join(".")
-    } else {
-        domain.to_string()
+fn ensure_dns_provider_active(
+    provider: &temps_entities::dns_providers::Model,
+    domain: &str,
+    domain_id: i32,
+) -> Result<(), Problem> {
+    if provider.is_active {
+        return Ok(());
     }
+
+    Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+        .title("DNS Provider Is Inactive")
+        .detail(format!(
+            "DNS provider {} ({}) is inactive and cannot set up the DNS challenge for domain {} (ID {})",
+            provider.id, provider.name, domain, domain_id
+        ))
+        .build())
 }
 
 /// Extract the record name relative to the base domain
@@ -2089,6 +2139,82 @@ pub(crate) async fn setup_dns_txt_records(
     (results, records_created)
 }
 
+pub(crate) enum DnsAutomationAuthorization {
+    Allowed,
+    Denied(String),
+    AuthorizationError(String),
+}
+
+/// Validate and authorize an unattended DNS mutation before callers construct
+/// a provider client. This function is deliberately provider-independent so a
+/// denied or failed decision cannot decrypt provider credentials.
+pub(crate) async fn authorize_dns_automation_request(
+    gate: &dyn temps_core::DnsAutomationGate,
+    request: &temps_core::DnsAutomationRequest,
+    actual_provider_id: i32,
+) -> DnsAutomationAuthorization {
+    if let Err(reason) = validate_dns_automation_request(request, actual_provider_id) {
+        return DnsAutomationAuthorization::Denied(reason);
+    }
+    match gate.authorize(request).await {
+        Ok(temps_core::DnsAutomationDecision::Allow) => DnsAutomationAuthorization::Allowed,
+        // Policy implementations receive the ACME proof in `request`. Their
+        // free-form reason must never cross into logs or durable audit data,
+        // because a buggy implementation could reflect that proof verbatim.
+        Ok(temps_core::DnsAutomationDecision::Deny { .. }) => {
+            DnsAutomationAuthorization::Denied("automation policy denied the request".to_string())
+        }
+        Err(_) => DnsAutomationAuthorization::AuthorizationError(
+            "automation policy evaluation failed".to_string(),
+        ),
+    }
+}
+
+fn normalize_dns_name(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+pub(crate) fn validate_dns_automation_request(
+    request: &temps_core::DnsAutomationRequest,
+    actual_provider_id: i32,
+) -> Result<(), String> {
+    if request.purpose != temps_core::DnsAutomationPurpose::AcmeDns01 {
+        return Err("background DNS mutation boundary accepts only ACME DNS-01 requests".into());
+    }
+    if request.provider_id != actual_provider_id {
+        return Err("authorized DNS provider does not match the provider instance".into());
+    }
+    if request.mutations.is_empty() {
+        return Err("background DNS mutation batch must not be empty".into());
+    }
+
+    let zone = normalize_dns_name(&request.zone);
+    let domain = normalize_dns_name(request.domain.trim_start_matches("*."));
+    if zone.is_empty()
+        || domain.is_empty()
+        || (domain != zone && !domain.ends_with(&format!(".{zone}")))
+    {
+        return Err("request domain is not covered by the authoritative DNS zone".into());
+    }
+
+    let expected_name = format!("_acme-challenge.{domain}");
+    for mutation in &request.mutations {
+        if !mutation.record_type.eq_ignore_ascii_case("TXT") {
+            return Err("background DNS mutation boundary accepts only TXT records".into());
+        }
+        if mutation.value.trim().is_empty() {
+            return Err("ACME DNS-01 mutation values must not be empty".into());
+        }
+        if normalize_dns_name(&mutation.name) != expected_name {
+            return Err(format!(
+                "DNS mutation name must be exactly {expected_name} for this ACME authorization"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Create a single ACME challenge TXT record using the DNS provider.
 /// Callers must remove stale records for every name in the batch before calling this
 /// (see `setup_dns_txt_records`) -- removing here, per-record, would delete a sibling
@@ -2104,8 +2230,8 @@ async fn create_acme_txt_record(
     let record_name = acme_txt_record_name(base_domain, name);
 
     debug!(
-        "Creating TXT record: name={} (relative: {}), value={}, base_domain={}",
-        name, record_name, value, base_domain
+        "Creating TXT record: name={} (relative: {}), base_domain={}",
+        name, record_name, base_domain
     );
 
     let request = DnsRecordRequest {
@@ -2120,8 +2246,8 @@ async fn create_acme_txt_record(
     match provider.create_record(base_domain, request).await {
         Ok(_record) => {
             info!(
-                "Successfully created TXT record {} = {} for {}",
-                name, value, base_domain
+                "Successfully created TXT record {} for {}",
+                name, base_domain
             );
             DnsChallengeRecordResult {
                 name: name.to_string(),
@@ -2366,6 +2492,38 @@ mod tests {
     };
     use temps_dns::DnsError;
 
+    #[test]
+    fn inactive_dns_provider_is_rejected_with_context() {
+        let now = chrono::Utc::now();
+        let provider = temps_entities::dns_providers::Model {
+            id: 42,
+            name: "disabled-cloudflare".to_string(),
+            provider_type: "cloudflare".to_string(),
+            credentials: "encrypted".to_string(),
+            is_active: false,
+            description: None,
+            last_used_at: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let problem = ensure_dns_provider_active(&provider, "api.example.com", 17)
+            .expect_err("inactive providers must be rejected before DNS setup");
+
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("DNS Provider Is Inactive")
+        );
+        let detail = problem.body.get("detail").and_then(|value| value.as_str());
+        assert!(detail.is_some_and(|detail| {
+            detail.contains("42 (disabled-cloudflare)")
+                && detail.contains("api.example.com")
+                && detail.contains("ID 17")
+        }));
+    }
+
     /// In-memory DNS provider used to drive `setup_dns_txt_records` end-to-end without
     /// a live Cloudflare/Route53/etc. account. Mirrors the real providers' semantics:
     /// `list_records`/`remove_record` see every record in the zone, `create_record`
@@ -2373,6 +2531,7 @@ mod tests {
     struct MockDnsProvider {
         records: Mutex<Vec<DnsRecord>>,
         next_id: AtomicU32,
+        fail_create_after: Option<u32>,
     }
 
     impl MockDnsProvider {
@@ -2380,6 +2539,7 @@ mod tests {
             Self {
                 records: Mutex::new(Vec::new()),
                 next_id: AtomicU32::new(1),
+                fail_create_after: None,
             }
         }
 
@@ -2387,6 +2547,14 @@ mod tests {
             let provider = Self::new();
             *provider.records.lock().unwrap() = records;
             provider
+        }
+
+        fn failing_after(successful_creates: u32) -> Self {
+            Self {
+                records: Mutex::new(Vec::new()),
+                next_id: AtomicU32::new(1),
+                fail_create_after: Some(successful_creates),
+            }
         }
 
         fn record_names(&self) -> Vec<(String, String)> {
@@ -2461,6 +2629,12 @@ mod tests {
             request: DnsRecordRequest,
         ) -> Result<DnsRecord, DnsError> {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst).to_string();
+            if self
+                .fail_create_after
+                .is_some_and(|limit| id.parse::<u32>().unwrap_or(u32::MAX) > limit)
+            {
+                return Err(DnsError::ApiError("injected create failure".to_string()));
+            }
             let record = DnsRecord {
                 id: Some(id),
                 zone: domain.to_string(),
@@ -2573,5 +2747,233 @@ mod tests {
             .iter()
             .any(|(n, v)| n == "_acme-challenge" && v == "fresh-token"));
         assert!(remaining.iter().any(|(n, _)| n == "www"));
+    }
+
+    struct TestAutomationGate {
+        decision: Result<temps_core::DnsAutomationDecision, String>,
+    }
+
+    struct PanicAutomationGate;
+
+    #[async_trait]
+    impl temps_core::DnsAutomationGate for PanicAutomationGate {
+        async fn authorize(
+            &self,
+            _request: &temps_core::DnsAutomationRequest,
+        ) -> Result<temps_core::DnsAutomationDecision, temps_core::DnsAutomationError> {
+            panic!("invalid requests must be rejected before the authorization gate")
+        }
+    }
+
+    #[async_trait]
+    impl temps_core::DnsAutomationGate for TestAutomationGate {
+        async fn authorize(
+            &self,
+            request: &temps_core::DnsAutomationRequest,
+        ) -> Result<temps_core::DnsAutomationDecision, temps_core::DnsAutomationError> {
+            self.decision.clone().map_err(|reason| {
+                temps_core::DnsAutomationError::policy_evaluation_failed(request, reason)
+            })
+        }
+    }
+
+    fn automation_request(records: &[(String, String)]) -> temps_core::DnsAutomationRequest {
+        temps_core::DnsAutomationRequest {
+            purpose: temps_core::DnsAutomationPurpose::AcmeDns01,
+            domain: "*.example.com".to_string(),
+            zone: "example.com".to_string(),
+            provider_id: 7,
+            provider_name: "test".to_string(),
+            mutations: records
+                .iter()
+                .map(|(name, value)| temps_core::DnsAutomationMutation {
+                    record_type: "TXT".to_string(),
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_automation_does_not_touch_provider() {
+        let provider = MockDnsProvider::seed(vec![txt_record("1", "_acme-challenge", "stale")]);
+        let records = vec![(
+            "_acme-challenge.example.com".to_string(),
+            "fresh".to_string(),
+        )];
+        let result = authorize_dns_automation_request(
+            &TestAutomationGate {
+                decision: Ok(temps_core::DnsAutomationDecision::Deny {
+                    reason: "fresh".to_string(),
+                }),
+            },
+            &automation_request(&records),
+            7,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            DnsAutomationAuthorization::Denied(reason)
+                if reason == "automation policy denied the request" && !reason.contains("fresh")
+        ));
+        assert_eq!(
+            provider.record_names(),
+            vec![("_acme-challenge".to_string(), "stale".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_error_does_not_touch_provider() {
+        let provider = MockDnsProvider::seed(vec![txt_record("1", "_acme-challenge", "stale")]);
+        let records = vec![(
+            "_acme-challenge.example.com".to_string(),
+            "fresh".to_string(),
+        )];
+        let result = authorize_dns_automation_request(
+            &TestAutomationGate {
+                decision: Err("fresh".to_string()),
+            },
+            &automation_request(&records),
+            7,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            DnsAutomationAuthorization::AuthorizationError(reason)
+                if reason == "automation policy evaluation failed" && !reason.contains("fresh")
+        ));
+        assert_eq!(provider.record_names().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_automation_requests_do_not_touch_gate_or_provider() {
+        let invalid_cases = [
+            automation_request(&[]),
+            automation_request(&[("_acme-challenge.example.com".to_string(), " ".to_string())]),
+            automation_request(&[(
+                "_acme-challenge.attacker.example".to_string(),
+                "token".to_string(),
+            )]),
+        ];
+
+        for request in invalid_cases {
+            let provider = MockDnsProvider::seed(vec![txt_record("1", "_acme-challenge", "stale")]);
+            let result = authorize_dns_automation_request(&PanicAutomationGate, &request, 7).await;
+
+            assert!(matches!(result, DnsAutomationAuthorization::Denied(_)));
+            assert_eq!(
+                provider.record_names(),
+                vec![("_acme-challenge".to_string(), "stale".to_string())]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_identity_mismatch_does_not_touch_gate_or_provider() {
+        let provider = MockDnsProvider::new();
+        let request = automation_request(&[(
+            "_acme-challenge.example.com".to_string(),
+            "token".to_string(),
+        )]);
+
+        let result = authorize_dns_automation_request(&PanicAutomationGate, &request, 99).await;
+
+        assert!(matches!(result, DnsAutomationAuthorization::Denied(_)));
+        assert!(provider.record_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn allowed_automation_replaces_only_acme_txt_records() {
+        let provider = MockDnsProvider::seed(vec![
+            txt_record("1", "_acme-challenge", "stale"),
+            txt_record("2", "www", "unrelated"),
+        ]);
+        let records = vec![(
+            "_acme-challenge.example.com".to_string(),
+            "fresh".to_string(),
+        )];
+        let authorization = authorize_dns_automation_request(
+            &TestAutomationGate {
+                decision: Ok(temps_core::DnsAutomationDecision::Allow),
+            },
+            &automation_request(&records),
+            7,
+        )
+        .await;
+        assert!(matches!(authorization, DnsAutomationAuthorization::Allowed));
+        let (results, records_created) =
+            setup_dns_txt_records(&provider, "example.com", &records).await;
+        assert_eq!(records_created, 1);
+        assert!(results.iter().all(|result| result.success));
+        let remaining = provider.record_names();
+        assert!(remaining
+            .iter()
+            .any(|(name, value)| { name == "_acme-challenge" && value == "fresh" }));
+        assert!(remaining.iter().any(|(name, _)| name == "www"));
+    }
+
+    #[tokio::test]
+    async fn authorized_setup_uses_the_request_authoritative_zone() {
+        let provider = MockDnsProvider::new();
+        let mut request = automation_request(&[(
+            "_acme-challenge.api.dev.example.com".to_string(),
+            "fresh".to_string(),
+        )]);
+        request.domain = "api.dev.example.com".to_string();
+        request.zone = "dev.example.com".to_string();
+
+        let authorization = authorize_dns_automation_request(
+            &TestAutomationGate {
+                decision: Ok(temps_core::DnsAutomationDecision::Allow),
+            },
+            &request,
+            7,
+        )
+        .await;
+
+        assert!(matches!(authorization, DnsAutomationAuthorization::Allowed));
+        let records = request
+            .mutations
+            .iter()
+            .map(|mutation| (mutation.name.clone(), mutation.value.clone()))
+            .collect::<Vec<_>>();
+        setup_dns_txt_records(&provider, &request.zone, &records).await;
+        assert_eq!(
+            provider.record_names(),
+            vec![("_acme-challenge.api".to_string(), "fresh".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_publish_failure_is_reported() {
+        let provider = MockDnsProvider::failing_after(1);
+        let records = vec![
+            (
+                "_acme-challenge.example.com".to_string(),
+                "first".to_string(),
+            ),
+            (
+                "_acme-challenge.example.com".to_string(),
+                "second".to_string(),
+            ),
+        ];
+        let request = automation_request(&records);
+        let authorization = authorize_dns_automation_request(
+            &TestAutomationGate {
+                decision: Ok(temps_core::DnsAutomationDecision::Allow),
+            },
+            &request,
+            7,
+        )
+        .await;
+        assert!(matches!(authorization, DnsAutomationAuthorization::Allowed));
+        let (results, records_created) =
+            setup_dns_txt_records(&provider, &request.zone, &records).await;
+        assert_eq!(records_created, 1);
+        assert_eq!(results.len(), 2);
+        assert!(!results[1].success);
     }
 }

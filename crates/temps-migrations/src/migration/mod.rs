@@ -174,6 +174,7 @@ mod m20260803_000001_add_template_slug_to_projects;
 mod m20260803_000002_add_step_up_expires_at_to_sessions;
 mod m20260804_000001_add_ai_data_access_to_external_services;
 mod m20260804_000001_add_must_change_password_to_users;
+pub mod m20260805_000001_index_normalized_managed_domains;
 
 pub struct Migrator;
 
@@ -363,6 +364,7 @@ impl MigratorTrait for Migrator {
             Box::new(
                 m20260804_000001_add_ai_data_access_to_external_services::Migration,
             ),
+            Box::new(m20260805_000001_index_normalized_managed_domains::Migration),
         ]
     }
 }

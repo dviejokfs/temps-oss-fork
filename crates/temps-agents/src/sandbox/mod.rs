@@ -7,6 +7,23 @@ pub mod pty_agent_bundle;
 pub mod routing;
 pub mod user;
 
+/// The Docker named volume holding `/home/temps` for a sandbox whose
+/// container suffix is `label`.
+///
+/// Public because the standalone sandbox service derives that label itself
+/// (it strips `sbx_` off the `public_id`) and a test needs to prove the two
+/// crates still agree — the leak this replaced was precisely two places
+/// deriving one identity independently. Production code goes through
+/// `DockerSandboxProvider::sandbox_names`.
+pub fn home_volume_name_for_label(label: &str) -> String {
+    format!(
+        "{}{}{}",
+        docker::HOME_VOLUME_PREFIX,
+        docker::HOME_VOLUME_SCHEME,
+        label
+    )
+}
+
 pub use user::{
     SANDBOX_CHOWN, SANDBOX_GID, SANDBOX_GROUP, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER,
     SANDBOX_WORK_DIR,
@@ -410,6 +427,22 @@ pub trait SandboxProvider: Send + Sync {
     /// uses this to preserve Claude auth / shell history across a session
     /// close+reopen cycle.
     async fn destroy(&self, handle: &SandboxHandle, purge_volumes: bool) -> Result<(), AgentError>;
+
+    // NOTE: there is deliberately no background "reclaim orphaned storage"
+    // hook here. Sandbox storage is freed only by an explicit destroy,
+    // which knows exactly which volume belongs to the sandbox being
+    // deleted. A sweep has to *infer* that instead, and every predicate we
+    // tried infers it wrong somewhere: "no container references it" also
+    // describes a sandbox mid-recreate whose image is still pulling, and
+    // "no database row claims it" also describes every sandbox belonging to
+    // a second temps instance sharing the same Docker daemon, or to a
+    // database that was restored, swapped, or cascade-deleted. Getting it
+    // wrong destroys a user's `/home/temps` — Claude credentials, shell
+    // history, project state — silently and irreversibly.
+    //
+    // Volumes stranded by older builds are reclaimed by the operator with
+    // `docker volume prune --filter label=sh.temps.sandbox.home`, which is
+    // explicit, reviewable, and cannot run while they aren't looking.
 
     /// Stop a running sandbox without removing it. Default implementation
     /// reports the operation as unsupported so non-Docker backends compile
