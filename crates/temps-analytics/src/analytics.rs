@@ -2137,6 +2137,10 @@ impl Analytics for AnalyticsService {
             "pv.page_path IS NOT NULL".to_string(),
             "pv.page_path != ''".to_string(),
             "pv.event_type = 'page_view'".to_string(),
+            // Crawler page views are excluded here for the same reason they are
+            // excluded from the headline unique counts: a per-page table that
+            // counts bots cannot be reconciled against a total that doesn't.
+            "pv.is_crawler = false".to_string(),
         ];
         let mut values: Vec<sea_orm::Value> = vec![project_id.into()];
         let mut param_index = 2;
@@ -2194,6 +2198,10 @@ impl Analytics for AnalyticsService {
                     WHERE {where_clause}
                 )
                 AND e.event_type IN ('page_view', 'page_leave')
+                -- Also filter here, not only in the session sub-select above:
+                -- qualifying a session on one human event would otherwise drag
+                -- in every crawler-flagged row that shares its session id.
+                AND e.is_crawler = false
             ),
             -- Priority 1: for each page_view, find the min page_leave timestamp
             -- for same session+page_path within 30 min (via self-join + GROUP BY)

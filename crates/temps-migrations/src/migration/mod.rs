@@ -172,7 +172,9 @@ mod m20260802_000002_create_feature_flags;
 mod m20260803_000001_add_flag_last_evaluated_at;
 mod m20260803_000001_add_template_slug_to_projects;
 mod m20260803_000002_add_step_up_expires_at_to_sessions;
+mod m20260804_000001_add_ai_data_access_to_external_services;
 mod m20260804_000001_add_must_change_password_to_users;
+pub mod m20260805_000001_index_normalized_managed_domains;
 
 pub struct Migrator;
 
@@ -352,7 +354,17 @@ impl MigratorTrait for Migrator {
             Box::new(m20260803_000001_add_flag_last_evaluated_at::Migration),
             Box::new(m20260803_000001_add_template_slug_to_projects::Migration),
             Box::new(m20260803_000002_add_step_up_expires_at_to_sessions::Migration),
+            // Both carry the 20260804_000001 stamp (independently authored on
+            // two branches). They touch different tables, so the order between
+            // them is arbitrary — but main's shipped first, so it runs first
+            // and this branch's is appended rather than inserted ahead of it.
+            // `DeriveMigrationName` keys on the full module name, so the shared
+            // timestamp is not a collision in `seaql_migrations`.
             Box::new(m20260804_000001_add_must_change_password_to_users::Migration),
+            Box::new(
+                m20260804_000001_add_ai_data_access_to_external_services::Migration,
+            ),
+            Box::new(m20260805_000001_index_normalized_managed_domains::Migration),
         ]
     }
 }

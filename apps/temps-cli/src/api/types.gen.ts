@@ -711,6 +711,17 @@ export type AiConfigSettings = {
     config_repo_branch?: string;
 };
 
+export type AiDataAccessResponse = {
+    /**
+     * Whether the AI assistant may read row data from this service
+     */
+    enabled: boolean;
+    /**
+     * Service id
+     */
+    service_id: number;
+};
+
 /**
  * Response wrapping the AI page breakdown rows.
  */
@@ -1339,7 +1350,10 @@ export type AuthFlavorDto = {
 
 export type AuthResponse = {
     message: string;
+    mfa_enrollment_required: boolean;
     mfa_required: boolean;
+    mfa_setup?: null | MfaSetupResponse;
+    password_change_required: boolean;
     success: boolean;
     user_id?: number | null;
 };
@@ -2148,6 +2162,7 @@ export type CloudSettings = {
 };
 
 export type CloudStatus = {
+    account_email?: string | null;
     backend_url: string;
     health: string;
     health_message: string;
@@ -3958,6 +3973,7 @@ export type CreateTeamRequest = {
 
 export type CreateUserRequest = {
     email?: string | null;
+    must_change_password?: boolean;
     password?: string | null;
     roles: Array<string>;
     username: string;
@@ -12428,6 +12444,12 @@ export type PropertyBreakdownQuery = {
      */
     group_by: PropertyColumn;
     /**
+     * Include crawler/bot traffic (default: false). Off by default so the
+     * breakdown percentages share a denominator with the headline counts,
+     * which always exclude crawlers.
+     */
+    include_crawlers?: boolean | null;
+    /**
      * Maximum number of results to return (default: 20, max: 100)
      */
     limit?: number | null;
@@ -12483,6 +12505,11 @@ export type PropertyTimelineQuery = {
      * Property column to group by
      */
     group_by: PropertyColumn;
+    /**
+     * Include crawler/bot traffic (default: false). See
+     * [`PropertyBreakdownQuery::include_crawlers`].
+     */
+    include_crawlers?: boolean | null;
     /**
      * Start date for the query range
      */
@@ -12842,6 +12869,17 @@ export type QueryDataResponse = {
      * Total number of rows matching the query (before limit/offset)
      */
     total_count: number;
+    /**
+     * Whether rows were dropped from this response to stay inside the byte
+     * budget.
+     *
+     * `returned_count` is always the number of rows actually present, so a
+     * truncated page is still internally consistent — but a caller comparing
+     * it against the requested limit would otherwise conclude the table simply
+     * ended. Reported explicitly so a partial page is never mistaken for a
+     * complete one, by a human, a script, or a model reading a tool result.
+     */
+    truncated: boolean;
 };
 
 export type QuotaResponse = {
@@ -12890,6 +12928,40 @@ export type ReadFileResponse = {
     contents_b64: string;
     path: string;
     size: number;
+};
+
+/**
+ * Query-string form of [`QueryDataRequest`] for the read-only `GET` rows
+ * endpoint.
+ *
+ * The `POST` variant exists because filters are arbitrary backend-specific
+ * JSON. Reading rows is nonetheless a *read*, and the AI agent's tool index
+ * is GET-only by construction, so the same capability has to be reachable
+ * without a body. `filter` therefore carries the JSON as a string.
+ */
+export type ReadRowsQuery = {
+    /**
+     * Backend-specific filter, JSON-encoded. Fetch the expected shape from
+     * the `filter_schema` field of the explorer-support endpoint — e.g.
+     * `{"where":"created_at > now() - interval '7 days'"}` for SQL sources.
+     */
+    filter?: string | null;
+    /**
+     * Maximum number of rows to return
+     */
+    limit?: number;
+    /**
+     * Number of rows to skip
+     */
+    offset?: number;
+    /**
+     * Sort by field name
+     */
+    sort_by?: string | null;
+    /**
+     * Sort order (asc/desc)
+     */
+    sort_order?: string | null;
 };
 
 /**
@@ -13320,6 +13392,18 @@ export type RequestRow = {
     trace_id?: string | null;
     ts: string;
     user_agent?: string | null;
+};
+
+export type RequiredPasswordChangeRequest = {
+    new_password: string;
+};
+
+export type RequiredPasswordChangeResponse = {
+    message: string;
+    mfa_enrollment_required: boolean;
+    mfa_setup?: null | MfaSetupResponse;
+    success: boolean;
+    user_id: number;
 };
 
 export type ResetPasswordRequest = {
@@ -13830,6 +13914,7 @@ export type RouteUser = {
     id: number;
     image: string;
     mfa_enabled: boolean;
+    must_change_password: boolean;
     name: string;
     updated_at: number;
     username: string;
@@ -16653,6 +16738,13 @@ export type TodayStatsResponse = {
      * Total requests today
      */
     total_requests: number;
+};
+
+export type ToggleAiDataAccessRequest = {
+    /**
+     * Whether the AI assistant may read row data from this service.
+     */
+    enabled: boolean;
 };
 
 /**
@@ -22388,6 +22480,37 @@ export type ListPublicProvidersResponses = {
 };
 
 export type ListPublicProvidersResponse = ListPublicProvidersResponses[keyof ListPublicProvidersResponses];
+
+export type ChangeRequiredPasswordData = {
+    body: RequiredPasswordChangeRequest;
+    path?: never;
+    query?: never;
+    url: '/auth/password-change-required';
+};
+
+export type ChangeRequiredPasswordErrors = {
+    /**
+     * Password does not meet requirements
+     */
+    400: unknown;
+    /**
+     * Password-change session is missing or expired
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ChangeRequiredPasswordResponses = {
+    /**
+     * Required password change completed
+     */
+    200: RequiredPasswordChangeResponse;
+};
+
+export type ChangeRequiredPasswordResponse = ChangeRequiredPasswordResponses[keyof ChangeRequiredPasswordResponses];
 
 export type RequestPasswordResetData = {
     body: EmailRequest;
@@ -28577,6 +28700,82 @@ export type GetSlowQueriesResponses = {
 
 export type GetSlowQueriesResponse = GetSlowQueriesResponses[keyof GetSlowQueriesResponses];
 
+export type GetAiDataAccessData = {
+    body?: never;
+    path: {
+        /**
+         * External service id
+         */
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/ai-data-access';
+};
+
+export type GetAiDataAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+};
+
+export type GetAiDataAccessResponses = {
+    /**
+     * Current AI data access setting
+     */
+    200: AiDataAccessResponse;
+};
+
+export type GetAiDataAccessResponse = GetAiDataAccessResponses[keyof GetAiDataAccessResponses];
+
+export type SetAiDataAccessData = {
+    body: ToggleAiDataAccessRequest;
+    path: {
+        /**
+         * External service id
+         */
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/ai-data-access';
+};
+
+export type SetAiDataAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetAiDataAccessResponses = {
+    /**
+     * Setting applied
+     */
+    200: AiDataAccessResponse;
+};
+
+export type SetAiDataAccessResponse = SetAiDataAccessResponses[keyof SetAiDataAccessResponses];
+
 export type ListRootContainersData = {
     body?: never;
     path: {
@@ -28738,6 +28937,79 @@ export type GetEntityInfoResponses = {
 
 export type GetEntityInfoResponse = GetEntityInfoResponses[keyof GetEntityInfoResponses];
 
+export type ReadEntityRowsData = {
+    body?: never;
+    path: {
+        /**
+         * External service id
+         */
+        service_id: number;
+        /**
+         * Container path, slash-separated (e.g. `mydb/public`)
+         */
+        path: string;
+        /**
+         * Table, collection, key or object name
+         */
+        entity: string;
+    };
+    query?: {
+        /**
+         * JSON-encoded backend-specific filter
+         */
+        filter?: string;
+        /**
+         * Maximum rows to return
+         */
+        limit?: number;
+        /**
+         * Rows to skip
+         */
+        offset?: number;
+        /**
+         * Field to sort by
+         */
+        sort_by?: string;
+        /**
+         * asc or desc
+         */
+        sort_order?: string;
+    };
+    url: '/external-services/{service_id}/query/containers/{path}/entities/{entity}/data';
+};
+
+export type ReadEntityRowsErrors = {
+    /**
+     * Invalid query or filter
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions, or AI data access not enabled for this service
+     */
+    403: unknown;
+    /**
+     * Service, container, or entity not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ReadEntityRowsResponses = {
+    /**
+     * Query results
+     */
+    200: QueryDataResponse;
+};
+
+export type ReadEntityRowsResponse = ReadEntityRowsResponses[keyof ReadEntityRowsResponses];
+
 export type QueryDataData = {
     body: QueryDataRequest;
     path: {
@@ -28820,7 +29092,7 @@ export type DownloadObjectResponses = {
 
 export type DownloadObjectResponse = DownloadObjectResponses[keyof DownloadObjectResponses];
 
-export type GetContainerInfoData = {
+export type GetQueryContainerInfoData = {
     body?: never;
     path: {
         service_id: number;
@@ -28830,7 +29102,7 @@ export type GetContainerInfoData = {
     url: '/external-services/{service_id}/query/containers/{path}/info';
 };
 
-export type GetContainerInfoErrors = {
+export type GetQueryContainerInfoErrors = {
     /**
      * Unauthorized
      */
@@ -28849,14 +29121,14 @@ export type GetContainerInfoErrors = {
     500: unknown;
 };
 
-export type GetContainerInfoResponses = {
+export type GetQueryContainerInfoResponses = {
     /**
      * Container information
      */
     200: ContainerResponse;
 };
 
-export type GetContainerInfoResponse = GetContainerInfoResponses[keyof GetContainerInfoResponses];
+export type GetQueryContainerInfoResponse = GetQueryContainerInfoResponses[keyof GetQueryContainerInfoResponses];
 
 export type CheckExplorerSupportData = {
     body?: never;
@@ -40908,6 +41180,10 @@ export type GetPropertyBreakdownData = {
          */
         limit?: number;
         /**
+         * Include crawler/bot traffic (default: false)
+         */
+        include_crawlers?: boolean;
+        /**
          * Filter by country (for region/city drill-downs)
          */
         filter_country?: string;
@@ -41000,6 +41276,10 @@ export type GetPropertyTimelineData = {
          * Time bucket: hour, day, week, month (default: auto-detect)
          */
         bucket_size?: string;
+        /**
+         * Include crawler/bot traffic (default: false)
+         */
+        include_crawlers?: boolean;
     };
     url: '/projects/{project_id}/events/properties/timeline';
 };
@@ -43954,7 +44234,7 @@ export type GetUniqueCountsResponses = {
 export type GetUniqueCountsResponse = GetUniqueCountsResponses[keyof GetUniqueCountsResponses];
 
 export type UploadStaticBundleData = {
-    body?: never;
+    body: SourceArchiveUpload;
     path: {
         project_id: number;
     };
@@ -47772,6 +48052,10 @@ export type SetupMfaErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * MFA is already enabled; verify and disable it before re-enrollment
+     */
+    409: unknown;
     /**
      * Internal server error
      */

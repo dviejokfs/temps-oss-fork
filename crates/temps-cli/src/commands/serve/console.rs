@@ -1538,6 +1538,41 @@ fn ai_read_allowlist() -> Vec<String> {
         "list_deliveries",
         "get_delivery",
         "list_event_types",
+        // ── Data browser: schema navigation, plus opt-in row reads ──
+        // Schema shape only (database/schema/bucket names, table and column
+        // names, row counts, sizes). These carry no stored values, so they
+        // are safe on the same footing as the rest of this list — and they
+        // are what lets the agent resolve a question like "the users in the
+        // landing production database" to a concrete container path.
+        "check_explorer_support",
+        "list_root_containers",
+        "list_containers_at_path",
+        // The data browser's container-info endpoint is now published as
+        // `get_query_container_info` (see its `operation_id` in
+        // temps-providers). It used to share `get_container_info` with the
+        // Docker container endpoint above, and since utoipa keys the document
+        // by operation_id one silently overwrote the other — the data browser
+        // won, so this allowlist granted the agent that endpoint while the
+        // comment here claimed the Docker one. Not listed: navigation is
+        // already covered by `list_containers_at_path`, and it is not needed.
+        // Entity names. On SQL and MongoDB these are tables and collections —
+        // developer-chosen names, no stored values, safe on the same footing as
+        // the rest of this list. On Redis and S3 the entity name IS user data
+        // (keys embed session tokens and emails; object names are user-supplied
+        // filenames), so for those engines the handler gates this behind the
+        // same `ai_data_access` opt-in as row reads. Allowlisting it here only
+        // makes the endpoint reachable. See `entity_names_are_user_data` in
+        // temps-providers.
+        "list_entities",
+        "get_entity_info",
+        // Row CONTENTS. Unlike every other entry here, this one *can* return
+        // secrets — password hashes, API tokens, customer PII — because it
+        // returns whatever the operator stored. It is therefore gated a
+        // second time inside the handler by the per-service `ai_data_access`
+        // column, which defaults to false: allowlisting it here only makes
+        // the endpoint reachable, it does not grant access to any service.
+        // See `read_entity_rows` in temps-providers.
+        "read_entity_rows",
         // ── KV / Blob: status only, no connection strings ──
         "kv_status",
         "blob_status",
@@ -1843,6 +1878,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     service_context.register_service(encryption_service.clone());
     service_context.register_service(cookie_crypto.clone());
     service_context.register_service(docker.clone());
+    // Background DNS mutation is fail-closed until an optional policy plugin
+    // claims this slot. DomainsPlugin captures the slot before later plugins
+    // register, so the indirection must exist before plugin initialization.
+    let dns_automation_gate_slot = Arc::new(temps_core::DnsAutomationGateSlot::new());
+    service_context.register_service(dns_automation_gate_slot);
     // Pre-registered before any plugin runs so ProxyPlugin uses this exact
     // slot instance instead of creating its own — see the field doc on
     // `ConsoleApiParams::retention_resolver_slot`.
@@ -1908,10 +1948,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // (depends only on ServerConfig for the data dir). Registered early so
     // every later plugin can require the Arc<dyn TelemetryReporter>.
     debug!("Registering TelemetryPlugin");
-    let telemetry_plugin = Box::new(TelemetryPlugin::new(
-        config.clone(),
-        env!("CARGO_PKG_VERSION"),
-    ));
+    // TEMPS_VERSION (git-describe, set by build.rs) is used instead of
+    // CARGO_PKG_VERSION so nightly/beta builds report a version telemetry
+    // can actually distinguish from a tagged release -- CARGO_PKG_VERSION
+    // is the static Cargo.toml version and is identical across all of them.
+    let telemetry_plugin = Box::new(TelemetryPlugin::new(config.clone(), env!("TEMPS_VERSION")));
     plugin_manager.register_plugin(telemetry_plugin);
 
     // 2. QueuePlugin - registers the pre-created job queue into the service context
