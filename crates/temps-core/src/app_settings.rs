@@ -1086,17 +1086,19 @@ impl AppSettings {
     /// to its default value.
     pub fn to_json_merged(&self, existing: &serde_json::Value) -> serde_json::Value {
         let incoming = self.to_json();
-        let (Some(existing_map), Some(incoming_map)) = (existing.as_object(), incoming.as_object())
+        let (Some(existing_map), serde_json::Value::Object(incoming_map)) =
+            (existing.as_object(), incoming)
         else {
-            // Existing blob isn't an object (fresh row, or corrupt): nothing to
-            // preserve, so the serialized settings are the whole document.
-            return incoming;
+            // Existing blob isn't an object (fresh row, or corrupt), or we
+            // somehow didn't serialize to one: nothing to preserve, so the
+            // serialized settings are the whole document.
+            return self.to_json();
         };
 
+        // `incoming_map` is owned, so move the values in rather than cloning
+        // every key and every serialized sub-document.
         let mut merged = existing_map.clone();
-        for (key, value) in incoming_map {
-            merged.insert(key.clone(), value.clone());
-        }
+        merged.extend(incoming_map);
         serde_json::Value::Object(merged)
     }
 
