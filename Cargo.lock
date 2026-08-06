@@ -10185,6 +10185,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-auth",
+ "temps-core",
  "temps-entities",
  "thiserror 2.0.19",
  "tokio",
@@ -12313,6 +12314,7 @@ dependencies = [
  "tokio-postgres-rustls",
  "tracing",
  "uuid",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

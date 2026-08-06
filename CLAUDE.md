@@ -44,6 +44,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Use `require_service` in plugins for dependencies the app can't function without
 - Let the user configure and control their setup -- show status, give instructions, don't do things silently on their behalf
 - Design new features to be scalable on a small resource footprint -- see [Scalability & Efficiency](#scalability--efficiency)
+- Give every new feature a visible surface, and make unconfigured features onboard rather than disappear -- see [Feature Discoverability](#feature-discoverability)
 
 ---
 
@@ -272,6 +273,58 @@ Classify every piece of new code. The bar differs by an order of magnitude:
 - **Pull over push for telemetry.** Prefer scrape/interval collection (existing `MetricsScraper` pattern) over per-event emission.
 - **Background loops must be O(changes), not O(total).** Reconciliation/polling loops should query deltas (updated_at cursors, NOTIFY) rather than rescanning entire tables each tick.
 - **Justify it in the PR.** For any feature touching the hot path or a high-volume data flow, the PR description must state the expected load, the memory bound, and what happens at saturation (drop, degrade, backpressure).
+
+---
+
+## Feature Discoverability
+
+A feature the user cannot find does not exist. Self-hosted operators debug alone — there is no support channel to ask "does temps do X?". Every capability must therefore announce itself in the UI at the point where the user would want it.
+
+### Always give a feature a visible surface
+
+- A keyboard shortcut is an accelerator, never the only entry point. If `⌘.` opens a palette, there must also be a visible control that does the same thing.
+- Put the entry point where the task happens, not in a settings page the user visits once.
+- Name the outcome, not the mechanism: "Ask a question about this data", not "LLM query interface".
+
+### Unconfigured features onboard — they never disappear
+
+Many features depend on optional operator configuration: an AI provider, S3 credentials, an SMTP server, a DNS API token. **Never gate the UI surface on that configuration being present.** Conditionally rendering nothing means the user never learns the feature exists and concludes temps can't do it.
+
+Render the surface unconditionally and switch it into an onboarding state that:
+
+1. **Shows what it would do** — with a concrete example, not an abstract description.
+2. **States precisely what is missing** — "No AI provider is configured", never a bare disabled control.
+3. **Links directly to the fix** — deep-link into the settings page/section that configures it, not to documentation.
+4. **Never silently no-ops** — if the user triggers it anyway, explain the gap; don't fail quietly or hang in a loading state.
+
+```tsx
+// BAD -- the feature vanishes; the user never learns it exists
+{aiConfigured && <AiQueryBar />}
+
+// GOOD -- always visible, onboards when unconfigured
+<AiQueryBar
+  configured={aiConfigured}
+  onboardingHref="/settings/ai"
+  example="show me the users created last week"
+/>
+```
+
+### Expose configuration state through the API
+
+Back the UI with a typed capability/status endpoint rather than letting the client infer availability from errors:
+
+```rust
+pub struct AiCapabilityResponse {
+    /// Whether a usable provider is configured
+    pub configured: bool,
+    /// Why it is unavailable, when `configured` is false
+    pub reason: Option<String>,
+    /// Console path the operator should visit to configure it
+    pub setup_path: Option<String>,
+}
+```
+
+A `404`/`500` leaves the client unable to distinguish "this feature does not exist" from "this feature is not set up yet" — and those need completely different UI. Returning `configured: false` with a reason and a setup path makes the onboarding state renderable without guesswork.
 
 ---
 

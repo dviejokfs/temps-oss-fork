@@ -8,7 +8,7 @@ use temps_query::{
     DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType,
     Introspect, QueryOptions, QueryResult, QuerySchemaProvider, QueryStats, Queryable, Result,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 pub struct MariaDbSource {
     pool: MySqlPool,
@@ -16,6 +16,67 @@ pub struct MariaDbSource {
 }
 
 impl MariaDbSource {
+    /// Above this many estimated rows, report `information_schema.TABLE_ROWS`
+    /// rather than running an exact `COUNT(*)`.
+    ///
+    /// Mirrors the Postgres backend's threshold. On InnoDB `COUNT(*)` is a
+    /// full index scan; TABLE_ROWS is a stored estimate that can be off by a
+    /// wide margin on small tables, which is why small ones still get counted
+    /// exactly.
+    const EXACT_COUNT_MAX_ROWS: u64 = 50_000;
+
+    /// Estimated row count and on-disk size (data + indexes) for one table,
+    /// read from `information_schema` — a catalog lookup, not a table scan.
+    ///
+    /// Returns `(None, None)` when the table has no `information_schema` row
+    /// (e.g. a view), so callers fall back to an exact count rather than
+    /// reporting zero.
+    async fn table_stats(
+        &self,
+        container_path: &ContainerPath,
+        entity_name: &str,
+    ) -> Result<(Option<u64>, Option<u64>)> {
+        let database_name = database_from_path(container_path, &self.database_name)?;
+        validate_identifier("table", entity_name)?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH
+            FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+            "#,
+        )
+        .bind(database_name)
+        .bind(entity_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            DataError::QueryFailed(format!(
+                "Failed to read table statistics for '{}.{}': {}",
+                database_name, entity_name, e
+            ))
+        })?;
+
+        let Some(row) = row else {
+            return Ok((None, None));
+        };
+
+        let table_rows = row.try_get::<Option<u64>, _>("TABLE_ROWS").ok().flatten();
+        let data_length = row
+            .try_get::<Option<u64>, _>("DATA_LENGTH")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let index_length = row
+            .try_get::<Option<u64>, _>("INDEX_LENGTH")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+
+        let size = data_length.saturating_add(index_length);
+        Ok((table_rows, (size > 0).then_some(size)))
+    }
+
     pub async fn connect(
         host: &str,
         port: u16,
@@ -335,14 +396,35 @@ impl DataSource for MariaDbSource {
             )));
         }
 
-        let row_count = self.count(container_path, entity_name, None).await.ok();
+        // Row count and size from information_schema rather than COUNT(*).
+        //
+        // `self.count()` issues `SELECT COUNT(*)`, which on InnoDB is a full
+        // index scan — so opening a large table blocked on scanning it before
+        // any rows could render. `list_entities` (above) already reads
+        // TABLE_ROWS/DATA_LENGTH/INDEX_LENGTH for exactly this reason; this
+        // path simply never did.
+        //
+        // TABLE_ROWS is an estimate on InnoDB (exact on MyISAM). Small tables
+        // fall back to the exact count below, where it is cheap and the
+        // estimate's error is proportionally worst.
+        let (estimated_rows, size_bytes) = self
+            .table_stats(container_path, entity_name)
+            .await
+            .unwrap_or((None, None));
+
+        let row_count = match estimated_rows {
+            Some(rows) if rows >= Self::EXACT_COUNT_MAX_ROWS => Some(rows),
+            // Small, or information_schema had nothing (a view, or stats never
+            // gathered) — an exact count is affordable and more useful.
+            _ => self.count(container_path, entity_name, None).await.ok(),
+        };
 
         Ok(EntityInfo {
             namespace: container_path.segments[0].clone(),
             name: entity_name.to_string(),
             entity_type: "table".to_string(),
             row_count: row_count.and_then(|v| usize::try_from(v).ok()),
-            size_bytes: None,
+            size_bytes,
             schema: Some(self.get_schema(container_path, entity_name).await?),
             metadata: None,
         })
@@ -525,15 +607,35 @@ impl Queryable for MariaDbSource {
 
         debug!("Executing MariaDB query: {}", sql);
 
+        // SECURITY / AVAILABILITY: bound the query server-side.
+        //
+        // The caller's tokio deadline frees the control-plane task, but dropping
+        // the future does not stop the server: it keeps executing and keeps
+        // holding its share of the operator's database. That matters here
+        // because this backend accepts a caller-supplied WHERE clause and a
+        // caller-supplied OFFSET, whose cost is O(offset) regardless of LIMIT.
+        //
+        // See `apply_statement_timeout` for why both spellings are tried and
+        // why this must share the query's connection.
+        let timeout_ms = options.timeout_ms.unwrap_or(30_000);
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            DataError::ConnectionFailed(format!(
+                "Failed to acquire a MariaDB connection for query on {}.{}: {}",
+                database_name, entity_name, e
+            ))
+        })?;
+        apply_statement_timeout(&mut conn, timeout_ms, database_name).await;
+
         let rows = sqlx::query(&sql)
             .bind(limit as i64)
             .bind(offset as i64)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| {
                 error!("MariaDB query failed: {}", e);
                 DataError::QueryFailed(format!("{}\n\nQuery: {}", e, sql))
             })?;
+        drop(conn);
 
         let data_rows: Result<Vec<DataRow>> = rows.iter().map(Self::row_to_datarow).collect();
         let data_rows = data_rows?;
@@ -576,8 +678,27 @@ impl Queryable for MariaDbSource {
             }
         }
 
+        // SECURITY: bound this the way `query` is bounded.
+        //
+        // The timeout work originally covered the row-reading path only, which
+        // left the more expensive operation unbounded. `COUNT(*)` is a full
+        // index scan, it takes a caller-supplied WHERE clause, and
+        // `get_entity_info` falls through to it whenever `TABLE_ROWS` is null
+        // or below the estimate threshold — true for every view and every table
+        // whose stats were never gathered, regardless of real size. Since
+        // `get_entity_info` is in the AI read allowlist, "check the row count of
+        // every table" would otherwise be a denial of service against the
+        // customer's production database.
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            DataError::ConnectionFailed(format!(
+                "Failed to acquire a MariaDB connection to count {}.{}: {}",
+                database_name, entity_name, e
+            ))
+        })?;
+        apply_statement_timeout(&mut conn, COUNT_TIMEOUT_MS, database_name).await;
+
         let row = sqlx::query(&sql)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| DataError::QueryFailed(format!("Count query failed: {}", e)))?;
 
@@ -751,13 +872,141 @@ fn normalize_sort_field(sort_by: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
-fn strip_sql_string_literals(sql: &str) -> String {
+/// Server-side ceiling for `count`, which takes no `QueryOptions` and so has no
+/// caller-supplied deadline to honour. See the call site for why it needs one.
+const COUNT_TIMEOUT_MS: u64 = 10_000;
+
+/// Apply a server-side statement timeout to one pooled connection.
+///
+/// The knob is spelled differently on the two engines this backend serves —
+/// MySQL 5.7.8+ has `max_execution_time` (milliseconds), MariaDB has
+/// `max_statement_time` (seconds, fractional) — and setting the one the server
+/// does not know is an error, so both are tried and whichever lands wins. Must
+/// run on the SAME connection as the statement it is meant to bound; a session
+/// variable set on some other connection in the pool bounds some other request.
+///
+/// Best-effort by design: failing to set a ceiling should not fail the query,
+/// but it must be visible, because it means only the control-plane deadline is
+/// in play and the server will keep working after the client gives up.
+async fn apply_statement_timeout(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
+    timeout_ms: u64,
+    database_name: &str,
+) {
+    let mysql_set = sqlx::query(&format!("SET SESSION max_execution_time = {timeout_ms}"))
+        .execute(&mut **conn)
+        .await
+        .is_ok();
+    let mariadb_set = sqlx::query(&format!(
+        "SET SESSION max_statement_time = {}",
+        timeout_ms as f64 / 1000.0
+    ))
+    .execute(&mut **conn)
+    .await
+    .is_ok();
+
+    if !mysql_set && !mariadb_set {
+        warn!(
+            database = %database_name,
+            "Neither max_execution_time nor max_statement_time is supported by this server; \
+             data browser statements are bounded only by the control-plane deadline"
+        );
+    }
+}
+
+fn strip_sql_string_literals(sql: &str) -> Result<String> {
     let mut result = String::with_capacity(sql.len());
     let mut in_string = false;
     let mut chars = sql.chars().peekable();
 
     while let Some(c) = chars.next() {
+        // SECURITY: backtick-quoted identifiers must be normalised before the
+        // shared structural check runs, and they must collapse to the *same*
+        // placeholder the PostgreSQL stripper emits for `"..."`.
+        //
+        // `reject_subqueries_and_function_calls` was written against PostgreSQL
+        // lexing: it recognises a function call either by a quote character
+        // (`"` or `'`) immediately before `(`, or by walking back over
+        // identifier characters. A backtick is neither — it is not a quote it
+        // knows about, and it terminates the identifier walk — so the guard saw
+        // an empty identifier before the paren and allowed the call through.
+        // The `sleep(`/`benchmark(` denylist entries missed it independently,
+        // because a backticked call contains "sleep`(" rather than "sleep(".
+        // One character defeated both layers, yielding a CPU/connection-hold
+        // primitive on the operator's database reachable from the agent's
+        // documented `--filter`.
+        //
+        // Emitting `""` means `` `benchmark`(...) `` reaches the shared check as
+        // `""(...)`, which it already rejects as a quoted function call. A
+        // backtick-quoted identifier in ordinary use (`` `order` = 1 ``) becomes
+        // `"" = 1` and still validates. Only the validator sees this rewrite;
+        // the server is always sent the caller's original text.
+        if c == '`' && !in_string {
+            let mut terminated = false;
+            while let Some(inner) = chars.next() {
+                if inner == '`' {
+                    // MySQL escapes a literal backtick inside a quoted
+                    // identifier by doubling it.
+                    if chars.peek() == Some(&'`') {
+                        chars.next();
+                        continue;
+                    }
+                    terminated = true;
+                    break;
+                }
+            }
+            if !terminated {
+                return Err(DataError::InvalidQuery(
+                    "Unterminated backtick-quoted identifier in the data browser filter"
+                        .to_string(),
+                ));
+            }
+            result.push_str("\"\"");
+            continue;
+        }
+
+        // SECURITY: refuse double quotes rather than guess what they mean.
+        //
+        // Under MySQL/MariaDB's default sql_mode `"..."` is a *string literal*;
+        // under ANSI_QUOTES it is a quoted identifier. The server's mode is not
+        // knowable from here, and the two readings disagree about where the
+        // literal ends — so any stripper that picks one desynchronises from the
+        // server whenever the other applies. That is exactly the class of bug
+        // the backslash rule below was added for: the stripper swallows a span
+        // the server executes, and every later check runs on a sanitised
+        // remainder.
+        //
+        // Single quotes delimit strings in both modes and backticks delimit
+        // identifiers in both modes, so a legitimate filter never needs `"`.
+        if c == '"' && !in_string {
+            return Err(DataError::InvalidQuery(
+                "Double quotes are not allowed in the data browser filter — use single quotes \
+                 for string values and backticks for identifiers"
+                    .to_string(),
+            ));
+        }
+
         if in_string {
+            // SECURITY: MySQL/MariaDB honour backslash escapes inside string
+            // literals unless NO_BACKSLASH_ESCAPES is set, and the server's
+            // sql_mode is not knowable from here. This stripper only
+            // understood the doubled-quote form, so `'\''` desynchronised it
+            // from the server: it read the escaped quote as the first half of
+            // a `''` pair, stayed "inside" the string, and discarded the rest
+            // of the clause — including the payload. Every downstream check
+            // then ran against a sanitised remainder and passed.
+            //
+            //   1='\'' union select 1 from mysql.user where 'a'='a'
+            //
+            // Rather than emulate a mode we cannot observe, refuse the input.
+            // A legitimate data-browser filter has no need of one.
+            if c == '\\' {
+                return Err(DataError::InvalidQuery(
+                    "Backslash escapes are not allowed inside string literals in the data \
+                     browser filter"
+                        .to_string(),
+                ));
+            }
             if c == '\'' {
                 if chars.peek() == Some(&'\'') {
                     chars.next();
@@ -774,7 +1023,13 @@ fn strip_sql_string_literals(sql: &str) -> String {
         }
     }
 
-    result
+    if in_string {
+        return Err(DataError::InvalidQuery(
+            "Unterminated string literal in the data browser filter".to_string(),
+        ));
+    }
+
+    Ok(result)
 }
 
 fn validate_where_clause(sql: &str) -> Result<()> {
@@ -786,7 +1041,12 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         ));
     }
 
-    let without_strings = strip_sql_string_literals(&sql_lower);
+    // SECURITY: normalise whitespace before any keyword matching. The list
+    // below matches literal prefixes like `"union "`, so a separator it does
+    // not enumerate (\r, \f, \v — all whitespace to MySQL's lexer) walked
+    // straight past it.
+    let without_strings =
+        temps_query_postgres::normalize_sql_whitespace(&strip_sql_string_literals(&sql_lower)?);
 
     if without_strings.contains(';') {
         return Err(DataError::InvalidQuery(
@@ -803,6 +1063,14 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         ));
     }
 
+    // STRUCTURAL CHECKS — shared with the PostgreSQL validator rather than
+    // reimplemented. The local copy drifted: it inspected only the byte
+    // immediately before `(` (so `sleep (5)` and `extractvalue (1, user ())`
+    // passed) and treated `select` as the only subquery starter (so
+    // `id IN (TABLE mysql.user)` passed on MySQL 8.0.19+, which this backend
+    // also serves). One implementation, one set of tests.
+    temps_query_postgres::reject_subqueries_and_function_calls(&without_strings)?;
+
     let dangerous_keywords = [
         "drop ",
         "truncate ",
@@ -815,11 +1083,16 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         "delete ",
         "replace ",
         "load ",
+        // One space suffices now that whitespace is normalised above.
         "union ",
-        "union\t",
-        "union\n",
         "intersect ",
         "except ",
+        // These two keep the paren attached deliberately. The real guard for
+        // function calls is the structural check above, which rejects *any*
+        // identifier before `(` — including the backtick-quoted form, now that
+        // the stripper normalises it. Matching bare "sleep"/"benchmark" here
+        // would add nothing the structural check does not already catch, while
+        // rejecting ordinary columns like `sleep_minutes` or `benchmark_id`.
         "sleep(",
         "benchmark(",
         "load_file",
@@ -839,11 +1112,69 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         "savepoint ",
     ];
 
+    // Match on token boundaries rather than raw substrings. The trailing space
+    // in each entry was doing that job badly: `payload = 'x'` matched `"load "`
+    // and `charset = 'utf8'` matched `"set "`, so two very ordinary column
+    // names were unfilterable. A validator that blocks legitimate queries is a
+    // validator someone eventually switches off.
     for keyword in &dangerous_keywords {
-        if without_strings.contains(keyword) {
+        let keyword = keyword.trim();
+        // `sleep(`/`benchmark(` keep their paren and stay substring matches —
+        // they are not identifiers, and the structural check above is the real
+        // guard for the function-call forms.
+        let hit = if keyword.ends_with('(') {
+            without_strings.contains(keyword)
+        } else {
+            temps_query_postgres::contains_sql_token(&without_strings, keyword)
+        };
+        if hit {
             return Err(DataError::InvalidQuery(format!(
                 "SQL operation '{}' is not allowed in the data browser",
-                keyword.trim()
+                keyword
+            )));
+        }
+    }
+
+    // SECURITY: no regex operators.
+    //
+    // The denylist runs on string-stripped input, so a regex pattern — which
+    // lives entirely inside a string literal — is invisible to it.
+    // `1=1 and 'aaaaaaaaaaaaaaaaaaaa' regexp '(a+)+b'` strips to
+    // `1=1 and '' regexp ''` and passes every check. MariaDB's engine is PCRE,
+    // which backtracks, so that is the same CPU-burn primitive on the
+    // operator's database that the `benchmark(`/backtick fix closed, reached
+    // through a door the fix cannot see. Not fixable by inspecting the payload:
+    // the payload is opaque to us by construction.
+    for operator in ["regexp", "rlike"] {
+        if temps_query_postgres::contains_sql_token(&without_strings, operator) {
+            return Err(DataError::InvalidQuery(
+                "Regular-expression operators (REGEXP, RLIKE) are not allowed in the data \
+                 browser — use LIKE instead"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // SECURITY: no system-variable reads.
+    //
+    // `@@datadir`, `@@version`, `@@secure_file_priv` and friends need no
+    // parentheses, so the function-call guard never sees them, and they give
+    // blind boolean extraction of the server's configuration through an
+    // ordinary filter. Same for the parenless information functions.
+    if without_strings.contains("@@") {
+        return Err(DataError::InvalidQuery(
+            "System variables (@@...) are not allowed in the data browser".to_string(),
+        ));
+    }
+    for token in [
+        "current_user",
+        "session_user",
+        "system_user",
+        "current_role",
+    ] {
+        if temps_query_postgres::contains_sql_token(&without_strings, token) {
+            return Err(DataError::InvalidQuery(format!(
+                "'{token}' is not allowed in the data browser"
             )));
         }
     }
@@ -859,6 +1190,156 @@ pub(crate) fn is_mariadb_compatible_image(image: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_where_rejected(clause: &str) {
+        assert!(
+            validate_where_clause(clause).is_err(),
+            "expected rejection: {clause}"
+        );
+    }
+
+    #[test]
+    fn where_clause_rejects_backslash_escaped_quote() {
+        // The stripper understood only the doubled-quote escape, so a
+        // backslash-escaped quote desynchronised it from the server: it read
+        // the escape as the first half of a `''` pair, stayed inside the
+        // string, and discarded the payload. Every later check then ran on a
+        // sanitised remainder and passed.
+        assert_where_rejected(r"1='\'' union select 1 from mysql.user where 'a'='a'");
+        assert_where_rejected(r"name = 'a\' or 1=1 -- '");
+        // An unterminated literal is equally untrustworthy.
+        assert_where_rejected("name = 'unterminated");
+    }
+
+    #[test]
+    fn where_clause_rejects_function_calls_with_space_before_paren() {
+        // The local check looked only at the byte immediately before `(`, so a
+        // single space defeated it. MySQL accepts `sleep (5)` for every
+        // function that isn't also a parser keyword.
+        assert_where_rejected("1=1 or sleep (5)");
+        assert_where_rejected("extractvalue (1, user ())");
+        assert_where_rejected("updatexml (1, concat (0x7e, version ()), 1)");
+    }
+
+    #[test]
+    fn where_clause_rejects_non_select_query_expressions() {
+        // MySQL 8.0.19+ accepts TABLE and VALUES in subquery position, and
+        // this backend serves MySQL images too.
+        assert_where_rejected("id in (table mysql.user)");
+        assert_where_rejected("id in (values row(1))");
+        assert_where_rejected("id = (with x as (select 1) select * from x)");
+    }
+
+    #[test]
+    fn where_clause_rejects_subqueries() {
+        // This validator was a pure denylist, unlike the Postgres one. Without
+        // structural checks these gave blind extraction of any table the
+        // connection user could read.
+        assert_where_rejected("1 = (SELECT LENGTH(authentication_string) FROM mysql.user LIMIT 1)");
+        assert_where_rejected("id IN (SELECT user_id FROM admin_users)");
+        assert_where_rejected("EXISTS ( SELECT 1 FROM mysql.user )");
+    }
+
+    #[test]
+    fn where_clause_rejects_function_calls() {
+        // Error-based extraction returned the value straight back in the 400
+        // body, which is faster than blind and equally unblocked before.
+        assert_where_rejected(
+            "extractvalue(1, concat(0x7e, (select authentication_string from mysql.user limit 1)))",
+        );
+        assert_where_rejected("updatexml(1,concat(0x7e,version()),1)");
+        assert_where_rejected("length(password) > 1");
+    }
+
+    #[test]
+    fn where_clause_rejects_union_with_exotic_whitespace() {
+        // The denylist enumerated "union ", "union\t", "union\n" only.
+        assert_where_rejected("false UNION\rSELECT user, authentication_string FROM mysql.user");
+        assert_where_rejected("false UNION\u{000C}SELECT 1");
+        assert_where_rejected("1=1 INTERSECT\rSELECT 1");
+    }
+
+    #[test]
+    fn where_clause_rejects_backtick_quoted_function_calls() {
+        // A backtick defeated BOTH layers at once. The shared structural check
+        // recognises a function call by a quote character (`"`/`'`) before `(`
+        // or by walking back over identifier characters; a backtick is neither,
+        // so it saw an empty identifier and allowed the call. The denylist
+        // missed it independently because the text contains "sleep`(" rather
+        // than the "sleep(" it matches on. `benchmark` in particular is a CPU
+        // burn on the operator's own database, reachable from `--filter` and so
+        // prompt-injectable.
+        assert_where_rejected("1=1 and `sleep`(5)");
+        assert_where_rejected("1=1 and `benchmark`(50000000, sha1('x'))");
+        assert_where_rejected("`extractvalue`(1, `user`())");
+        // Qualified and spaced variants of the same trick.
+        assert_where_rejected("1=1 and `mysql`.`sleep` (5)");
+        // An unterminated identifier is as untrustworthy as an unterminated
+        // string: we cannot know where the server thinks it ends.
+        assert_where_rejected("`unterminated");
+    }
+
+    #[test]
+    fn where_clause_rejects_double_quotes() {
+        // Under default sql_mode `"..."` is a string literal; under ANSI_QUOTES
+        // it is an identifier. The stripper cannot observe the mode, and the
+        // two readings disagree about where the span ends — the same
+        // stripper/server desync the backslash rule above exists to prevent,
+        // reached through a different quote character.
+        assert_where_rejected(r#"name = "value""#);
+        assert_where_rejected(r#"1=1 or "it's" = 'x'"#);
+    }
+
+    #[test]
+    fn where_clause_rejects_regex_and_system_variables() {
+        // The regex pattern hides inside a string literal, so the stripper
+        // removes it before any keyword check runs. MariaDB's PCRE backtracks.
+        assert_where_rejected("1=1 and 'aaaaaaaaaaaaaaaaaaaaaaaa' regexp '(a+)+b'");
+        assert_where_rejected("name rlike '(a+)+b'");
+        // System variables need no parens, so the function-call guard never
+        // sees them, and they leak server configuration a filter away.
+        assert_where_rejected("1=1 and @@datadir like 'a%'");
+        assert_where_rejected("@@version like '8%'");
+        assert_where_rejected("@@secure_file_priv is null");
+        assert_where_rejected("current_user like 'root%'");
+    }
+
+    #[test]
+    fn where_clause_still_accepts_ordinary_filters() {
+        // The structural checks must not break the filters this exists to run.
+        // Grouping parens are preceded by whitespace or an operator, so they
+        // are not mistaken for function calls.
+        for clause in [
+            "plan = 'pro'",
+            "id > 5 AND status = 'active'",
+            "(plan = 'pro' OR plan = 'scale') AND amount_cents > 100",
+            "name LIKE '%test%'",
+            "id IN (1, 2, 3)",
+            "created_at BETWEEN '2025-01-01' AND '2025-02-01'",
+            // Backtick-quoted identifiers are ordinary MySQL and must survive
+            // normalisation — including reserved words, which are the whole
+            // reason the quoting exists.
+            "`order` = 1",
+            "`user`.`status` = 'active' AND `order` > 2",
+            // Columns whose names merely contain a denylisted function name.
+            // Matching bare "sleep"/"benchmark" would reject these.
+            "sleep_minutes > 30",
+            "benchmark_id = 7",
+            // Substring matching on the denylist rejected both of these:
+            // `payload` contains `load `, `charset` contains `set `. Very
+            // ordinary column names, and the kind of false positive that gets a
+            // validator switched off rather than fixed.
+            "payload = 'x'",
+            "charset = 'utf8'",
+            "download_count > 3",
+            "offset_seconds = 1",
+        ] {
+            assert!(
+                validate_where_clause(clause).is_ok(),
+                "should have been accepted: {clause}"
+            );
+        }
+    }
 
     #[test]
     fn maps_mysql_types() {

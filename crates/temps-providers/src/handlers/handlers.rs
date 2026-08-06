@@ -2515,6 +2515,9 @@ async fn update_service_resources(
         super::query_handlers::list_entities,
         super::query_handlers::get_entity_info,
         super::query_handlers::query_data,
+        super::query_handlers::read_entity_rows,
+        super::query_handlers::get_ai_data_access,
+        super::query_handlers::set_ai_data_access,
         super::query_handlers::download_object,
         super::metrics_handlers::get_service_metrics_range,
         super::metrics_handlers::get_service_metrics_latest,
@@ -2576,6 +2579,9 @@ async fn update_service_resources(
         super::query_handlers::FieldResponse,
         super::query_handlers::QueryDataRequest,
         super::query_handlers::QueryDataResponse,
+        super::query_handlers::ReadRowsQuery,
+        super::query_handlers::ToggleAiDataAccessRequest,
+        super::query_handlers::AiDataAccessResponse,
         super::metrics_handlers::MetricDataPoint,
         super::metrics_handlers::MetricsRangeQuery,
         super::metrics_handlers::MetricsStatusResponse,
@@ -2820,6 +2826,7 @@ mod tests {
             health_metadata: None,
             metrics_enabled: false,
             default_backup_provisioned: false,
+            ai_data_access: false,
             container_name: None,
         };
         let db = Arc::new(
