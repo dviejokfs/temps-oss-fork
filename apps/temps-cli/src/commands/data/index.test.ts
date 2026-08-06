@@ -58,6 +58,16 @@ describe('cell', () => {
     expect(cell(0)).toBe('0')
     expect(cell(false)).toBe('false')
   })
+
+  test('strips terminal control sequences before truncating', () => {
+    const malicious =
+      '\x1b[31mred\x1b[0m\x1b]8;;https://attacker.example\x1b\\link\x1b]8;;\x1b\\' +
+      '\x1b]52;c;dG9rX2xpdmVfc2VjcmV0\x07\nforged'
+    const out = cell(malicious, 80)
+    expect(out).toBe('redlink forged')
+    expect(out).not.toContain('\x1b')
+    expect(out).not.toContain('\n')
+  })
 })
 
 describe('formatBytes', () => {
