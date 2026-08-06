@@ -3882,6 +3882,17 @@ export type CreateSandboxBody = {
      * Docker image override. `null` uses the platform default.
      */
     image?: string | null;
+    /**
+     * Lifecycle class (ADR-036, temps-native): `"ephemeral"` (default) or
+     * `"workspace"`.
+     *
+     * A workspace is a long-lived development environment: it is still
+     * suspended after `timeout_secs` of inactivity, but the next exec or
+     * filesystem call wakes it transparently instead of returning 409, and
+     * nothing ever destroys it automatically. Use it for "give me a place
+     * to work on this repo"; leave it unset for throwaway sandboxes.
+     */
+    lifecycle?: string | null;
     memory_limit_mb?: number | null;
     name?: string | null;
     networkPolicy?: unknown;
@@ -3902,6 +3913,16 @@ export type CreateSandboxBody = {
      */
     preview_password?: string | null;
     projectId?: string | null;
+    /**
+     * Create the sandbox against a temps project (temps-native). The
+     * project's connected repo and git credential seed the work dir when
+     * no explicit `source` is given, and the sandbox is attributed to the
+     * project so it can be listed alongside it.
+     *
+     * Requires access to the project — the same team/scope rules that
+     * gate every other project-scoped endpoint apply.
+     */
+    project_id?: number | null;
     resources?: null | ResourcesBody;
     source?: null | SourceBody;
     /**
@@ -14003,16 +14024,30 @@ export type SandboxInner = {
     disk_size_mb?: number | null;
     id: string;
     image?: string | null;
+    /**
+     * Lifecycle class (ADR-036): `"ephemeral"` or `"workspace"`. Always
+     * present — a client that doesn't know about workspaces sees
+     * `"ephemeral"` and behaves exactly as before.
+     */
+    lifecycle: string;
     memory: number;
     name: string;
     preview_password_hint?: string | null;
     preview_url_template: string;
+    /**
+     * Project this sandbox was created from, when created from one.
+     */
+    project_id?: number | null;
     region: string;
     /**
      * Creation time as Unix epoch milliseconds.
      */
     requestedAt: number;
     runtime: string;
+    /**
+     * Repo the work dir was seeded from. Never carries credentials.
+     */
+    source_repo_url?: string | null;
     status: string;
     /**
      * Idle timeout in milliseconds (SDK convention).
@@ -48411,8 +48446,23 @@ export type ListSandboxesData = {
          * Items per page (default 20, max 100)
          */
         page_size?: number;
+        /**
+         * Filter by lifecycle class: "ephemeral" or "workspace"
+         */
+        lifecycle?: string;
+        /**
+         * Filter to sandboxes created from a project
+         */
+        project_id?: number;
     };
     url: '/v1/sandboxes';
+};
+
+export type ListSandboxesErrors = {
+    /**
+     * Unknown lifecycle value
+     */
+    400: unknown;
 };
 
 export type ListSandboxesResponses = {
@@ -49263,6 +49313,54 @@ export type StopSandboxResponses = {
 };
 
 export type StopSandboxResponse = StopSandboxResponses[keyof StopSandboxResponses];
+
+export type TerminalData = {
+    body?: never;
+    path: {
+        /**
+         * Sandbox public ID
+         */
+        id: string;
+    };
+    query?: {
+        /**
+         * Tab to attach to (default "main"); reusing an id reattaches to the running program
+         */
+        tab?: string;
+        /**
+         * Program to launch when the tab is created (default: login shell)
+         */
+        cmd?: string;
+        /**
+         * Initial columns (default 80)
+         */
+        cols?: number;
+        /**
+         * Initial rows (default 24)
+         */
+        rows?: number;
+    };
+    url: '/v1/sandboxes/{id}/terminal';
+};
+
+export type TerminalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+    /**
+     * Sandbox is not in a state that can be attached to
+     */
+    409: unknown;
+};
 
 export type CmdKillData = {
     body?: CmdKillBody;
