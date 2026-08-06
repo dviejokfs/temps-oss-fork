@@ -73,12 +73,21 @@ Wake latency is a container start, not a create: the image is local, the volumes
 
 Explicit `source` always wins over the project-derived one — the project is a convenience default, not an override.
 
-### 6. Out of scope for this ADR's first phase
+### 6. Interactive terminal, and why it must heartbeat
 
-Two follow-ups, deliberately separated because each is its own reviewable change:
+`GET /v1/sandboxes/{id}/terminal` upgrades to a WebSocket bridged to the in-sandbox PTY agent (ADR-008), via a new `SandboxProvider::attach_pty` — a trait method rather than direct Docker access, because `temps-sandbox` must not depend on `bollard` (ADR-010, enforced by `scripts/check-provider-boundary.sh`). `temps sandbox shell <id>` is the client.
 
-- **Interactive terminal on `/v1/sandboxes/{id}/terminal`.** The in-sandbox half exists (`temps-pty-agent` + `dtach`, ADR-008); the host-side handler does not exist in this repo. Building it requires a new PTY-attach method on the `SandboxProvider` trait, because `temps-sandbox` must not depend on `bollard` (ADR-010, enforced by `scripts/check-provider-boundary.sh`). Until then, workspaces are driven through `exec` and the CLI.
+The agent keeps a tab alive with zero subscribers, so disconnecting does not kill the program in it. Reattaching to the same tab returns `existed: true` for the same PID with recent scrollback replayed — which is what makes `--cmd claude` viable across a closed laptop.
+
+**Suspension is the exception, and it forces a design constraint.** `/run/temps-pty` is tmpfs and the agent dies with the container, so a suspend destroys every tab. Combined with §3, that creates a trap: activity is otherwise recorded only by exec and filesystem calls, and someone sitting in a terminal talking to an AI CLI makes neither. Without intervention the sweeper would stop the container out from under a live session.
+
+So an attached terminal is itself activity: the handler calls `touch` on connect, every 20s while attached, and once more on detach. The interval is bounded below the 60s minimum `timeout_secs` so no sandbox can be swept between two beats.
+
+### 7. Out of scope for this ADR
+
 - **AI CLI credential injection at create.** The CLIs are installed in the image; the credential catalog and injector (`crates/temps-agents/src/ai_cli/`, `services/sandbox_injector.rs`) are currently wired only to agent runs. Until that is extended, users supply their own key via the existing create-time `env` map.
+- **A browser terminal.** The WebSocket protocol is deliberately the same shape `temps-deployments`' container terminal already speaks (binary frames for PTY bytes, JSON text frames for control), so an xterm.js client can be added against the same endpoint without server changes.
+- **Terminals on non-Docker backends.** `attach_pty` defaults to an explicit "not supported" error; Firecracker and the local dev provider return it. A sandbox on those backends is still fully usable through `exec`.
 
 ## Consequences
 
@@ -95,6 +104,7 @@ Two follow-ups, deliberately separated because each is its own reviewable change
 - **Wake adds latency on a cold call**, on an endpoint that previously either worked immediately or failed immediately. Clients with tight timeouts on `exec` may see a timeout where they used to see a clean 409.
 - **The `touch()` change extends real lifetimes.** An ephemeral sandbox polled by a health check every minute now never expires. That is the intended reading of an idle timeout, but it is a change to observable behaviour and is called out in the changelog.
 - **Wake-on-access does not cover preview URLs.** A suspended workspace's preview URL still fails until something calls the API. Waking from the gateway path is a larger change (it crosses the proxy/console split, ADR-017) and is not attempted here.
+- **A terminal left attached indefinitely keeps a sandbox alive indefinitely.** That is the intended reading of "attached is active", but it does mean a forgotten terminal pins a container. The disk/quota follow-up above should account for it.
 
 ## Alternatives considered
 

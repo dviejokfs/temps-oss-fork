@@ -63,7 +63,7 @@ fn require_sandbox_admin(auth: &temps_auth::context::AuthContext) -> Result<(), 
     )
 }
 
-fn sandbox_permission_guard(
+pub(crate) fn sandbox_permission_guard(
     auth: &temps_auth::context::AuthContext,
     primary: Permission,
     fallback: Permission,
@@ -2477,6 +2477,10 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
         .route("/v1/sandboxes/rootfs", get(rootfs_report))
         .route("/v1/sandboxes/rootfs/gc", post(rootfs_gc))
         .route("/v1/sandboxes/{id}", get(get_sandbox))
+        .route(
+            "/v1/sandboxes/{id}/terminal",
+            get(crate::handlers::terminal::terminal),
+        )
         .route("/v1/sandboxes/{id}/stop", post(stop_sandbox))
         .route("/v1/sandboxes/{id}/destroy", post(destroy_sandbox))
         .route("/v1/sandboxes/{id}/events", get(list_events))

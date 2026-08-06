@@ -3,6 +3,7 @@
 //! No business logic lives here.
 
 pub mod sandboxes;
+pub mod terminal;
 pub mod version_header;
 
 use std::sync::Arc;
@@ -69,6 +70,7 @@ pub struct SandboxAppState {
         sandboxes::list_events,
         sandboxes::rootfs_report,
         sandboxes::rootfs_gc,
+        terminal::terminal,
     ),
     components(schemas(
         sandboxes::CreateSandboxBody,
@@ -161,6 +163,7 @@ mod tests {
             "/v1/sandboxes/{id}/preview-link",
             "/v1/sandboxes/{id}/events",
             "/v1/sandboxes/{id}/resize",
+            "/v1/sandboxes/{id}/terminal",
             "/v1/sandboxes/rootfs",
             "/v1/sandboxes/rootfs/gc",
         ] {

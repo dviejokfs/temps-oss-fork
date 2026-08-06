@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use super::user::{SANDBOX_CHOWN, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER, SANDBOX_WORK_DIR};
 use super::{
-    ExecStream, OnStreamEventCallback, SandboxCreateConfig, SandboxExecResult, SandboxHandle,
-    SandboxProvider,
+    ExecStream, OnStreamEventCallback, PtyAttachment, SandboxCreateConfig, SandboxExecResult,
+    SandboxHandle, SandboxProvider, PTY_AGENT_SOCKET,
 };
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
@@ -2312,6 +2312,97 @@ impl SandboxProvider for DockerSandboxProvider {
                 );
                 Ok(())
             }
+        }
+    }
+
+    /// Bridge to the in-sandbox PTY agent, exactly as ADR-008 §Host-side
+    /// Bridge specifies: a `docker exec` running `socat` that relays the
+    /// exec's stdio to the agent's unix socket.
+    ///
+    /// Nothing long-lived runs inside this exec — `socat` exits when its
+    /// stdin closes, and the exec dies with it. The only persistent
+    /// in-container process is the agent itself, which is what keeps a
+    /// `claude` session alive across a dropped connection.
+    ///
+    /// Runs as `SANDBOX_USER` because the socket is mode 0600 owned by that
+    /// user. Executing as root would work but would break the "same trust
+    /// boundary as the sandbox user" property the ADR relies on.
+    async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
+        let exec_failed = |reason: String| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason,
+        };
+
+        let exec_config = bollard::models::ExecConfig {
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            // No `tty: true` here. The PTY lives *inside* the agent; this
+            // exec is a plain binary pipe carrying framed protocol bytes.
+            // Asking Docker for a TTY would mangle them with ONLCR.
+            tty: Some(false),
+            cmd: Some(vec![
+                "socat".to_string(),
+                "-".to_string(),
+                format!("UNIX-CONNECT:{}", PTY_AGENT_SOCKET),
+            ]),
+            user: Some(SANDBOX_USER.to_string()),
+            ..Default::default()
+        };
+
+        let exec = self
+            .docker
+            .create_exec(&handle.sandbox_id, exec_config)
+            .await
+            .map_err(|e| exec_failed(format!("failed to create PTY attach exec: {}", e)))?;
+
+        let started = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(bollard::exec::StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| exec_failed(format!("failed to start PTY attach exec: {}", e)))?;
+
+        match started {
+            StartExecResults::Attached { output, input } => {
+                let sandbox_id = handle.sandbox_id.clone();
+                // Docker frames the exec's stdout/stderr; the agent's bytes
+                // arrive as StdOut. StdErr here is socat complaining (e.g.
+                // the socket is missing because the image predates the
+                // agent), which must surface as an error rather than be
+                // silently mixed into the protocol stream.
+                let output = output.map(move |chunk| match chunk {
+                    Ok(LogOutput::StdOut { message }) => Ok(message),
+                    Ok(LogOutput::Console { message }) => Ok(message),
+                    Ok(LogOutput::StdErr { message }) => Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: sandbox_id.clone(),
+                        reason: format!(
+                            "PTY agent relay error: {}",
+                            String::from_utf8_lossy(&message).trim()
+                        ),
+                    }),
+                    Ok(LogOutput::StdIn { .. }) => Ok(bytes::Bytes::new()),
+                    Err(e) => Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: sandbox_id.clone(),
+                        reason: format!("PTY attach stream failed: {}", e),
+                    }),
+                });
+                Ok(PtyAttachment {
+                    output: Box::pin(output),
+                    input,
+                })
+            }
+            StartExecResults::Detached => Err(exec_failed(
+                "PTY attach exec returned detached; expected an attached stream".to_string(),
+            )),
         }
     }
 

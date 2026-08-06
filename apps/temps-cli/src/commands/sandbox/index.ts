@@ -20,6 +20,7 @@ import {
   resolveWorkspaceSource,
   resolveProjectIdBySlug,
 } from './workspace-source.js'
+import { shellAction } from './shell.js'
 
 // ── Types mirroring /v1/sandbox/* responses ─────────────────────────────────
 
@@ -94,8 +95,17 @@ async function auth(): Promise<SandboxApi> {
   return { baseUrl, apiKey }
 }
 
-function sandboxUrl(api: SandboxApi, path: string): string {
-  return `${api.baseUrl}/v1/sandbox${path}`
+/**
+ * Build the absolute URL for a sandbox API path.
+ *
+ * The route is `/v1/sandboxes` — plural. The singular form predates a
+ * rename and matches nothing on any current server, so every command in
+ * this group was returning 404 against a real instance. The Rust CLI's
+ * `sandbox_url` already carried both the fix and the warning; this one
+ * did not. Covered by a test below so it can't drift back.
+ */
+export function sandboxUrl(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/+$/, '')}/v1/sandboxes${path}`
 }
 
 async function apiRequest<T>(
@@ -109,7 +119,7 @@ async function apiRequest<T>(
     headers.set('Content-Type', 'application/json')
   }
 
-  const response = await fetch(sandboxUrl(api, path), { ...init, headers })
+  const response = await fetch(sandboxUrl(api.baseUrl, path), { ...init, headers })
 
   if (!response.ok) {
     throw await readApiError(response)
@@ -308,6 +318,23 @@ export function registerSandboxCommands(program: Command): void {
     .option('--git-password <token>', 'HTTP Basic password/token (injected via GIT_ASKPASS)')
     .option('--tarball-url <url>', 'Tarball URL to download and extract')
     .action(cloneAction)
+
+  sandbox
+    .command('shell <id>')
+    .alias('attach')
+    .description(
+      'Open an interactive terminal in a sandbox. Detaching leaves the program running — reattach with the same --tab',
+    )
+    .option(
+      '--tab <name>',
+      'Tab to attach to; reusing a name reattaches to the program already running in it',
+      'main',
+    )
+    .option(
+      '--cmd <command>',
+      'Program to start when the tab is created, e.g. "claude" (default: login shell)',
+    )
+    .action(shellAction)
 
   sandbox
     .command('extend <id>')
@@ -950,7 +977,7 @@ async function logsAction(id: string, jobId: string): Promise<void> {
   const api = await auth()
 
   const response = await fetch(
-    sandboxUrl(api, `/${encodeURIComponent(id)}/jobs/${encodeURIComponent(jobId)}/logs`),
+    sandboxUrl(api.baseUrl, `/${encodeURIComponent(id)}/jobs/${encodeURIComponent(jobId)}/logs`),
     {
       headers: {
         Authorization: `Bearer ${api.apiKey}`,
