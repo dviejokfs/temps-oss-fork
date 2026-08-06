@@ -1492,3 +1492,397 @@ async fn test_migration_ddl_safe_on_compressed_chunks() {
     .await
     .expect("GIN CREATE INDEX must succeed on a compressed hypertable");
 }
+
+// ── Span stats (per-operation latency report) ────────────────────────
+
+/// Build a span with an explicit start time, so aggregation tests can place
+/// spans deterministically inside (and outside) the queried window.
+#[allow(clippy::too_many_arguments)]
+fn stats_span(
+    project_id: i32,
+    service_name: &str,
+    name: &str,
+    duration_ms: f64,
+    status: SpanStatusCode,
+    start_time: DateTime<Utc>,
+) -> SpanRecord {
+    let seq = next_span_seq();
+    let mut span = sample_span(
+        project_id,
+        &format!("{seq:032x}"),
+        &format!("{seq:016x}"),
+        None,
+        name,
+        SpanKind::Server,
+        status,
+        duration_ms,
+    );
+    span.resource.service_name = service_name.into();
+    span.start_time = start_time;
+    span.end_time = start_time + Duration::microseconds((duration_ms * 1000.0) as i64);
+    span
+}
+
+/// Monotonic id source — trace/span ids only need to be distinct here, and a
+/// counter keeps the fixtures reproducible.
+fn next_span_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn stats_query(project_ids: Vec<i32>, start: DateTime<Utc>, end: DateTime<Utc>) -> SpanStatsQuery {
+    SpanStatsQuery {
+        project_ids,
+        start_time: start,
+        end_time: end,
+        service_name: None,
+        span_name: None,
+        name_pattern: None,
+        kind: None,
+        status: None,
+        environment_id: None,
+        deployment_id: None,
+        attributes: None,
+        min_duration_ms: None,
+        min_count: 1,
+        sort_by: SpanStatsSortField::default(),
+        sort_order: SortOrder::default(),
+        limit: None,
+        offset: None,
+    }
+}
+
+#[tokio::test]
+async fn test_span_stats_aggregates_percentiles_and_ratios() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let now = Utc::now();
+    let window_start = now - Duration::hours(1);
+
+    // `steady` is uniformly ~100ms. `erratic` is bimodal: 18 fast calls and
+    // 2 that take 2s — the case an average alone hides completely.
+    let mut spans = Vec::new();
+    for i in 0..20 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "steady",
+            100.0 + i as f64,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(30),
+        ));
+    }
+    for i in 0..18 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "erratic",
+            40.0 + i as f64,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(30),
+        ));
+    }
+    for _ in 0..2 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "erratic",
+            2000.0,
+            SpanStatusCode::Error,
+            now - Duration::minutes(30),
+        ));
+    }
+    storage.store_spans(spans).await.expect("store spans");
+
+    let rows = storage
+        .query_span_stats(stats_query(vec![1], window_start, now))
+        .await
+        .expect("query span stats");
+
+    let steady = rows
+        .iter()
+        .find(|r| r.span_name == "steady")
+        .expect("steady");
+    let erratic = rows
+        .iter()
+        .find(|r| r.span_name == "erratic")
+        .expect("erratic");
+
+    assert_eq!(steady.count, 20);
+    assert_eq!(erratic.count, 20);
+    assert_eq!(erratic.error_count, 2);
+    assert!((erratic.error_rate - 0.1).abs() < 1e-9);
+
+    // The max is what "how bad did it ever get?" asks for.
+    assert!((erratic.max_duration_ms - 2000.0).abs() < 1.0);
+    // p50 stays in the fast band even though the max is 2s — which is exactly
+    // why a median-only view misses this operation.
+    assert!(
+        erratic.p50_duration_ms < 100.0,
+        "p50 was {}",
+        erratic.p50_duration_ms
+    );
+    assert!(
+        erratic.p99_duration_ms > 1000.0,
+        "p99 was {}",
+        erratic.p99_duration_ms
+    );
+
+    // Both ranking signals must prefer the erratic operation, even though the
+    // steady one is not meaningfully faster on average.
+    assert!(erratic.tail_ratio > steady.tail_ratio);
+    assert!(erratic.coefficient_of_variation > steady.coefficient_of_variation);
+}
+
+#[tokio::test]
+async fn test_span_stats_respects_window_project_and_min_count() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let now = Utc::now();
+
+    let mut spans = Vec::new();
+    // In-window, project 1, 5 samples.
+    for _ in 0..5 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "in-window",
+            10.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ));
+    }
+    // In-window, project 1, but only 2 samples — below a min_count of 3.
+    for _ in 0..2 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "rare",
+            10.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ));
+    }
+    // Outside the window entirely.
+    for _ in 0..5 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "too-old",
+            10.0,
+            SpanStatusCode::Ok,
+            now - Duration::hours(48),
+        ));
+    }
+    // A different project.
+    for _ in 0..5 {
+        spans.push(stats_span(
+            2,
+            "api",
+            "other-project",
+            10.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ));
+    }
+    storage.store_spans(spans).await.expect("store spans");
+
+    let query = stats_query(vec![1], now - Duration::hours(1), now);
+    let rows = storage
+        .query_span_stats(query.clone())
+        .await
+        .expect("query span stats");
+    let names: Vec<&str> = rows.iter().map(|r| r.span_name.as_str()).collect();
+
+    assert!(names.contains(&"in-window"));
+    assert!(names.contains(&"rare"));
+    assert!(
+        !names.contains(&"too-old"),
+        "spans outside the window must not be aggregated"
+    );
+    assert!(
+        !names.contains(&"other-project"),
+        "another project's spans must never leak into the report"
+    );
+
+    // The min_count floor is what keeps three-sample noise out of a
+    // variability ranking, so it must actually drop rows.
+    let floored = SpanStatsQuery {
+        min_count: 3,
+        ..query.clone()
+    };
+    let rows = storage
+        .query_span_stats(floored.clone())
+        .await
+        .expect("query span stats");
+    let names: Vec<&str> = rows.iter().map(|r| r.span_name.as_str()).collect();
+    assert!(names.contains(&"in-window"));
+    assert!(
+        !names.contains(&"rare"),
+        "min_count must drop low-sample rows"
+    );
+
+    // The count must agree with the rows, including the min_count floor —
+    // otherwise pagination silently loses or repeats operations.
+    let total = storage
+        .count_span_stats(floored)
+        .await
+        .expect("count span stats");
+    assert_eq!(total as usize, rows.len());
+}
+
+#[tokio::test]
+async fn test_span_stats_spans_multiple_projects_and_sorts() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let now = Utc::now();
+
+    let mut spans = Vec::new();
+    // Project 1: cheap but very frequent — wins on count, loses on p95.
+    for _ in 0..50 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "cache.get",
+            2.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ));
+    }
+    // Project 2: expensive but rare — wins on p95, loses on count.
+    for _ in 0..5 {
+        spans.push(stats_span(
+            2,
+            "worker",
+            "report.render",
+            900.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ));
+    }
+    storage.store_spans(spans).await.expect("store spans");
+
+    let base = stats_query(vec![1, 2], now - Duration::hours(1), now);
+
+    // Both projects appear in one report, each tagged with its own project_id.
+    let rows = storage
+        .query_span_stats(base.clone())
+        .await
+        .expect("query span stats");
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .any(|r| r.project_id == 1 && r.span_name == "cache.get"));
+    assert!(rows
+        .iter()
+        .any(|r| r.project_id == 2 && r.span_name == "report.render"));
+
+    // total_time: 50 x 2ms = 100ms vs 5 x 900ms = 4500ms.
+    let by_total = storage
+        .query_span_stats(SpanStatsQuery {
+            sort_by: SpanStatsSortField::TotalDurationMs,
+            ..base.clone()
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(by_total[0].span_name, "report.render");
+
+    // count: the frequent cheap call wins.
+    let by_count = storage
+        .query_span_stats(SpanStatsQuery {
+            sort_by: SpanStatsSortField::Count,
+            ..base.clone()
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(by_count[0].span_name, "cache.get");
+
+    // Ascending order must actually invert the ranking.
+    let ascending = storage
+        .query_span_stats(SpanStatsQuery {
+            sort_by: SpanStatsSortField::TotalDurationMs,
+            sort_order: SortOrder::Asc,
+            ..base
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(ascending[0].span_name, "cache.get");
+}
+
+#[tokio::test]
+async fn test_span_stats_filters_by_service_name_and_status() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let now = Utc::now();
+
+    let spans = vec![
+        stats_span(
+            1,
+            "api",
+            "checkout",
+            100.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ),
+        stats_span(
+            1,
+            "api",
+            "checkout",
+            900.0,
+            SpanStatusCode::Error,
+            now - Duration::minutes(5),
+        ),
+        stats_span(
+            1,
+            "worker",
+            "checkout",
+            50.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ),
+    ];
+    storage.store_spans(spans).await.expect("store spans");
+
+    let base = stats_query(vec![1], now - Duration::hours(1), now);
+
+    let api_only = storage
+        .query_span_stats(SpanStatsQuery {
+            service_name: Some("api".into()),
+            ..base.clone()
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(api_only.len(), 1);
+    assert_eq!(api_only[0].service_name, "api");
+    assert_eq!(api_only[0].count, 2);
+
+    // status=error answers "how slow are the failures?" — the OK span must not
+    // dilute the numbers.
+    let errors_only = storage
+        .query_span_stats(SpanStatsQuery {
+            status: Some(SpanStatusCode::Error),
+            ..base.clone()
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(errors_only.len(), 1);
+    assert_eq!(errors_only[0].count, 1);
+    assert!((errors_only[0].max_duration_ms - 900.0).abs() < 1.0);
+
+    // An exact span_name plus max is the "worst case for this operation" query.
+    let named = storage
+        .query_span_stats(SpanStatsQuery {
+            span_name: Some("checkout".into()),
+            service_name: Some("api".into()),
+            ..base
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(named.len(), 1);
+    assert!((named[0].max_duration_ms - 900.0).abs() < 1.0);
+}
