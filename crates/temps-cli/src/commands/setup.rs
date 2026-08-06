@@ -1242,10 +1242,15 @@ async fn update_app_settings(
     app_settings.setup_complete = true;
 
     let now = Utc::now();
-    let settings_json = app_settings.to_json();
+    let settings_json = existing
+        .as_ref()
+        .map(|r| app_settings.to_json_merged(&r.data))
+        .unwrap_or_else(|| app_settings.to_json());
 
     if let Some(existing_model) = existing {
-        // Update existing settings
+        // Update existing settings. Merge, don't replace — re-running `temps
+        // setup` on a configured install must not drop sub-documents owned by
+        // other subsystems (`admin_gate`). See `AppSettings::to_json_merged`.
         let mut active_model: settings::ActiveModel = existing_model.into();
         active_model.data = Set(settings_json);
         active_model.updated_at = Set(now);

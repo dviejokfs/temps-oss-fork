@@ -1,7 +1,7 @@
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, Set, Statement, TransactionTrait,
+    PaginatorTrait, QueryFilter, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -891,8 +891,24 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // a delay that the database did not actually apply (or vice versa).
         let txn = self.db.begin().await?;
 
-        // Check if record exists
-        let existing = settings::Entity::find_by_id(1).one(&txn).await?;
+        // Check if record exists.
+        //
+        // Locked FOR UPDATE on Postgres: this is a read-modify-write of a
+        // shared JSON document, and the window between the read and the write
+        // below spans the TimescaleDB policy comparison — seconds, not
+        // microseconds. Without the lock two concurrent writers both merge
+        // onto the same pre-race snapshot and the loser's sub-document (e.g.
+        // the admin gate's allowlist, saved from the console at the same
+        // moment as a startup `console_version` write) is silently dropped
+        // despite `to_json_merged`. SQLite serializes write transactions
+        // already and has no `FOR UPDATE`, so the lock is Postgres-only.
+        let existing_query = settings::Entity::find_by_id(1);
+        let existing_query = if self.is_postgres() {
+            existing_query.lock_exclusive()
+        } else {
+            existing_query
+        };
+        let existing = existing_query.one(&txn).await?;
 
         let previous_compression = existing
             .as_ref()
@@ -1010,9 +1026,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
 
         if let Some(existing_model) = existing {
-            // Update existing settings
+            // Update existing settings. Merge into the stored document rather
+            // than replacing it: the `settings` row carries sub-documents owned
+            // by other subsystems (`admin_gate`) that `AppSettings` cannot
+            // round-trip. See `AppSettings::to_json_merged`.
+            let merged = settings.to_json_merged(&existing_model.data);
             let mut active_model: settings::ActiveModel = existing_model.into();
-            active_model.data = Set(settings.to_json());
+            active_model.data = Set(merged);
             active_model.updated_at = Set(now);
             active_model.update(&txn).await?;
         } else {
