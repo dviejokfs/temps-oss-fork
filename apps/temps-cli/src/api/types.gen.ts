@@ -13184,6 +13184,34 @@ export type ReinstallWebhookResponse = {
     message: string;
 };
 
+/**
+ * Outcome of an operator-triggered release check.
+ */
+export type ReleaseCheckResult = {
+    /**
+     * Channel that was queried.
+     */
+    channel: string;
+    /**
+     * Version tag of the running binary.
+     */
+    current_version: string;
+    /**
+     * Newest release published on that channel, if any could be resolved.
+     */
+    latest_version?: string | null;
+    /**
+     * Release-notes page for `latest_version`.
+     */
+    release_url?: string | null;
+    /**
+     * True when `latest_version` is strictly newer than what is running.
+     * False on a channel whose newest release is older — which is normal and
+     * expected right after switching a nightly box onto stable.
+     */
+    update_available: boolean;
+};
+
 export type ReleaseListResponse = {
     releases: Array<string>;
 };
@@ -14508,18 +14536,33 @@ export type SelfUpdateAttempt = {
  * fundamental blocker wins, so the operator fixes the real problem first
  * rather than clearing one only to hit the next.
  */
-export type SelfUpdateBlocker = 'disabled_by_flag' | 'disabled_by_setting' | 'container' | 'no_supervisor' | 'binary_not_writable' | 'unsupported_platform' | 'in_progress';
+export type SelfUpdateBlocker = 'disabled_by_flag' | 'disabled_by_setting' | 'not_supported' | 'binary_not_writable' | 'unsupported_platform' | 'in_progress';
 
 /**
  * Where an in-flight update has got to. Polled by the console so a long
  * download shows progress instead of an indefinite spinner.
  */
-export type SelfUpdatePhase = 'idle' | 'resolving' | 'downloading' | 'verifying' | 'installing' | 'restarting' | 'failed';
+export type SelfUpdatePhase = 'idle' | 'resolving' | 'downloading' | 'verifying' | 'installing' | 'restarting' | 'pending_restart' | 'failed';
+
+/**
+ * What happens to the running process once the new binary is in place.
+ */
+export type SelfUpdateRestartMode = 'automatic' | 'manual';
 
 /**
  * Controls the console's one-click "Update now" action.
  */
 export type SelfUpdateSettings = {
+    /**
+     * Release channel this install tracks: `stable`, `beta` or `nightly`.
+     *
+     * `None` (the default) means "infer from the running version tag", which
+     * is what the CLI has always done — a `-nightly.` build tracks nightly, a
+     * `-beta.N` build tracks beta, a plain tag tracks stable. Setting it
+     * explicitly pins the channel, so an operator can move a nightly box back
+     * onto stable without reinstalling.
+     */
+    channel?: string | null;
     /**
      * Allow admins to apply a release and restart the server from the console.
      * `true` by default: the action is permission-gated, audited, and only
@@ -14534,7 +14577,7 @@ export type SelfUpdateSettings = {
 /**
  * Outcome of an update attempt, as persisted in the journal.
  */
-export type SelfUpdateStatus = 'pending' | 'succeeded' | 'failed';
+export type SelfUpdateStatus = 'pending' | 'succeeded' | 'installed_pending_restart' | 'failed';
 
 export type SendEmailRequestBody = {
     /**
@@ -16126,10 +16169,14 @@ export type StartUpdateResponse = {
     current_version: string;
     /**
      * How long to allow for the server to come back before treating the
-     * restart as failed.
+     * restart as failed. `0` when nothing restarts.
      */
     estimated_restart_secs: number;
     message: string;
+    /**
+     * `automatic` (temps restarts itself) or `manual` (installed only).
+     */
+    restart_mode: SelfUpdateRestartMode;
 };
 
 export type StatResponse = {
@@ -17317,6 +17364,20 @@ export type UpdateCapabilityResponse = {
      * Non-blocking warning to show with the confirmation (split topology).
      */
     caveat?: string | null;
+    /**
+     * Channel actually tracked, after applying the configured override or
+     * falling back to inference from the running version tag.
+     */
+    channel: string;
+    /**
+     * True when `channel` was set explicitly in settings rather than inferred.
+     */
+    channel_is_pinned: boolean;
+    /**
+     * Version tag of the running binary. Always present — the version page
+     * needs it whether or not an update exists.
+     */
+    current_version: string;
     last_attempt?: null | SelfUpdateAttempt;
     /**
      * The equivalent command to run by hand. Always present.
@@ -17334,6 +17395,12 @@ export type UpdateCapabilityResponse = {
      * Operator-facing explanation of `blocker`.
      */
     reason?: string | null;
+    /**
+     * `automatic` when applying an update also restarts temps; `manual` when
+     * it only installs the binary and the operator restarts on their own
+     * schedule. Lets the console set expectations before the click.
+     */
+    restart_mode: SelfUpdateRestartMode;
     /**
      * What would restart the process: `systemd`, `launchd`, `container`, `none`.
      */
@@ -47409,6 +47476,43 @@ export type GetUpdateStatusResponses = {
 };
 
 export type GetUpdateStatusResponse = GetUpdateStatusResponses[keyof GetUpdateStatusResponses];
+
+export type CheckForUpdateData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/update/check';
+};
+
+export type CheckForUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * This process cannot check for updates
+     */
+    501: ProblemDetails;
+    /**
+     * The release API could not be reached
+     */
+    502: ProblemDetails;
+};
+
+export type CheckForUpdateError = CheckForUpdateErrors[keyof CheckForUpdateErrors];
+
+export type CheckForUpdateResponses = {
+    /**
+     * Result of the release check
+     */
+    200: ReleaseCheckResult;
+};
+
+export type CheckForUpdateResponse = CheckForUpdateResponses[keyof CheckForUpdateResponses];
 
 export type ListTeamsData = {
     body?: never;

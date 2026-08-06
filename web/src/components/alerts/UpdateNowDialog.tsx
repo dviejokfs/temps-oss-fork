@@ -14,7 +14,11 @@ import {
   useSelfUpdateCapability,
   useStartSelfUpdate,
 } from '@/hooks/useSelfUpdate'
-import type { SelfUpdateAttempt, SelfUpdatePhase } from '@/api/client/types.gen'
+import type {
+  SelfUpdateAttempt,
+  SelfUpdatePhase,
+  SelfUpdateRestartMode,
+} from '@/api/client/types.gen'
 import {
   AlertTriangle,
   ArrowUpCircle,
@@ -39,6 +43,7 @@ const PHASE_LABEL: Record<SelfUpdatePhase, string> = {
   verifying: 'Verifying checksum…',
   installing: 'Installing…',
   restarting: 'Restarting the server…',
+  pending_restart: 'Installed — waiting for you to restart temps',
   failed: 'Failed',
 }
 
@@ -155,7 +160,8 @@ export function UpdateNowDialog({
       <AlertDialogContent className="max-w-lg">
         <AlertDialogHeader>
           <AlertDialogTitle className="flex items-center gap-2">
-            {result?.status === 'succeeded' ? (
+            {result?.status === 'succeeded' ||
+            result?.status === 'installed_pending_restart' ? (
               <CheckCircle2 className="h-5 w-5 text-green-600" />
             ) : result?.status === 'failed' ? (
               <XCircle className="h-5 w-5 text-destructive" />
@@ -164,18 +170,24 @@ export function UpdateNowDialog({
             )}
             {result?.status === 'succeeded'
               ? 'Update complete'
-              : result?.status === 'failed'
-                ? 'Update failed'
-                : watching
-                  ? 'Updating temps'
-                  : 'Update temps'}
+              : result?.status === 'installed_pending_restart'
+                ? 'Update installed'
+                : result?.status === 'failed'
+                  ? 'Update failed'
+                  : watching
+                    ? 'Updating temps'
+                    : 'Update temps'}
           </AlertDialogTitle>
           <AlertDialogDescription asChild>
             <div className="space-y-3 text-sm">
               {result ? (
                 <ResultBody result={result} />
               ) : watching ? (
-                <WatchingBody phase={phase} waitedTooLong={waitedTooLong} />
+                <WatchingBody
+                  phase={phase}
+                  waitedTooLong={waitedTooLong}
+                  expectRestart={capability?.restart_mode !== 'manual'}
+                />
               ) : (
                 <ConfirmBody
                   currentVersion={currentVersion}
@@ -184,6 +196,7 @@ export function UpdateNowDialog({
                   caveat={capability?.caveat ?? null}
                   manualCommand={capability?.manual_command ?? 'temps upgrade'}
                   binaryPath={capability?.binary_path ?? ''}
+                  restartMode={capability?.restart_mode}
                   loading={capabilityPending}
                 />
               )}
@@ -205,6 +218,8 @@ export function UpdateNowDialog({
                 Reload console
               </Button>
             </>
+          ) : result ? (
+            <AlertDialogCancel>Close</AlertDialogCancel>
           ) : watching ? (
             <AlertDialogCancel>Hide</AlertDialogCancel>
           ) : (
@@ -221,7 +236,9 @@ export function UpdateNowDialog({
                 {startUpdate.isPending && (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 )}
-                Update and restart
+                {capability?.restart_mode === 'manual'
+                  ? 'Install update'
+                  : 'Update and restart'}
               </Button>
             </>
           )}
@@ -238,6 +255,7 @@ function ConfirmBody({
   caveat,
   manualCommand,
   binaryPath,
+  restartMode,
   loading,
 }: {
   currentVersion?: string | null
@@ -246,8 +264,10 @@ function ConfirmBody({
   caveat: string | null
   manualCommand: string
   binaryPath: string
+  restartMode?: SelfUpdateRestartMode
   loading: boolean
 }) {
+  const willRestart = restartMode !== 'manual'
   return (
     <>
       <p>
@@ -255,19 +275,19 @@ function ConfirmBody({
         <strong className="font-mono">
           {latestVersion ?? 'the latest release'}
         </strong>
-        , verify its checksum, replace the binary
+        , verify its checksum and replace the binary
         {currentVersion && (
           <>
             {' '}
             (currently <span className="font-mono">{currentVersion}</span>)
           </>
-        )}{' '}
-        and restart.
+        )}
+        {willRestart ? ', then restart.' : '.'}
       </p>
       <p className="text-muted-foreground">
-        The server — including proxied traffic to your deployed apps — is
-        unavailable for a few seconds while it restarts. The previous binary is
-        kept alongside the new one so you can roll back by hand.
+        {willRestart
+          ? 'The server — including proxied traffic to your deployed apps — is unavailable for a few seconds while it restarts. The previous binary is kept alongside the new one so you can roll back by hand.'
+          : 'Nothing goes offline: temps keeps serving the current version until you restart it yourself, which is when the new version takes over. The previous binary is kept alongside the new one so you can roll back by hand.'}
       </p>
 
       {caveat && (
@@ -309,9 +329,11 @@ function ConfirmBody({
 function WatchingBody({
   phase,
   waitedTooLong,
+  expectRestart,
 }: {
   phase: SelfUpdatePhase
   waitedTooLong: boolean
+  expectRestart: boolean
 }) {
   return (
     <>
@@ -320,10 +342,11 @@ function WatchingBody({
         {PHASE_LABEL[phase] ?? 'Working…'}
       </p>
       <p className="text-muted-foreground">
-        The console loses contact with the server while it restarts — that is
-        expected. This dialog reports the result as soon as it is back.
+        {expectRestart
+          ? 'The console loses contact with the server while it restarts — that is expected. This dialog reports the result as soon as it is back.'
+          : 'temps stays up while this runs; the new version takes over when you restart it.'}
       </p>
-      {waitedTooLong && (
+      {waitedTooLong && expectRestart && (
         <p className="flex gap-2 rounded border border-destructive/40 bg-destructive/10 p-2 text-destructive">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
@@ -341,6 +364,29 @@ function WatchingBody({
 }
 
 function ResultBody({ result }: { result: SelfUpdateAttempt }) {
+  if (result.status === 'installed_pending_restart') {
+    // The most important case to be blunt about: the bytes are on disk but the
+    // running server is unchanged, and only the operator can finish the job.
+    return (
+      <>
+        <p>
+          <strong className="font-mono">{result.to_version}</strong> is
+          installed, but temps is still running{' '}
+          <span className="font-mono">{result.from_version}</span>.
+        </p>
+        <p className="text-muted-foreground">
+          Nothing on this host restarts temps automatically, so the update goes
+          live the next time you restart it yourself.
+        </p>
+        {result.previous_binary_path && (
+          <p className="text-xs text-muted-foreground">
+            Previous binary kept at{' '}
+            <span className="font-mono">{result.previous_binary_path}</span>
+          </p>
+        )}
+      </>
+    )
+  }
   if (result.status === 'succeeded') {
     return (
       <>

@@ -933,11 +933,24 @@ pub struct SelfUpdateSettings {
     /// banner and the manual command, it just refuses to run it for you.
     #[schema(example = true)]
     pub enabled: bool,
+
+    /// Release channel this install tracks: `stable`, `beta` or `nightly`.
+    ///
+    /// `None` (the default) means "infer from the running version tag", which
+    /// is what the CLI has always done — a `-nightly.` build tracks nightly, a
+    /// `-beta.N` build tracks beta, a plain tag tracks stable. Setting it
+    /// explicitly pins the channel, so an operator can move a nightly box back
+    /// onto stable without reinstalling.
+    #[schema(example = "stable")]
+    pub channel: Option<String>,
 }
 
 impl Default for SelfUpdateSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            channel: None,
+        }
     }
 }
 

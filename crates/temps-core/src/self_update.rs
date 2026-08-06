@@ -15,6 +15,7 @@
 //! capability is reported honestly up front, with the reason and the manual
 //! command to run instead, rather than discovering it after the process is gone.
 
+use crate::AvailableUpdate;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -41,9 +42,17 @@ pub enum SupervisorKind {
 }
 
 impl SupervisorKind {
-    /// Can a process under this supervisor be expected to come back after exit?
-    pub fn restarts_on_exit(self) -> bool {
-        matches!(self, Self::Systemd | Self::Launchd)
+    /// How the new binary gets picked up under this supervisor.
+    ///
+    /// Only systemd and launchd are known to relaunch the process, so only they
+    /// get an automatic restart. Everything else installs and stays put: the
+    /// operator restarts on their own schedule, which is strictly better than
+    /// either refusing to install or exiting into an outage.
+    pub fn restart_mode(self) -> SelfUpdateRestartMode {
+        match self {
+            Self::Systemd | Self::Launchd => SelfUpdateRestartMode::Automatic,
+            Self::Container | Self::None => SelfUpdateRestartMode::Manual,
+        }
     }
 
     pub fn as_str(self) -> &'static str {
@@ -68,16 +77,37 @@ pub enum SelfUpdateBlocker {
     /// Turned off in Settings (`self_update.enabled = false`). An admin can turn
     /// it back on in the UI.
     DisabledBySetting,
-    /// Running in a container: update the image tag instead.
-    Container,
-    /// Nothing would restart the process after it exits.
-    NoSupervisor,
+    /// This process does not manage the temps binary at all (e.g. the settings
+    /// API running inside the standalone proxy), so there is nothing to replace.
+    NotSupported,
     /// The binary (or its directory) is not writable by the server user.
     BinaryNotWritable,
     /// No release assets are published for this OS/arch.
     UnsupportedPlatform,
     /// Another update attempt is already running.
     InProgress,
+}
+
+/// What happens to the running process once the new binary is in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfUpdateRestartMode {
+    /// A supervisor will relaunch temps, so the update finishes by exiting.
+    /// Costs a few seconds of downtime and completes without further action.
+    Automatic,
+    /// Nothing would relaunch temps, so it installs the binary and keeps
+    /// running the OLD version until the operator restarts it themselves.
+    /// No downtime, but the update is not live until they do.
+    Manual,
+}
+
+impl SelfUpdateRestartMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Manual => "manual",
+        }
+    }
 }
 
 /// Where an in-flight update has got to. Polled by the console so a long
@@ -98,6 +128,9 @@ pub enum SelfUpdatePhase {
     Installing,
     /// Binary swapped; the process is shutting down so the supervisor restarts it.
     Restarting,
+    /// Binary swapped, but nothing will restart temps automatically — it is
+    /// still serving the old version until the operator restarts it.
+    PendingRestart,
     /// The attempt failed. The running binary was left untouched.
     Failed,
 }
@@ -119,6 +152,7 @@ impl SelfUpdatePhase {
             Self::Verifying => "verifying",
             Self::Installing => "installing",
             Self::Restarting => "restarting",
+            Self::PendingRestart => "pending_restart",
             Self::Failed => "failed",
         }
     }
@@ -133,6 +167,10 @@ pub enum SelfUpdateStatus {
     Pending,
     /// The process came back on the target version.
     Succeeded,
+    /// The new binary is on disk, but temps is still running the old one
+    /// because nothing restarts it automatically. Resolves to `Succeeded` on
+    /// the next boot; stays here (never fails) until the operator restarts.
+    InstalledPendingRestart,
     /// The attempt failed before the swap, or the process came back on the old
     /// version despite a completed swap.
     Failed,
@@ -175,7 +213,20 @@ pub struct SelfUpdateCapability {
     /// Command to run by hand instead. Always present — the manual path works
     /// even when the API path is blocked, so the operator is never stuck.
     pub manual_command: String,
+    /// Version tag of the running binary, e.g. `v0.1.0-beta.55`. Always
+    /// present — the version page needs it whether or not an update exists.
+    pub current_version: String,
+    /// Channel this install actually tracks, after applying the configured
+    /// override or falling back to inference from `current_version`.
+    pub channel: String,
+    /// Whether `channel` came from settings (`true`) or was inferred from the
+    /// running version tag (`false`). The UI shows inference as the default
+    /// rather than as an explicit choice the operator made.
+    pub channel_is_pinned: bool,
     pub supervisor: SupervisorKind,
+    /// Whether applying an update also restarts temps, or only installs the
+    /// binary and leaves the restart to the operator.
+    pub restart_mode: SelfUpdateRestartMode,
     /// Absolute path of the binary that would be replaced.
     pub binary_path: String,
     /// Something true about this topology that the operator must know *before*
@@ -198,7 +249,41 @@ pub struct StartedSelfUpdate {
     pub current_version: String,
     /// How long the console should expect to wait before the server answers
     /// again, so it can poll with a sensible timeout instead of guessing.
+    /// Meaningless when `restart_mode` is `manual` — nothing goes down.
     pub estimated_restart_secs: u64,
+    /// Echoed from the capability so the caller knows whether to expect a
+    /// restart at all, without racing a second capability fetch.
+    pub restart_mode: SelfUpdateRestartMode,
+}
+
+/// Outcome of an operator-triggered release check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReleaseCheckResult {
+    /// Channel that was queried.
+    pub channel: String,
+    /// Version tag of the running binary.
+    pub current_version: String,
+    /// Newest release published on that channel, if any could be resolved.
+    pub latest_version: Option<String>,
+    /// Release-notes page for `latest_version`.
+    pub release_url: Option<String>,
+    /// True when `latest_version` is strictly newer than what is running.
+    /// False on a channel whose newest release is older — which is normal and
+    /// expected right after switching a nightly box onto stable.
+    pub update_available: bool,
+}
+
+/// The database-backed half of the update policy.
+///
+/// Passed in by the caller rather than read here: these live in the settings
+/// table, which this trait deliberately knows nothing about. Bundled into one
+/// struct so adding policy later doesn't churn every call site.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelfUpdatePolicy {
+    /// `self_update.enabled` — the console's soft off switch.
+    pub enabled: bool,
+    /// `self_update.channel` — `None` means infer from the running version.
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -227,17 +312,18 @@ impl SelfUpdateError {
 /// Registered as a service by `temps serve` and consumed by the settings API.
 /// Absent in hosts that cannot restart themselves meaningfully (e.g. the
 /// standalone proxy), in which case the endpoint reports "not supported here".
+#[async_trait::async_trait]
 pub trait SelfUpdater: Send + Sync {
-    /// Report whether an update can be applied right now.
-    ///
-    /// `enabled_in_settings` is passed in rather than read here: the setting
-    /// lives in the database, which this trait deliberately knows nothing
-    /// about. The caller (which already loaded `AppSettings`) supplies it.
-    fn capability(&self, enabled_in_settings: bool) -> SelfUpdateCapability;
+    /// Report whether an update can be applied right now, plus the version and
+    /// channel information the console's version page renders.
+    fn capability(&self, policy: &SelfUpdatePolicy) -> SelfUpdateCapability;
 
     /// Begin an update. Returns as soon as the attempt is accepted — the
-    /// download, swap and restart continue in the background and are observable
-    /// through `capability().phase`, then through the journal after the restart.
+    /// download and swap continue in the background, observable through
+    /// `capability().phase`. Under `Automatic` restart mode the process then
+    /// exits and the outcome is read from the journal on the next boot; under
+    /// `Manual` it finishes at `PendingRestart` with temps still serving the
+    /// old binary.
     ///
     /// `target_version` pins a specific tag; `None` takes the newest release on
     /// this install's channel.
@@ -245,8 +331,20 @@ pub trait SelfUpdater: Send + Sync {
         &self,
         target_version: Option<String>,
         triggered_by_user_id: Option<i32>,
-        enabled_in_settings: bool,
+        policy: &SelfUpdatePolicy,
     ) -> Result<StartedSelfUpdate, SelfUpdateError>;
+
+    /// Query the release API right now instead of waiting for the background
+    /// notifier's next pass, and republish the shared update slot from the
+    /// result (including clearing it when nothing newer exists).
+    ///
+    /// `channel` is the configured override; `None` infers from the running
+    /// version. Errors are returned as operator-facing strings — a failed
+    /// check is a network problem to show, not a domain error to model.
+    async fn check_now(&self, channel: Option<String>) -> Result<ReleaseCheckResult, String>;
+
+    /// The update the last successful check found, if it is still current.
+    fn available_update(&self) -> Option<AvailableUpdate>;
 }
 
 #[cfg(test)]
@@ -254,13 +352,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_only_real_supervisors_restart_on_exit() {
-        assert!(SupervisorKind::Systemd.restarts_on_exit());
-        assert!(SupervisorKind::Launchd.restarts_on_exit());
-        // A container restart returns to the image's binary, not the swapped
-        // one, so it must never count as "will come back updated".
-        assert!(!SupervisorKind::Container.restarts_on_exit());
-        assert!(!SupervisorKind::None.restarts_on_exit());
+    fn test_only_real_supervisors_restart_automatically() {
+        assert_eq!(
+            SupervisorKind::Systemd.restart_mode(),
+            SelfUpdateRestartMode::Automatic
+        );
+        assert_eq!(
+            SupervisorKind::Launchd.restart_mode(),
+            SelfUpdateRestartMode::Automatic
+        );
+        // Neither of these is known to relaunch temps, so the update must
+        // install and stop rather than exit into an outage.
+        assert_eq!(
+            SupervisorKind::Container.restart_mode(),
+            SelfUpdateRestartMode::Manual
+        );
+        assert_eq!(
+            SupervisorKind::None.restart_mode(),
+            SelfUpdateRestartMode::Manual
+        );
     }
 
     #[test]
@@ -276,6 +386,9 @@ mod tests {
         // Restarting is deliberately NOT active: the swap is done and the
         // process is on its way out, so a second attempt has nothing to race.
         assert!(!SelfUpdatePhase::Restarting.is_active());
+        // Likewise once installed — the binary is in place and the updater is
+        // free; only the operator's restart is outstanding.
+        assert!(!SelfUpdatePhase::PendingRestart.is_active());
         assert!(!SelfUpdatePhase::Idle.is_active());
         assert!(!SelfUpdatePhase::Failed.is_active());
     }

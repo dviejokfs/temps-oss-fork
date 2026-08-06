@@ -508,6 +508,7 @@ impl AppSettingsResponse {
         get_update_status,
         get_update_capability,
         start_update,
+        check_for_update,
         get_disk_status,
         update_settings,
         generate_join_token,
@@ -553,7 +554,9 @@ impl AppSettingsResponse {
         temps_core::SelfUpdateAttempt,
         temps_core::SelfUpdateBlocker,
         temps_core::SelfUpdatePhase,
+        temps_core::SelfUpdateRestartMode,
         temps_core::SelfUpdateStatus,
+        temps_core::ReleaseCheckResult,
         temps_core::SupervisorKind,
     )),
     info(
@@ -574,6 +577,7 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
             "/settings/update",
             get(get_update_capability).post(start_update),
         )
+        .route("/settings/update/check", post(check_for_update))
         .route("/settings/disk-status", get(get_disk_status))
         .route("/settings/join-token/generate", post(generate_join_token))
         .route("/settings/join-token", delete(revoke_join_token))
@@ -905,8 +909,20 @@ pub struct UpdateCapabilityResponse {
     pub caveat: Option<String>,
     /// The equivalent command to run by hand. Always present.
     pub manual_command: String,
+    /// Version tag of the running binary. Always present — the version page
+    /// needs it whether or not an update exists.
+    pub current_version: String,
+    /// Channel actually tracked, after applying the configured override or
+    /// falling back to inference from the running version tag.
+    pub channel: String,
+    /// True when `channel` was set explicitly in settings rather than inferred.
+    pub channel_is_pinned: bool,
     /// What would restart the process: `systemd`, `launchd`, `container`, `none`.
     pub supervisor: temps_core::SupervisorKind,
+    /// `automatic` when applying an update also restarts temps; `manual` when
+    /// it only installs the binary and the operator restarts on their own
+    /// schedule. Lets the console set expectations before the click.
+    pub restart_mode: temps_core::SelfUpdateRestartMode,
     /// Binary that would be replaced.
     pub binary_path: String,
     /// Phase of an in-flight attempt: `idle` when none is running.
@@ -932,9 +948,31 @@ pub struct StartUpdateResponse {
     /// Version the server is running as it accepts this request.
     pub current_version: String,
     /// How long to allow for the server to come back before treating the
-    /// restart as failed.
+    /// restart as failed. `0` when nothing restarts.
     pub estimated_restart_secs: u64,
+    /// `automatic` (temps restarts itself) or `manual` (installed only).
+    pub restart_mode: temps_core::SelfUpdateRestartMode,
     pub message: String,
+}
+
+/// Read the database-backed half of the update policy.
+///
+/// Fails CLOSED: if settings cannot be read we must not report (or act on) a
+/// capability the operator may have deliberately turned off.
+async fn load_self_update_policy(app_state: &SettingsState) -> temps_core::SelfUpdatePolicy {
+    match app_state.config_service.get_settings().await {
+        Ok(settings) => temps_core::SelfUpdatePolicy {
+            enabled: settings.self_update.enabled,
+            channel: settings.self_update.channel,
+        },
+        Err(e) => {
+            error!("Could not read self-update settings, treating as disabled: {e}");
+            temps_core::SelfUpdatePolicy {
+                enabled: false,
+                channel: None,
+            }
+        }
+    }
 }
 
 /// Build the "no updater registered in this process" answer.
@@ -947,7 +985,7 @@ fn updater_unavailable_response(allowed: bool) -> UpdateCapabilityResponse {
     UpdateCapabilityResponse {
         can_apply: false,
         allowed,
-        blocker: Some(temps_core::SelfUpdateBlocker::NoSupervisor),
+        blocker: Some(temps_core::SelfUpdateBlocker::NotSupported),
         reason: Some(
             "This process does not manage the temps binary, so it cannot apply an update. \
              Upgrade from the command line on the host instead."
@@ -955,12 +993,59 @@ fn updater_unavailable_response(allowed: bool) -> UpdateCapabilityResponse {
         ),
         caveat: None,
         manual_command: "temps upgrade".to_string(),
+        current_version: String::new(),
+        channel: "unknown".to_string(),
+        channel_is_pinned: false,
         supervisor: temps_core::SupervisorKind::None,
+        restart_mode: temps_core::SelfUpdateRestartMode::Manual,
         binary_path: String::new(),
         phase: temps_core::SelfUpdatePhase::Idle,
         phase_error: None,
         last_attempt: None,
     }
+}
+
+/// Ask the release API for the newest version on this install's channel, now,
+/// instead of waiting for the background notifier's next pass.
+#[utoipa::path(
+    tag = "Settings",
+    post,
+    path = "/settings/update/check",
+    responses(
+        (status = 200, description = "Result of the release check", body = temps_core::ReleaseCheckResult),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 502, description = "The release API could not be reached", body = temps_core::ProblemDetails),
+        (status = 501, description = "This process cannot check for updates", body = temps_core::ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn check_for_update(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+) -> Result<impl IntoResponse, Problem> {
+    // A read-only network probe that changes no state the operator can't
+    // already see, so it sits with the rest of the settings reads.
+    permission_guard!(auth, SettingsRead);
+
+    let Some(updater) = app_state.self_updater.as_ref() else {
+        return Err(ErrorBuilder::new(StatusCode::NOT_IMPLEMENTED)
+            .title("Update Checks Not Supported Here")
+            .detail("This process does not track temps releases.")
+            .build());
+    };
+
+    let policy = load_self_update_policy(&app_state).await;
+    let result = updater.check_now(policy.channel).await.map_err(|reason| {
+        // Upstream reachability, not a client mistake — say so plainly so the
+        // operator looks at egress rather than at their own request.
+        ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+            .title("Release Check Failed")
+            .detail(reason)
+            .build()
+    })?;
+
+    Ok(Json(result))
 }
 
 /// Report whether a release update can be applied from the console.
@@ -990,18 +1075,7 @@ async fn get_update_capability(
         return Ok(Json(updater_unavailable_response(allowed)));
     };
 
-    // The database toggle is only half the answer; the updater combines it with
-    // the launch flag and the environment to decide what is actually possible.
-    let enabled_in_settings = app_state
-        .config_service
-        .get_settings()
-        .await
-        .map(|s| s.self_update.enabled)
-        // Fail closed: if the setting cannot be read we must not report a
-        // capability the operator may have turned off.
-        .unwrap_or(false);
-
-    let capability = updater.capability(enabled_in_settings);
+    let capability = updater.capability(&load_self_update_policy(&app_state).await);
     Ok(Json(UpdateCapabilityResponse {
         // Describes the SERVER only. Permission is reported separately as
         // `allowed` so a blocked install and an under-privileged caller stay
@@ -1013,7 +1087,11 @@ async fn get_update_capability(
         reason: capability.reason,
         caveat: capability.caveat,
         manual_command: capability.manual_command,
+        current_version: capability.current_version,
+        channel: capability.channel,
+        channel_is_pinned: capability.channel_is_pinned,
         supervisor: capability.supervisor,
+        restart_mode: capability.restart_mode,
         binary_path: capability.binary_path,
         phase: capability.phase,
         phase_error: capability.phase_error,
@@ -1062,18 +1140,11 @@ async fn start_update(
             .build());
     };
 
-    let enabled_in_settings = app_state
-        .config_service
-        .get_settings()
-        .await
-        .map(|s| s.self_update.enabled)
-        .unwrap_or(false);
-
     let started = updater
         .start(
             request.version.clone(),
             Some(auth.user_id()),
-            enabled_in_settings,
+            &load_self_update_policy(&app_state).await,
         )
         .map_err(self_update_error_to_problem)?;
 
@@ -1105,8 +1176,17 @@ async fn start_update(
         Json(StartUpdateResponse {
             current_version: started.current_version,
             estimated_restart_secs: started.estimated_restart_secs,
-            message: "Update started. The server will restart when the new binary is installed."
-                .to_string(),
+            restart_mode: started.restart_mode,
+            message: match started.restart_mode {
+                temps_core::SelfUpdateRestartMode::Automatic => {
+                    "Update started. The server will restart when the new binary is installed."
+                }
+                temps_core::SelfUpdateRestartMode::Manual => {
+                    "Update started. The new binary will be installed, but temps keeps running \
+                     the current version until you restart it."
+                }
+            }
+            .to_string(),
         }),
     ))
 }
@@ -1127,8 +1207,7 @@ fn self_update_error_to_problem(error: temps_core::SelfUpdateError) -> Problem {
             "Self-Update Disabled"
         }
         SelfUpdateBlocker::InProgress => "Update Already Running",
-        SelfUpdateBlocker::Container => "Self-Update Not Possible In A Container",
-        SelfUpdateBlocker::NoSupervisor => "No Process Supervisor",
+        SelfUpdateBlocker::NotSupported => "Self-Update Not Supported Here",
         SelfUpdateBlocker::BinaryNotWritable => "Binary Not Writable",
         SelfUpdateBlocker::UnsupportedPlatform => "Unsupported Platform",
     };

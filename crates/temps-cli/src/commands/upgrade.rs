@@ -64,7 +64,19 @@ fn is_nightly_tag(tag: &str) -> bool {
 }
 
 impl UpgradeChannel {
-    fn as_str(self) -> &'static str {
+    /// Parse a channel configured in settings. Unknown values return `None` so
+    /// the caller falls back to inferring from the running version rather than
+    /// silently tracking the wrong channel.
+    pub fn from_setting(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stable" => Some(Self::Stable),
+            "beta" => Some(Self::Beta),
+            "nightly" => Some(Self::Nightly),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Stable => "stable",
             Self::Beta => "beta",
@@ -747,7 +759,7 @@ fn version_sort_key(tag: &str) -> Option<VersionSortKey> {
 /// exotic tags. This is deliberately stricter than `temps upgrade`, which
 /// treats any tag difference as upgradeable (including downgrades the
 /// operator explicitly pins with `--version`).
-fn is_newer_version(candidate: &str, current: &str) -> bool {
+pub(crate) fn is_newer_version(candidate: &str, current: &str) -> bool {
     match (version_sort_key(candidate), version_sort_key(current)) {
         (Some(candidate_key), Some(current_key)) => candidate_key > current_key,
         _ => false,
@@ -759,9 +771,13 @@ fn is_newer_version(candidate: &str, current: &str) -> bool {
 /// binary. Every failure path (network, GitHub quota, unparsable tags)
 /// collapses to `None` with a debug log — the notifier is advisory and must
 /// never surface errors to an operator who didn't ask for a check.
-pub async fn check_for_newer_release() -> Option<UpdateNotice> {
+pub async fn check_for_newer_release(configured_channel: Option<&str>) -> Option<UpdateNotice> {
     let current_version = current_version_tag();
-    let channel = UpgradeChannel::for_installed_version(&current_version);
+    // An explicit channel from settings wins; otherwise fall back to the tag
+    // the running binary carries, which is what the CLI has always done.
+    let channel = configured_channel
+        .and_then(UpgradeChannel::from_setting)
+        .unwrap_or_else(|| UpgradeChannel::for_installed_version(&current_version));
 
     let release = match tokio::time::timeout(
         UPDATE_CHECK_TIMEOUT,
@@ -815,10 +831,18 @@ pub async fn check_for_newer_release() -> Option<UpdateNotice> {
 pub async fn update_notifier_loop(
     slot: Arc<temps_core::UpdateStatusSlot>,
     interval: std::time::Duration,
+    config_service: Arc<temps_config::ConfigService>,
 ) {
     tokio::time::sleep(UPDATE_CHECK_STARTUP_DELAY).await;
     loop {
-        if let Some(notice) = check_for_newer_release().await {
+        // Re-read every pass so switching channel in the console takes effect
+        // on the next check instead of requiring a restart.
+        let configured_channel = config_service
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|s| s.self_update.channel);
+        if let Some(notice) = check_for_newer_release(configured_channel.as_deref()).await {
             tracing::warn!(
                 current_version = %notice.current_version,
                 latest_version = %notice.latest_version,

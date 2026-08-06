@@ -18,6 +18,7 @@ import {
   Activity,
   AlarmClock,
   ArrowLeft,
+  ArrowUpCircle,
   BadgeCheck,
   BarChart3,
   Bell,
@@ -179,6 +180,7 @@ const settingsGroups: SettingsGroupDef[] = [
     label: 'General',
     items: [
       { title: 'Platform', url: '/settings', icon: Settings2 },
+      { title: 'Version', url: '/settings/version', icon: ArrowUpCircle },
       { title: 'AI Providers', url: '/settings/ai-providers', icon: Sparkles },
       { title: 'Notifications', url: '/settings/notifications', icon: Bell },
     ],

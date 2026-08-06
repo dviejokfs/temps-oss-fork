@@ -7,11 +7,15 @@
 //! back after it exits, and (b) reporting the outcome of an operation that by
 //! definition kills the process that started it.
 //!
-//! **How the restart works.** Nothing in temps restarts temps. The binary is
-//! swapped on disk and the process exits; whatever supervises it (systemd
-//! `Restart=always`, launchd `KeepAlive`) starts it again, now on the new
-//! binary. That is why an install with no supervisor is refused up front rather
-//! than left dead — see `detect_supervisor`.
+//! **How the restart works.** Nothing in temps restarts temps. Where a
+//! supervisor is detected (systemd `Restart=always`, launchd `KeepAlive`) the
+//! binary is swapped and the process exits, and the supervisor brings it back
+//! on the new one. Where no supervisor is detected the binary is still
+//! installed — the operator asked for the update and gets it — but the process
+//! deliberately keeps running the OLD version instead of exiting into an
+//! outage nothing would recover from. The capability says which of the two
+//! will happen BEFORE the click, and the result says the update is not live
+//! until temps is restarted. See `detect_supervisor` and `SelfUpdateRestartMode`.
 //!
 //! **How the outcome is reported.** The attempt is written to
 //! `<data_dir>/self-update.json` as `pending` immediately before exiting, and
@@ -25,15 +29,18 @@ use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 use temps_core::{
-    SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability, SelfUpdateError, SelfUpdatePhase,
-    SelfUpdateStatus, SelfUpdater, StartedSelfUpdate, SupervisorKind, SELF_UPDATE_JOURNAL_FILE,
+    AvailableUpdate, ReleaseCheckResult, SelfUpdateAttempt, SelfUpdateBlocker,
+    SelfUpdateCapability, SelfUpdateError, SelfUpdatePhase, SelfUpdatePolicy,
+    SelfUpdateRestartMode, SelfUpdateStatus, SelfUpdater, StartedSelfUpdate, SupervisorKind,
+    UpdateStatusSlot, SELF_UPDATE_JOURNAL_FILE,
 };
 use tracing::{error, info, warn};
 
 use crate::commands::upgrade::{
     check_write_permission, current_version_tag, download_asset, download_asset_text,
     extract_binary_from_tarball, fetch_latest_release_in_channel, fetch_specific_release,
-    platform_target, replace_binary, verify_checksum, GitHubRelease, UpgradeChannel,
+    is_newer_version, platform_target, replace_binary, verify_checksum, GitHubRelease,
+    UpgradeChannel,
 };
 
 /// Grace period between accepting the update and exiting the process. Long
@@ -45,6 +52,10 @@ const RESTART_GRACE: std::time::Duration = std::time::Duration::from_millis(1_50
 /// installed by `deploy.sh` uses `RestartSec=5`, plus boot (migrations, plugin
 /// init). Advisory only — it drives the polling timeout, nothing else.
 const ESTIMATED_RESTART_SECS: u64 = 45;
+
+/// Bound on an operator-triggered check so a hung release API cannot leave the
+/// request (and the spinner behind it) waiting indefinitely.
+const CHECK_NOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Debug, Default)]
 struct UpdaterState {
@@ -63,9 +74,11 @@ pub struct BinarySelfUpdater {
     /// the settings toggle, nothing reachable over HTTP can clear it.
     disabled_by_flag: bool,
     supervisor: SupervisorKind,
-    /// Topology caveat surfaced with the confirmation (see the field of the
-    /// same name on `SelfUpdateCapability`).
-    caveat: Option<String>,
+    /// Split-topology note supplied by the caller, merged into `caveats()`.
+    topology_caveat: Option<String>,
+    /// Shared notice slot the background notifier also writes. An on-demand
+    /// check republishes it so the banner and the version page never disagree.
+    update_status: Arc<UpdateStatusSlot>,
     state: Arc<RwLock<UpdaterState>>,
 }
 
@@ -74,7 +87,12 @@ impl BinarySelfUpdater {
     /// process. Never fails: a bad journal or an unresolvable binary path
     /// degrades to "self-update unavailable", which the capability endpoint
     /// reports with a reason.
-    pub fn new(data_dir: PathBuf, disabled_by_flag: bool, caveat: Option<String>) -> Self {
+    pub fn new(
+        data_dir: PathBuf,
+        disabled_by_flag: bool,
+        topology_caveat: Option<String>,
+        update_status: Arc<UpdateStatusSlot>,
+    ) -> Self {
         let binary_path = std::env::current_exe()
             .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
             .unwrap_or_else(|e| {
@@ -95,7 +113,8 @@ impl BinarySelfUpdater {
             data_dir,
             disabled_by_flag,
             supervisor,
-            caveat,
+            topology_caveat,
+            update_status,
             state: Arc::new(RwLock::new(UpdaterState::default())),
         };
 
@@ -131,11 +150,17 @@ impl BinarySelfUpdater {
             }
         };
 
-        if attempt.status != SelfUpdateStatus::Pending {
+        // `InstalledPendingRestart` is resolvable too: the operator may be
+        // restarting right now, which is exactly this boot.
+        if !matches!(
+            attempt.status,
+            SelfUpdateStatus::Pending | SelfUpdateStatus::InstalledPendingRestart
+        ) {
             return Some(attempt);
         }
 
         let running = current_version_tag();
+        let awaiting_manual_restart = attempt.status == SelfUpdateStatus::InstalledPendingRestart;
         attempt.finished_at = Some(Utc::now());
         if attempt.to_version.as_deref() == Some(running.as_str()) {
             attempt.status = SelfUpdateStatus::Succeeded;
@@ -143,6 +168,17 @@ impl BinarySelfUpdater {
                 from = %attempt.from_version,
                 to = %running,
                 "Self-update completed: restarted on the new version"
+            );
+        } else if awaiting_manual_restart {
+            // Still on the old binary, but nothing ever promised otherwise:
+            // this install is waiting on a restart the operator hasn't done.
+            // Calling that a failure would hide a pending upgrade, so the
+            // attempt stays exactly where it is.
+            attempt.finished_at = None;
+            info!(
+                installed = ?attempt.to_version,
+                running = %running,
+                "A self-update is installed and waiting for a restart"
             );
         } else {
             attempt.status = SelfUpdateStatus::Failed;
@@ -177,12 +213,40 @@ impl BinarySelfUpdater {
     /// Always answerable — there is no state in which the manual path is gone.
     fn manual_command(&self, blocker: Option<SelfUpdateBlocker>) -> String {
         match blocker {
-            Some(SelfUpdateBlocker::Container) => {
+            Some(SelfUpdateBlocker::BinaryNotWritable) => "sudo temps upgrade".to_string(),
+            _ if self.supervisor == SupervisorKind::Container => {
                 "docker compose pull && docker compose up -d".to_string()
             }
-            Some(SelfUpdateBlocker::BinaryNotWritable) => "sudo temps upgrade".to_string(),
             _ => "temps upgrade".to_string(),
         }
+    }
+
+    /// Everything true about this install that the operator should know before
+    /// clicking, but that does not stop the update. Composed rather than
+    /// single-valued because a split-topology console in a container has two
+    /// separate things worth saying.
+    fn caveats(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        match self.supervisor {
+            SupervisorKind::Container => parts.push(
+                "This server runs in a container. The new binary is written into the container's \
+                 filesystem and survives a restart, but recreating the container (for example \
+                 `docker compose up -d` after an image change) reverts it to the image's version \
+                 — update your image tag for a durable upgrade."
+                    .to_string(),
+            ),
+            SupervisorKind::None => parts.push(
+                "No process supervisor was detected, so temps cannot restart itself. The new \
+                 binary will be installed and temps will keep serving the current version until \
+                 you restart it."
+                    .to_string(),
+            ),
+            SupervisorKind::Systemd | SupervisorKind::Launchd => {}
+        }
+        if let Some(topology) = &self.topology_caveat {
+            parts.push(topology.clone());
+        }
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
 
     /// First blocker that applies, or `None` when an update can run.
@@ -191,7 +255,7 @@ impl BinarySelfUpdater {
     /// then the settings toggle) is reported before any environmental problem,
     /// because "you turned this off" is the honest answer even on a host that
     /// also happens to be unsupervised.
-    fn find_blocker(&self, enabled_in_settings: bool) -> Option<(SelfUpdateBlocker, String)> {
+    fn find_blocker(&self, policy: &SelfUpdatePolicy) -> Option<(SelfUpdateBlocker, String)> {
         if self.disabled_by_flag {
             return Some((
                 SelfUpdateBlocker::DisabledByFlag,
@@ -200,7 +264,7 @@ impl BinarySelfUpdater {
                     .to_string(),
             ));
         }
-        if !enabled_in_settings {
+        if !policy.enabled {
             return Some((
                 SelfUpdateBlocker::DisabledBySetting,
                 "One-click updates are turned off in Settings → Platform. An admin can re-enable \
@@ -208,24 +272,9 @@ impl BinarySelfUpdater {
                     .to_string(),
             ));
         }
-        if self.supervisor == SupervisorKind::Container {
-            return Some((
-                SelfUpdateBlocker::Container,
-                "This server runs inside a container, where the binary comes from the image. \
-                 Replacing it would be undone the next time the container is recreated — pull a \
-                 newer image tag instead."
-                    .to_string(),
-            ));
-        }
-        if !self.supervisor.restarts_on_exit() {
-            return Some((
-                SelfUpdateBlocker::NoSupervisor,
-                "No process supervisor was detected (no systemd or launchd), so nothing would \
-                 restart the server after it exits. Run temps under a service manager, or upgrade \
-                 from the command line."
-                    .to_string(),
-            ));
-        }
+        // NOTE: a missing supervisor is deliberately NOT a blocker. Installing
+        // the binary is still exactly what the operator asked for; only the
+        // restart is out of reach, and `restart_mode` says so up front.
         if let Err(e) = platform_target() {
             return Some((SelfUpdateBlocker::UnsupportedPlatform, e.to_string()));
         }
@@ -270,9 +319,30 @@ impl BinarySelfUpdater {
     }
 }
 
+/// Resolve the channel to track: the operator's explicit setting, else the one
+/// implied by the running version tag. An unparsable setting falls back to
+/// inference rather than erroring, so a bad value can never wedge the checker.
+pub(crate) fn resolve_channel(
+    configured: Option<&str>,
+    current_version: &str,
+) -> (UpgradeChannel, bool) {
+    match configured.and_then(UpgradeChannel::from_setting) {
+        Some(channel) => (channel, true),
+        None => (
+            UpgradeChannel::for_installed_version(current_version),
+            false,
+        ),
+    }
+}
+
+#[async_trait::async_trait]
 impl SelfUpdater for BinarySelfUpdater {
-    fn capability(&self, enabled_in_settings: bool) -> SelfUpdateCapability {
-        let blocker = self.find_blocker(enabled_in_settings);
+    fn capability(&self, policy: &SelfUpdatePolicy) -> SelfUpdateCapability {
+        let blocker = self.find_blocker(policy);
+        let current_version = current_version_tag();
+        // The capability also backs the version page, so it reports the
+        // effective channel even when no update is pending.
+        let (channel, pinned) = resolve_channel(policy.channel.as_deref(), &current_version);
         let (phase, phase_error, last_attempt) = match self.state.read() {
             Ok(state) => (
                 state.phase,
@@ -294,9 +364,13 @@ impl SelfUpdater for BinarySelfUpdater {
             blocker: blocker.as_ref().map(|(b, _)| *b),
             reason: blocker.as_ref().map(|(_, r)| r.clone()),
             manual_command: self.manual_command(blocker.as_ref().map(|(b, _)| *b)),
+            current_version: current_version.clone(),
+            channel: channel.as_str().to_string(),
+            channel_is_pinned: pinned,
             supervisor: self.supervisor,
+            restart_mode: self.supervisor.restart_mode(),
             binary_path: self.binary_path.display().to_string(),
-            caveat: self.caveat.clone(),
+            caveat: self.caveats(),
             phase,
             phase_error,
             last_attempt,
@@ -307,9 +381,9 @@ impl SelfUpdater for BinarySelfUpdater {
         &self,
         target_version: Option<String>,
         triggered_by_user_id: Option<i32>,
-        enabled_in_settings: bool,
+        policy: &SelfUpdatePolicy,
     ) -> Result<StartedSelfUpdate, SelfUpdateError> {
-        if let Some((blocker, reason)) = self.find_blocker(enabled_in_settings) {
+        if let Some((blocker, reason)) = self.find_blocker(policy) {
             if blocker == SelfUpdateBlocker::InProgress {
                 let phase = self
                     .state
@@ -326,12 +400,16 @@ impl SelfUpdater for BinarySelfUpdater {
         let current_version = current_version_tag();
         self.set_phase(SelfUpdatePhase::Resolving, None);
 
+        let restart_mode = self.supervisor.restart_mode();
+        let (channel, _) = resolve_channel(policy.channel.as_deref(), &current_version);
         let job = UpdateJob {
             binary_path: self.binary_path.clone(),
             journal_path: self.journal_path(),
             from_version: current_version.clone(),
             target_version,
             triggered_by_user_id,
+            restart_mode,
+            channel,
             state: self.state.clone(),
         };
         tokio::spawn(job.run());
@@ -339,13 +417,73 @@ impl SelfUpdater for BinarySelfUpdater {
         info!(
             user_id = ?triggered_by_user_id,
             from = %current_version,
+            restart_mode = restart_mode.as_str(),
             "Self-update accepted; downloading in the background"
         );
 
         Ok(StartedSelfUpdate {
             current_version,
-            estimated_restart_secs: ESTIMATED_RESTART_SECS,
+            // Nothing goes down in manual mode, so the caller has nothing to
+            // wait out.
+            estimated_restart_secs: match restart_mode {
+                SelfUpdateRestartMode::Automatic => ESTIMATED_RESTART_SECS,
+                SelfUpdateRestartMode::Manual => 0,
+            },
+            restart_mode,
         })
+    }
+
+    async fn check_now(&self, channel: Option<String>) -> Result<ReleaseCheckResult, String> {
+        let current_version = current_version_tag();
+        let (channel, _) = resolve_channel(channel.as_deref(), &current_version);
+
+        let release =
+            tokio::time::timeout(CHECK_NOW_TIMEOUT, fetch_latest_release_in_channel(channel))
+                .await
+                .map_err(|_| {
+                    format!(
+                        "Checking the {} channel timed out after {}s.",
+                        channel.as_str(),
+                        CHECK_NOW_TIMEOUT.as_secs()
+                    )
+                })?
+                .map_err(|e| format!("Could not check the {} channel: {e}", channel.as_str()))?;
+
+        let update_available = is_newer_version(&release.tag_name, &current_version);
+        if update_available {
+            self.update_status.set(AvailableUpdate {
+                current_version: current_version.clone(),
+                latest_version: release.tag_name.clone(),
+                channel: channel.as_str().to_string(),
+                release_url: release.html_url.clone(),
+                checked_at: Utc::now(),
+            });
+        } else {
+            // Clear rather than leave the previous notice: after switching from
+            // nightly to stable the newest stable is OLDER, so it can never
+            // overwrite the stale nightly notice and the banner would lie.
+            self.update_status.clear();
+        }
+
+        info!(
+            channel = channel.as_str(),
+            current = %current_version,
+            latest = %release.tag_name,
+            update_available,
+            "Release check requested from the console"
+        );
+
+        Ok(ReleaseCheckResult {
+            channel: channel.as_str().to_string(),
+            current_version,
+            latest_version: Some(release.tag_name),
+            release_url: Some(release.html_url),
+            update_available,
+        })
+    }
+
+    fn available_update(&self) -> Option<AvailableUpdate> {
+        self.update_status.get()
     }
 }
 
@@ -358,6 +496,9 @@ struct UpdateJob {
     from_version: String,
     target_version: Option<String>,
     triggered_by_user_id: Option<i32>,
+    restart_mode: SelfUpdateRestartMode,
+    /// Channel the "newest release" lookup uses when no version is pinned.
+    channel: UpgradeChannel,
     state: Arc<RwLock<UpdaterState>>,
 }
 
@@ -372,19 +513,35 @@ impl UpdateJob {
     async fn run(self) {
         let started_at = Utc::now();
         match self.execute(started_at).await {
-            Ok(target) => {
-                // The swap is done and the journal says `pending`. Exiting is
-                // now the whole job: the supervisor brings us back on the new
-                // binary and the next boot resolves the journal entry.
-                self.set_phase(SelfUpdatePhase::Restarting, None);
-                warn!(
-                    from = %self.from_version,
-                    to = %target,
-                    "Binary replaced — exiting so the supervisor restarts temps on the new version"
-                );
-                tokio::time::sleep(RESTART_GRACE).await;
-                std::process::exit(0);
-            }
+            Ok(target) => match self.restart_mode {
+                SelfUpdateRestartMode::Automatic => {
+                    // The swap is done and the journal says `pending`. Exiting
+                    // is now the whole job: the supervisor brings us back on
+                    // the new binary and the next boot resolves the journal.
+                    self.set_phase(SelfUpdatePhase::Restarting, None);
+                    warn!(
+                        from = %self.from_version,
+                        to = %target,
+                        "Binary replaced — exiting so the supervisor restarts temps on the new version"
+                    );
+                    tokio::time::sleep(RESTART_GRACE).await;
+                    std::process::exit(0);
+                }
+                SelfUpdateRestartMode::Manual => {
+                    // Installed, but exiting here would take the server down
+                    // with nothing to bring it back. Keep serving the old
+                    // binary and make the outstanding restart obvious.
+                    self.set_phase(SelfUpdatePhase::PendingRestart, None);
+                    warn!(
+                        from = %self.from_version,
+                        to = %target,
+                        "Binary replaced, but no supervisor was detected — temps is STILL RUNNING \
+                         {} and will pick up {} when you restart it",
+                        self.from_version,
+                        target
+                    );
+                }
+            },
             Err(e) => {
                 let message = e.to_string();
                 error!(
@@ -494,9 +651,18 @@ impl UpdateJob {
         let attempt = SelfUpdateAttempt {
             from_version: self.from_version.clone(),
             to_version: Some(to_version.clone()),
-            status: SelfUpdateStatus::Pending,
+            // `Pending` means "we are about to exit, resolve this on the next
+            // boot". In manual mode nothing exits, so the attempt is already
+            // as finished as it can get until the operator restarts.
+            status: match self.restart_mode {
+                SelfUpdateRestartMode::Automatic => SelfUpdateStatus::Pending,
+                SelfUpdateRestartMode::Manual => SelfUpdateStatus::InstalledPendingRestart,
+            },
             started_at,
-            finished_at: None,
+            finished_at: match self.restart_mode {
+                SelfUpdateRestartMode::Automatic => None,
+                SelfUpdateRestartMode::Manual => Some(Utc::now()),
+            },
             triggered_by_user_id: self.triggered_by_user_id,
             error: None,
             previous_binary_path: backup_path.map(|p| p.display().to_string()),
@@ -515,10 +681,7 @@ impl UpdateJob {
     async fn resolve_release(&self) -> anyhow::Result<GitHubRelease> {
         match &self.target_version {
             Some(version) => fetch_specific_release(version).await,
-            None => {
-                let channel = UpgradeChannel::for_installed_version(&self.from_version);
-                fetch_latest_release_in_channel(channel).await
-            }
+            None => fetch_latest_release_in_channel(self.channel).await,
         }
     }
 }
@@ -682,8 +845,17 @@ mod tests {
             data_dir: dir.to_path_buf(),
             disabled_by_flag,
             supervisor,
-            caveat: None,
+            topology_caveat: None,
+            update_status: Arc::new(UpdateStatusSlot::new()),
             state: Arc::new(RwLock::new(UpdaterState::default())),
+        }
+    }
+
+    /// Settings-backed policy for tests: enabled/disabled, channel inferred.
+    fn policy(enabled: bool) -> SelfUpdatePolicy {
+        SelfUpdatePolicy {
+            enabled,
+            channel: None,
         }
     }
 
@@ -698,7 +870,7 @@ mod tests {
     #[test]
     fn test_flag_blocks_even_when_everything_else_is_fine() {
         let dir = temp_dir("flag");
-        let cap = updater(&dir, true, SupervisorKind::Systemd).capability(true);
+        let cap = updater(&dir, true, SupervisorKind::Systemd).capability(&policy(true));
         assert!(!cap.can_apply);
         assert_eq!(cap.blocker, Some(SelfUpdateBlocker::DisabledByFlag));
         // The reason must say the flag cannot be cleared from the UI, or an
@@ -712,7 +884,7 @@ mod tests {
         // Both off: the flag is the one the operator cannot undo in the UI, so
         // it must be the reported blocker.
         let dir = temp_dir("flag-wins");
-        let cap = updater(&dir, true, SupervisorKind::Systemd).capability(false);
+        let cap = updater(&dir, true, SupervisorKind::Systemd).capability(&policy(false));
         assert_eq!(cap.blocker, Some(SelfUpdateBlocker::DisabledByFlag));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -720,39 +892,70 @@ mod tests {
     #[test]
     fn test_settings_toggle_blocks() {
         let dir = temp_dir("setting");
-        let cap = updater(&dir, false, SupervisorKind::Systemd).capability(false);
+        let cap = updater(&dir, false, SupervisorKind::Systemd).capability(&policy(false));
         assert!(!cap.can_apply);
         assert_eq!(cap.blocker, Some(SelfUpdateBlocker::DisabledBySetting));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_container_is_never_updatable() {
+    fn test_container_installs_with_a_caveat_instead_of_being_refused() {
         let dir = temp_dir("container");
-        let cap = updater(&dir, false, SupervisorKind::Container).capability(true);
-        assert!(!cap.can_apply);
-        assert_eq!(cap.blocker, Some(SelfUpdateBlocker::Container));
-        // Must point at the image, not at `temps upgrade`, which would be
-        // undone on the next container recreate.
+        let cap = updater(&dir, false, SupervisorKind::Container).capability(&policy(true));
+        // The operator asked for the binary to be updated; a container is a
+        // reason to warn, not to refuse.
+        assert!(cap.can_apply, "blocked by {:?}", cap.blocker);
+        assert_eq!(cap.restart_mode, SelfUpdateRestartMode::Manual);
+        // ...but they must be told the swap does not survive a recreate.
+        let caveat = cap.caveat.expect("container needs a caveat");
+        assert!(
+            caveat.contains("recreating") || caveat.contains("recreate"),
+            "{caveat}"
+        );
+        // The durable fix points at the image, not `temps upgrade`.
         assert!(cap.manual_command.contains("docker"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_unsupervised_is_refused() {
+    fn test_unsupervised_installs_without_restarting() {
         let dir = temp_dir("unsupervised");
-        let cap = updater(&dir, false, SupervisorKind::None).capability(true);
-        assert!(!cap.can_apply);
-        assert_eq!(cap.blocker, Some(SelfUpdateBlocker::NoSupervisor));
-        // The manual path always remains available.
+        let cap = updater(&dir, false, SupervisorKind::None).capability(&policy(true));
+        // Installing still works with no supervisor — only the restart is out
+        // of reach, and that is stated rather than used as a refusal.
+        assert!(cap.can_apply, "blocked by {:?}", cap.blocker);
+        assert_eq!(cap.blocker, None);
+        assert_eq!(cap.restart_mode, SelfUpdateRestartMode::Manual);
+        let caveat = cap.caveat.expect("manual restart needs a caveat");
+        assert!(caveat.contains("restart it"), "{caveat}");
         assert_eq!(cap.manual_command, "temps upgrade");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_supervised_install_restarts_automatically_and_has_no_caveat() {
+        let dir = temp_dir("supervised-mode");
+        let cap = updater(&dir, false, SupervisorKind::Systemd).capability(&policy(true));
+        assert_eq!(cap.restart_mode, SelfUpdateRestartMode::Automatic);
+        assert_eq!(cap.caveat, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_split_topology_caveat_is_kept_alongside_the_restart_caveat() {
+        let dir = temp_dir("caveats");
+        let mut u = updater(&dir, false, SupervisorKind::None);
+        u.topology_caveat = Some("Console only; restart the proxy too.".to_string());
+        let caveat = u.capability(&policy(true)).caveat.expect("both caveats");
+        assert!(caveat.contains("restart it"), "{caveat}");
+        assert!(caveat.contains("restart the proxy too"), "{caveat}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_supervised_install_can_apply() {
         let dir = temp_dir("ok");
-        let cap = updater(&dir, false, SupervisorKind::Systemd).capability(true);
+        let cap = updater(&dir, false, SupervisorKind::Systemd).capability(&policy(true));
         assert!(
             cap.can_apply,
             "blocked by {:?}: {:?}",
@@ -767,7 +970,7 @@ mod tests {
     fn test_start_refused_when_disabled_reports_blocker() {
         let dir = temp_dir("start-refused");
         let err = updater(&dir, false, SupervisorKind::Systemd)
-            .start(None, Some(1), false)
+            .start(None, Some(1), &policy(false))
             .expect_err("must refuse when disabled in settings");
         assert_eq!(err.blocker(), SelfUpdateBlocker::DisabledBySetting);
         let _ = std::fs::remove_dir_all(&dir);
@@ -779,7 +982,7 @@ mod tests {
         let updater = updater(&dir, false, SupervisorKind::Systemd);
         updater.set_phase(SelfUpdatePhase::Downloading, None);
         let err = updater
-            .start(None, Some(1), true)
+            .start(None, Some(1), &policy(true))
             .expect_err("must refuse a concurrent attempt");
         assert!(matches!(err, SelfUpdateError::AlreadyRunning { .. }));
         let _ = std::fs::remove_dir_all(&dir);
@@ -792,7 +995,7 @@ mod tests {
         let dir = temp_dir("retry");
         let updater = updater(&dir, false, SupervisorKind::Systemd);
         updater.set_phase(SelfUpdatePhase::Failed, Some("network down".to_string()));
-        let cap = updater.capability(true);
+        let cap = updater.capability(&policy(true));
         assert!(cap.can_apply);
         assert_eq!(cap.phase, SelfUpdatePhase::Failed);
         assert_eq!(cap.phase_error.as_deref(), Some("network down"));
@@ -876,6 +1079,55 @@ mod tests {
             .expect("journal entry");
         assert_eq!(resolved.status, SelfUpdateStatus::Succeeded);
         assert_eq!(resolved.to_version.as_deref(), Some("v0.0.2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_installed_pending_restart_survives_a_restart_on_the_old_version() {
+        // The operator installed an update but has not restarted yet. Booting
+        // the OLD binary must not turn that into a failure — the new binary is
+        // still sitting there waiting.
+        let dir = temp_dir("journal-pending-restart");
+        let attempt = SelfUpdateAttempt {
+            from_version: current_version_tag(),
+            to_version: Some("v999.0.0".to_string()),
+            status: SelfUpdateStatus::InstalledPendingRestart,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            triggered_by_user_id: Some(1),
+            error: None,
+            previous_binary_path: None,
+        };
+        write_journal(&dir.join(SELF_UPDATE_JOURNAL_FILE), &attempt).expect("write journal");
+
+        let resolved = updater(&dir, false, SupervisorKind::None)
+            .reconcile_journal()
+            .expect("journal entry");
+        assert_eq!(resolved.status, SelfUpdateStatus::InstalledPendingRestart);
+        assert_eq!(resolved.error, None, "waiting is not a failure");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_installed_pending_restart_resolves_once_the_new_version_boots() {
+        let dir = temp_dir("journal-pending-done");
+        let running = current_version_tag();
+        let attempt = SelfUpdateAttempt {
+            from_version: "v0.0.1".to_string(),
+            to_version: Some(running.clone()),
+            status: SelfUpdateStatus::InstalledPendingRestart,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            triggered_by_user_id: Some(1),
+            error: None,
+            previous_binary_path: None,
+        };
+        write_journal(&dir.join(SELF_UPDATE_JOURNAL_FILE), &attempt).expect("write journal");
+
+        let resolved = updater(&dir, false, SupervisorKind::None)
+            .reconcile_journal()
+            .expect("journal entry");
+        assert_eq!(resolved.status, SelfUpdateStatus::Succeeded);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

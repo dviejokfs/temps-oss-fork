@@ -33,8 +33,9 @@ pub mod traces;
 pub mod update_status;
 pub use problemdetails::ProblemDetails;
 pub use self_update::{
-    SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability, SelfUpdateError, SelfUpdatePhase,
-    SelfUpdateStatus, SelfUpdater, StartedSelfUpdate, SupervisorKind, SELF_UPDATE_JOURNAL_FILE,
+    ReleaseCheckResult, SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability,
+    SelfUpdateError, SelfUpdatePhase, SelfUpdatePolicy, SelfUpdateRestartMode, SelfUpdateStatus,
+    SelfUpdater, StartedSelfUpdate, SupervisorKind, SELF_UPDATE_JOURNAL_FILE,
 };
 pub use update_status::{AvailableUpdate, UpdateStatusSlot, UPGRADE_DOCS_URL};
 mod app_settings;

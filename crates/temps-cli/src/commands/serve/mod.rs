@@ -334,6 +334,10 @@ impl ServeCommand {
         rt.spawn(crate::commands::upgrade::update_notifier_loop(
             update_status.clone(),
             update_check_interval,
+            Arc::new(temps_config::ConfigService::new(
+                serve_config.clone(),
+                db.clone(),
+            )),
         ));
 
         // Companion to the notifier above: the notifier says a release exists,
@@ -355,6 +359,7 @@ impl ServeCommand {
             serve_config.data_dir.clone(),
             self.disable_self_update,
             self_update_caveat,
+            update_status.clone(),
         ));
 
         // Connect to Docker once and share the handle between:

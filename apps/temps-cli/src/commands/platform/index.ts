@@ -9,6 +9,9 @@ import {
   getUpdateCapability,
   getUpdateStatus,
   startUpdate,
+  checkForUpdate,
+  getSettings,
+  updateSettings,
 } from '../../api/sdk.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -51,6 +54,20 @@ export function registerPlatformCommands(program: Command): void {
     .description('Show the available release and whether it can be applied from here')
     .option('--json', 'Output in JSON format')
     .action(updateStatusAction)
+
+  update
+    .command('check')
+    .description('Ask the release API for the newest version on this channel now')
+    .option('--json', 'Output in JSON format')
+    .action(updateCheckAction)
+
+  update
+    .command('channel [channel]')
+    .description(
+      'Show or set the release channel: stable, beta, nightly, or "auto" to follow the installed version'
+    )
+    .option('--json', 'Output in JSON format')
+    .action(updateChannelAction)
 
   update
     .command('apply')
@@ -389,4 +406,119 @@ async function waitForUpdateOutcome(
     }
   }
   return null
+}
+
+/** Valid channels, plus the sentinel that clears an explicit pin. */
+const UPDATE_CHANNELS = ['stable', 'beta', 'nightly'] as const
+const CHANNEL_AUTO = 'auto'
+
+/** Force a release check instead of waiting for the server's periodic one. */
+async function updateCheckAction(options: { json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const result = await withSpinner('Checking the release API...', async () => {
+    const { data, error: err } = await checkForUpdate({ client })
+    if (err) {
+      throw new Error(getErrorMessage(err))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  header(`${icons.globe} Release Check`)
+  keyValue('Channel', result?.channel ?? colors.muted('unknown'))
+  keyValue('Current', result?.current_version ?? colors.muted('unknown'))
+  keyValue('Latest', result?.latest_version ?? colors.muted('none published'))
+  if (result?.update_available) {
+    success('An update is available. Run `temps platform update apply` to install it.')
+    if (result.release_url) {
+      keyValue('Release notes', result.release_url)
+    }
+  } else {
+    // Not necessarily "nothing newer exists" — on a more stable channel the
+    // newest release is often older than a nightly build, which is expected.
+    info('Nothing newer on this channel.')
+  }
+  newline()
+}
+
+/** Show or pin the release channel this server tracks. */
+async function updateChannelAction(
+  channel: string | undefined,
+  options: { json?: boolean }
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  if (!channel) {
+    const capability = await withSpinner('Fetching channel...', async () => {
+      const { data, error: err } = await getUpdateCapability({ client })
+      if (err) {
+        throw new Error(getErrorMessage(err))
+      }
+      return data
+    })
+    if (options.json) {
+      json({
+        channel: capability?.channel,
+        pinned: capability?.channel_is_pinned,
+      })
+      return
+    }
+    newline()
+    keyValue('Channel', capability?.channel ?? colors.muted('unknown'))
+    keyValue(
+      'Source',
+      capability?.channel_is_pinned
+        ? 'pinned in settings'
+        : 'inferred from the installed version'
+    )
+    newline()
+    return
+  }
+
+  const requested = channel.trim().toLowerCase()
+  const isAuto = requested === CHANNEL_AUTO
+  if (!isAuto && !UPDATE_CHANNELS.includes(requested as (typeof UPDATE_CHANNELS)[number])) {
+    error(
+      `Unknown channel '${channel}'. Use one of: ${UPDATE_CHANNELS.join(', ')}, or ${CHANNEL_AUTO}.`
+    )
+    process.exitCode = 1
+    return
+  }
+
+  await withSpinner('Updating channel...', async () => {
+    // The settings PUT replaces the whole document, so read-modify-write is
+    // required — sending only `self_update` would reset every other field.
+    const { data: current, error: readErr } = await getSettings({ client })
+    if (readErr || !current) {
+      throw new Error(readErr ? getErrorMessage(readErr) : 'Could not read settings')
+    }
+    const { error: writeErr } = await updateSettings({
+      client,
+      body: {
+        ...current,
+        self_update: {
+          enabled: current.self_update?.enabled ?? true,
+          channel: isAuto ? null : requested,
+        },
+      } as never,
+    })
+    if (writeErr) {
+      throw new Error(getErrorMessage(writeErr))
+    }
+  })
+
+  success(
+    isAuto
+      ? 'Channel now follows the installed version.'
+      : `Now tracking the ${requested} channel.`
+  )
+  info('Run `temps platform update check` to look for releases on it.')
 }
