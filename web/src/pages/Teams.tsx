@@ -52,7 +52,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { Plus, Trash2, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 
 /** Slugify a team name into the `[a-z0-9-]+` shape the backend validates. */
@@ -224,7 +224,7 @@ export function Teams() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [createOpen, setCreateOpen] = useState(false)
+  const [searchParams, setSearchParams] = useSearchParams()
   const [teamToDelete, setTeamToDelete] = useState<TeamResponse | null>(null)
 
   usePageTitle('Teams')
@@ -232,6 +232,19 @@ export function Teams() {
   useEffect(() => {
     setBreadcrumbs([{ label: 'Teams' }])
   }, [setBreadcrumbs])
+
+  // The URL owns the dialog, so the command palette (and any deep link) can
+  // open it with `?new=1` — there is no /teams/new route, creation is a
+  // dialog. Deriving it beats mirroring the param into state via an effect:
+  // no cascading render, and it still reacts when the palette navigates here
+  // while this page is already mounted.
+  const createOpen = searchParams.get('new') === '1'
+  const setCreateOpen = (open: boolean) => {
+    const next = new URLSearchParams(searchParams)
+    if (open) next.set('new', '1')
+    else next.delete('new')
+    setSearchParams(next, { replace: !open })
+  }
 
   const { data, isLoading, isError, error } = useQuery(
     listTeamsOptions({ query: { page: 1, page_size: 100 } })

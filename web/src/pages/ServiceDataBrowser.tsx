@@ -118,7 +118,14 @@ import {
   Type,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useDefaultLayout } from 'react-resizable-panels'
+import { useIsMobile } from '@/components/hooks/use-mobile'
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from '@/components/ui/resizable'
 import { useNavigate, useParams, useSearchParams } from 'react-router'
 
 interface TreeNode {
@@ -173,6 +180,8 @@ export function ServiceDataBrowser() {
 
   // Filter state (for sidebar tree only)
   const [filterText, setFilterText] = useState('')
+
+  const isMobile = useIsMobile()
 
   // Sidebar toggle state (mobile responsive) - default closed on mobile, open on desktop
   const [isSidebarOpen, setIsSidebarOpen] = useState(
@@ -333,6 +342,62 @@ export function ServiceDataBrowser() {
   const commitActiveTab = (patch: Partial<BrowserTab>) => {
     setTabs((prev) =>
       prev.map((t) => (t.id === activeTabId ? { ...t, ...patch } : t))
+    )
+  }
+
+  // Persisted split between the tree and the table. Keyed per service so a
+  // wide-schema database can keep a wider tree than a simple one.
+  const { defaultLayout, onLayoutChanged } = useDefaultLayout({
+    id: `data-browser-split:${id ?? 'unknown'}`,
+    onlySaveAfterUserInteractions: true,
+  })
+
+  /**
+   * Desktop splits the tree and the table with a draggable separator; mobile
+   * keeps the overlay drawer, where a resize handle has nothing to drag
+   * against.
+   *
+   * Deliberately a function, not a component: a component declared during
+   * render is a new type every render, so React would unmount and remount the
+   * whole tree (losing expansion state and the filter input's focus) on every
+   * keystroke.
+   */
+  const renderShell = (
+    sidebar: ReactNode,
+    overlay: ReactNode,
+    content: ReactNode
+  ) => {
+    if (isMobile) {
+      return (
+        <div className="flex-1 flex min-h-0 relative overflow-hidden">
+          {sidebar}
+          {overlay}
+          {content}
+        </div>
+      )
+    }
+    return (
+      <ResizablePanelGroup
+        orientation="horizontal"
+        className="flex-1 min-h-0 px-6 pb-6 overflow-hidden"
+        defaultLayout={defaultLayout}
+        onLayoutChanged={onLayoutChanged}
+      >
+        {/* Numbers are pixels in v4; the string maxSize is a percentage, so
+            the tree can never crowd out the table it exists to navigate. */}
+        <ResizablePanel
+          id="tree"
+          defaultSize={320}
+          minSize={220}
+          maxSize="50"
+        >
+          {sidebar}
+        </ResizablePanel>
+        <ResizableHandle withHandle className="mx-3" />
+        <ResizablePanel id="content" minSize={320}>
+          {content}
+        </ResizablePanel>
+      </ResizablePanelGroup>
     )
   }
 
@@ -1246,10 +1311,10 @@ export function ServiceDataBrowser() {
         !hasLoadedChildren
 
       if (isLeafContainer) {
-        // Update URL params - use replace to avoid page reload
-        setSearchParams({ path: node.path }, { replace: true })
-        setPage(1)
-        commitActiveTab({ path: node.path, entity: undefined, page: 1 })
+        // navigateTo (not a bare setSearchParams) so the previous container's
+        // sort column and filter don't follow us to a container that has no
+        // such field.
+        navigateTo(node.path)
 
         // Don't expand in tree, just select it
         // The main content area will show the entities table via ContainerEntitiesView
@@ -1292,9 +1357,7 @@ export function ServiceDataBrowser() {
           }
         } else {
           // Different container - select it and expand if not already expanded
-          setSearchParams({ path: node.path }, { replace: true })
-          setPage(1)
-          commitActiveTab({ path: node.path, entity: undefined, page: 1 })
+          navigateTo(node.path)
 
           // If not currently expanded, expand it
           if (!isCurrentlyExpanded) {
@@ -1322,17 +1385,13 @@ export function ServiceDataBrowser() {
         }
       }
     } else if (node.type === 'entity') {
-      // Update URL params for entity selection - use replace to avoid page reload
+      // Switching tables must drop the outgoing table's sort column and
+      // filter: they name fields the incoming table may not have, and the
+      // query then sorts/filters on something that doesn't exist. navigateTo
+      // resets sort/filter/page for the new target; a bare setSearchParams
+      // only moved the selection and left both behind.
       const parentPath = node.path.split('/').slice(0, -1).join('/')
-      setSearchParams(
-        {
-          path: parentPath,
-          entity: node.name,
-        },
-        { replace: true }
-      )
-      setPage(1)
-      commitActiveTab({ path: parentPath, entity: node.name, page: 1 })
+      navigateTo(parentPath, node.name)
 
       // Close sidebar on mobile when selecting an entity
       if (window.innerWidth < 768) {
@@ -1796,6 +1855,8 @@ export function ServiceDataBrowser() {
             variant="ghost"
             size="icon"
             className="md:hidden"
+            aria-label="Toggle containers sidebar"
+            aria-expanded={isSidebarOpen}
             onClick={() => setIsSidebarOpen(!isSidebarOpen)}
           >
             <Menu className="h-4 w-4" />
@@ -1859,21 +1920,21 @@ export function ServiceDataBrowser() {
       </div>
 
       {/* Main content area with sidebar */}
-      <div className="flex-1 flex gap-0 md:gap-6 px-0 md:px-6 pb-0 md:pb-6 min-h-0 relative overflow-hidden">
-        {/* Sidebar - Tree View */}
+      {renderShell(
+        /* Sidebar - Tree View. On desktop the width comes from the resizable
+           panel, so the drawer/translate classes only apply on mobile. */
         <div
-          className={`
+          key="sidebar"
+          className={
+            isMobile
+              ? `
             ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
-            md:translate-x-0
             transition-transform duration-300 ease-in-out
-            fixed md:relative
-            top-0 left-0 md:left-auto md:top-auto
-            z-40
-            w-full md:w-80
-            h-full
-            flex-shrink-0
-            px-4 md:px-0
-          `}
+            fixed top-0 left-0 z-40
+            w-full h-full flex-shrink-0 px-4
+          `
+              : 'h-full w-full min-w-0'
+          }
         >
           {/* Flush rail rather than a card: the tree is primary navigation,
               not a standalone object, and a card here only added a border,
@@ -1960,25 +2021,27 @@ export function ServiceDataBrowser() {
               </div>
             </div>
           </div>
-        </div>
-
-        {/* Overlay for mobile when sidebar is open */}
-        {isSidebarOpen && (
+        </div>,
+        /* Overlay for mobile when the drawer is open */
+        isSidebarOpen ? (
           <div
+            key="overlay"
             className="fixed inset-0 bg-black/50 z-30 md:hidden"
             onClick={() => setIsSidebarOpen(false)}
           />
-        )}
-
-        {/* Main content.
+        ) : null,
+        /* Main content.
             `min-h-0` rather than a hardcoded `calc(100vh - 180px)`: the magic
             number assumed a fixed header height, so it drifted whenever the
             header wrapped (long service name, mobile) and left the pane either
             clipped or overflowing the viewport. With min-h-0 the flex child
             can shrink below its content, which is what lets the inner
             `overflow-y-auto` own the scroll — and lets the tree rail scroll
-            independently of it. */}
-        <div className="flex min-h-0 flex-1 flex-col min-w-0 px-4 md:px-0">
+            independently of it. */
+        <div
+          key="content"
+          className="flex min-h-0 flex-1 flex-col min-w-0 px-4 md:px-0"
+        >
           <DataBrowserTabs
             tabs={tabs}
             activeTabId={activeTabId}
@@ -2101,7 +2164,7 @@ export function ServiceDataBrowser() {
           )}
           </div>
         </div>
-      </div>
+      )}
 
       <DataBrowserCommandBar
         open={commandOpen}
