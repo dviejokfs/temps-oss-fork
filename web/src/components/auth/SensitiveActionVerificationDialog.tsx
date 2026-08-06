@@ -93,13 +93,19 @@ export function SensitiveActionVerificationDialog({
           </DialogDescription>
         </DialogHeader>
 
+        {/* Only reachable when an operator has registered a policy that
+            mandates MFA enrolment. The default policy no longer demands
+            step-up from users with no enrolled factor — that was a dead end
+            for anyone who hadn't set up MFA, and on a fresh instance it left
+            the first admin unable to create an API key at all. Kept so a
+            stricter custom authorizer still renders something actionable. */}
         {mfaSetupRequired ? (
           <div className="space-y-4">
             <Alert variant="warning">
               <AlertCircle className="h-4 w-4" />
               <AlertDescription>
-                Configure multi-factor authentication before performing
-                sensitive actions.
+                This instance requires multi-factor authentication for
+                sensitive actions. Set up MFA on your account to continue.
               </AlertDescription>
             </Alert>
             <DialogFooter>
