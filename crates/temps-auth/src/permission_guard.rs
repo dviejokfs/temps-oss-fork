@@ -30,6 +30,10 @@ macro_rules! permission_guard {
                 $crate::permissions::Permission::$permission.to_string(),
             )
             .value("user_role", $auth.effective_role.to_string())
+            .permission_denial(
+                temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+                Some($crate::permissions::Permission::$permission.to_string()),
+            )
             .build());
         }
     };
@@ -74,6 +78,10 @@ macro_rules! project_scope_guard {
                 "This deployment token is scoped to a different project and \
                  cannot access this resource",
             )
+            .permission_denial(
+                temps_core::problemdetails::PermissionDenialKind::CrossProjectScope,
+                None,
+            )
             .build());
         }
     };
@@ -112,6 +120,10 @@ macro_rules! deny_deployment_token {
             .detail(
                 "This endpoint requires user or API-key authentication; \
                  deployment tokens are not permitted",
+            )
+            .permission_denial(
+                temps_core::problemdetails::PermissionDenialKind::DeploymentTokenNotAllowed,
+                None,
             )
             .build());
         }
@@ -183,6 +195,10 @@ macro_rules! project_access_guard {
                                 .detail(
                                     "Your team membership does not include access to \
                                      this project",
+                                )
+                                .permission_denial(
+                                    temps_core::problemdetails::PermissionDenialKind::ProjectAccess,
+                                    None,
                                 )
                                 .build());
                             }
@@ -291,6 +307,10 @@ macro_rules! project_permission_guard {
                 $crate::permissions::Permission::$permission.to_string(),
             )
             .value("user_role", $auth.effective_role.to_string())
+            .permission_denial(
+                temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+                Some($crate::permissions::Permission::$permission.to_string()),
+            )
             .build());
         }
 
@@ -324,6 +344,10 @@ macro_rules! project_permission_guard {
                                         __required
                                     ))
                                     .value("required_permission", __required)
+                                    .permission_denial(
+                                        temps_core::problemdetails::PermissionDenialKind::ProjectPermission,
+                                        Some($crate::permissions::Permission::$permission.to_string()),
+                                    )
                                     .build());
                                 }
                             }
@@ -361,6 +385,10 @@ macro_rules! project_permission_guard {
                         .title("Insufficient Permissions")
                         .detail(
                             "Could not resolve caller identity for project permission check",
+                        )
+                        .permission_denial(
+                            temps_core::problemdetails::PermissionDenialKind::MissingPrincipal,
+                            Some($crate::permissions::Permission::$permission.to_string()),
                         )
                         .build());
                     }
@@ -401,6 +429,10 @@ macro_rules! permission_check {
             ))
             .value("required_permission", $permission.to_string())
             .value("user_role", $auth.effective_role.to_string())
+            .permission_denial(
+                temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+                Some($permission.to_string()),
+            )
             .build());
         }
     };
@@ -411,13 +443,14 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
+    use axum::response::IntoResponse;
     use chrono::Utc;
-    use temps_core::problemdetails::Problem;
+    use temps_core::problemdetails::{PermissionDenialKind, PermissionDenialMarker, Problem};
     use temps_core::ProjectAccessChecker;
     use temps_entities::users;
 
     use crate::context::AuthContext;
-    use crate::permissions::Role;
+    use crate::permissions::{Permission, Role};
 
     // ---------------------------------------------------------------------------
     // Test helpers
@@ -460,6 +493,65 @@ mod tests {
             "deploy-token".to_string(),
             vec![],
         )
+    }
+
+    fn denial_marker(problem: Problem) -> Option<PermissionDenialMarker> {
+        problem
+            .into_response()
+            .extensions()
+            .get::<PermissionDenialMarker>()
+            .cloned()
+    }
+
+    fn run_instance_permission_guard(auth: &AuthContext) -> Result<(), Problem> {
+        permission_guard!(auth, UsersWrite);
+        Ok(())
+    }
+
+    fn run_permission_check(auth: &AuthContext) -> Result<(), Problem> {
+        permission_check!(auth, Permission::UsersWrite);
+        Ok(())
+    }
+
+    fn run_project_scope_guard(auth: &AuthContext, project_id: i32) -> Result<(), Problem> {
+        project_scope_guard!(auth, project_id);
+        Ok(())
+    }
+
+    fn run_deny_deployment_token(auth: &AuthContext) -> Result<(), Problem> {
+        deny_deployment_token!(auth);
+        Ok(())
+    }
+
+    #[test]
+    fn synchronous_guard_denials_carry_stable_markers() {
+        let auth = user_auth(Role::User);
+        for problem in [
+            run_instance_permission_guard(&auth).expect_err("user lacks users:write"),
+            run_permission_check(&auth).expect_err("user lacks users:write"),
+        ] {
+            let marker = denial_marker(problem).expect("permission denial marker");
+            assert_eq!(marker.kind(), PermissionDenialKind::InsufficientPermission);
+            assert_eq!(marker.required_permission(), Some("users:write"));
+        }
+
+        let token = deployment_token_auth();
+        let marker = denial_marker(
+            run_project_scope_guard(&token, 8).expect_err("token is bound to project 7"),
+        )
+        .expect("project scope denial marker");
+        assert_eq!(marker.kind(), PermissionDenialKind::CrossProjectScope);
+        assert_eq!(marker.required_permission(), None);
+
+        let marker = denial_marker(
+            run_deny_deployment_token(&token).expect_err("deployment token is denied"),
+        )
+        .expect("deployment token denial marker");
+        assert_eq!(
+            marker.kind(),
+            PermissionDenialKind::DeploymentTokenNotAllowed
+        );
+        assert_eq!(marker.required_permission(), None);
     }
 
     /// A mock [`ProjectAccessChecker`] that returns a fixed outcome.
@@ -546,6 +638,9 @@ mod tests {
             axum::http::StatusCode::FORBIDDEN,
             "denial should be HTTP 403"
         );
+        let marker = denial_marker(err).expect("project access denial marker");
+        assert_eq!(marker.kind(), PermissionDenialKind::ProjectAccess);
+        assert_eq!(marker.required_permission(), None);
     }
 
     // ---------------------------------------------------------------------------
@@ -562,6 +657,10 @@ mod tests {
             err.status_code,
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "infrastructure failure should be HTTP 500"
+        );
+        assert!(
+            denial_marker(err).is_none(),
+            "infrastructure failures must not be marked as auth denials"
         );
     }
 
@@ -760,6 +859,9 @@ mod tests {
             err.body.get("type").and_then(|v| v.as_str()),
             Some("https://temps.sh/probs/project-permission-denied")
         );
+        let marker = denial_marker(err).expect("project permission denial marker");
+        assert_eq!(marker.kind(), PermissionDenialKind::ProjectPermission);
+        assert_eq!(marker.required_permission(), Some("deployments:create"));
     }
 
     #[tokio::test]
@@ -806,6 +908,10 @@ mod tests {
         assert_eq!(
             err.status_code,
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            denial_marker(err).is_none(),
+            "resolver failures must not be marked as auth denials"
         );
     }
 

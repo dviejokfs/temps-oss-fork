@@ -22,6 +22,7 @@ mod oidc_service;
 mod oidc_types;
 mod permission_attribute;
 mod permission_decorator;
+mod permission_denial_recorder;
 mod permission_guard;
 pub mod permissions;
 mod plugin;

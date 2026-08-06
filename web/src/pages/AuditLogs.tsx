@@ -23,6 +23,7 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { PERMISSION_DENIED_FILTER } from '@/lib/audit-operation-filters'
 import { useQuery } from '@tanstack/react-query'
 import { ScrollText, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
@@ -45,6 +46,7 @@ const OPERATION_GROUPS: OperationGroup[] = [
       { value: 'USER_LOGOUT', label: 'User Logout' },
       { value: 'PASSWORD_RESET', label: 'Password Reset' },
       { value: 'EMAIL_VERIFIED', label: 'Email Verified' },
+      PERMISSION_DENIED_FILTER,
     ],
   },
   {
