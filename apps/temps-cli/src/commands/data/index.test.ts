@@ -17,7 +17,7 @@ describe('validateFilter', () => {
     // envelope. Sending it would let the server drop the filter and return a
     // full unfiltered table, which reads as a correct answer.
     expect(() => validateFilter("plan = 'pro'", 'my-db')).toThrow(
-      /--filter must be JSON/,
+      /--filter must be valid JSON/,
     )
   })
 
@@ -29,6 +29,24 @@ describe('validateFilter', () => {
 
   test('echoes what was received so a typo is visible', () => {
     expect(() => validateFilter('{oops}', 'my-db')).toThrow(/\{oops\}/)
+  })
+
+  test('does not expose parser or terminal controls for a malicious filter', () => {
+    const payload =
+      '{"where":"\x1b]52;c;dG9rX2xpdmVfc2VjcmV0\x07\x1b[31m\n\u202E"'
+    let message = ''
+    try {
+      validateFilter(payload, 'service\x1b]8;;https://attacker.example\x1b\\')
+    } catch (error) {
+      message = (error as Error).message
+    }
+
+    expect(message).toContain('--filter must be valid JSON')
+    expect(message).not.toContain('\x1b')
+    expect(message).not.toContain('\x07')
+    expect(message).not.toContain('\n')
+    expect(message).not.toContain('\u202E')
+    expect(message).not.toContain('Unexpected')
   })
 })
 

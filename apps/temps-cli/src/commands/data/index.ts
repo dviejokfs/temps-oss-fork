@@ -179,11 +179,10 @@ export function validateFilter(raw: string | undefined, service: string): string
   try {
     JSON.parse(raw)
     return raw
-  } catch (e) {
+  } catch {
     throw new Error(
-      `--filter must be JSON, but failed to parse: ${(e as Error).message}\n` +
-        `  Received: ${sanitizeTerminalText(raw)}\n` +
-        `  Run "temps data info ${sanitizeTerminalText(service)}" to see this backend's filter schema.`,
+      `--filter must be valid JSON. Received: ${sanitizeTerminalText(raw)}. ` +
+        `Run "temps data info ${sanitizeTerminalText(service)}" to see this backend's filter schema.`,
     )
   }
 }

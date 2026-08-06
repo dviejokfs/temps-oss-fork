@@ -25,9 +25,10 @@ export function sanitizeTerminalText(value: unknown): string {
 
   // A value must never create a second terminal line. Preserve word separation
   // while removing the remaining C0/C1 controls and DEL.
-  text = text.replace(/\r\n?|\n/g, ' ')
+  text = text.replace(/\r\n?|\n|\t/g, ' ')
   text = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, '')
 
-  // Bidirectional overrides can visually reorder commands and identifiers.
-  return text.replace(/[\u202A-\u202E\u2066-\u2069]/g, '')
+  // Bidirectional marks, isolates, and overrides can visually reorder commands
+  // and identifiers even though they do not alter the underlying byte order.
+  return text.replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '')
 }

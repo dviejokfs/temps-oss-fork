@@ -15,7 +15,11 @@ describe('sanitizeTerminalText', () => {
   })
 
   test('collapses newlines and strips C0, C1, and bidi overrides', () => {
-    expect(sanitizeTerminalText('one\r\ntwo\nthree\x00\x9b31m\u202E')).toBe(
+    expect(
+      sanitizeTerminalText(
+        'one\r\ntwo\tthree\x00\x9b31m\u061C\u200E\u200F\u202E',
+      ),
+    ).toBe(
       'one two three',
     )
   })
