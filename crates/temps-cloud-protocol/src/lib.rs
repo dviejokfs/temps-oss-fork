@@ -29,11 +29,11 @@
 pub mod messages;
 
 pub use messages::{
-    BackupCompleted, BackupTarget, BackupTargetRequest, EnrollRequest, EnrollResponse, Envelope,
-    Heartbeat, HeartbeatAck, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
-    ManagedAiCapability, ManagedAiCitation, ManagedAiEvidence, ManagedAiTask,
-    ManagedNotificationAccepted, ManagedNotificationRequest, ManagedNotificationSeverity,
-    SpanRecord, TelemetryBatch,
+    BackupArtifact, BackupCompleted, BackupCompression, BackupEngine, BackupFormat, BackupTarget,
+    BackupTargetRequest, EnrollRequest, EnrollResponse, Envelope, Heartbeat, HeartbeatAck,
+    IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability,
+    ManagedAiCitation, ManagedAiEvidence, ManagedAiTask, ManagedNotificationAccepted,
+    ManagedNotificationRequest, ManagedNotificationSeverity, SpanRecord, TelemetryBatch,
 };
 
 use serde::{Deserialize, Serialize};

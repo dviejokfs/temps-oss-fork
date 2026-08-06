@@ -154,6 +154,37 @@ pub struct IngestAck {
 // Backups
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupEngine {
+    Postgres,
+    TimescaleDb,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupFormat {
+    /// Plain SQL produced by `pg_dump` or `pg_dumpall` and restored with psql.
+    PgDumpPlain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupCompression {
+    Gzip,
+}
+
+/// Machine-readable restore contract for one backup object.
+///
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupArtifact {
+    pub engine: BackupEngine,
+    pub format: BackupFormat,
+    pub compression: BackupCompression,
+    /// Major server/tooling version used to create the dump.
+    pub postgres_major: u16,
+}
+
 /// Instance asks where to put a backup.
 ///
 /// The cloud replies with a presigned destination; backup bytes then travel
@@ -171,6 +202,7 @@ pub struct BackupTargetRequest {
     /// direct PUT. Optional only for wire compatibility; Cloud may require it.
     #[serde(default)]
     pub checksum_sha256: Option<String>,
+    pub artifact: BackupArtifact,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,5 +467,39 @@ mod tests {
         assert_eq!(response.tenant_id, tenant_id);
         assert!(response.account_email.is_none());
         assert!(response.capabilities.is_empty());
+    }
+
+    #[test]
+    fn backup_target_request_requires_a_restore_contract() {
+        let request = serde_json::from_value::<BackupTargetRequest>(serde_json::json!({
+            "instance_id": Uuid::new_v4(),
+            "source": "postgres/main",
+            "estimated_bytes": 42,
+            "checksum_sha256": "00"
+        }));
+
+        assert!(request.is_err());
+    }
+
+    #[test]
+    fn backup_restore_contract_uses_stable_wire_names() {
+        let request = BackupTargetRequest {
+            instance_id: Uuid::new_v4(),
+            source: "timescaledb/telemetry".into(),
+            estimated_bytes: 42,
+            checksum_sha256: Some("00".into()),
+            artifact: BackupArtifact {
+                engine: BackupEngine::TimescaleDb,
+                format: BackupFormat::PgDumpPlain,
+                compression: BackupCompression::Gzip,
+                postgres_major: 18,
+            },
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["artifact"]["engine"], "timescale_db");
+        assert_eq!(value["artifact"]["format"], "pg_dump_plain");
+        assert_eq!(value["artifact"]["compression"], "gzip");
+        assert_eq!(value["artifact"]["postgres_major"], 18);
     }
 }
