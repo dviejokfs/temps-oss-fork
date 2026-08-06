@@ -16,6 +16,10 @@ import {
   warning,
   keyValue,
 } from '../../ui/output.js'
+import {
+  resolveWorkspaceSource,
+  resolveProjectIdBySlug,
+} from './workspace-source.js'
 
 // ── Types mirroring /v1/sandbox/* responses ─────────────────────────────────
 
@@ -227,8 +231,17 @@ export function registerSandboxCommands(program: Command): void {
       'Create a persistent workspace: suspends when idle, wakes automatically on the next command, and is never destroyed for you',
     )
     .option(
-      '--project <id>',
-      "Seed the work dir from a temps project's connected repo (and attribute the sandbox to it)",
+      '--project <slug>',
+      "Seed from a temps project's connected repo (and attribute the sandbox to it). Defaults to the linked project in .temps/config.json",
+    )
+    .option(
+      '--repo <owner/name>',
+      'Seed from a repo on one of your git connections that has no temps project',
+    )
+    .option('--branch <ref>', 'Branch, tag, or SHA to check out (alias of --git-rev)')
+    .option(
+      '--new-branch <name>',
+      'Create and switch to a new branch after cloning, based on whatever was checked out',
     )
     .option(
       '--preview-password',
@@ -249,7 +262,7 @@ export function registerSandboxCommands(program: Command): void {
     .option('--page-size <n>', 'Items per page (default 20, max 100)')
     .option('--workspace', 'Show only persistent workspaces')
     .option('--lifecycle <class>', 'Filter by lifecycle class: ephemeral | workspace')
-    .option('--project <id>', 'Show only sandboxes created from this project')
+    .option('--project <slug>', 'Show only sandboxes created from this project')
     .option('--json', 'Output as JSON')
     .action(listAction)
 
@@ -387,6 +400,9 @@ interface CreateOptions {
   previewPasswordLength?: string
   workspace?: boolean
   project?: string
+  repo?: string
+  branch?: string
+  newBranch?: string
   json?: boolean
 }
 
@@ -472,18 +488,29 @@ async function createAction(options: CreateOptions): Promise<void> {
   if (options.cpuLimit !== undefined) body.cpu_limit = Number(options.cpuLimit)
   if (options.memoryMb !== undefined) body.memory_limit_mb = Number(options.memoryMb)
   if (options.workspace) body.lifecycle = 'workspace'
-  if (options.project !== undefined) {
-    const projectId = Number(options.project)
-    if (!Number.isInteger(projectId)) {
-      throw new Error('--project must be a numeric project ID')
-    }
-    body.project_id = projectId
-  }
 
-  // An explicit --git-url/--tarball-url wins over the project's repo,
-  // matching the server: --project is a convenience default, not a lock.
-  const source = buildSource(options)
-  if (source) body.source = source
+  // A workspace always needs code, so resolve one even when no source flag
+  // was passed — that's the whole point of `sandbox create --workspace` in
+  // a linked checkout. A plain sandbox stays empty unless asked, so it
+  // never turns into an interactive command.
+  const wantsSource =
+    options.workspace ||
+    options.repo !== undefined ||
+    options.project !== undefined ||
+    options.gitUrl !== undefined ||
+    options.tarballUrl !== undefined
+
+  let origin: string | undefined
+  if (wantsSource) {
+    const resolved = await resolveWorkspaceSource(options)
+    if (resolved.projectId !== undefined) body.project_id = resolved.projectId
+    if (resolved.source) body.source = resolved.source
+    origin = resolved.origin
+  } else {
+    // Preserves the "--git-* without --git-url" guard for stray flags.
+    const source = buildSource(options)
+    if (source) body.source = source
+  }
 
   // Preview-password generation happens client-side so the plaintext
   // exists only on this machine: the server stores just an argon2 hash
@@ -501,12 +528,40 @@ async function createAction(options: CreateOptions): Promise<void> {
     body.preview_password = generatedPassword
   }
 
-  const sbx = await withSpinner('Creating sandbox...', () =>
-    apiRequest<SandboxResponse>(api, '', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
+  const sbx = await withSpinner(
+    options.workspace ? 'Creating workspace...' : 'Creating sandbox...',
+    () =>
+      apiRequest<SandboxResponse>(api, '', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
   )
+
+  // Branch creation is a post-clone step: the server seeds the work dir at
+  // whatever ref was requested, then we branch off it. Non-fatal — the
+  // workspace exists and is usable either way, so report and carry on
+  // rather than leaving the user with a sandbox they think failed.
+  let newBranchError: string | undefined
+  if (options.newBranch) {
+    try {
+      const res = await apiRequest<ExecResponse>(
+        api,
+        `/${encodeURIComponent(sbx.id)}/exec`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            cmd: ['git', 'checkout', '-b', options.newBranch],
+            cwd: sbx.work_dir,
+          }),
+        },
+      )
+      if (res.exit_code !== 0) {
+        newBranchError = res.stderr.trim() || `git exited ${res.exit_code}`
+      }
+    } catch (e) {
+      newBranchError = e instanceof Error ? e.message : String(e)
+    }
+  }
 
   if (options.json) {
     // In JSON mode the generated plaintext is part of the payload so
@@ -525,8 +580,25 @@ async function createAction(options: CreateOptions): Promise<void> {
   keyValue('Image', sbx.image ?? '(default)')
   keyValue('Work dir', sbx.work_dir)
   keyValue(createdWorkspace ? 'Suspends at' : 'Expires', sbx.expires_at)
-  if (sbx.source_repo_url) {
+  // `origin` says where the code came from *and how we worked that out*
+  // (flag, linked project, this directory's remote) — the inference is
+  // only trustworthy if it's visible.
+  if (origin) {
+    keyValue('Source', origin)
+  } else if (sbx.source_repo_url) {
     keyValue('Repo', sbx.source_repo_url)
+  }
+  if (options.newBranch && !newBranchError) {
+    keyValue('Branch', `${options.newBranch} (created)`)
+  }
+  if (newBranchError) {
+    newline()
+    warning(
+      `Workspace created, but creating branch '${options.newBranch}' failed: ${newBranchError}`,
+    )
+    info(
+      `Retry inside it: temps sandbox exec ${sbx.id} -- git checkout -b ${options.newBranch}`,
+    )
   }
   if (createdWorkspace) {
     newline()
@@ -633,7 +705,13 @@ async function listAction(options: ListOptions): Promise<void> {
   // given, the explicit one wins rather than silently conflicting.
   const lifecycle = options.lifecycle ?? (options.workspace ? 'workspace' : undefined)
   if (lifecycle) qs.push(`lifecycle=${encodeURIComponent(lifecycle)}`)
-  if (options.project) qs.push(`project_id=${encodeURIComponent(options.project)}`)
+  // Slug in, numeric id out — the filter is on `sandboxes.project_id`, but
+  // every other `--project` in this CLI takes a slug and users shouldn't
+  // have to know which is which.
+  if (options.project) {
+    const projectId = await resolveProjectIdBySlug(options.project)
+    qs.push(`project_id=${projectId}`)
+  }
   const path = qs.length ? `?${qs.join('&')}` : ''
 
   const data = await withSpinner('Fetching sandboxes...', () =>

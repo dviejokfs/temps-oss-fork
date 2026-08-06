@@ -31,23 +31,29 @@ bunx @temps-sdk/cli sandbox exec sbx_abc123 -- node --version
 # Remove the sandbox when done (aliases: \`stop\`, \`destroy\`)
 bunx @temps-sdk/cli sandbox rm sbx_abc123`
 
-const WORKSPACE_EXAMPLE = `# A persistent workspace on one of your projects' repos.
-# It suspends when idle and wakes on the next command — nothing
-# is destroyed until you ask for it.
-bunx @temps-sdk/cli sandbox create --workspace --project 12 --name my-workspace
+const WORKSPACE_EXAMPLE = `# From a linked checkout, nothing else is needed: the project comes
+# from .temps/config.json, the repo and branch from your git remote.
+cd ~/code/my-repo
+bunx @temps-sdk/cli sandbox create --workspace
 
-# ...or on any repo you can reach
+# Name the project explicitly, and start a fresh branch
 bunx @temps-sdk/cli sandbox create --workspace \\
-  --git-url https://github.com/org/repo.git \\
-  --git-connection 3
+  --project my-api --branch main --new-branch feat/checkout
 
-# Come back days later — this wakes it automatically
+# A repo that has no temps project — resolved off your git connection,
+# so private repos clone without you handling a token
+bunx @temps-sdk/cli sandbox create --workspace --repo acme/internal-tools
+
+# Any other URL
+bunx @temps-sdk/cli sandbox create --workspace \\
+  --git-url https://github.com/org/repo.git --branch develop
+
+# Come back days later — this wakes the workspace automatically
 bunx @temps-sdk/cli sandbox exec sbx_abc123 -- git status
 
-# The image ships claude, codex, opencode, gh and glab. Supply your
-# own key at create time until credential injection lands (ADR-036).
-bunx @temps-sdk/cli sandbox create --workspace --project 12 \\
-  -e ANTHROPIC_API_KEY=sk-ant-...
+# The image ships claude, codex, opencode, gh and glab. Supply your own
+# key at create time until credential injection lands (ADR-036).
+bunx @temps-sdk/cli sandbox create --workspace -e ANTHROPIC_API_KEY=sk-ant-...
 
 bunx @temps-sdk/cli sandbox list --workspace`
 
