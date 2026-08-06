@@ -827,6 +827,18 @@ mod tests {
 
     // =============================================================================
     // Integration Tests - GitHub API
+    //
+    // The `*_real_api` tests below call github.com / gitlab.com for real, with
+    // no credentials, so they are subject to a per-IP rate limit shared with
+    // everything else running on the CI fleet. They are EXCLUDED from the
+    // unit-b job in .github/workflows/rust-tests.yml for that reason: a
+    // throttled provider returns a body these parsers can't decode, which
+    // arrives as `ApiError`, not `RateLimitExceeded`, and fails the build on
+    // PRs that never touched this crate.
+    //
+    // They are not dead: `cargo test -p temps-git` runs them, and they still
+    // assert strictly there. Keep them that way -- if you add one, expect it
+    // to run locally and on demand, not on every PR.
     // =============================================================================
 
     #[tokio::test]
