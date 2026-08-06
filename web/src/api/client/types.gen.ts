@@ -12408,6 +12408,12 @@ export type PropertyBreakdownQuery = {
      */
     group_by: PropertyColumn;
     /**
+     * Include crawler/bot traffic (default: false). Off by default so the
+     * breakdown percentages share a denominator with the headline counts,
+     * which always exclude crawlers.
+     */
+    include_crawlers?: boolean | null;
+    /**
      * Maximum number of results to return (default: 20, max: 100)
      */
     limit?: number | null;
@@ -12463,6 +12469,11 @@ export type PropertyTimelineQuery = {
      * Property column to group by
      */
     group_by: PropertyColumn;
+    /**
+     * Include crawler/bot traffic (default: false). See
+     * [`PropertyBreakdownQuery::include_crawlers`].
+     */
+    include_crawlers?: boolean | null;
     /**
      * Start date for the query range
      */
@@ -12823,9 +12834,14 @@ export type QueryDataResponse = {
      */
     total_count: number;
     /**
-     * Whether rows were dropped from this response to stay inside the byte budget.
+     * Whether rows were dropped from this response to stay inside the byte
+     * budget.
      *
-     * `returned_count` is always the number of rows actually present, so a truncated page is still internally consistent — but a caller comparing it against the requested limit would otherwise conclude the table simply ended. Reported explicitly so a partial page is never mistaken for a complete one, by a human, a script, or a model reading a tool result.
+     * `returned_count` is always the number of rows actually present, so a
+     * truncated page is still internally consistent — but a caller comparing
+     * it against the requested limit would otherwise conclude the table simply
+     * ended. Reported explicitly so a partial page is never mistaken for a
+     * complete one, by a human, a script, or a model reading a tool result.
      */
     truncated: boolean;
 };
@@ -15894,6 +15910,76 @@ export type SpanRow = {
     status?: string | null;
     trace_id: string;
     ts: string;
+};
+
+/**
+ * Latency and error statistics for one operation, i.e. one
+ * `(project, service, span name)` triple over the queried window.
+ */
+export type SpanStats = {
+    avg_duration_ms: number;
+    /**
+     * `stddev / avg`, or `0` when `avg` is zero.
+     */
+    coefficient_of_variation: number;
+    /**
+     * Number of spans aggregated.
+     */
+    count: number;
+    error_count: number;
+    /**
+     * `error_count / count`, in `[0, 1]`.
+     */
+    error_rate: number;
+    /**
+     * The most common span kind for this operation.
+     */
+    kind: SpanKind;
+    /**
+     * Start time of the most recent span in this group.
+     */
+    last_seen: string;
+    max_duration_ms: number;
+    min_duration_ms: number;
+    p50_duration_ms: number;
+    p95_duration_ms: number;
+    p99_duration_ms: number;
+    project_id: number;
+    service_name: string;
+    /**
+     * The span name, which is the operation identity: `GET /api/checkout`,
+     * `SELECT carts`, `payments.charge`.
+     */
+    span_name: string;
+    /**
+     * Sample standard deviation. `0` when the operation has a single sample.
+     */
+    stddev_duration_ms: number;
+    /**
+     * `p99 / p50`, or `0` when `p50` is zero.
+     */
+    tail_ratio: number;
+    /**
+     * `SUM(duration_ms)` — total wall-clock attributable to this operation.
+     */
+    total_duration_ms: number;
+};
+
+/**
+ * Response for `GET /otel/span-stats`.
+ */
+export type SpanStatsResponse = {
+    data: Array<SpanStats>;
+    end_time: string;
+    /**
+     * The window actually aggregated, echoed back because it is defaulted
+     * server-side when the caller omits it.
+     */
+    start_time: string;
+    /**
+     * Total number of distinct operations matching the filters, for pagination.
+     */
+    total: number;
 };
 
 /**
@@ -28988,7 +29074,7 @@ export type DownloadObjectResponses = {
 
 export type DownloadObjectResponse = DownloadObjectResponses[keyof DownloadObjectResponses];
 
-export type GetContainerInfoData = {
+export type GetQueryContainerInfoData = {
     body?: never;
     path: {
         service_id: number;
@@ -28998,7 +29084,7 @@ export type GetContainerInfoData = {
     url: '/external-services/{service_id}/query/containers/{path}/info';
 };
 
-export type GetContainerInfoErrors = {
+export type GetQueryContainerInfoErrors = {
     /**
      * Unauthorized
      */
@@ -29017,14 +29103,14 @@ export type GetContainerInfoErrors = {
     500: unknown;
 };
 
-export type GetContainerInfoResponses = {
+export type GetQueryContainerInfoResponses = {
     /**
      * Container information
      */
     200: ContainerResponse;
 };
 
-export type GetContainerInfoResponse = GetContainerInfoResponses[keyof GetContainerInfoResponses];
+export type GetQueryContainerInfoResponse = GetQueryContainerInfoResponses[keyof GetQueryContainerInfoResponses];
 
 export type CheckExplorerSupportData = {
     body?: never;
@@ -34305,6 +34391,116 @@ export type GetQuotaResponses = {
 };
 
 export type GetQuotaResponse = GetQuotaResponses[keyof GetQuotaResponses];
+
+export type QuerySpanStatsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Single project to report on
+         */
+        project_id?: number;
+        /**
+         * Comma-separated project ids, e.g. `4,5,6`
+         */
+        project_ids?: string;
+        /**
+         * Window start (RFC 3339); defaults to 24h before end_time
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); defaults to now
+         */
+        end_time?: string;
+        /**
+         * Restrict to one service
+         */
+        service_name?: string;
+        /**
+         * Restrict to one operation by exact span name
+         */
+        span_name?: string;
+        /**
+         * Case-insensitive substring match on the span name
+         */
+        name_pattern?: string;
+        /**
+         * server | client | internal | producer | consumer
+         */
+        kind?: string;
+        /**
+         * ok | error | unset
+         */
+        status?: string;
+        /**
+         * Restrict to one environment
+         */
+        environment_id?: number;
+        /**
+         * Restrict to one deployment
+         */
+        deployment_id?: number;
+        /**
+         * Comma-separated key=value span attribute filters
+         */
+        attributes?: string;
+        /**
+         * Ignore spans faster than this
+         */
+        min_duration_ms?: number;
+        /**
+         * Drop operations with fewer samples than this
+         */
+        min_count?: number;
+        /**
+         * total_time | p50 | p95 | p99 | max | avg | stddev | count | errors | error_rate | variability | tail_ratio
+         */
+        sort_by?: string;
+        /**
+         * asc | desc (default)
+         */
+        sort_order?: string;
+        /**
+         * Page size (default 20, max 100)
+         */
+        limit?: number;
+        /**
+         * Page offset
+         */
+        offset?: number;
+    };
+    url: '/otel/span-stats';
+};
+
+export type QuerySpanStatsErrors = {
+    /**
+     * Invalid query (no project, empty window)
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type QuerySpanStatsError = QuerySpanStatsErrors[keyof QuerySpanStatsErrors];
+
+export type QuerySpanStatsResponses = {
+    /**
+     * Per-operation latency statistics
+     */
+    200: SpanStatsResponse;
+};
+
+export type QuerySpanStatsResponse = QuerySpanStatsResponses[keyof QuerySpanStatsResponses];
 
 export type QueryTraceSummariesData = {
     body?: never;
@@ -41053,6 +41249,10 @@ export type GetPropertyBreakdownData = {
          */
         limit?: number;
         /**
+         * Include crawler/bot traffic (default: false)
+         */
+        include_crawlers?: boolean;
+        /**
          * Filter by country (for region/city drill-downs)
          */
         filter_country?: string;
@@ -41145,6 +41345,10 @@ export type GetPropertyTimelineData = {
          * Time bucket: hour, day, week, month (default: auto-detect)
          */
         bucket_size?: string;
+        /**
+         * Include crawler/bot traffic (default: false)
+         */
+        include_crawlers?: boolean;
     };
     url: '/projects/{project_id}/events/properties/timeline';
 };

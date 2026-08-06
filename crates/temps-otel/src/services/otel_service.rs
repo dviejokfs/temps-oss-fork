@@ -391,6 +391,45 @@ impl OtelService {
         self.storage.get_trace(project_id, trace_id).await
     }
 
+    /// Per-operation latency statistics for the queried window.
+    ///
+    /// Validates the window here rather than in the handler so every caller —
+    /// including future internal ones — gets the same guarantee the storage
+    /// backends rely on: a bounded, correctly-ordered time range over at least
+    /// one project.
+    pub async fn query_span_stats(
+        &self,
+        query: SpanStatsQuery,
+    ) -> Result<Vec<SpanStats>, OtelError> {
+        Self::validate_span_stats_query(&query)?;
+        self.storage.query_span_stats(query).await
+    }
+
+    /// Count the operations a span-stats query matches, for pagination.
+    pub async fn count_span_stats(&self, query: SpanStatsQuery) -> Result<u64, OtelError> {
+        Self::validate_span_stats_query(&query)?;
+        self.storage.count_span_stats(query).await
+    }
+
+    fn validate_span_stats_query(query: &SpanStatsQuery) -> Result<(), OtelError> {
+        if query.project_ids.is_empty() {
+            return Err(OtelError::Validation {
+                message: "span-stats requires at least one project id".to_string(),
+            });
+        }
+        if query.end_time <= query.start_time {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "span-stats time window is empty or inverted: start_time {} is not before \
+                     end_time {}",
+                    query.start_time.to_rfc3339(),
+                    query.end_time.to_rfc3339()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn query_logs(&self, query: LogQuery) -> Result<Vec<LogRecord>, OtelError> {
         self.storage.query_logs(query).await
     }

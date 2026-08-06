@@ -42661,6 +42661,143 @@
             }
           }
         }
+      },
+      "SpanStats": {
+        "type": "object",
+        "description": "Latency and error statistics for one operation, i.e. one\n`(project, service, span name)` triple over the queried window.",
+        "required": [
+          "project_id",
+          "service_name",
+          "span_name",
+          "kind",
+          "count",
+          "error_count",
+          "error_rate",
+          "total_duration_ms",
+          "min_duration_ms",
+          "max_duration_ms",
+          "avg_duration_ms",
+          "stddev_duration_ms",
+          "p50_duration_ms",
+          "p95_duration_ms",
+          "p99_duration_ms",
+          "coefficient_of_variation",
+          "tail_ratio",
+          "last_seen"
+        ],
+        "properties": {
+          "avg_duration_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "coefficient_of_variation": {
+            "type": "number",
+            "format": "double",
+            "description": "`stddev / avg`, or `0` when `avg` is zero."
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of spans aggregated."
+          },
+          "error_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "error_rate": {
+            "type": "number",
+            "format": "double",
+            "description": "`error_count / count`, in `[0, 1]`."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SpanKind",
+            "description": "The most common span kind for this operation."
+          },
+          "last_seen": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Start time of the most recent span in this group."
+          },
+          "max_duration_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "min_duration_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "p50_duration_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "p95_duration_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "p99_duration_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "project_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "span_name": {
+            "type": "string",
+            "description": "The span name, which is the operation identity: `GET /api/checkout`,\n`SELECT carts`, `payments.charge`."
+          },
+          "stddev_duration_ms": {
+            "type": "number",
+            "format": "double",
+            "description": "Sample standard deviation. `0` when the operation has a single sample."
+          },
+          "tail_ratio": {
+            "type": "number",
+            "format": "double",
+            "description": "`p99 / p50`, or `0` when `p50` is zero."
+          },
+          "total_duration_ms": {
+            "type": "number",
+            "format": "double",
+            "description": "`SUM(duration_ms)` \u2014 total wall-clock attributable to this operation."
+          }
+        }
+      },
+      "SpanStatsResponse": {
+        "type": "object",
+        "description": "Response for `GET /otel/span-stats`.",
+        "required": [
+          "data",
+          "total",
+          "start_time",
+          "end_time"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SpanStats"
+            }
+          },
+          "end_time": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "start_time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The window actually aggregated, echoed back because it is defaulted\nserver-side when the caller omits it."
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total number of distinct operations matching the filters, for pagination.",
+            "minimum": 0
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -91410,6 +91547,247 @@
         "security": [
           {
             "api_key": []
+          }
+        ]
+      }
+    },
+    "/otel/span-stats": {
+      "get": {
+        "tags": [
+          "Traces"
+        ],
+        "summary": "Rank operations by latency, volume, or inconsistency.",
+        "description": "Groups spans by `(project, service, span name)` over a bounded window and\nreturns count, error rate, total/min/max/avg/stddev duration, p50/p95/p99,\nand two variability ratios per operation. Sorting is what makes it useful:\n\n- `sort_by=total_time` (default) \u2014 where the wall-clock actually goes.\n- `sort_by=p95` / `p99` \u2014 what users actually feel.\n- `sort_by=variability` or `tail_ratio` \u2014 operations whose *spread* is the\n  problem: the ones that take 40ms most of the time and 4s the rest.\n- `span_name=payments.charge` \u2014 the worst this one operation ever got, in\n  `max_duration_ms`.\n\nPair the variability sorts with `min_count` \u2014 a ratio computed from three\nsamples is noise, and without a floor it outranks every real signal.",
+        "operationId": "query_span_stats",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "query",
+            "description": "Single project to report on",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "project_ids",
+            "in": "query",
+            "description": "Comma-separated project ids, e.g. `4,5,6`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start_time",
+            "in": "query",
+            "description": "Window start (RFC 3339); defaults to 24h before end_time",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "end_time",
+            "in": "query",
+            "description": "Window end (RFC 3339); defaults to now",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "service_name",
+            "in": "query",
+            "description": "Restrict to one service",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "span_name",
+            "in": "query",
+            "description": "Restrict to one operation by exact span name",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name_pattern",
+            "in": "query",
+            "description": "Case-insensitive substring match on the span name",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "server | client | internal | producer | consumer",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "ok | error | unset",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "query",
+            "description": "Restrict to one environment",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "deployment_id",
+            "in": "query",
+            "description": "Restrict to one deployment",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "attributes",
+            "in": "query",
+            "description": "Comma-separated key=value span attribute filters",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "min_duration_ms",
+            "in": "query",
+            "description": "Ignore spans faster than this",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          {
+            "name": "min_count",
+            "in": "query",
+            "description": "Drop operations with fewer samples than this",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "description": "total_time | p50 | p95 | p99 | max | avg | stddev | count | errors | error_rate | variability | tail_ratio",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sort_order",
+            "in": "query",
+            "description": "asc | desc (default)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size (default 20, max 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Page offset",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-operation latency statistics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpanStatsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query (no project, empty window)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient permissions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
           }
         ]
       }
