@@ -38,7 +38,7 @@ import {
   type ResourceSpanGroup,
   type SeedSpan,
 } from "./otlp.ts";
-import { totp, waitForFreshWindow } from "./totp.ts";
+import { mintApiKey } from "./admin-key.ts";
 
 const API = process.env.TEMPS_API || "http://localhost:8080";
 const EMAIL = process.env.TEMPS_EMAIL || "dev@temps.sh";
@@ -461,46 +461,11 @@ async function ensureProject(def: ProjectDef): Promise<number> {
   return created.id;
 }
 
-/**
- * Mint an OTLP ingest key through the product's own flow.
- *
- * `POST /api-keys` is a step-up-guarded sensitive action: it requires a browser
- * session with MFA enrolled and verified within the last five minutes. Rather
- * than reach around that guard, this enrols TOTP on the seeding account,
- * satisfies the step-up challenge for real, creates the key, and then disables
- * MFA again so the dev account is left exactly as it was found.
- */
+/** Mint the OTLP ingest key. See `admin-key.ts` for why this is not a direct insert. */
 async function createIngestKey(): Promise<string> {
-  const setup = await api<{ secret_key: string }>("/users/me/mfa/setup", { method: "POST" });
-  const secret = setup.secret_key;
-
-  await waitForFreshWindow();
-  await api<void>("/users/me/mfa/verify", {
-    method: "POST",
-    body: JSON.stringify({ code: await totp(secret) }),
-  });
-
-  await api<{ step_up_expires_at?: string }>("/auth/step-up", {
-    method: "POST",
-    body: JSON.stringify({ code: await totp(secret) }),
-  });
-
-  const created = await api<{ api_key: string }>("/api-keys", {
-    method: "POST",
-    body: JSON.stringify({ name: `otel-trace-seed-${Date.now()}`, role_type: "admin" }),
-  });
-
-  // Leave the account as we found it — MFA was enrolled purely to satisfy the
-  // step-up challenge, and a seeding run should not silently change how the
-  // developer logs in tomorrow.
-  await waitForFreshWindow();
-  await api<void>("/users/me/mfa", {
-    method: "DELETE",
-    body: JSON.stringify({ code: await totp(secret) }),
-  });
-
+  const key = await mintApiKey(api, `otel-trace-seed-${Date.now()}`);
   console.log("✓ created OTLP ingest API key (MFA enrolled, used, and removed)");
-  return created.api_key;
+  return key;
 }
 
 // ── trace generation ────────────────────────────────────────────────

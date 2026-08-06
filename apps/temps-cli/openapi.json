@@ -91557,7 +91557,7 @@
           "Traces"
         ],
         "summary": "Rank operations by latency, volume, or inconsistency.",
-        "description": "Groups spans by `(project, service, span name)` over a bounded window and\nreturns count, error rate, total/min/max/avg/stddev duration, p50/p95/p99,\nand two variability ratios per operation. Sorting is what makes it useful:\n\n- `sort_by=total_time` (default) \u2014 where the wall-clock actually goes.\n- `sort_by=p95` / `p99` \u2014 what users actually feel.\n- `sort_by=variability` or `tail_ratio` \u2014 operations whose *spread* is the\n  problem: the ones that take 40ms most of the time and 4s the rest.\n- `span_name=payments.charge` \u2014 the worst this one operation ever got, in\n  `max_duration_ms`.\n\nPair the variability sorts with `min_count` \u2014 a ratio computed from three\nsamples is noise, and without a floor it outranks every real signal.",
+        "description": "Groups spans by `(project, service, span name)` over a bounded window and\nreturns count, error rate, total/min/max/avg/stddev duration, p50/p95/p99,\nand two variability ratios per operation. Sorting is what makes it useful:\n\n- `sort_by=total_time` (default) \u2014 where the wall-clock actually goes.\n- `sort_by=p95` / `p99` \u2014 what users actually feel.\n- `sort_by=variability` or `tail_ratio` \u2014 operations whose *spread* is the\n  problem: the ones that take 40ms most of the time and 4s the rest.\n- `span_name=payments.charge` \u2014 the worst this one operation ever got, in\n  `max_duration_ms`.\n\nPair the variability sorts with `min_count` \u2014 a ratio computed from three\nsamples is noise, and without a floor it outranks every real signal.\n\nTwo bounds are enforced rather than clamped, so a result never claims to\ncover more than it does: at most 50 projects, and a window no wider than\n31 days. Both return 400. Unlike the trace list this report has no early\nexit \u2014 it aggregates every span in the window before it can rank anything.",
         "operationId": "query_span_stats",
         "parameters": [
           {
@@ -91573,7 +91573,7 @@
           {
             "name": "project_ids",
             "in": "query",
-            "description": "Comma-separated project ids, e.g. `4,5,6`",
+            "description": "Comma-separated project ids, e.g. `4,5,6` (max 50)",
             "required": false,
             "schema": {
               "type": "string"
@@ -91582,7 +91582,7 @@
           {
             "name": "start_time",
             "in": "query",
-            "description": "Window start (RFC 3339); defaults to 24h before end_time",
+            "description": "Window start (RFC 3339); defaults to 24h before end_time. The window may not exceed 31 days",
             "required": false,
             "schema": {
               "type": "string"

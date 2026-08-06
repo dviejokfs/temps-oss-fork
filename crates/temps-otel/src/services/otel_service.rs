@@ -417,6 +417,15 @@ impl OtelService {
                 message: "span-stats requires at least one project id".to_string(),
             });
         }
+        if query.project_ids.len() > SPAN_STATS_MAX_PROJECTS {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "span-stats accepts at most {} projects per query, got {}",
+                    SPAN_STATS_MAX_PROJECTS,
+                    query.project_ids.len()
+                ),
+            });
+        }
         if query.end_time <= query.start_time {
             return Err(OtelError::Validation {
                 message: format!(
@@ -424,6 +433,20 @@ impl OtelService {
                      end_time {}",
                     query.start_time.to_rfc3339(),
                     query.end_time.to_rfc3339()
+                ),
+            });
+        }
+        // Reject rather than silently truncate: a caller asking for 90 days and
+        // getting 31 back would read the result as "the last 90 days", and the
+        // whole point of the report is that the numbers mean what they say.
+        let window = query.end_time - query.start_time;
+        if window > chrono::Duration::days(SPAN_STATS_MAX_WINDOW_DAYS) {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "span-stats time window is {} days, which exceeds the {}-day maximum; \
+                     narrow start_time/end_time",
+                    window.num_days(),
+                    SPAN_STATS_MAX_WINDOW_DAYS
                 ),
             });
         }
@@ -1234,5 +1257,79 @@ mod tests {
 
         drop(permits);
         assert!(service.try_acquire_ingest_permit().is_ok());
+    }
+
+    // ── span-stats query validation ─────────────────────────────────
+
+    fn span_stats_query(project_ids: Vec<i32>, window_days: i64) -> SpanStatsQuery {
+        let end = chrono::Utc::now();
+        SpanStatsQuery {
+            project_ids,
+            start_time: end - chrono::Duration::days(window_days),
+            end_time: end,
+            service_name: None,
+            span_name: None,
+            name_pattern: None,
+            kind: None,
+            status: None,
+            environment_id: None,
+            deployment_id: None,
+            attributes: None,
+            min_duration_ms: None,
+            min_count: 1,
+            sort_by: SpanStatsSortField::default(),
+            sort_order: SortOrder::default(),
+            limit: None,
+            offset: None,
+        }
+    }
+
+    #[test]
+    fn span_stats_rejects_more_projects_than_the_cap() {
+        // The handler checks a project's access one round-trip at a time, and
+        // an instance admin skips those checks entirely — so the id list has to
+        // be bounded before it reaches storage, not just before it reaches auth.
+        let too_many: Vec<i32> = (1..=(SPAN_STATS_MAX_PROJECTS as i32 + 1)).collect();
+        let err = OtelService::validate_span_stats_query(&span_stats_query(too_many, 1))
+            .expect_err("over-cap project list must be rejected");
+        assert!(matches!(err, OtelError::Validation { .. }), "got {err:?}");
+        assert!(err.to_string().contains("at most"), "got {err}");
+
+        let at_cap: Vec<i32> = (1..=SPAN_STATS_MAX_PROJECTS as i32).collect();
+        assert!(OtelService::validate_span_stats_query(&span_stats_query(at_cap, 1)).is_ok());
+    }
+
+    #[test]
+    fn span_stats_rejects_a_window_wider_than_the_cap() {
+        // This report aggregates the whole window before it can rank anything,
+        // so an unbounded window is an unbounded query on a small box.
+        let err = OtelService::validate_span_stats_query(&span_stats_query(
+            vec![1],
+            SPAN_STATS_MAX_WINDOW_DAYS + 1,
+        ))
+        .expect_err("over-wide window must be rejected");
+        assert!(matches!(err, OtelError::Validation { .. }), "got {err:?}");
+        assert!(err.to_string().contains("exceeds"), "got {err}");
+
+        // Rejected, never silently narrowed: a caller who asked for 90 days and
+        // got 31 back would read the numbers as covering 90.
+        assert!(OtelService::validate_span_stats_query(&span_stats_query(
+            vec![1],
+            SPAN_STATS_MAX_WINDOW_DAYS
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn span_stats_still_rejects_empty_and_inverted_windows() {
+        assert!(OtelService::validate_span_stats_query(&span_stats_query(vec![], 1)).is_err());
+
+        let now = chrono::Utc::now();
+        let inverted = SpanStatsQuery {
+            start_time: now,
+            end_time: now - chrono::Duration::hours(1),
+            ..span_stats_query(vec![1], 1)
+        };
+        assert!(OtelService::validate_span_stats_query(&inverted).is_err());
     }
 }

@@ -10,7 +10,7 @@
  *   TEMPS_API=http://localhost:8261 TEMPS_PASSWORD=... bun run mint-api-key.ts
  */
 
-import { totp, waitForFreshWindow } from "./totp.ts";
+import { mintApiKey } from "./admin-key.ts";
 
 const API = process.env.TEMPS_API || "http://localhost:8080";
 const EMAIL = process.env.TEMPS_EMAIL || "dev@temps.sh";
@@ -51,27 +51,6 @@ const session = (login.headers.getSetCookie?.() ?? [])
 if (!session) throw new Error("login returned no session cookie");
 sessionCookie = session;
 
-const setup = await api<{ secret_key: string }>("/users/me/mfa/setup", { method: "POST" });
-await waitForFreshWindow();
-await api<void>("/users/me/mfa/verify", {
-  method: "POST",
-  body: JSON.stringify({ code: await totp(setup.secret_key) }),
-});
-await api("/auth/step-up", {
-  method: "POST",
-  body: JSON.stringify({ code: await totp(setup.secret_key) }),
-});
+const apiKey = await mintApiKey(api, `cli-dev-${Date.now()}`);
 
-const created = await api<{ api_key: string }>("/api-keys", {
-  method: "POST",
-  body: JSON.stringify({ name: `cli-dev-${Date.now()}`, role_type: "admin" }),
-});
-
-// Restore the account to how we found it.
-await waitForFreshWindow();
-await api<void>("/users/me/mfa", {
-  method: "DELETE",
-  body: JSON.stringify({ code: await totp(setup.secret_key) }),
-});
-
-console.log(created.api_key);
+console.log(apiKey);
