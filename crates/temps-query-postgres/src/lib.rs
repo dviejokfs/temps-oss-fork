@@ -47,11 +47,17 @@ fn pg_column_admission(column: &PgQueryColumn, row_budget: usize) -> Result<Stri
         }
         "bytea" => format!("COALESCE(OCTET_LENGTH({value})::bigint * 2 + 8, 4)"),
         "json" => format!("COALESCE(OCTET_LENGTH({value}::text)::bigint * 6 + 8, 4)"),
-        "jsonb" | "ARRAY" => format!(
+        "jsonb" => format!(
             "CASE WHEN {value} IS NULL THEN 4 WHEN PG_COLUMN_COMPRESSION({value}) IS NOT NULL \
              THEN {} ELSE PG_COLUMN_SIZE({value})::bigint * 8 + 64 END",
             row_budget.saturating_add(1)
         ),
+        "ARRAY" => {
+            return Err(DataError::OperationNotSupported(
+                "PostgreSQL array columns are not supported by the bounded data browser"
+                    .to_string(),
+            ))
+        }
         "boolean"
         | "smallint"
         | "integer"
@@ -2244,6 +2250,29 @@ mod wire_budget_tests {
             error,
             temps_query::DataError::OperationNotSupported(_)
         ));
+    }
+
+    #[test]
+    fn every_array_type_is_rejected_before_json_query_generation() {
+        for name in [
+            "token_tok_live_secret",
+            "large_numeric_array",
+            "custom_type_array",
+        ] {
+            let error = with_wire_row_budget(
+                "SELECT * FROM public.array_payloads",
+                &[PgQueryColumn {
+                    name: name.to_string(),
+                    data_type: "ARRAY".to_string(),
+                }],
+                QueryBudget::default(),
+            )
+            .expect_err("array output expansion has no generic stored-size bound");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("array columns are not supported"));
+            assert!(!diagnostic.contains("tok_live_secret"));
+            assert!(!diagnostic.contains("TO_JSONB"));
+        }
     }
 }
 

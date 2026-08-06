@@ -99,16 +99,35 @@ impl AuditOperation for AiDataAccessChangedAudit {
 /// a suspected prompt injection the operator's first question is "what did the
 /// model see?", and without this record there is nothing to answer it with.
 ///
-/// Deliberately records the location and shape of the read (service, container
-/// path, entity, row count) and never the values themselves — an audit log that
-/// copied the rows would just be a second place the same secrets live.
+/// Deliberately records only stable IDs and fixed categories. Service names,
+/// container paths and entity names are omitted because key-value/object
+/// backends routinely store emails, tokens and filenames in those identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiBackendCategory {
+    Relational,
+    Document,
+    KeyValue,
+    ObjectStore,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiEntityCategory {
+    Table,
+    Collection,
+    Key,
+    Object,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AiRowsReadAudit {
     pub context: AuditContext,
     pub service_id: i32,
-    pub service_name: String,
-    pub container_path: String,
-    pub entity: String,
+    pub backend_category: AiBackendCategory,
+    pub entity_category: AiEntityCategory,
     pub returned_rows: usize,
     pub truncated: bool,
     /// Bounded structural category only; literal filter values are never
@@ -478,9 +497,8 @@ mod tests {
                 user_agent: "test-agent".to_string(),
             },
             service_id: 7,
-            service_name: "postgres".to_string(),
-            container_path: "app/public".to_string(),
-            entity: "users".to_string(),
+            backend_category: AiBackendCategory::Relational,
+            entity_category: AiEntityCategory::Table,
             returned_rows: 1,
             truncated: false,
             filter_shape: Some("sql_where".to_string()),
@@ -490,5 +508,34 @@ mod tests {
         assert!(serialized.contains("sql_where"));
         assert!(!serialized.contains("alice@example.com"));
         assert!(!serialized.contains("tok_live_secret"));
+    }
+
+    #[test]
+    fn ai_row_read_audit_omits_secret_bearing_identifiers() {
+        // These are the raw values available at the handler boundary. The
+        // audit type has no fields capable of accepting them.
+        let service_name = "service-alice@example.com";
+        let container_path = "bucket/tok_live_secret";
+        let entity = "session:alice@example.com:tok_live_secret";
+        let audit = AiRowsReadAudit {
+            context: AuditContext {
+                user_id: 42,
+                ip_address: None,
+                user_agent: "test-agent".to_string(),
+            },
+            service_id: 7,
+            backend_category: AiBackendCategory::KeyValue,
+            entity_category: AiEntityCategory::Key,
+            returned_rows: 1,
+            truncated: false,
+            filter_shape: Some("structured_object".to_string()),
+        };
+        let serialized = AuditOperation::serialize(&audit).expect("audit serializes");
+
+        for secret_identifier in [service_name, container_path, entity] {
+            assert!(!serialized.contains(secret_identifier));
+        }
+        assert!(serialized.contains("key_value"));
+        assert!(serialized.contains("entity_category"));
     }
 }

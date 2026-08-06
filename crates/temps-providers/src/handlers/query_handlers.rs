@@ -12,7 +12,9 @@ use temps_core::problemdetails::Problem;
 use temps_query::{ContainerInfo, ContainerPath, EntityInfo, QueryBudget, QueryOptions};
 use utoipa::ToSchema;
 
-use super::audit::{AiDataAccessChangedAudit, AiRowsReadAudit};
+use super::audit::{
+    AiBackendCategory, AiDataAccessChangedAudit, AiEntityCategory, AiRowsReadAudit,
+};
 use super::types::AppState;
 
 // ============================================================================
@@ -329,12 +331,7 @@ fn filter_shape(filter: Option<&serde_json::Value>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn query_error_problem(
-    error: temps_query::DataError,
-    service_id: i32,
-    entity: &str,
-    limit: usize,
-) -> Problem {
+fn query_error_problem(error: temps_query::DataError, service_id: i32, limit: usize) -> Problem {
     let (status, title, kind, safe_detail) = match &error {
         temps_query::DataError::ResultLimitExceeded { .. } => (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -373,7 +370,6 @@ fn query_error_problem(
     };
     tracing::warn!(
         service_id,
-        entity,
         limit,
         error_kind = kind,
         "external-service data query failed"
@@ -416,6 +412,20 @@ fn entity_names_are_user_data(service_type: &str) -> bool {
         service_type.trim().to_ascii_lowercase().as_str(),
         "postgres" | "postgresql" | "mysql" | "mariadb" | "mongodb"
     )
+}
+
+/// Fixed audit categories derived only from an allowlisted engine type.
+/// Unknown future engines fail closed to non-identifying categories.
+fn ai_read_audit_categories(service_type: &str) -> (AiBackendCategory, AiEntityCategory) {
+    match service_type.trim().to_ascii_lowercase().as_str() {
+        "postgres" | "postgresql" | "mysql" | "mariadb" => {
+            (AiBackendCategory::Relational, AiEntityCategory::Table)
+        }
+        "mongodb" => (AiBackendCategory::Document, AiEntityCategory::Collection),
+        "redis" => (AiBackendCategory::KeyValue, AiEntityCategory::Key),
+        "s3" | "rustfs" => (AiBackendCategory::ObjectStore, AiEntityCategory::Object),
+        _ => (AiBackendCategory::Unknown, AiEntityCategory::Unknown),
+    }
 }
 
 /// Enforce the `ai_data_access` opt-in on an endpoint that returns *entity
@@ -463,14 +473,15 @@ async fn apply_entity_name_gate(
 /// A no-op for human callers — their authorization is `ExternalServicesRead`,
 /// checked by the caller before this runs.
 ///
-/// Returns the service name for an agent call that passed the gate, so the
-/// caller can name the service in the audit record without a second lookup.
+/// Returns fixed, non-identifying backend/entity categories for an agent call
+/// that passed the gate. User-controlled service and entity names never leave
+/// this function for audit serialization.
 async fn enforce_ai_data_access(
     app_state: &AppState,
     service_id: i32,
     is_ai_call: bool,
     what: &str,
-) -> Result<Option<String>, Problem> {
+) -> Result<Option<(AiBackendCategory, AiEntityCategory)>, Problem> {
     if !is_ai_call {
         return Ok(None);
     }
@@ -486,7 +497,7 @@ async fn enforce_ai_data_access(
         })?;
 
     if ai_may_read_rows(is_ai_call, service.ai_data_access) {
-        return Ok(Some(service.name.clone()));
+        return Ok(Some(ai_read_audit_categories(&service.service_type)));
     }
 
     Err(temps_core::problemdetails::new(StatusCode::FORBIDDEN)
@@ -598,7 +609,7 @@ pub async fn read_entity_rows(
     // projects, so there is no single owning project to scope to, and the
     // `ai_data_access` opt-in below is the intended boundary — an operator
     // enables row access per service, whatever project the chat is about.
-    let ai_service_name =
+    let ai_audit_categories =
         enforce_ai_data_access(&app_state, service_id, is_ai_call, "row data").await?;
 
     let filter_schema = app_state
@@ -629,7 +640,7 @@ pub async fn read_entity_rows(
         .query_service
         .query_data(service_id, &path, &entity, filters, options)
         .await
-        .map_err(|error| query_error_problem(error, service_id, &entity, limit))?;
+        .map_err(|error| query_error_problem(error, service_id, limit))?;
 
     let total_count = result.stats.total_rows.unwrap_or(result.stats.row_count) as u64;
     let execution_time_ms = result.stats.execution_ms;
@@ -649,9 +660,9 @@ pub async fn read_entity_rows(
 
     // Record what the model actually read. The `ai_data_access` toggle is
     // audited, but that only says the door was opened; this says what went
-    // through it. Location and shape only — never the values, or the audit log
-    // becomes a second copy of the same secrets.
-    if let Some(service_name) = ai_service_name {
+    // through it. Stable ID, fixed categories and shape only — names and values
+    // can both contain secrets, so the audit type cannot represent either.
+    if let Some((backend_category, entity_category)) = ai_audit_categories {
         let audit = AiRowsReadAudit {
             context: temps_core::audit::AuditContext {
                 user_id: auth.user_id(),
@@ -659,9 +670,8 @@ pub async fn read_entity_rows(
                 user_agent: metadata.user_agent.clone(),
             },
             service_id,
-            service_name,
-            container_path: path_str.clone(),
-            entity: entity.clone(),
+            backend_category,
+            entity_category,
             returned_rows: rows.len(),
             truncated,
             filter_shape: audit_filter_shape,
@@ -1407,7 +1417,7 @@ pub async fn query_data(
         .query_service
         .query_data(service_id, &path, &entity, request.filters, options)
         .await
-        .map_err(|error| query_error_problem(error, service_id, &entity, request.limit))?;
+        .map_err(|error| query_error_problem(error, service_id, request.limit))?;
 
     let total_count = result.stats.total_rows.unwrap_or(result.stats.row_count) as u64;
     let execution_time_ms = result.stats.execution_ms;
@@ -1818,7 +1828,6 @@ mod tests {
         let problem = query_error_problem(
             temps_query::DataError::QueryFailed(format!("syntax near {secret}")),
             7,
-            "users",
             100,
         );
         let serialized = serde_json::to_string(&problem.body).expect("problem body serializes");
@@ -1833,7 +1842,6 @@ mod tests {
                 "invalid email alice@example.com with tok_live_secret".to_string(),
             ),
             7,
-            "users",
             100,
         );
         let serialized = serde_json::to_string(&problem.body).expect("problem body serializes");
@@ -1852,7 +1860,6 @@ mod tests {
                 observed: 1_024,
             },
             7,
-            "session:tok_live_secret:alice@example.com",
             1,
         );
         let serialized = serde_json::to_string(&problem.body).expect("problem body serializes");
@@ -1884,6 +1891,30 @@ mod tests {
         assert!(!entity_names_are_user_data("mongodb"));
         // Casing and stray whitespace must not open the gate.
         assert!(!entity_names_are_user_data("  PostgreSQL "));
+    }
+
+    #[test]
+    fn ai_audit_categories_are_fixed_and_unknown_backends_fail_closed() {
+        assert_eq!(
+            ai_read_audit_categories("postgres"),
+            (AiBackendCategory::Relational, AiEntityCategory::Table)
+        );
+        assert_eq!(
+            ai_read_audit_categories("mongodb"),
+            (AiBackendCategory::Document, AiEntityCategory::Collection)
+        );
+        assert_eq!(
+            ai_read_audit_categories("redis"),
+            (AiBackendCategory::KeyValue, AiEntityCategory::Key)
+        );
+        assert_eq!(
+            ai_read_audit_categories("s3"),
+            (AiBackendCategory::ObjectStore, AiEntityCategory::Object)
+        );
+        assert_eq!(
+            ai_read_audit_categories("future-secret-bearing-engine"),
+            (AiBackendCategory::Unknown, AiEntityCategory::Unknown)
+        );
     }
 
     #[test]
