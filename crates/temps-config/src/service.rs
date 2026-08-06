@@ -1010,9 +1010,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
 
         if let Some(existing_model) = existing {
-            // Update existing settings
+            // Update existing settings. Merge into the stored document rather
+            // than replacing it: the `settings` row carries sub-documents owned
+            // by other subsystems (`admin_gate`) that `AppSettings` cannot
+            // round-trip. See `AppSettings::to_json_merged`.
+            let merged = settings.to_json_merged(&existing_model.data);
             let mut active_model: settings::ActiveModel = existing_model.into();
-            active_model.data = Set(settings.to_json());
+            active_model.data = Set(merged);
             active_model.updated_at = Set(now);
             active_model.update(&txn).await?;
         } else {

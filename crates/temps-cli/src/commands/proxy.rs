@@ -467,11 +467,13 @@ impl ProxyCommand {
         // persist API). `new` fails CLOSED on a DB error, so a broken settings
         // row refuses to boot rather than opening the gate.
         //
-        // NOTE: this is boot-time config only. Live admin-gate edits made
-        // through the console's API swap the console's in-process handle but do
-        // NOT yet propagate to this separate proxy process — operators must
-        // restart `temps proxy` to pick up a changed allowlist. Cross-process
-        // admin-gate refresh is tracked as ADR-017 Phase 3.
+        // Live admin-gate edits made through the console's API swap only the
+        // console's in-process handle, so this separate process subscribes to
+        // the Postgres `settings_change` channel and reloads the allowlist
+        // itself. Without that, this proxy would enforce its boot-time config
+        // forever: a newly saved allowlist would go unenforced here, and a
+        // cleared one would keep 404ing hosts that should now fall through to
+        // the console.
         let admin_gate_handle = match rt.block_on(
             crate::commands::serve::admin_gate_service::AdminGateService::new(
                 db.clone(),
@@ -480,7 +482,16 @@ impl ProxyCommand {
                 config.admin_trust_forwarded_for,
             ),
         ) {
-            Ok((_service, handle)) => Some(handle),
+            Ok((service, handle)) => {
+                // `start_settings_listener` calls `tokio::spawn`, so it must run
+                // inside the runtime context. `rt` lives on this stack for the
+                // duration of the blocking Pingora server below, which is what
+                // keeps the task alive (same pattern as the route listeners).
+                let service = Arc::new(service);
+                let database_url = self.database_url.clone();
+                rt.block_on(async { service.start_settings_listener(database_url) });
+                Some(handle)
+            }
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "Failed to initialize admin gate: {}. Refusing to start the proxy with \

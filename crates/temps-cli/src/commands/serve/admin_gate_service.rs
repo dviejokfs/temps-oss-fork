@@ -205,6 +205,133 @@ impl AdminGateService {
         );
         Ok(self.handle.current())
     }
+
+    /// Re-read the gate config from the DB and swap the live handle.
+    ///
+    /// Used by the `settings_change` listener so a process that did NOT
+    /// perform the write (the standalone `temps proxy`, whose console lives in
+    /// a different process) still converges on the operator's current config.
+    ///
+    /// Fails SAFE: on a load error the previous config is retained rather than
+    /// falling back to an open gate — a transient DB blip must never widen the
+    /// management surface. Env-overridden processes are a no-op, matching
+    /// `update()`'s precedence rule.
+    pub async fn reload_from_db(&self) -> Result<Arc<AdminGateConfig>, AdminGateServiceError> {
+        if self.env_overridden {
+            return Ok(self.handle.current());
+        }
+
+        let config = match load_from_db(self.db.as_ref()).await? {
+            Some(settings) => AdminGateConfig::from_parts(
+                &settings.allowed_ips,
+                &settings.allowed_hosts,
+                settings.trust_forwarded_for,
+                AdminGateSource::Db,
+            )?,
+            None => AdminGateConfig::from_parts(&[], &[], false, AdminGateSource::Default)?,
+        };
+
+        let prev = self.handle.store(config);
+        info!(
+            previous_source = ?prev.source,
+            "Admin gate: reloaded after settings_change notification"
+        );
+        Ok(self.handle.current())
+    }
+
+    /// Spawn the background task that LISTENs on the Postgres `settings_change`
+    /// channel and reloads the gate whenever ANY process writes the settings
+    /// row.
+    ///
+    /// In the single-binary `temps serve` the console and the Pingora proxy
+    /// share one `AdminGateHandle`, so a UI save is visible to both instantly.
+    /// In the ADR-017 split topology they are separate processes with separate
+    /// handles: without this listener the standalone `temps proxy` enforces
+    /// whatever allowlist existed when it booted, forever. That divergence is
+    /// visible in both directions — a newly saved allowlist isn't enforced at
+    /// the proxy (management surface stays reachable from disallowed hosts),
+    /// and a cleared allowlist keeps 404ing hosts that should now fall through
+    /// to the console.
+    ///
+    /// Startup failure to connect is non-fatal: the gate keeps its boot-time
+    /// config (the pre-existing behavior) and the operator can still restart
+    /// the process to pick up changes.
+    pub fn start_settings_listener(self: &Arc<Self>, database_url: String) {
+        let service = Arc::clone(self);
+
+        // Env precedence: the DB is not the source of truth here, so there is
+        // nothing to converge on.
+        if service.env_overridden {
+            return;
+        }
+
+        tokio::spawn(async move {
+            use sqlx::postgres::{PgListener, PgPool};
+
+            let pool = match PgPool::connect(&database_url).await {
+                Ok(pool) => pool,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Admin gate: failed to connect for settings_change LISTEN; \
+                         the gate will keep its boot-time config until this process restarts"
+                    );
+                    return;
+                }
+            };
+
+            let mut listener = match PgListener::connect_with(&pool).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Admin gate: failed to create PgListener; \
+                         the gate will keep its boot-time config until this process restarts"
+                    );
+                    return;
+                }
+            };
+
+            if let Err(e) = listener.listen("settings_change").await {
+                tracing::warn!(
+                    error = %e,
+                    "Admin gate: failed to subscribe to settings_change; \
+                     the gate will keep its boot-time config until this process restarts"
+                );
+                return;
+            }
+            info!("Admin gate: listening for settings_change to refresh the allowlist");
+
+            loop {
+                match listener.recv().await {
+                    Ok(_) => {
+                        if let Err(e) = service.reload_from_db().await {
+                            // Keep the previous (stricter or equal) config.
+                            tracing::error!(
+                                error = %e,
+                                "Admin gate: reload after settings_change failed; \
+                                 keeping the previously active configuration"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Admin gate: settings_change listener error; reconnecting"
+                        );
+                        // Reconnect, then reload once to catch anything missed
+                        // during the gap.
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        if listener.listen("settings_change").await.is_ok() {
+                            let _ = service.reload_from_db().await;
+                        } else {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// Read the `admin_gate` key off the singleton `settings` row. Returns
@@ -382,6 +509,80 @@ mod tests {
             result.unwrap_err(),
             AdminGateServiceError::WouldLockOut { .. }
         ));
+    }
+
+    /// The split-topology convergence path: a write performed by the *console*
+    /// process must become effective in the *proxy* process, which only sees
+    /// the `settings_change` NOTIFY.
+    #[tokio::test]
+    async fn reload_from_db_picks_up_another_process_write() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Boot: gate empty.
+            .append_query_results(vec![vec![settings_row(serde_json::json!({}))]])
+            // After the console saved an allowlist.
+            .append_query_results(vec![vec![settings_row(serde_json::json!({
+                "admin_gate": {
+                    "allowed_ips": [],
+                    "allowed_hosts": ["app.temps.kfs.es"],
+                    "trust_forwarded_for": false
+                }
+            }))]])
+            .into_connection();
+
+        let (svc, handle) = AdminGateService::new(Arc::new(db), &[], &[], false)
+            .await
+            .unwrap();
+        assert!(handle.current().is_noop(), "boots with an empty gate");
+
+        svc.reload_from_db().await.unwrap();
+
+        let cfg = handle.current();
+        assert_eq!(cfg.source, AdminGateSource::Db);
+        assert_eq!(cfg.allowed_hosts.len(), 1);
+    }
+
+    /// A cleared allowlist must also converge — otherwise the proxy keeps
+    /// 404ing hosts the operator has since unblocked.
+    #[tokio::test]
+    async fn reload_from_db_converges_when_gate_is_cleared() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row(serde_json::json!({
+                "admin_gate": {
+                    "allowed_ips": [],
+                    "allowed_hosts": ["app.temps.kfs.es"],
+                    "trust_forwarded_for": false
+                }
+            }))]])
+            // Console cleared the key.
+            .append_query_results(vec![vec![settings_row(serde_json::json!({}))]])
+            .into_connection();
+
+        let (svc, handle) = AdminGateService::new(Arc::new(db), &[], &[], false)
+            .await
+            .unwrap();
+        assert!(!handle.current().is_noop());
+
+        svc.reload_from_db().await.unwrap();
+
+        assert!(handle.current().is_noop());
+        assert_eq!(handle.current().source, AdminGateSource::Default);
+    }
+
+    /// Env precedence holds on the reload path too: a DB write must not be
+    /// able to override an env-pinned gate.
+    #[tokio::test]
+    async fn reload_from_db_is_noop_when_env_overridden() {
+        // Zero queued results — touching the DB would panic.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let (svc, handle) =
+            AdminGateService::new(Arc::new(db), &["10.0.0.0/8".to_string()], &[], false)
+                .await
+                .unwrap();
+
+        svc.reload_from_db().await.unwrap();
+
+        assert_eq!(handle.current().source, AdminGateSource::Env);
+        assert_eq!(handle.current().allowed_nets.len(), 1);
     }
 
     #[tokio::test]
