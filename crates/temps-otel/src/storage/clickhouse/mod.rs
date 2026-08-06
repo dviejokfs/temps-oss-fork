@@ -57,7 +57,8 @@ use crate::storage::{
 use crate::types::{
     GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, HistogramSummary, Insight,
     InsightStatus, LogQuery, LogRecord, MetricAggregation, MetricBucket, MetricPoint, MetricQuery,
-    SpanEvent, SpanKind, SpanRecord, SpanStatusCode, StorageQuota, TraceQuery, TraceSummary,
+    SpanEvent, SpanKind, SpanRecord, SpanStats, SpanStatsQuery, SpanStatusCode, StorageQuota,
+    TraceQuery, TraceSummary,
 };
 
 // ── Client configuration ────────────────────────────────────────────────────
@@ -764,6 +765,187 @@ struct ChTraceSummaryRow {
 #[derive(::clickhouse::Row, Deserialize, Debug)]
 struct ChCountRow {
     cnt: u64,
+}
+
+/// Row returned by `query_span_stats` — one row per operation.
+#[derive(::clickhouse::Row, Deserialize, Debug)]
+struct ChSpanStatsRow {
+    project_id: i32,
+    service_name: String,
+    span_name: String,
+    kind: String,
+    span_count: u64,
+    error_count: u64,
+    total_duration_ms: f64,
+    min_duration_ms: f64,
+    max_duration_ms: f64,
+    avg_duration_ms: f64,
+    stddev_duration_ms: f64,
+    p50_duration_ms: f64,
+    p95_duration_ms: f64,
+    p99_duration_ms: f64,
+    /// Unix milliseconds (toUnixTimestamp64Milli)
+    last_seen_ms: i64,
+}
+
+impl From<ChSpanStatsRow> for SpanStats {
+    fn from(r: ChSpanStatsRow) -> Self {
+        use chrono::TimeZone;
+        let last_seen = chrono::Utc
+            .timestamp_millis_opt(r.last_seen_ms)
+            .single()
+            .unwrap_or_default();
+        crate::types::build_span_stats(
+            crate::types::SpanStatsGroup {
+                project_id: r.project_id,
+                service_name: r.service_name,
+                span_name: r.span_name,
+                kind: str_to_span_kind(&r.kind),
+                count: r.span_count as i64,
+                error_count: r.error_count as i64,
+            },
+            crate::types::SpanDurationStats {
+                total_ms: r.total_duration_ms,
+                min_ms: r.min_duration_ms,
+                max_ms: r.max_duration_ms,
+                avg_ms: r.avg_duration_ms,
+                stddev_ms: r.stddev_duration_ms,
+                p50_ms: r.p50_duration_ms,
+                p95_ms: r.p95_duration_ms,
+                p99_ms: r.p99_duration_ms,
+            },
+            last_seen,
+        )
+    }
+}
+
+/// A value bound into a ClickHouse query, in placeholder order.
+#[derive(Clone, Debug)]
+pub(crate) enum ChBind {
+    I32(i32),
+    I64(i64),
+    F64(f64),
+    Str(String),
+}
+
+/// Apply an ordered bind list to a query builder.
+pub(crate) fn bind_all(
+    mut q: ::clickhouse::query::Query,
+    binds: Vec<ChBind>,
+) -> ::clickhouse::query::Query {
+    for b in binds {
+        q = match b {
+            ChBind::I32(v) => q.bind(v),
+            ChBind::I64(v) => q.bind(v),
+            ChBind::F64(v) => q.bind(v),
+            ChBind::Str(v) => q.bind(v),
+        };
+    }
+    q
+}
+
+/// Build the shared WHERE clause and ordered binds for the ClickHouse
+/// span-stats list/count queries.
+///
+/// The list and count queries MUST share this builder: a filter applied to one
+/// but not the other yields a total that disagrees with the rows.
+///
+/// `environment_id` is **not** applied here. Resolving an environment to its
+/// deployments requires the Postgres `deployments` table, which ClickHouse
+/// cannot join against — the same limitation `query_trace_summaries` has. The
+/// caller is warned rather than silently given unfiltered numbers.
+fn build_ch_span_stats_filters(query: &SpanStatsQuery) -> (String, Vec<ChBind>) {
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut binds: Vec<ChBind> = Vec::new();
+
+    // `IN (...)` with one placeholder per id: the ClickHouse driver has no
+    // array-bind for Int32, and the list is bounded by the caller's project
+    // access, so rendering N placeholders is safe and stays parameterised.
+    let placeholders = std::iter::repeat_n("?", query.project_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    where_parts.push(format!("project_id IN ({placeholders})"));
+    binds.extend(query.project_ids.iter().map(|id| ChBind::I32(*id)));
+
+    where_parts.push("start_time >= fromUnixTimestamp64Milli(?)".to_owned());
+    binds.push(ChBind::I64(query.start_time.timestamp_millis()));
+    where_parts.push("start_time <= fromUnixTimestamp64Milli(?)".to_owned());
+    binds.push(ChBind::I64(query.end_time.timestamp_millis()));
+
+    if let Some(ref svc) = query.service_name {
+        // Qualified: the SELECT list aliases `service_name`, and an unqualified
+        // reference in WHERE would bind to the aggregate (ClickHouse Code 184).
+        where_parts.push("spans.service_name = ?".to_owned());
+        binds.push(ChBind::Str(svc.clone()));
+    }
+    if let Some(ref name) = query.span_name {
+        where_parts.push("spans.name = ?".to_owned());
+        binds.push(ChBind::Str(name.clone()));
+    }
+    if let Some(ref pattern) = query.name_pattern {
+        where_parts.push("spans.name ILIKE ?".to_owned());
+        binds.push(ChBind::Str(format!(
+            "%{}%",
+            escape_like_pattern(pattern.as_str())
+        )));
+    }
+    if let Some(kind) = query.kind {
+        where_parts.push("spans.kind = ?".to_owned());
+        binds.push(ChBind::Str(kind.to_string()));
+    }
+    if let Some(status) = query.status {
+        where_parts.push("status_code = ?".to_owned());
+        binds.push(ChBind::Str(status.to_string()));
+    }
+    if let Some(min_dur) = query.min_duration_ms {
+        where_parts.push("duration_ms >= ?".to_owned());
+        binds.push(ChBind::F64(min_dur));
+    }
+    if let Some(did) = query.deployment_id {
+        where_parts.push("deployment_id = ?".to_owned());
+        binds.push(ChBind::I32(did));
+    }
+    if query.environment_id.is_some() {
+        tracing::warn!(
+            "span-stats environment_id filter ignored: the ClickHouse backend cannot join \
+             the Postgres deployments table. Filter by deployment_id instead."
+        );
+    }
+    if let Some(ref attrs) = query.attributes {
+        for (key, value) in attrs {
+            where_parts.push("JSONExtractString(attributes, ?) = ?".to_owned());
+            binds.push(ChBind::Str(key.clone()));
+            binds.push(ChBind::Str(value.clone()));
+        }
+    }
+
+    (where_parts.join(" AND "), binds)
+}
+
+/// The SELECT alias (or expression) a span-stats sort field orders by in
+/// ClickHouse.
+///
+/// The ratio fields are computed inline rather than selected, because they are
+/// derived in Rust (see [`crate::types::build_span_stats`]) and so have no
+/// alias to sort on. `nullIf` guards the denominator: dividing by zero in
+/// ClickHouse yields `inf`, which would sort above every real value and put
+/// all-zero-duration operations at the top of an "inconsistency" ranking.
+fn ch_span_stats_order_alias(field: crate::types::SpanStatsSortField) -> &'static str {
+    use crate::types::SpanStatsSortField as F;
+    match field {
+        F::TotalDurationMs => "total_duration_ms",
+        F::P50DurationMs => "p50_duration_ms",
+        F::P95DurationMs => "p95_duration_ms",
+        F::P99DurationMs => "p99_duration_ms",
+        F::MaxDurationMs => "max_duration_ms",
+        F::AvgDurationMs => "avg_duration_ms",
+        F::StddevDurationMs => "stddev_duration_ms",
+        F::Count => "span_count",
+        F::ErrorCount => "error_count",
+        F::ErrorRate => "error_count / nullIf(span_count, 0)",
+        F::CoefficientOfVariation => "stddev_duration_ms / nullIf(avg_duration_ms, 0)",
+        F::TailRatio => "p99_duration_ms / nullIf(p50_duration_ms, 0)",
+    }
 }
 
 /// Row returned by `query_genai_trace_summaries`.
@@ -1877,6 +2059,116 @@ impl OtelStorage for ClickHouseOtelStorage {
             "ClickHouseOtelStorage: get_trace"
         );
         Ok(spans)
+    }
+
+    /// Per-operation latency statistics, aggregated over the queried window.
+    ///
+    /// # Duplicate rows are not resolved, deliberately
+    ///
+    /// `spans` is a `ReplacingMergeTree`, so a retried OTLP batch can leave a
+    /// superseded copy of a span visible until the next merge. Removing those
+    /// copies means grouping by `(trace_id, span_id)` first — one group per
+    /// span, across the whole window — which is precisely the shape
+    /// `count_traces` documents as "the wrong trade", and it would make peak
+    /// memory proportional to the window rather than to the number of distinct
+    /// operations. On the 4 GB reference box that is the difference between a
+    /// report and an OOM.
+    ///
+    /// What that costs, concretely: `count` and `total_duration_ms` can be
+    /// inflated by the fraction of spans whose retry has not yet merged
+    /// (transient, typically minutes, and proportionally tiny). The shape
+    /// statistics — percentiles, min, max, avg, and the two ratios — are
+    /// effectively unaffected, because a duplicate re-samples a value already
+    /// in the distribution rather than introducing a new one. That is the right
+    /// trade for a ranking report; it would be the wrong one for billing.
+    ///
+    /// # Percentiles are approximate here
+    ///
+    /// `quantileTDigest` keeps memory bounded per group and stays accurate in
+    /// the tail, where this report is read. The TimescaleDB backend uses exact
+    /// `percentile_cont`, so the two can disagree in the last digit or two —
+    /// they never disagree about which operation is the outlier.
+    async fn query_span_stats(&self, query: SpanStatsQuery) -> StorageResult<Vec<SpanStats>> {
+        let (where_sql, binds) = build_ch_span_stats_filters(&query);
+        let limit = query.effective_limit();
+        let offset = query.effective_offset();
+
+        // sort_by/sort_order are fixed enums, never user strings, so
+        // interpolating them is injection-safe. Ordering references the SELECT
+        // aliases, which ClickHouse resolves after aggregation. The trailing
+        // tie-breaker keeps pagination deterministic.
+        let order_expr = ch_span_stats_order_alias(query.sort_by);
+        let order_dir = query.sort_order.as_sql();
+
+        let sql = format!(
+            r#"SELECT
+                project_id,
+                service_name,
+                name AS span_name,
+                argMax(kind, start_time) AS kind,
+                count() AS span_count,
+                countIf(status_code = 'ERROR') AS error_count,
+                sum(duration_ms) AS total_duration_ms,
+                min(duration_ms) AS min_duration_ms,
+                max(duration_ms) AS max_duration_ms,
+                avg(duration_ms) AS avg_duration_ms,
+                -- `stddevSamp` returns NaN (not NULL) for a single-sample
+                -- group, and NaN serializes to JSON `null` and poisons every
+                -- ratio derived from it. `ifNotFinite` is the only guard that
+                -- catches it; `ifNull` does not.
+                ifNotFinite(stddevSamp(duration_ms), 0) AS stddev_duration_ms,
+                -- `quantileTDigest` yields Float32; the row struct and every
+                -- other duration column are f64, and the driver rejects the
+                -- mismatch at deserialization rather than coercing.
+                toFloat64(quantileTDigest(0.50)(duration_ms)) AS p50_duration_ms,
+                toFloat64(quantileTDigest(0.95)(duration_ms)) AS p95_duration_ms,
+                toFloat64(quantileTDigest(0.99)(duration_ms)) AS p99_duration_ms,
+                toUnixTimestamp64Milli(max(start_time)) AS last_seen_ms
+            FROM spans
+            WHERE {where_sql}
+            GROUP BY project_id, service_name, name
+            HAVING count() >= ?
+            ORDER BY {order_expr} {order_dir}, project_id, service_name, span_name
+            LIMIT ? OFFSET ?"#
+        );
+
+        let mut q = bind_all(self.ch.query(&sql), binds);
+        q = q
+            .bind(query.min_count as i64)
+            .bind(limit as i64)
+            .bind(offset as i64);
+
+        let rows = q
+            .fetch_all::<ChSpanStatsRow>()
+            .await
+            .map_err(|e| ch_query_err("query_span_stats", e))?;
+
+        Ok(rows.into_iter().map(SpanStats::from).collect())
+    }
+
+    async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64> {
+        let (where_sql, binds) = build_ch_span_stats_filters(&query);
+
+        // Mirrors the list query's GROUP BY/HAVING exactly so the total agrees
+        // with the rows. `uniqExact` over the grouping tuple would be cheaper
+        // but cannot express the `min_count` floor, which is part of the filter.
+        let sql = format!(
+            r#"SELECT count() AS cnt FROM (
+                SELECT project_id, service_name, name
+                FROM spans
+                WHERE {where_sql}
+                GROUP BY project_id, service_name, name
+                HAVING count() >= ?
+            )"#
+        );
+
+        let q = bind_all(self.ch.query(&sql), binds).bind(query.min_count as i64);
+
+        let row = q
+            .fetch_one::<ChCountRow>()
+            .await
+            .map_err(|e| ch_query_err("count_span_stats", e))?;
+        Ok(row.cnt)
     }
 
     /// List GenAI trace summaries from ClickHouse.

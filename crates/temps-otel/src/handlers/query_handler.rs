@@ -104,6 +104,61 @@ pub struct TraceQueryParams {
     pub offset: Option<u64>,
 }
 
+/// Query parameters for `GET /otel/span-stats`.
+///
+/// Every filter is optional except the project selection: pass `project_id` for
+/// one project, or `project_ids` (comma-separated) to rank operations across
+/// several at once. Each project is access-checked individually.
+#[derive(Debug, Deserialize)]
+pub struct SpanStatsQueryParams {
+    /// Single project to report on. Ignored when `project_ids` is given.
+    pub project_id: Option<i32>,
+    /// Comma-separated project ids, e.g. `4,5,6`.
+    pub project_ids: Option<String>,
+    /// Window start (RFC 3339). Defaults to 24h before `end_time`.
+    pub start_time: Option<String>,
+    /// Window end (RFC 3339). Defaults to now.
+    pub end_time: Option<String>,
+    pub service_name: Option<String>,
+    /// Exact span name — "how slow did *this* operation get?".
+    pub span_name: Option<String>,
+    /// Substring match on the span name (case-insensitive).
+    pub name_pattern: Option<String>,
+    /// `server` | `client` | `internal` | `producer` | `consumer`.
+    pub kind: Option<String>,
+    /// `ok` | `error` | `unset`. `error` answers "how slow are the failures?".
+    pub status: Option<String>,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
+    /// Span attribute filters as comma-separated `key=value` pairs.
+    pub attributes: Option<String>,
+    /// Ignore spans faster than this before aggregating.
+    pub min_duration_ms: Option<f64>,
+    /// Drop operations with fewer than this many samples (default 1).
+    pub min_count: Option<u64>,
+    /// `total_time` (default) | `p50` | `p95` | `p99` | `max` | `avg` |
+    /// `stddev` | `count` | `errors` | `error_rate` | `variability` | `tail_ratio`.
+    pub sort_by: Option<String>,
+    /// `asc` | `desc` (default).
+    pub sort_order: Option<String>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+/// Response for `GET /otel/span-stats`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SpanStatsResponse {
+    pub data: Vec<SpanStats>,
+    /// Total number of distinct operations matching the filters, for pagination.
+    pub total: u64,
+    /// The window actually aggregated, echoed back because it is defaulted
+    /// server-side when the caller omits it.
+    #[schema(value_type = String, format = DateTime)]
+    pub start_time: DateTime<Utc>,
+    #[schema(value_type = String, format = DateTime)]
+    pub end_time: DateTime<Utc>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LogQueryParams {
     pub project_id: i32,
@@ -692,6 +747,183 @@ pub async fn query_trace_summaries(
     }
 
     Ok(Json(TraceSummariesResponse { data, total }))
+}
+
+/// Rank operations by latency, volume, or inconsistency.
+///
+/// Groups spans by `(project, service, span name)` over a bounded window and
+/// returns count, error rate, total/min/max/avg/stddev duration, p50/p95/p99,
+/// and two variability ratios per operation. Sorting is what makes it useful:
+///
+/// - `sort_by=total_time` (default) — where the wall-clock actually goes.
+/// - `sort_by=p95` / `p99` — what users actually feel.
+/// - `sort_by=variability` or `tail_ratio` — operations whose *spread* is the
+///   problem: the ones that take 40ms most of the time and 4s the rest.
+/// - `span_name=payments.charge` — the worst this one operation ever got, in
+///   `max_duration_ms`.
+///
+/// Pair the variability sorts with `min_count` — a ratio computed from three
+/// samples is noise, and without a floor it outranks every real signal.
+#[utoipa::path(
+    tag = "Traces",
+    get,
+    path = "/otel/span-stats",
+    params(
+        ("project_id" = Option<i32>, Query, description = "Single project to report on"),
+        ("project_ids" = Option<String>, Query, description = "Comma-separated project ids, e.g. `4,5,6`"),
+        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); defaults to 24h before end_time"),
+        ("end_time" = Option<String>, Query, description = "Window end (RFC 3339); defaults to now"),
+        ("service_name" = Option<String>, Query, description = "Restrict to one service"),
+        ("span_name" = Option<String>, Query, description = "Restrict to one operation by exact span name"),
+        ("name_pattern" = Option<String>, Query, description = "Case-insensitive substring match on the span name"),
+        ("kind" = Option<String>, Query, description = "server | client | internal | producer | consumer"),
+        ("status" = Option<String>, Query, description = "ok | error | unset"),
+        ("environment_id" = Option<i32>, Query, description = "Restrict to one environment"),
+        ("deployment_id" = Option<i32>, Query, description = "Restrict to one deployment"),
+        ("attributes" = Option<String>, Query, description = "Comma-separated key=value span attribute filters"),
+        ("min_duration_ms" = Option<f64>, Query, description = "Ignore spans faster than this"),
+        ("min_count" = Option<u64>, Query, description = "Drop operations with fewer samples than this"),
+        ("sort_by" = Option<String>, Query, description = "total_time | p50 | p95 | p99 | max | avg | stddev | count | errors | error_rate | variability | tail_ratio"),
+        ("sort_order" = Option<String>, Query, description = "asc | desc (default)"),
+        ("limit" = Option<u64>, Query, description = "Page size (default 20, max 100)"),
+        ("offset" = Option<u64>, Query, description = "Page offset"),
+    ),
+    responses(
+        (status = 200, description = "Per-operation latency statistics", body = SpanStatsResponse),
+        (status = 400, description = "Invalid query (no project, empty window)", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn query_span_stats(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<SpanStatsQueryParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+
+    let project_ids = parse_project_ids(&params)?;
+    // Authorize every project individually. A multi-project report must not
+    // become a way to read a project the caller cannot open on its own.
+    for project_id in &project_ids {
+        project_scope_guard!(auth, *project_id);
+        project_access_guard!(auth, *project_id, state.project_access_checker);
+    }
+
+    let (start_time, end_time) =
+        discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
+
+    let query = SpanStatsQuery {
+        project_ids,
+        start_time,
+        end_time,
+        service_name: params.service_name.clone(),
+        span_name: params.span_name.clone(),
+        name_pattern: params.name_pattern.clone().filter(|p| !p.is_empty()),
+        kind: params.kind.as_deref().and_then(parse_span_kind_param),
+        status: params.status.as_deref().and_then(parse_span_status_param),
+        environment_id: params.environment_id,
+        deployment_id: params.deployment_id,
+        attributes: params
+            .attributes
+            .as_deref()
+            .map(parse_attributes)
+            .filter(|m| !m.is_empty()),
+        min_duration_ms: params.min_duration_ms,
+        min_count: params.min_count.unwrap_or(1).max(1),
+        sort_by: params
+            .sort_by
+            .as_deref()
+            .map(SpanStatsSortField::parse)
+            .unwrap_or_default(),
+        sort_order: params
+            .sort_order
+            .as_deref()
+            .map(SortOrder::parse)
+            .unwrap_or_default(),
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    // The count ignores limit/offset but must keep every other filter, or the
+    // total disagrees with the page.
+    let count_query = SpanStatsQuery {
+        limit: None,
+        offset: None,
+        ..query.clone()
+    };
+
+    let (data, total) = tokio::try_join!(
+        state.otel_service.query_span_stats(query),
+        state.otel_service.count_span_stats(count_query),
+    )?;
+
+    Ok(Json(SpanStatsResponse {
+        data,
+        total,
+        start_time,
+        end_time,
+    }))
+}
+
+/// Resolve the requested projects from `project_ids` (preferred) or the
+/// single-project `project_id`.
+///
+/// Rejects an empty selection with a 400 rather than silently reporting on
+/// nothing: a typo in `project_ids` would otherwise return an empty table that
+/// looks exactly like "this project has no traces".
+fn parse_project_ids(params: &SpanStatsQueryParams) -> Result<Vec<i32>, Problem> {
+    let mut ids: Vec<i32> = match params.project_ids.as_deref() {
+        Some(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<i32>().map_err(|_| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid Project Ids")
+                        .with_detail(format!("'{s}' in project_ids is not an integer"))
+                })
+            })
+            .collect::<Result<Vec<i32>, Problem>>()?,
+        None => params.project_id.into_iter().collect(),
+    };
+    ids.sort_unstable();
+    ids.dedup();
+
+    if ids.is_empty() {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Project Required")
+            .with_detail(
+                "Provide project_id, or project_ids as a comma-separated list of project ids",
+            ));
+    }
+    Ok(ids)
+}
+
+/// Parse a span-kind query token. Unknown → `None` (no filter).
+fn parse_span_kind_param(s: &str) -> Option<SpanKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "server" => Some(SpanKind::Server),
+        "client" => Some(SpanKind::Client),
+        "internal" => Some(SpanKind::Internal),
+        "producer" => Some(SpanKind::Producer),
+        "consumer" => Some(SpanKind::Consumer),
+        "unspecified" => Some(SpanKind::Unspecified),
+        _ => None,
+    }
+}
+
+/// Parse a span-status query token. Unknown → `None` (no filter).
+fn parse_span_status_param(s: &str) -> Option<SpanStatusCode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "ok" => Some(SpanStatusCode::Ok),
+        "error" => Some(SpanStatusCode::Error),
+        "unset" => Some(SpanStatusCode::Unset),
+        _ => None,
+    }
 }
 
 /// Get all spans for a specific trace.

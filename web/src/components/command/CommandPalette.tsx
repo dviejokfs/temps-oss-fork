@@ -17,6 +17,7 @@ import {
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { useFrecency } from '@/hooks/useFrecency'
+import { normalizeFrecency } from '@/lib/frecency'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { useQuery } from '@tanstack/react-query'
 import Fuse from 'fuse.js'
@@ -58,11 +59,18 @@ import {
   SunMoon,
   Upload,
   Users,
+  UsersRound,
   Wand2,
   Workflow,
   type LucideIcon,
 } from 'lucide-react'
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from 'react'
 import { useLocation, useNavigate } from 'react-router'
 
 interface NavigationItem {
@@ -78,6 +86,63 @@ interface CommandAction {
   icon: LucideIcon
   keywords: string[]
   run: () => void
+}
+
+/**
+ * One row in the flat, relevance-ranked result list used while the user is
+ * typing. `category` is only a label here — it no longer decides ordering.
+ */
+interface RankedResult {
+  key: string
+  title: string
+  subtitle?: string
+  category: string
+  icon: ReactNode
+  score: number
+  run: () => void
+}
+
+/**
+ * The project sub-pages reachable from anywhere, without first navigating into
+ * the project. Indexing every entry in `projectNavItems` for every project
+ * would be projects x ~50 rows, which floods the palette and makes the Fuse
+ * build noticeably slower; these are the ones worth jumping straight to.
+ */
+const CROSS_PROJECT_PAGE_URLS = new Set([
+  'project',
+  'deployments',
+  'environments',
+  'runtime',
+  'analytics',
+  'errors',
+  'storage',
+  'monitors',
+  'metrics',
+  'settings/general',
+  'settings/domains',
+  'settings/environment-variables',
+])
+
+/**
+ * How well the query matches an item's *title*, on the same 0..1 scale as
+ * `combinedScore`, to be added on top of the Fuse relevance.
+ *
+ * Fuse alone ranks an exact *keyword* hit above a near-exact *title* hit:
+ * searching "team" put Users (which lists "team" as a keyword) above Teams.
+ * Per-key weights don't fix it either — a zero-distance keyword match beats a
+ * fuzzy title match at any weight — so the title match is scored explicitly.
+ */
+function titleBoost(title: string, query: string): number {
+  const t = title.toLowerCase().trim()
+  const q = query.toLowerCase().trim()
+  if (!q || !t) return 0
+  if (t === q) return 0.6
+  // "team" should still find "Teams", and "teams" should find "Team".
+  if (t === `${q}s` || `${t}s` === q) return 0.5
+  if (t.startsWith(q)) return 0.35
+  if (t.split(/\s+/).some((word) => word.startsWith(q))) return 0.25
+  if (t.includes(q)) return 0.15
+  return 0
 }
 
 const commandActions: CommandAction[] = [
@@ -190,6 +255,26 @@ const settingsNavItems: NavigationItem[] = [
     url: '/settings/users',
     icon: Users,
     keywords: ['team', 'members', 'people', 'accounts'],
+  },
+  {
+    title: 'Teams',
+    url: '/settings/teams',
+    icon: UsersRound,
+    keywords: [
+      'teams',
+      'groups',
+      'access',
+      'permissions',
+      'grants',
+      'members',
+      'rbac',
+    ],
+  },
+  {
+    title: 'Create Team',
+    url: '/settings/teams?new=1',
+    icon: UsersRound,
+    keywords: ['new', 'create', 'add', 'team', 'group', 'access'],
   },
   {
     title: 'Authentication',
@@ -825,7 +910,26 @@ export function CommandPalette() {
     return () => document.removeEventListener('keydown', down)
   }, [])
 
-  const { record, blend, recent } = useFrecency()
+  const { record, getScore, recent } = useFrecency()
+
+  /**
+   * Rank one candidate. The title match dominates; the Fuse score — which is
+   * also what makes keyword/alias hits findable at all — and frecency only
+   * break ties.
+   *
+   * The weights are the point: a keyword-only hit scores at most 0.25, while
+   * any title hit starts at 0.15 and an exact one reaches 0.60. So a tag still
+   * ranks (searching "team" finds Users, which is tagged `team`) but never
+   * above the page actually called Teams.
+   */
+  const rank = useCallback(
+    (key: string, title: string, fuseScore: number | undefined, damp = 1) =>
+      titleBoost(title, search) * damp +
+      // Fuse score: 0 = perfect match, 1 = no match. Invert to relevance.
+      (1 - (fuseScore ?? 0)) * 0.25 +
+      normalizeFrecency(getScore(key)) * 0.15,
+    [search, getScore]
+  )
 
   const runCommand = (command: () => void) => {
     setOpen(false)
@@ -940,6 +1044,42 @@ export function CommandPalette() {
     })
   }, [globalSkills])
 
+  // Every project x a bounded set of its pages, so the palette can jump
+  // straight to "<project> Deployments" from anywhere instead of only offering
+  // project sub-pages once you are already inside that project.
+  const crossProjectItems = useMemo(() => {
+    const pages = projectNavItems.filter((item) =>
+      CROSS_PROJECT_PAGE_URLS.has(item.url)
+    )
+    return projects.flatMap((project) =>
+      pages.map((page) => ({
+        title: page.title,
+        projectName: project.name,
+        url: `/projects/${project.slug}/${page.url}`,
+        icon: page.icon,
+        // One field so a two-word query ("demo deploy") can match the project
+        // and the page at once.
+        searchText: `${project.name} ${project.slug} ${page.title} ${(
+          page.keywords ?? []
+        ).join(' ')}`,
+      }))
+    )
+  }, [projects])
+
+  const crossProjectFuse = useMemo(() => {
+    return new Fuse(crossProjectItems, {
+      keys: ['searchText'],
+      // Extended search so each whitespace-separated token must match
+      // ("demo deploy" = 'demo AND 'deploy). Plain fuzzy treats the query as
+      // one contiguous pattern and would miss "<project> <page>".
+      useExtendedSearch: true,
+      threshold: 0.3,
+      includeScore: true,
+      shouldSort: true,
+      minMatchCharLength: 1,
+    })
+  }, [crossProjectItems])
+
   const mcpFuse = useMemo(() => {
     return new Fuse(globalMcpServers, {
       keys: [
@@ -954,9 +1094,9 @@ export function CommandPalette() {
     })
   }, [globalMcpServers])
 
-  // Perform fuzzy search
-  const searchResults = useMemo(() => {
-    // Prepare project navigation with full URLs
+  // Browse mode: the full, sectioned lists shown when the input is empty.
+  // Once the user types, `rankedResults` takes over — see the comment there.
+  const browseResults = useMemo(() => {
     const projectNavigation =
       currentProjectSlug && currentProject
         ? [...projectNavItems, ...projectPluginNavItems].map((item) => ({
@@ -965,117 +1105,21 @@ export function CommandPalette() {
           }))
         : []
 
-    if (!search) {
-      return {
-        navigation: mainNavItems,
-        settings: settingsNavItems,
-        observe: observeNavItems,
-        account: accountNavItems,
-        plugins: pluginNavItems,
-        projectNav: projectNavigation,
-        projects: projects,
-        skills: globalSkills,
-        mcpServers: globalMcpServers,
-        actions: commandActions,
-      }
-    }
-
-    // Search navigation items
-    const navResults = navFuse.search(search)
-    const groupedNavResults = {
-      navigation: [] as Array<{ item: NavigationItem; score: number }>,
-      settings: [] as Array<{ item: NavigationItem; score: number }>,
-      observe: [] as Array<{ item: NavigationItem; score: number }>,
-      account: [] as Array<{ item: NavigationItem; score: number }>,
-      plugins: [] as Array<{ item: NavigationItem; score: number }>,
-      projectNav: [] as Array<{ item: NavigationItem; score: number }>,
-    }
-
-    navResults.forEach((result) => {
-      const item = result.item
-      const baseItem: NavigationItem = {
-        title: item.title,
-        url: item.url,
-        icon: item.icon,
-        keywords: item.keywords,
-      }
-      // Fuse score: 0 = perfect match, 1 = no match. Invert to relevance.
-      const relevance = 1 - (result.score ?? 0)
-      const ranked = { item: baseItem, score: blend(item.url, relevance) }
-
-      if (item.category === 'Navigation') {
-        groupedNavResults.navigation.push(ranked)
-      } else if (item.category === 'Settings') {
-        groupedNavResults.settings.push(ranked)
-      } else if (item.category === 'Observe') {
-        groupedNavResults.observe.push(ranked)
-      } else if (item.category === 'Account') {
-        groupedNavResults.account.push(ranked)
-      } else if (item.category === 'Plugins') {
-        groupedNavResults.plugins.push(ranked)
-      } else if (item.category === 'Project') {
-        groupedNavResults.projectNav.push(ranked)
-      }
-    })
-
-    const sortByScore = (
-      list: Array<{ item: NavigationItem; score: number }>
-    ): NavigationItem[] =>
-      list.sort((a, b) => b.score - a.score).map((entry) => entry.item)
-
-    // Search projects, blended with frecency
-    const projectResults = projectsFuse.search(search)
-    const filteredProjects = projectResults
-      .map((result) => ({
-        item: result.item,
-        score: blend(`project:${result.item.id}`, 1 - (result.score ?? 0)),
-      }))
-      .sort((a, b) => b.score - a.score)
-      .map((entry) => entry.item)
-
-    // Search skills & mcp servers, blended with frecency
-    const filteredSkills = skillsFuse
-      .search(search)
-      .map((r) => ({
-        item: r.item,
-        score: blend(`skill:${r.item.slug}`, 1 - (r.score ?? 0)),
-      }))
-      .sort((a, b) => b.score - a.score)
-      .map((entry) => entry.item)
-    const filteredMcp = mcpFuse
-      .search(search)
-      .map((r) => ({
-        item: r.item,
-        score: blend(`mcp:${r.item.slug}`, 1 - (r.score ?? 0)),
-      }))
-      .sort((a, b) => b.score - a.score)
-      .map((entry) => entry.item)
-
-    const actions = commandActions.filter((action) => {
-      const actionFuse = new Fuse([action.title, ...action.keywords], {
-        threshold: 0.4,
-      })
-      return actionFuse.search(search).length > 0
-    })
-
     return {
-      navigation: sortByScore(groupedNavResults.navigation),
-      settings: sortByScore(groupedNavResults.settings),
-      observe: sortByScore(groupedNavResults.observe),
-      account: sortByScore(groupedNavResults.account),
-      plugins: sortByScore(groupedNavResults.plugins),
-      projectNav: sortByScore(groupedNavResults.projectNav),
-      projects: filteredProjects,
-      skills: filteredSkills,
-      mcpServers: filteredMcp,
-      actions: actions,
+      navigation: mainNavItems,
+      settings: settingsNavItems,
+      observe: observeNavItems.filter(
+        (item) => canViewAuditLogs || item.url !== '/audit-logs'
+      ),
+      account: accountNavItems,
+      plugins: pluginNavItems,
+      projectNav: projectNavigation,
+      projects,
+      skills: globalSkills,
+      mcpServers: globalMcpServers,
+      actions: commandActions,
     }
   }, [
-    search,
-    navFuse,
-    projectsFuse,
-    skillsFuse,
-    mcpFuse,
     projects,
     globalSkills,
     globalMcpServers,
@@ -1083,7 +1127,137 @@ export function CommandPalette() {
     projectPluginNavItems,
     currentProjectSlug,
     currentProject,
-    blend,
+    canViewAuditLogs,
+  ])
+
+  // Search mode: ONE list ordered by relevance (blended with frecency).
+  //
+  // This used to be grouped by section and each section rendered in a fixed
+  // order, so a weak keyword hit in "Navigation" beat an exact title match in
+  // "Settings" purely because Navigation renders first — searching "work" put
+  // Sandboxes (keyword: workspace) above Worker Nodes. Section is a label
+  // here, not an ordering.
+  const rankedResults = useMemo<RankedResult[]>(() => {
+    if (!search) return []
+    const out: RankedResult[] = []
+    for (const result of navFuse.search(search)) {
+      const item = result.item
+      const Icon = item.icon
+      out.push({
+        key: item.url,
+        title: item.title,
+        subtitle:
+          item.category === 'Project' && currentProject
+            ? currentProject.name
+            : undefined,
+        category: item.category,
+        icon: <Icon className="h-4 w-4" />,
+        score: rank(item.url, item.title, result.score),
+        run: () => navigate(item.url),
+      })
+    }
+
+    for (const result of projectsFuse.search(search)) {
+      const project = result.item
+      out.push({
+        key: `project:${project.id}`,
+        title: project.slug,
+        category: 'Project',
+        icon: (
+          <Avatar className="size-5">
+            <AvatarImage src={`/api/projects/${project.id}/favicon`} />
+            <AvatarFallback>{project.name.charAt(0)}</AvatarFallback>
+          </Avatar>
+        ),
+        score: rank(`project:${project.id}`, project.name, result.score),
+        run: () => navigate(`/projects/${project.slug}`),
+      })
+    }
+
+    const tokens = search.trim().split(/\s+/).filter(Boolean)
+    if (tokens.length > 0) {
+      const extendedQuery = tokens.map((token) => `'${token}`).join(' ')
+      for (const result of crossProjectFuse.search(extendedQuery)) {
+        const item = result.item
+        const Icon = item.icon
+        out.push({
+          key: item.url,
+          title: item.title,
+          subtitle: item.projectName,
+          category: 'Project',
+          icon: <Icon className="h-4 w-4" />,
+          // Damped: a top-level page named X should beat every project's X.
+          score: rank(item.url, item.title, result.score, 0.6),
+          run: () => navigate(item.url),
+        })
+      }
+    }
+
+    for (const result of skillsFuse.search(search)) {
+      const skill = result.item
+      out.push({
+        key: `skill:${skill.slug}`,
+        title: skill.name,
+        subtitle: skill.slug,
+        category: 'Skill',
+        icon: <Wand2 className="h-4 w-4" />,
+        score: rank(`skill:${skill.slug}`, skill.name, result.score),
+        run: () => navigate(`/skills/${skill.slug}`),
+      })
+    }
+
+    for (const result of mcpFuse.search(search)) {
+      const mcp = result.item
+      out.push({
+        key: `mcp:${mcp.slug}`,
+        title: mcp.name,
+        subtitle: mcp.slug,
+        category: 'MCP Server',
+        icon: <Server className="h-4 w-4" />,
+        score: rank(`mcp:${mcp.slug}`, mcp.name, result.score),
+        run: () => navigate(`/mcp-servers/${mcp.slug}`),
+      })
+    }
+
+    for (const action of commandActions) {
+      const actionFuse = new Fuse([action.title, ...action.keywords], {
+        threshold: 0.4,
+        includeScore: true,
+      })
+      const hit = actionFuse.search(search)[0]
+      if (!hit) continue
+      const Icon = action.icon
+      out.push({
+        key: `action:${action.id}`,
+        title: action.title,
+        category: 'Action',
+        icon: <Icon className="h-4 w-4" />,
+        score: rank(`action:${action.id}`, action.title, hit.score),
+        run: action.run,
+      })
+    }
+
+    // The current project's pages are indexed by both navFuse and the
+    // cross-project index; sorting first means the dedupe keeps the better
+    // scoring copy.
+    const seen = new Set<string>()
+    return out
+      .sort((a, b) => b.score - a.score)
+      .filter((entry) => {
+        if (seen.has(entry.key)) return false
+        seen.add(entry.key)
+        return true
+      })
+  }, [
+    search,
+    navFuse,
+    projectsFuse,
+    crossProjectFuse,
+    skillsFuse,
+    mcpFuse,
+    currentProject,
+    rank,
+    navigate,
   ])
 
   // Resolve recent frecency keys into renderable items (icon + title + run).
@@ -1193,10 +1367,10 @@ export function CommandPalette() {
     navigate,
   ])
 
-  const projectResultsGroup = searchResults.projects.length > 0 && (
+  const projectResultsGroup = browseResults.projects.length > 0 && (
     <>
       <CommandGroup heading="Projects">
-        {searchResults.projects.map((project) => (
+        {browseResults.projects.map((project) => (
           <CommandItem
             key={project.id}
             onSelect={() =>
@@ -1237,6 +1411,33 @@ export function CommandPalette() {
         <CommandList className="max-h-[60vh]">
           <CommandEmpty>No results found.</CommandEmpty>
 
+          {/* Typing: one list, best match first, regardless of section. The
+              section name rides along as a right-aligned label so you can
+              still tell a project page from a settings page. */}
+          {search && rankedResults.length > 0 && (
+            <CommandGroup heading="Results">
+              {rankedResults.slice(0, 30).map((entry) => (
+                <CommandItem
+                  key={entry.key}
+                  value={entry.key}
+                  onSelect={() => runWithFrecency(entry.key, entry.run)}
+                  className="flex items-center gap-2"
+                >
+                  {entry.icon}
+                  <span className="truncate">{entry.title}</span>
+                  {entry.subtitle && (
+                    <span className="truncate font-mono text-xs text-muted-foreground">
+                      {entry.subtitle}
+                    </span>
+                  )}
+                  <span className="ml-auto shrink-0 pl-2 text-xs text-muted-foreground">
+                    {entry.category}
+                  </span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          )}
+
           {/* Recent (frecency-ranked, only when input is empty) */}
           {!search && recentItems.length > 0 && (
             <>
@@ -1263,10 +1464,10 @@ export function CommandPalette() {
           )}
 
           {/* Project Navigation (shown first when on a project page) */}
-          {searchResults.projectNav.length > 0 && currentProject && (
+          {!search && browseResults.projectNav.length > 0 && currentProject && (
             <>
               <CommandGroup heading={`${currentProject.name}`}>
-                {searchResults.projectNav.map((item) => (
+                {browseResults.projectNav.map((item) => (
                   <CommandItem
                     key={item.url}
                     value={`project-nav-${item.url}`}
@@ -1285,13 +1486,11 @@ export function CommandPalette() {
           )}
 
           {/* Matching projects take priority over common navigation pages. */}
-          {search && projectResultsGroup}
-
           {/* Main Navigation */}
-          {searchResults.navigation.length > 0 && (
+          {!search && browseResults.navigation.length > 0 && (
             <>
               <CommandGroup heading="Navigation">
-                {searchResults.navigation.map((item) => (
+                {browseResults.navigation.map((item) => (
                   <CommandItem
                     key={item.url}
                     value={`nav-${item.url}`}
@@ -1310,10 +1509,10 @@ export function CommandPalette() {
           )}
 
           {/* Settings Navigation */}
-          {searchResults.settings.length > 0 && (
+          {!search && browseResults.settings.length > 0 && (
             <>
               <CommandGroup heading="Settings">
-                {searchResults.settings.map((item) => (
+                {browseResults.settings.map((item) => (
                   <CommandItem
                     key={item.url}
                     value={`settings-${item.url}`}
@@ -1332,10 +1531,10 @@ export function CommandPalette() {
           )}
 
           {/* Observe Navigation */}
-          {searchResults.observe.length > 0 && (
+          {!search && browseResults.observe.length > 0 && (
             <>
               <CommandGroup heading="Observe">
-                {searchResults.observe.map((item) => (
+                {browseResults.observe.map((item) => (
                   <CommandItem
                     key={item.url}
                     value={`observe-${item.url}`}
@@ -1354,10 +1553,10 @@ export function CommandPalette() {
           )}
 
           {/* Plugins Navigation */}
-          {searchResults.plugins.length > 0 && (
+          {!search && browseResults.plugins.length > 0 && (
             <>
               <CommandGroup heading="Plugins">
-                {searchResults.plugins.map((item) => (
+                {browseResults.plugins.map((item) => (
                   <CommandItem
                     key={item.url}
                     value={`plugins-${item.url}`}
@@ -1376,10 +1575,10 @@ export function CommandPalette() {
           )}
 
           {/* Account Navigation */}
-          {searchResults.account.length > 0 && (
+          {!search && browseResults.account.length > 0 && (
             <>
               <CommandGroup heading="Account">
-                {searchResults.account.map((item) => (
+                {browseResults.account.map((item) => (
                   <CommandItem
                     key={item.url}
                     value={`account-${item.url}`}
@@ -1398,10 +1597,10 @@ export function CommandPalette() {
           )}
 
           {/* Skills */}
-          {searchResults.skills.length > 0 && (
+          {!search && browseResults.skills.length > 0 && (
             <>
               <CommandGroup heading="Skills">
-                {searchResults.skills.slice(0, 10).map((skill) => (
+                {browseResults.skills.slice(0, 10).map((skill) => (
                   <CommandItem
                     key={`skill-${skill.id}`}
                     onSelect={() =>
@@ -1424,10 +1623,10 @@ export function CommandPalette() {
           )}
 
           {/* MCP Servers */}
-          {searchResults.mcpServers.length > 0 && (
+          {!search && browseResults.mcpServers.length > 0 && (
             <>
               <CommandGroup heading="MCP Servers">
-                {searchResults.mcpServers.slice(0, 10).map((mcp) => (
+                {browseResults.mcpServers.slice(0, 10).map((mcp) => (
                   <CommandItem
                     key={`mcp-${mcp.id}`}
                     onSelect={() =>
@@ -1453,9 +1652,9 @@ export function CommandPalette() {
           {!search && projectResultsGroup}
 
           {/* Actions */}
-          {searchResults.actions.length > 0 && (
+          {!search && browseResults.actions.length > 0 && (
             <CommandGroup heading="Actions">
-              {searchResults.actions.map((action) => (
+              {browseResults.actions.map((action) => (
                 <CommandItem
                   key={action.id}
                   onSelect={() =>

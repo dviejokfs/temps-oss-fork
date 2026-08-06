@@ -6,6 +6,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -137,13 +138,12 @@ export function ProjectFeatureFlags({ project }: ProjectFeatureFlagsProps) {
             {tab === 'setup' ? 'Back to flags' : 'Setup'}
           </Button>
 
-          <Button
+          <CreateActionButton
             className="w-full sm:w-auto"
             onClick={() => setCreateOpen(true)}
-          >
-            <Plus className="mr-1.5 h-4 w-4" />
-            New flag
-          </Button>
+            label="New flag"
+            icon={<Plus className="mr-1.5 h-4 w-4" />}
+          />
         </div>
       </div>
 
