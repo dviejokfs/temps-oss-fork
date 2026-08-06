@@ -766,6 +766,26 @@ pub const SPAN_STATS_DEFAULT_LIMIT: u64 = 20;
 /// Hard cap on span-stats rows per page.
 pub const SPAN_STATS_MAX_LIMIT: u64 = 100;
 
+/// Hard cap on how many projects one span-stats query may aggregate.
+///
+/// Bounds two costs that scale with the list. The handler runs a project-access
+/// check per id, and the ClickHouse backend renders one bind placeholder per id
+/// — an instance admin skips the access checks entirely, so without a cap a
+/// single request could hand storage an arbitrarily long id list. Ranking
+/// across more than a few dozen projects is not a real workflow; ranking across
+/// ten thousand is a typo or an attack.
+pub const SPAN_STATS_MAX_PROJECTS: usize = 50;
+
+/// Hard cap on the span-stats time window.
+///
+/// Unlike the trace list, this report has no early exit: it aggregates every
+/// span in the window before it can rank anything, so cost grows with the
+/// window rather than with the page size. A month covers "how did last month
+/// look"; a full 90-day retention scan on a busy project is the query that
+/// takes the instance down, and the reference deployment is a 3 vCPU / 4 GB
+/// box.
+pub const SPAN_STATS_MAX_WINDOW_DAYS: i64 = 31;
+
 /// Filter for the span-stats (per-operation latency) report.
 ///
 /// Unlike [`TraceQuery`], the time window is **not** optional. Every backend

@@ -59,6 +59,10 @@ const SORT_FIELDS = [
 const SPAN_KINDS = ['server', 'client', 'internal', 'producer', 'consumer', 'unspecified']
 const SPAN_STATUSES = ['ok', 'error', 'unset']
 
+/** Server-side caps, mirrored so the CLI can explain them before a round trip. */
+const MAX_PROJECTS = 50
+const MAX_WINDOW_DAYS = 31
+
 /**
  * Parse a relative duration like `30m`, `24h`, `7d` into milliseconds.
  * Returns `null` for anything that isn't one of those shapes, so the caller can
@@ -106,8 +110,8 @@ export function registerTracesCommands(program: Command): void {
     .alias('ops')
     .description('Rank operations by time spent, latency percentiles, or inconsistency')
     .option('--project-id <id>', 'Project ID')
-    .option('--project-ids <ids>', 'Comma-separated project IDs to rank across, e.g. 4,5,6')
-    .option('--since <duration>', 'Relative window: 30m, 24h, 7d', '24h')
+    .option('--project-ids <ids>', `Comma-separated project IDs to rank across, e.g. 4,5,6 (max ${MAX_PROJECTS})`)
+    .option('--since <duration>', `Relative window: 30m, 24h, 7d (max ${MAX_WINDOW_DAYS}d)`, '24h')
     .option('--start-time <iso>', 'Window start (ISO 8601); overrides --since')
     .option('--end-time <iso>', 'Window end (ISO 8601); defaults to now')
     .option('--service <name>', 'Only this service')
@@ -159,6 +163,13 @@ async function spanStatsAction(options: SpanStatsOptions): Promise<void> {
     warning('Provide --project-id, or --project-ids with a comma-separated list')
     return
   }
+  if (options.projectIds) {
+    const count = options.projectIds.split(',').filter((s) => s.trim()).length
+    if (count > MAX_PROJECTS) {
+      warning(`--project-ids accepts at most ${MAX_PROJECTS} projects, got ${count}`)
+      return
+    }
+  }
   if (options.sortBy && !SORT_FIELDS.includes(options.sortBy)) {
     warning(`Invalid --sort-by: ${options.sortBy}. Available: ${SORT_FIELDS.join(', ')}`)
     return
@@ -193,6 +204,17 @@ async function spanStatsAction(options: SpanStatsOptions): Promise<void> {
       return
     }
     startTime = new Date(endTime.getTime() - sinceMs)
+  }
+
+  // The server rejects an over-wide window rather than narrowing it, so catch
+  // it here and say which flag to change instead of surfacing a bare 400.
+  const windowDays = (endTime.getTime() - startTime.getTime()) / 86_400_000
+  if (windowDays > MAX_WINDOW_DAYS) {
+    warning(
+      `Window is ${windowDays.toFixed(1)} days; the maximum is ${MAX_WINDOW_DAYS}. ` +
+        `Narrow --since, or --start-time/--end-time.`,
+    )
+    return
   }
 
   const result = await withSpinner('Aggregating operation latency...', async () => {

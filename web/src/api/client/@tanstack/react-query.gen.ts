@@ -8331,6 +8331,11 @@ export const querySpanStatsQueryKey = (options?: Options<QuerySpanStatsData>) =>
  *
  * Pair the variability sorts with `min_count` — a ratio computed from three
  * samples is noise, and without a floor it outranks every real signal.
+ *
+ * Two bounds are enforced rather than clamped, so a result never claims to
+ * cover more than it does: at most 50 projects, and a window no wider than
+ * 31 days. Both return 400. Unlike the trace list this report has no early
+ * exit — it aggregates every span in the window before it can rank anything.
  */
 export const querySpanStatsOptions = (options?: Options<QuerySpanStatsData>) => queryOptions<QuerySpanStatsResponse, QuerySpanStatsError, QuerySpanStatsResponse, ReturnType<typeof querySpanStatsQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
@@ -8363,6 +8368,11 @@ export const querySpanStatsInfiniteQueryKey = (options?: Options<QuerySpanStatsD
  *
  * Pair the variability sorts with `min_count` — a ratio computed from three
  * samples is noise, and without a floor it outranks every real signal.
+ *
+ * Two bounds are enforced rather than clamped, so a result never claims to
+ * cover more than it does: at most 50 projects, and a window no wider than
+ * 31 days. Both return 400. Unlike the trace list this report has no early
+ * exit — it aggregates every span in the window before it can rank anything.
  */
 export const querySpanStatsInfiniteOptions = (options?: Options<QuerySpanStatsData>) => {
     const opts = infiniteQueryOptions<QuerySpanStatsResponse, QuerySpanStatsError, InfiniteData<QuerySpanStatsResponse>, QueryKey<Options<QuerySpanStatsData>>, number | Pick<QueryKey<Options<QuerySpanStatsData>>[0], 'body' | 'headers' | 'path' | 'query'>>(

@@ -49821,11 +49821,11 @@ export type QuerySpanStatsData = {
          */
         project_id?: number;
         /**
-         * Comma-separated project ids, e.g. `4,5,6`
+         * Comma-separated project ids, e.g. `4,5,6` (max 50)
          */
         project_ids?: string;
         /**
-         * Window start (RFC 3339); defaults to 24h before end_time
+         * Window start (RFC 3339); defaults to 24h before end_time. The window may not exceed 31 days
          */
         start_time?: string;
         /**

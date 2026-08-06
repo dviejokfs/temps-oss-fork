@@ -8017,6 +8017,11 @@ export const getAuditLog = <ThrowOnError extends boolean = false>(options: Optio
  *
  * Pair the variability sorts with `min_count` — a ratio computed from three
  * samples is noise, and without a floor it outranks every real signal.
+ *
+ * Two bounds are enforced rather than clamped, so a result never claims to
+ * cover more than it does: at most 50 projects, and a window no wider than
+ * 31 days. Both return 400. Unlike the trace list this report has no early
+ * exit — it aggregates every span in the window before it can rank anything.
  */
 export const querySpanStats = <ThrowOnError extends boolean = false>(options?: Options<QuerySpanStatsData, ThrowOnError>): RequestResult<QuerySpanStatsResponses, QuerySpanStatsErrors, ThrowOnError> => (options?.client ?? client).get<QuerySpanStatsResponses, QuerySpanStatsErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],

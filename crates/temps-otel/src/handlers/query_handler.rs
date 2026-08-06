@@ -113,7 +113,8 @@ pub struct TraceQueryParams {
 pub struct SpanStatsQueryParams {
     /// Single project to report on. Ignored when `project_ids` is given.
     pub project_id: Option<i32>,
-    /// Comma-separated project ids, e.g. `4,5,6`.
+    /// Comma-separated project ids, e.g. `4,5,6`. At most
+    /// [`SPAN_STATS_MAX_PROJECTS`].
     pub project_ids: Option<String>,
     /// Window start (RFC 3339). Defaults to 24h before `end_time`.
     pub start_time: Option<String>,
@@ -764,14 +765,19 @@ pub async fn query_trace_summaries(
 ///
 /// Pair the variability sorts with `min_count` — a ratio computed from three
 /// samples is noise, and without a floor it outranks every real signal.
+///
+/// Two bounds are enforced rather than clamped, so a result never claims to
+/// cover more than it does: at most 50 projects, and a window no wider than
+/// 31 days. Both return 400. Unlike the trace list this report has no early
+/// exit — it aggregates every span in the window before it can rank anything.
 #[utoipa::path(
     tag = "Traces",
     get,
     path = "/otel/span-stats",
     params(
         ("project_id" = Option<i32>, Query, description = "Single project to report on"),
-        ("project_ids" = Option<String>, Query, description = "Comma-separated project ids, e.g. `4,5,6`"),
-        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); defaults to 24h before end_time"),
+        ("project_ids" = Option<String>, Query, description = "Comma-separated project ids, e.g. `4,5,6` (max 50)"),
+        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); defaults to 24h before end_time. The window may not exceed 31 days"),
         ("end_time" = Option<String>, Query, description = "Window end (RFC 3339); defaults to now"),
         ("service_name" = Option<String>, Query, description = "Restrict to one service"),
         ("span_name" = Option<String>, Query, description = "Restrict to one operation by exact span name"),
@@ -899,6 +905,18 @@ fn parse_project_ids(params: &SpanStatsQueryParams) -> Result<Vec<i32>, Problem>
             .with_detail(
                 "Provide project_id, or project_ids as a comma-separated list of project ids",
             ));
+    }
+    // Rejected here, before the per-project access checks run, so an oversized
+    // list costs one string parse rather than one authorization round-trip per
+    // id. The service re-checks the same bound for non-HTTP callers.
+    if ids.len() > SPAN_STATS_MAX_PROJECTS {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Too Many Projects")
+            .with_detail(format!(
+                "span-stats accepts at most {} projects per query, got {}",
+                SPAN_STATS_MAX_PROJECTS,
+                ids.len()
+            )));
     }
     Ok(ids)
 }
