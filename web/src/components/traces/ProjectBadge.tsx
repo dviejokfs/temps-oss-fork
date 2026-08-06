@@ -55,7 +55,7 @@ export function ProjectBadge({
  *
  * Span rows are the one place the full badge does not pay for itself: the name
  * column is already competing with indentation and the span name, so a slug
- * like `galachain-gateway` truncates to `galachain-gat…` on every row and
+ * like `payments-gateway-prod` truncates to `payments-gatew…` on every row and
  * still costs ~88px. The colour carries the identity and `ProjectLegend`
  * decodes it once at the top; the name stays reachable via the tooltip.
  */
