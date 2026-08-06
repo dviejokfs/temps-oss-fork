@@ -271,6 +271,80 @@ fn idle_deadline(
     now + chrono::Duration::seconds(timeout_secs as i64)
 }
 
+/// Security validation for a seed source *after* it has been resolved.
+///
+/// The handler validates the caller-supplied `source` DTO, which covers the
+/// request-shape rules it owns (mutually exclusive auth fields, and so on).
+/// It cannot cover a source this layer derives from a project row, so the
+/// two checks that actually matter for safety are repeated here on whatever
+/// we finally decided to clone:
+///
+/// - **SSRF**, including DNS resolution. `validate_external_url` rejects
+///   hosts that resolve to private, loopback, link-local or cloud-metadata
+///   addresses — the project-side URL guard only checks IP *literals*, so a
+///   name like `metadata.google.internal` would otherwise pass.
+/// - **Embedded credentials.** A `user:password@` in the URL would be
+///   persisted to `sandboxes.source_repo_url` and echoed back out of the
+///   API. Rows predating the project-side guard can still carry one.
+async fn validate_resolved_source(source: &SandboxSource) -> Result<(), SandboxError> {
+    let (url, kind) = match source {
+        SandboxSource::Git { url, .. } => (url.as_str(), "git"),
+        SandboxSource::Tarball { url } => (url.as_str(), "tarball"),
+    };
+
+    if url_has_embedded_credentials(url) {
+        return Err(SandboxError::Validation {
+            message: format!(
+                "{kind} source: url must not contain embedded credentials — \
+                 use a stored git connection instead"
+            ),
+        });
+    }
+
+    // Sync pass first: scheme + IP-literal blocklist. Cheap, and it avoids a
+    // DNS lookup for URLs that are already disqualified.
+    let parsed = temps_core::url_validation::validate_external_url(url).map_err(|_| {
+        SandboxError::Validation {
+            message: format!(
+                "{kind} source: scheme must be http or https, and the host must \
+                 not be a private, loopback, or metadata address"
+            ),
+        }
+    })?;
+
+    // Then resolve: an IP literal is already covered above, but a *name*
+    // pointing at 169.254.169.254 is only caught here.
+    if let Some(url::Host::Domain(domain)) = parsed.host() {
+        temps_core::url_validation::validate_domain_async(domain)
+            .await
+            .map_err(|_| SandboxError::Validation {
+                message: format!(
+                    "{kind} source: host resolves to a private, loopback, or \
+                     metadata address"
+                ),
+            })?;
+    }
+    Ok(())
+}
+
+/// Does the URL carry `user:password@`?
+///
+/// A bare `user@` is fine — git reads that as "prompt for a password" and it
+/// carries no secret. Only the colon form is a credential.
+fn url_has_embedded_credentials(url: &str) -> bool {
+    let Some(scheme_end) = url.find("://") else {
+        return false;
+    };
+    let rest = &url[scheme_end + 3..];
+    // Stop at the path: an `@` after the first `/` belongs to the path, not
+    // to userinfo (e.g. `https://host/org/repo@v1.git`).
+    let authority = rest.split('/').next().unwrap_or(rest);
+    match authority.find('@') {
+        Some(at) => authority[..at].contains(':'),
+        None => false,
+    }
+}
+
 /// Reject standalone lifecycle ops (`pause`/`resume`/`restart`/`resize`)
 /// on rows attributed to an agent run. Those containers are named
 /// `temps-sandbox-<run_id>` — not by the row's public id — so the
@@ -748,10 +822,25 @@ impl SandboxService {
         // default, so a caller can create a workspace attributed to a
         // project while seeding it from a fork or a different branch.
         let source = match (req.source.clone(), req.project_id) {
+            // Caller-supplied: already validated by the handler, which owns
+            // the request-shape rules too. Re-checking here would duplicate a
+            // DNS lookup on every create for no gain.
             (Some(explicit), _) => Some(explicit),
-            (None, Some(project_id)) => Some(self.source_from_project(project_id).await?),
+            // Project-derived: the handler never saw this URL, so it is
+            // validated here — the layer that produced it. `projects.git_url`
+            // is checked for IP literals on the project side but never
+            // resolved, so a name pointing at the metadata endpoint would
+            // otherwise pass; and a row predating that guard can still carry
+            // `user:password@`, which would land in `source_repo_url` and be
+            // echoed back out of the API.
+            (None, Some(project_id)) => {
+                let derived = self.source_from_project(project_id).await?;
+                validate_resolved_source(&derived).await?;
+                Some(derived)
+            }
             (None, None) => None,
         };
+
         let source_repo_url = source.as_ref().and_then(|s| match s {
             SandboxSource::Git { url, .. } => Some(url.clone()),
             SandboxSource::Tarball { .. } => None,
@@ -3003,6 +3092,80 @@ mod storage_cleanup_tests {
             SandboxError::ProjectNotFound { project_id: 999 }
         ));
         let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    // ── Resolved-source validation ───────────────────────────────────────
+
+    #[test]
+    fn embedded_credentials_are_detected_only_in_userinfo() {
+        assert!(url_has_embedded_credentials(
+            "https://user:secret@github.com/org/repo.git"
+        ));
+        // A bare user is not a credential — git treats it as "prompt".
+        assert!(!url_has_embedded_credentials(
+            "https://user@github.com/org/repo.git"
+        ));
+        assert!(!url_has_embedded_credentials(
+            "https://github.com/org/repo.git"
+        ));
+        // An `@` in the *path* must not be mistaken for userinfo, or every
+        // pinned-ref URL would be rejected as leaking a password.
+        assert!(!url_has_embedded_credentials(
+            "https://github.com/org/repo@v1.git"
+        ));
+        assert!(!url_has_embedded_credentials("git@github.com:org/repo.git"));
+    }
+
+    #[tokio::test]
+    async fn resolved_source_rejects_embedded_credentials() {
+        // This is the project-derived path's guard: a legacy `projects.git_url`
+        // carrying a password would otherwise be persisted to
+        // `source_repo_url` and echoed back out of the API.
+        let source = SandboxSource::Git {
+            url: "https://user:secret@github.com/org/repo.git".into(),
+            revision: None,
+            depth: None,
+            username: None,
+            password: None,
+            git_connection_id: None,
+        };
+        let err = validate_resolved_source(&source)
+            .await
+            .expect_err("credentials in the url must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("embedded credentials"), "msg: {msg}");
+        // The message must not echo the secret back at the caller.
+        assert!(!msg.contains("secret"), "error leaked the password: {msg}");
+    }
+
+    #[tokio::test]
+    async fn resolved_source_rejects_loopback_and_metadata_hosts() {
+        for url in [
+            "http://127.0.0.1/repo.git",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/repo.git",
+        ] {
+            let source = SandboxSource::Git {
+                url: url.into(),
+                revision: None,
+                depth: None,
+                username: None,
+                password: None,
+                git_connection_id: None,
+            };
+            assert!(
+                validate_resolved_source(&source).await.is_err(),
+                "{url} must be rejected as an SSRF target"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_source_rejects_non_http_schemes() {
+        let source = SandboxSource::Tarball {
+            url: "file:///etc/passwd".into(),
+        };
+        assert!(validate_resolved_source(&source).await.is_err());
     }
 
     #[tokio::test]

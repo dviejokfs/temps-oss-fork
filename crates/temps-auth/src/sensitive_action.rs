@@ -34,10 +34,19 @@ pub const STEP_UP_TTL_MINUTES: i64 = 5;
 /// applies only to enrolled users, it can be avoided by not enrolling. It is
 /// therefore a protection for accounts that opted into MFA — limiting the blast
 /// radius of a stolen session cookie for those users — not a barrier an
-/// attacker who controls account settings must clear. Operators who want the
-/// stricter posture should mandate MFA enrolment at the account level, which is
-/// the control that actually enforces it, or register a custom
-/// [`SensitiveActionAuthorizer`].
+/// attacker who controls account settings must clear.
+///
+/// What it is *not* weakened by: a stolen session cannot unenrol to escape the
+/// challenge, because disabling MFA itself requires a valid TOTP code.
+///
+/// # Operators who want the stricter posture
+///
+/// `AppSettings::require_mfa_for_admins` is **not** sufficient on its own: it
+/// gates the password-login path only, and OIDC logins are intentionally
+/// unaffected. On an SSO instance, admins keep `users.mfa_enabled == false`
+/// and so pass this gate without a challenge. Closing that requires either
+/// enforcing enrolment in the identity provider, or registering a custom
+/// [`SensitiveActionAuthorizer`] that denies unenrolled principals.
 pub struct DefaultSensitiveActionAuthorizer {
     db: Arc<sea_orm::DatabaseConnection>,
 }
@@ -68,10 +77,17 @@ impl SensitiveActionAuthorizer for DefaultSensitiveActionAuthorizer {
 
         // No enrolled factor, nothing to re-verify — allow. See the type-level
         // docs for why this is a deliberate policy choice and what it costs.
+        //
+        // Logged at INFO, not DEBUG: this is the record that the action ran at
+        // a *reduced* assurance level. Without it the audit entry for e.g.
+        // `create_api_key` is indistinguishable from one where step-up was
+        // actually satisfied, and the difference is exactly what an incident
+        // responder needs.
         if !mfa_enabled {
-            tracing::debug!(
+            tracing::info!(
                 user_id = *user_id,
                 action = action.as_str(),
+                step_up = "skipped_no_mfa",
                 "Sensitive action allowed without step-up: user has no MFA enrolled"
             );
             return Ok(SensitiveActionDecision::Allow);

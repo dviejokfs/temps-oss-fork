@@ -52,8 +52,9 @@ bunx @temps-sdk/cli sandbox create --workspace \\
 bunx @temps-sdk/cli sandbox exec sbx_abc123 -- git status
 
 # The image ships claude, codex, opencode, gh and glab. Supply your own
-# key at create time until credential injection lands (ADR-036).
-bunx @temps-sdk/cli sandbox create --workspace -e ANTHROPIC_API_KEY=sk-ant-...
+# key at create time until credential injection lands (ADR-036). Pass it by
+# reference so the secret stays out of your shell history.
+bunx @temps-sdk/cli sandbox create --workspace -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
 
 bunx @temps-sdk/cli sandbox list --workspace`
 

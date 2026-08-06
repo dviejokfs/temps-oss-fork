@@ -49,6 +49,7 @@ use temps_auth::{permissions::Permission, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_pty_agent::protocol as pty;
 use tokio::io::AsyncWriteExt;
+use tokio_util::codec::FramedRead;
 use tokio_util::io::StreamReader;
 use utoipa::ToSchema;
 
@@ -63,6 +64,44 @@ const ACTIVITY_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Scrollback replayed on attach. Matches the agent's default ring size —
 /// asking for more just gets clamped agent-side.
 const REPLAY_BYTES: u32 = 64 * 1024;
+
+/// Concurrent terminal attachments allowed across the whole process.
+///
+/// Every attach holds a `docker exec` and a bollard connection for the life
+/// of the session, and writes an activity row every [`ACTIVITY_HEARTBEAT`].
+/// Unbounded, that is a self-service denial of service from any account with
+/// `sandboxes:write` on the 3 vCPU / 4 GB reference host. A global cap is
+/// crude but bounds the daemon pressure; callers past it get a 429 telling
+/// them to close a session rather than a hang.
+const MAX_CONCURRENT_TERMINALS: usize = 32;
+
+/// Permits for [`MAX_CONCURRENT_TERMINALS`]. A process-wide static rather
+/// than state on `SandboxAppState` so the bound holds even if a future
+/// refactor builds more than one router.
+static TERMINAL_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_TERMINALS);
+
+/// Longest accepted `tab` identifier, and the character set.
+///
+/// The agent keys tabs by this string and allocates a PTY plus a 64 KiB
+/// scrollback ring per distinct value, so an unbounded one is a memory lever
+/// inside the container. It is also interpolated into operator logs, where a
+/// newline would forge log lines.
+fn validate_tab(tab: &str) -> Result<(), Problem> {
+    let ok = !tab.is_empty()
+        && tab.len() <= 64
+        && tab
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok {
+        return Ok(());
+    }
+    Err(problemdetails::new(StatusCode::BAD_REQUEST)
+        .with_title("Invalid Tab Name")
+        .with_detail(
+            "tab must be 1-64 characters of ASCII letters, digits, '-' or '_'".to_string(),
+        ))
+}
 
 /// Query parameters for the terminal upgrade.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -144,6 +183,21 @@ pub async fn terminal(
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
 
+    let tab = params.tab.clone().unwrap_or_else(|| "main".to_string());
+    validate_tab(&tab)?;
+
+    // Take a slot before doing any work. Held for the whole session by moving
+    // the permit into the upgrade closure; dropped when the session ends.
+    let permit = TERMINAL_SLOTS.try_acquire().map_err(|_| {
+        problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+            .with_title("Too Many Terminals")
+            .with_detail(format!(
+                "This instance already has {} terminal sessions open. \
+                 Close one and retry.",
+                MAX_CONCURRENT_TERMINALS
+            ))
+    })?;
+
     // Resolve *before* the upgrade so ownership failures, a missing sandbox,
     // or a stopped ephemeral one surface as a real HTTP status instead of a
     // WebSocket that opens and immediately dies. This also wakes a suspended
@@ -186,7 +240,6 @@ pub async fn terminal(
 
     let service = state.sandbox_service.clone();
     let timeout_secs = row.timeout_secs;
-    let tab = params.tab.unwrap_or_else(|| "main".to_string());
     let cmd = params.cmd.unwrap_or_else(default_shell_cmd);
     let cols = params.cols.unwrap_or(80);
     let rows = params.rows.unwrap_or(24);
@@ -198,6 +251,9 @@ pub async fn terminal(
     let work_dir = handle.work_dir.to_string_lossy().to_string();
 
     Ok(ws.on_upgrade(move |socket| async move {
+        // Held for the session's lifetime; released when this future ends,
+        // however it ends.
+        let _permit = permit;
         let session = TerminalSession {
             socket,
             attachment,
@@ -254,7 +310,13 @@ impl TerminalSession {
         let agent_bytes = attachment
             .output
             .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())));
-        let mut agent_out = StreamReader::new(agent_bytes);
+        // `FramedRead` + `FrameCodec`, never `read_frame`: this stream is
+        // multiplexed in the `select!` below against client input and the
+        // activity heartbeat, so the read is cancelled constantly. The codec
+        // buffers across polls; `read_frame`'s `read_exact` pair would drop
+        // whatever it had already consumed and desynchronise the stream on
+        // the first keystroke that landed mid-frame.
+        let mut agent_out = FramedRead::new(StreamReader::new(agent_bytes), pty::FrameCodec);
 
         // OPEN the tab. Reattaches when it already exists, which is what
         // makes a long-running CLI survive disconnection.
@@ -293,18 +355,18 @@ impl TerminalSession {
                     service.touch(internal_id, timeout_secs).await;
                 }
 
-                // Agent → client.
-                frame = pty::read_frame(&mut agent_out) => {
+                // Agent → client. Cancellation-safe: see the codec above.
+                frame = agent_out.next() => {
                     match frame {
-                        Ok(Some((op, payload))) => {
+                        Some(Ok((op, payload))) => {
                             if !forward_agent_frame(&mut ws_tx, op, payload).await {
                                 break;
                             }
                         }
                         // Clean EOF: the relay exited (container stopped, or
                         // the agent went away). Nothing more to read.
-                        Ok(None) => break,
-                        Err(e) => {
+                        None => break,
+                        Some(Err(e)) => {
                             send_error(&mut ws_tx, format!("terminal stream failed: {}", e)).await;
                             break;
                         }
@@ -476,6 +538,42 @@ mod tests {
         })
         .expect("serialize");
         assert!(exit.contains(r#""type":"exit""#), "{}", exit);
+    }
+
+    #[test]
+    fn tab_accepts_ordinary_names() {
+        for ok in ["main", "claude", "tab-2", "my_work_1", &"a".repeat(64)] {
+            assert!(validate_tab(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn tab_rejects_log_forging_and_unbounded_names() {
+        // A newline would forge lines in the operator's structured log, and
+        // each distinct tab costs a PTY plus a 64 KiB ring in the agent.
+        for bad in [
+            "",
+            "has space",
+            "new\nline",
+            "semi;colon",
+            "../escape",
+            "unicodé",
+        ] {
+            assert!(validate_tab(bad).is_err(), "should reject {bad:?}");
+        }
+        assert!(
+            validate_tab(&"a".repeat(65)).is_err(),
+            "should reject over-long tab names"
+        );
+    }
+
+    #[test]
+    fn terminal_slot_cap_is_bounded_and_nonzero() {
+        // Zero would make every attach 429; unbounded would let one account
+        // exhaust dockerd on the reference host.
+        const _: () = assert!(MAX_CONCURRENT_TERMINALS > 0);
+        const _: () = assert!(MAX_CONCURRENT_TERMINALS <= 128);
+        assert_eq!(TERMINAL_SLOTS.available_permits(), MAX_CONCURRENT_TERMINALS);
     }
 
     #[test]
