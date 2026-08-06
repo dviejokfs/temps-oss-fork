@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router'
+import { Link, useParams } from 'react-router'
+import { useGoBack } from '@/hooks/useGoBack'
 import { useQuery } from '@tanstack/react-query'
 import { getUnifiedTraceOptions } from '@/api/client/@tanstack/react-query.gen'
 import type {
@@ -18,7 +19,11 @@ import {
   kindLabel,
   statusIcon,
 } from '@/components/traces/SpanWaterfall'
-import { ProjectBadge } from '@/components/traces/ProjectBadge'
+import {
+  ProjectBadge,
+  ProjectDot,
+  ProjectLegend,
+} from '@/components/traces/ProjectBadge'
 import { buildSpanTree, flattenTree } from '@/utils/spanTree'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
@@ -113,7 +118,6 @@ function UnifiedSpanDetail({
 
 export default function CrossProjectTraceDetail() {
   const { traceId } = useParams()
-  const navigate = useNavigate()
 
   const { data, isPending, isError, error } = useQuery({
     ...getUnifiedTraceOptions({ path: { trace_id: traceId || '' } }),
@@ -130,6 +134,15 @@ export default function CrossProjectTraceDetail() {
 
   const projectName = (span: SpanRecord) =>
     projectById.get(span.project_id)?.project_name ?? `Project ${span.project_id}`
+
+  // This view is global, so there is no single list it belongs to. The first
+  // contributing project's trace list is the closest thing; before the trace
+  // loads (and in the error state) fall back to the project list.
+  const goBack = useGoBack(
+    data?.projects[0]
+      ? `/projects/${data.projects[0].project_slug}/traces`
+      : '/projects'
+  )
 
   const spans: SpanRecord[] = useMemo(
     () => (data?.spans ?? []).map((a) => a.span),
@@ -158,12 +171,10 @@ export default function CrossProjectTraceDetail() {
     [selectedSpanId, flatSpans]
   )
 
+  // Dot, not badge: the legend above decodes the colour, so each row keeps its
+  // width for the span name instead of repeating a truncated slug.
   const renderRowBadge = (span: SpanRecord) => (
-    <ProjectBadge
-      projectId={span.project_id}
-      name={projectName(span)}
-      className="shrink-0"
-    />
+    <ProjectDot projectId={span.project_id} name={projectName(span)} />
   )
 
   if (isPending) {
@@ -190,7 +201,7 @@ export default function CrossProjectTraceDetail() {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate(-1)}
+          onClick={() => goBack()}
           className="gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
@@ -217,7 +228,7 @@ export default function CrossProjectTraceDetail() {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate(-1)}
+          onClick={() => goBack()}
           className="gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
@@ -241,7 +252,7 @@ export default function CrossProjectTraceDetail() {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate(-1)}
+          onClick={() => goBack()}
           className="shrink-0 gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
@@ -325,17 +336,8 @@ export default function CrossProjectTraceDetail() {
         </div>
       )}
 
-      {/* Project legend */}
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-xs text-muted-foreground">Projects:</span>
-        {data.projects.map((p) => (
-          <ProjectBadge
-            key={p.project_id}
-            projectId={p.project_id}
-            name={p.project_name}
-          />
-        ))}
-      </div>
+      {/* Project legend — decodes the per-span dots in the waterfall below. */}
+      <ProjectLegend projects={data.projects} />
 
       {/* Waterfall + selected-span detail */}
       <div
