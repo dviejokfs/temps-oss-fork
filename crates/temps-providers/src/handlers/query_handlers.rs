@@ -340,13 +340,13 @@ fn query_error_problem(
             StatusCode::PAYLOAD_TOO_LARGE,
             "Query Result Too Large",
             "result_limit_exceeded",
-            Some(error.to_string()),
+            Some("The query result exceeds the configured response limits".to_string()),
         ),
         temps_query::DataError::InvalidQuery(_) => (
             StatusCode::BAD_REQUEST,
             "Invalid Query",
             "invalid_query",
-            Some(error.to_string()),
+            Some("The query parameters are invalid for this data source".to_string()),
         ),
         temps_query::DataError::QueryFailed(_)
         | temps_query::DataError::BackendQueryFailed { .. } => (
@@ -520,13 +520,12 @@ fn parse_row_filter(
 
     match serde_json::from_str::<serde_json::Value>(raw) {
         Ok(value) => Ok(Some(value)),
-        Err(e) => {
+        Err(_error) => {
             let mut problem = temps_core::problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Filter")
-                .with_detail(format!(
-                    "The `filter` parameter must be JSON matching this service's filter schema, \
-                     but it failed to parse: {e}. Received: {raw}"
-                ));
+                .with_detail(
+                    "The `filter` parameter must be valid JSON matching this service's filter schema",
+                );
             if let Some(schema) = filter_schema {
                 problem = problem.with_value("expected_filter_schema", schema.clone());
             }
@@ -1828,6 +1827,40 @@ mod tests {
     }
 
     #[test]
+    fn invalid_query_problem_does_not_echo_submitted_values() {
+        let problem = query_error_problem(
+            temps_query::DataError::InvalidQuery(
+                "invalid email alice@example.com with tok_live_secret".to_string(),
+            ),
+            7,
+            "users",
+            100,
+        );
+        let serialized = serde_json::to_string(&problem.body).expect("problem body serializes");
+        assert!(!serialized.contains("alice@example.com"));
+        assert!(!serialized.contains("tok_live_secret"));
+        assert!(serialized.contains("query parameters are invalid"));
+    }
+
+    #[test]
+    fn result_limit_problem_does_not_echo_sensitive_entity_name() {
+        let problem = query_error_problem(
+            temps_query::DataError::ResultLimitExceeded {
+                entity: "session:tok_live_secret:alice@example.com".to_string(),
+                limit_kind: "wire_cell_bytes",
+                limit: 64,
+                observed: 1_024,
+            },
+            7,
+            "session:tok_live_secret:alice@example.com",
+            1,
+        );
+        let serialized = serde_json::to_string(&problem.body).expect("problem body serializes");
+        assert!(!serialized.contains("alice@example.com"));
+        assert!(!serialized.contains("tok_live_secret"));
+    }
+
+    #[test]
     fn entity_names_are_user_data_for_key_value_and_object_stores() {
         // `list_entities` is allowlisted for the agent as schema navigation.
         // That framing only holds where an entity is a table or collection. On
@@ -1892,6 +1925,18 @@ mod tests {
             .expect_err("a bare WHERE clause is not JSON and must be rejected");
 
         assert_eq!(err.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn malformed_filter_problem_does_not_echo_email_or_token() {
+        let err = parse_row_filter(
+            Some(r#"{"email":"alice@example.com","token":"tok_live_secret""#),
+            None,
+        )
+        .expect_err("malformed secret-bearing JSON must be rejected");
+        let serialized = serde_json::to_string(&err.body).expect("problem body serializes");
+        assert!(!serialized.contains("alice@example.com"));
+        assert!(!serialized.contains("tok_live_secret"));
     }
 
     #[test]

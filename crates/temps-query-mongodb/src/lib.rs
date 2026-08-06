@@ -28,7 +28,7 @@
 
 use async_trait::async_trait;
 use mongodb::{
-    bson::{doc, Document},
+    bson::{doc, Bson, Document},
     options::ClientOptions,
     Client,
 };
@@ -100,6 +100,43 @@ const ALLOWED_FILTER_OPERATORS: [&str; 15] = [
 /// Deep nesting is both a parser-stack risk and a way to hide an operator from
 /// a shallow check. Honest filters are one or two levels.
 const MAX_FILTER_DEPTH: usize = 8;
+
+fn bounded_document_pipeline(
+    filter: Document,
+    sort: Document,
+    skip: u64,
+    limit: i64,
+    max_document_bytes: usize,
+) -> Vec<Document> {
+    let byte_limit = i64::try_from(max_document_bytes).unwrap_or(i64::MAX);
+    vec![
+        doc! { "$match": filter },
+        doc! { "$sort": sort },
+        doc! { "$skip": i64::try_from(skip).unwrap_or(i64::MAX) },
+        doc! { "$limit": limit },
+        doc! {
+            "$replaceWith": {
+                "$let": {
+                    "vars": { "temps_size": { "$bsonSize": "$$ROOT" } },
+                    "in": {
+                        "$cond": [
+                            { "$lte": ["$$temps_size", byte_limit] },
+                            {
+                                "__temps_admitted": true,
+                                "__temps_size": "$$temps_size",
+                                "__temps_doc": "$$ROOT"
+                            },
+                            {
+                                "__temps_admitted": false,
+                                "__temps_size": "$$temps_size"
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    ]
+}
 
 /// Server-side ceiling for the standalone `count`, which carries no
 /// `QueryOptions` and therefore no caller deadline. Matches the SQL backends.
@@ -644,7 +681,9 @@ impl temps_query::Queryable for MongoDBSource {
                 Some("desc") | Some("DESC") => -1,
                 _ => 1,
             };
-            doc! { sort_by: sort_order }
+            [(sort_by.clone(), Bson::Int32(sort_order))]
+                .into_iter()
+                .collect()
         } else {
             doc! { "_id": 1 } // Default sort by _id ascending
         };
@@ -665,12 +704,21 @@ impl temps_query::Queryable for MongoDBSource {
         // every skipped document regardless of `limit`.
         let max_time = std::time::Duration::from_millis(options.timeout_ms.unwrap_or(30_000));
 
-        // Execute query
+        // `$bsonSize` is evaluated by mongod before the conditional projection.
+        // Using the cell ceiling as the document ceiling is deliberately
+        // conservative: no individual nested value can cross the wire above
+        // the per-cell budget, even though MongoDB documents are dynamic.
+        let wire_document_limit = options.budget.max_bytes.min(options.budget.max_cell_bytes);
+        let pipeline = bounded_document_pipeline(
+            filter_doc.clone(),
+            sort_doc,
+            skip,
+            limit,
+            wire_document_limit,
+        );
         let mut cursor = collection
-            .find(filter_doc.clone())
-            .sort(sort_doc)
-            .limit(limit)
-            .skip(skip)
+            .aggregate(pipeline)
+            .batch_size(1)
             .max_time(max_time)
             .await
             .map_err(|_error| {
@@ -692,7 +740,7 @@ impl temps_query::Queryable for MongoDBSource {
                 entity: entity_name.to_string(),
             }
         })? {
-            let doc = cursor.deserialize_current().map_err(|_error| {
+            let mut envelope = cursor.deserialize_current().map_err(|_error| {
                 error!(
                     entity = entity_name,
                     limit, "MongoDB document decode failed"
@@ -703,7 +751,37 @@ impl temps_query::Queryable for MongoDBSource {
                 }
             })?;
 
-            // Convert Document to HashMap for DataRow
+            let observed = match envelope.remove("__temps_size") {
+                Some(Bson::Int32(value)) => usize::try_from(value).unwrap_or(usize::MAX),
+                Some(Bson::Int64(value)) => usize::try_from(value).unwrap_or(usize::MAX),
+                _ => {
+                    return Err(DataError::BackendQueryFailed {
+                        backend: "MongoDB",
+                        entity: entity_name.to_string(),
+                    })
+                }
+            };
+            let admitted = envelope
+                .remove("__temps_admitted")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if !admitted {
+                return Err(DataError::ResultLimitExceeded {
+                    entity: entity_name.to_string(),
+                    limit_kind: "wire_document_bytes",
+                    limit: wire_document_limit,
+                    observed,
+                });
+            }
+            let doc = envelope
+                .remove("__temps_doc")
+                .and_then(|value| value.as_document().cloned())
+                .ok_or_else(|| DataError::BackendQueryFailed {
+                    backend: "MongoDB",
+                    entity: entity_name.to_string(),
+                })?;
+
+            // Convert the admitted Document to HashMap for DataRow.
             let mut row_map = std::collections::HashMap::new();
             for (key, value) in doc {
                 // Convert BSON to serde_json::Value
@@ -875,6 +953,28 @@ impl temps_query::Queryable for MongoDBSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregation_sizes_before_conditionally_projecting_document() {
+        let pipeline = bounded_document_pipeline(
+            doc! { "status": "active" },
+            doc! { "created_at": -1 },
+            25,
+            10,
+            65_536,
+        );
+        let encoded = mongodb::bson::serialize_to_bson(&pipeline)
+            .expect("test pipeline should serialize")
+            .to_string();
+
+        assert!(encoded.contains("$bsonSize"));
+        assert!(encoded.contains("$cond"));
+        assert!(encoded.contains("__temps_admitted"));
+        assert!(encoded.contains("__temps_doc"));
+        assert!(encoded.contains("65536"));
+        assert_eq!(pipeline[2], doc! { "$skip": 25_i64 });
+        assert_eq!(pipeline[3], doc! { "$limit": 10_i64 });
+    }
 
     #[test]
     fn test_source_type() {

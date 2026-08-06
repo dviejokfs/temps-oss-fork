@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use temps_query::{
     BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
     DataError, DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef,
-    FieldType, Introspect, QueryOptions, QueryResult, QuerySchemaProvider, QueryStats, Queryable,
-    Result,
+    FieldType, Introspect, QueryBudget, QueryOptions, QueryResult, QuerySchemaProvider, QueryStats,
+    Queryable, Result,
 };
 use tracing::{debug, error, warn};
 
@@ -131,6 +131,45 @@ impl MariaDbSource {
             "json" => FieldType::Json,
             _ => FieldType::String,
         }
+    }
+
+    async fn query_columns(
+        &self,
+        database_name: &str,
+        entity_name: &str,
+    ) -> Result<Vec<MariaQueryColumn>> {
+        let rows = sqlx::query(
+            "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+        )
+        .bind(database_name)
+        .bind(entity_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_error| {
+            DataError::SchemaError(format!(
+                "Failed to inspect MariaDB query columns for '{}.{}'",
+                database_name, entity_name
+            ))
+        })?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(MariaQueryColumn {
+                    name: row.try_get("COLUMN_NAME").map_err(|_error| {
+                        DataError::SchemaError(format!(
+                            "Failed to decode a column name for '{}.{}'",
+                            database_name, entity_name
+                        ))
+                    })?,
+                    data_type: row.try_get("DATA_TYPE").map_err(|_error| {
+                        DataError::SchemaError(format!(
+                            "Failed to decode a column type for '{}.{}'",
+                            database_name, entity_name
+                        ))
+                    })?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -497,11 +536,11 @@ impl Queryable for MariaDbSource {
         let database_name = database_from_path(container_path, &self.database_name)?;
         validate_identifier("table", entity_name)?;
         let schema = self.get_schema(container_path, entity_name).await?;
+        let columns = self.query_columns(database_name, entity_name).await?;
 
         let start = std::time::Instant::now();
-        let projection = mariadb_json_projection(&schema);
         let mut sql = format!(
-            "SELECT {projection} AS __temps_payload FROM {}.{}",
+            "SELECT * FROM {}.{}",
             quote_identifier(database_name),
             quote_identifier(entity_name)
         );
@@ -530,7 +569,7 @@ impl Queryable for MariaDbSource {
         let limit = options.limit.unwrap_or(100);
         let offset = options.offset.unwrap_or(0);
         sql.push_str(" LIMIT ? OFFSET ?");
-        let sql = with_wire_row_budget(&sql);
+        let sql = with_wire_row_budget(&sql, &columns, options.budget)?;
 
         debug!(
             entity = entity_name,
@@ -557,7 +596,6 @@ impl Queryable for MariaDbSource {
         apply_statement_timeout(&mut conn, timeout_ms, database_name).await;
 
         let mut stream = sqlx::query(&sql)
-            .bind(options.budget.max_bytes as u64)
             .bind(limit as i64)
             .bind(offset as i64)
             .fetch(&mut *conn);
@@ -579,6 +617,12 @@ impl Queryable for MariaDbSource {
                     entity: entity_name.to_string(),
                 }
             })?;
+            let observed_cell = row
+                .try_get::<u64, _>("__temps_max_cell")
+                .map_err(|_error| DataError::BackendQueryFailed {
+                    backend: "MariaDB",
+                    entity: entity_name.to_string(),
+                })?;
             let payload = row
                 .try_get::<Option<String>, _>("__temps_row")
                 .map_err(|_error| {
@@ -591,11 +635,28 @@ impl Queryable for MariaDbSource {
                         entity: entity_name.to_string(),
                     }
                 })?
-                .ok_or_else(|| DataError::ResultLimitExceeded {
-                    entity: entity_name.to_string(),
-                    limit_kind: "wire_row_bytes",
-                    limit: options.budget.max_bytes,
-                    observed: usize::try_from(observed).unwrap_or(usize::MAX),
+                .ok_or_else(|| {
+                    let observed_cell = usize::try_from(observed_cell).unwrap_or(usize::MAX);
+                    let (limit_kind, limit, observed) =
+                        if observed_cell > options.budget.max_cell_bytes {
+                            (
+                                "wire_cell_bytes",
+                                options.budget.max_cell_bytes,
+                                observed_cell,
+                            )
+                        } else {
+                            (
+                                "wire_row_bytes",
+                                options.budget.max_bytes,
+                                usize::try_from(observed).unwrap_or(usize::MAX),
+                            )
+                        };
+                    DataError::ResultLimitExceeded {
+                        entity: entity_name.to_string(),
+                        limit_kind,
+                        limit,
+                        observed,
+                    }
                 })?;
             let data_row = serde_json::from_str::<DataRow>(&payload).map_err(|_error| {
                 error!(
@@ -805,23 +866,29 @@ fn quote_identifier(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
 }
 
-/// Build one JSON value per source row so MariaDB can measure it before the
-/// driver sees any user-controlled cell contents. Binary values retain the
-/// previous API representation (base64 text).
-fn mariadb_json_projection(schema: &DatasetSchema) -> String {
-    let entries = schema.fields.iter().flat_map(|field| {
-        let key_hex = field
+#[derive(Clone, Debug)]
+struct MariaQueryColumn {
+    name: String,
+    data_type: String,
+}
+
+fn mariadb_json_projection(columns: &[MariaQueryColumn]) -> String {
+    let entries = columns.iter().flat_map(|column| {
+        let key_hex = column
             .name
             .as_bytes()
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         let key = format!("CONVERT(X'{key_hex}' USING utf8mb4)");
-        let column = quote_identifier(&field.name);
-        let value = if field.field_type == FieldType::Bytes {
-            format!("TO_BASE64({column})")
+        let column_ref = format!("__temps_source.{}", quote_identifier(&column.name));
+        let value = if matches!(
+            column.data_type.as_str(),
+            "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
+        ) {
+            format!("TO_BASE64({column_ref})")
         } else {
-            column
+            column_ref
         };
         [key, value]
     });
@@ -829,16 +896,62 @@ fn mariadb_json_projection(schema: &DatasetSchema) -> String {
     format!("JSON_OBJECT({})", entries.collect::<Vec<_>>().join(", "))
 }
 
-/// Apply the per-row response ceiling in the same statement that reads the
-/// row. Oversized JSON is replaced by NULL plus its length, so it never crosses
-/// the database wire into the control plane and there is no check/read race.
-fn with_wire_row_budget(sql: &str) -> String {
-    format!(
-        "SELECT CASE WHEN OCTET_LENGTH(__temps_payload) <= ? \
-             THEN __temps_payload ELSE NULL END AS __temps_row, \
-             OCTET_LENGTH(__temps_payload) AS __temps_size \
-         FROM ({sql}) AS __temps_bounded"
-    )
+fn mariadb_column_admission(column: &MariaQueryColumn) -> Result<String> {
+    let value = format!("__temps_source.{}", quote_identifier(&column.name));
+    let estimate = match column.data_type.as_str() {
+        "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => {
+            format!("OCTET_LENGTH({value}) * 5 + 8")
+        }
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set" => {
+            format!("OCTET_LENGTH({value}) * 6 + 8")
+        }
+        "json" => format!("JSON_STORAGE_SIZE({value}) * 6 + 8"),
+        "bool" | "boolean" | "tinyint" | "smallint" | "mediumint" | "int" | "integer"
+        | "bigint" | "float" | "double" | "real" | "decimal" | "numeric" | "date" | "datetime"
+        | "timestamp" | "time" | "year" => "128".to_string(),
+        unsupported => {
+            return Err(DataError::OperationNotSupported(format!(
+                "MariaDB column '{}' uses unsupported type '{}'",
+                column.name, unsupported
+            )))
+        }
+    };
+    Ok(format!("COALESCE({estimate}, 4)"))
+}
+
+/// Admission expressions execute before the JSON constructor. Rejected rows
+/// return only conservative byte metadata, never the original values.
+fn with_wire_row_budget(
+    sql: &str,
+    columns: &[MariaQueryColumn],
+    budget: QueryBudget,
+) -> Result<String> {
+    let estimates = columns
+        .iter()
+        .map(mariadb_column_admission)
+        .collect::<Result<Vec<_>>>()?;
+    let max_cell = if estimates.is_empty() {
+        "0".to_string()
+    } else {
+        format!("GREATEST({})", estimates.join(", "))
+    };
+    let key_overhead = columns.iter().fold(2usize, |total, column| {
+        total.saturating_add(column.name.len().saturating_mul(6).saturating_add(4))
+    });
+    let row_size = if estimates.is_empty() {
+        key_overhead.to_string()
+    } else {
+        format!("{key_overhead} + {}", estimates.join(" + "))
+    };
+    let projection = mariadb_json_projection(columns);
+
+    Ok(format!(
+        "SELECT CASE WHEN {max_cell} <= {} AND {row_size} <= {} \
+             THEN {projection} ELSE NULL END AS __temps_row, \
+             {row_size} AS __temps_size, {max_cell} AS __temps_max_cell \
+         FROM ({sql}) AS __temps_source",
+        budget.max_cell_bytes, budget.max_bytes
+    ))
 }
 
 fn validate_identifier(label: &str, value: &str) -> Result<()> {
@@ -1205,34 +1318,56 @@ mod tests {
 
     #[test]
     fn generated_query_guards_encoded_row_before_wire_transfer() {
-        let schema = DatasetSchema {
-            fields: vec![
-                FieldDef {
-                    name: "display_name".to_string(),
-                    field_type: FieldType::String,
-                    nullable: false,
-                    description: None,
-                },
-                FieldDef {
-                    name: "avatar".to_string(),
-                    field_type: FieldType::Bytes,
-                    nullable: true,
-                    description: None,
-                },
-            ],
-            partitions: None,
-            primary_key: None,
+        let columns = vec![
+            MariaQueryColumn {
+                name: "display_name".to_string(),
+                data_type: "longtext".to_string(),
+            },
+            MariaQueryColumn {
+                name: "avatar".to_string(),
+                data_type: "longblob".to_string(),
+            },
+            MariaQueryColumn {
+                name: "settings".to_string(),
+                data_type: "json".to_string(),
+            },
+        ];
+        let budget = QueryBudget {
+            max_bytes: 262_144,
+            max_cell_bytes: 65_536,
+            ..QueryBudget::default()
         };
-        let projection = mariadb_json_projection(&schema);
-        let sql = with_wire_row_budget(&format!(
-            "SELECT {projection} AS __temps_payload FROM `app`.`users` LIMIT ? OFFSET ?"
-        ));
+        let sql = with_wire_row_budget(
+            "SELECT * FROM `app`.`users` LIMIT ? OFFSET ?",
+            &columns,
+            budget,
+        )
+        .expect("supported schema should build a bounded query");
 
-        assert!(sql.contains("OCTET_LENGTH(__temps_payload) <= ?"));
-        assert!(sql.contains("THEN __temps_payload ELSE NULL"));
+        assert!(sql.contains("OCTET_LENGTH(__temps_source.`display_name`) * 6"));
+        assert!(sql.contains("OCTET_LENGTH(__temps_source.`avatar`) * 5"));
+        assert!(sql.contains("JSON_STORAGE_SIZE(__temps_source.`settings`) * 6"));
+        assert!(sql.contains("<= 65536"));
+        assert!(sql.contains("<= 262144"));
+        assert!(sql.contains("THEN JSON_OBJECT("));
         assert!(sql.contains("JSON_OBJECT("));
-        assert!(sql.contains("TO_BASE64(`avatar`)"));
+        assert_eq!(sql.matches("JSON_OBJECT(").count(), 1);
+        assert!(sql.contains("TO_BASE64(__temps_source.`avatar`)"));
         assert!(sql.contains("FROM `app`.`users` LIMIT ? OFFSET ?"));
+    }
+
+    #[test]
+    fn unsupported_mariadb_types_are_rejected_before_query_execution() {
+        let error = with_wire_row_budget(
+            "SELECT * FROM `app`.`places`",
+            &[MariaQueryColumn {
+                name: "shape".to_string(),
+                data_type: "geometry".to_string(),
+            }],
+            QueryBudget::default(),
+        )
+        .expect_err("unknown encodings cannot be safely admitted");
+        assert!(matches!(error, DataError::OperationNotSupported(_)));
     }
 
     fn assert_where_rejected(clause: &str) {

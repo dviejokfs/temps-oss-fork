@@ -9,7 +9,7 @@ use std::sync::Arc;
 use temps_query::{
     BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
     DataError, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType,
-    Introspect, QueryOptions, QueryResult, QueryStats, Queryable, Result,
+    Introspect, QueryBudget, QueryOptions, QueryResult, QueryStats, Queryable, Result,
 };
 use tokio_postgres::{types::ToSql, Client, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -33,19 +33,83 @@ fn escape_ident(name: &str) -> String {
     name.replace('"', "\"\"")
 }
 
-/// Keep an individual PostgreSQL row bounded before it crosses the wire.
-/// `CASE` returns only NULL plus the observed size for oversized rows, so the
-/// client driver never allocates their text/blob/json contents. The projection
-/// and size decision are part of the same statement, avoiding a TOCTOU race.
-fn with_wire_row_budget(sql: &str, max_bytes: usize) -> String {
-    format!(
-        "SELECT CASE WHEN OCTET_LENGTH(__temps_payload) <= {max_bytes} \
-             THEN __temps_payload::jsonb ELSE NULL END AS __temps_row, \
-             OCTET_LENGTH(__temps_payload)::bigint AS __temps_size \
+#[derive(Clone, Debug)]
+struct PgQueryColumn {
+    name: String,
+    data_type: String,
+}
+
+fn pg_column_admission(column: &PgQueryColumn, row_budget: usize) -> Result<String> {
+    let value = format!("__temps_source.\"{}\"", escape_ident(&column.name));
+    let expression = match column.data_type.as_str() {
+        "character varying" | "character" | "text" => {
+            format!("COALESCE(OCTET_LENGTH({value})::bigint * 6 + 2, 4)")
+        }
+        "bytea" => format!("COALESCE(OCTET_LENGTH({value})::bigint * 2 + 8, 4)"),
+        "json" => format!("COALESCE(OCTET_LENGTH({value}::text)::bigint * 6 + 8, 4)"),
+        "jsonb" | "ARRAY" => format!(
+            "CASE WHEN {value} IS NULL THEN 4 WHEN PG_COLUMN_COMPRESSION({value}) IS NOT NULL \
+             THEN {} ELSE PG_COLUMN_SIZE({value})::bigint * 8 + 64 END",
+            row_budget.saturating_add(1)
+        ),
+        "boolean"
+        | "smallint"
+        | "integer"
+        | "bigint"
+        | "real"
+        | "double precision"
+        | "numeric"
+        | "decimal"
+        | "date"
+        | "timestamp without time zone"
+        | "timestamp with time zone"
+        | "uuid" => {
+            format!("COALESCE(PG_COLUMN_SIZE({value})::bigint * 8 + 64, 4)")
+        }
+        unsupported => {
+            return Err(DataError::OperationNotSupported(format!(
+                "PostgreSQL column '{}' uses unsupported type '{}'",
+                column.name, unsupported
+            )))
+        }
+    };
+    Ok(expression)
+}
+
+/// Admit rows from non-materializing per-column upper bounds. `TO_JSONB` is
+/// located only in the admitted CASE arm, so rejected values are never encoded.
+fn with_wire_row_budget(
+    sql: &str,
+    columns: &[PgQueryColumn],
+    budget: QueryBudget,
+) -> Result<String> {
+    let estimates = columns
+        .iter()
+        .map(|column| pg_column_admission(column, budget.max_bytes))
+        .collect::<Result<Vec<_>>>()?;
+    let max_cell = if estimates.is_empty() {
+        "0".to_string()
+    } else {
+        format!("GREATEST({})", estimates.join(", "))
+    };
+    let key_overhead = columns.iter().fold(2usize, |total, column| {
+        total.saturating_add(column.name.len().saturating_mul(6).saturating_add(4))
+    });
+    let row_size = if estimates.is_empty() {
+        key_overhead.to_string()
+    } else {
+        format!("{key_overhead} + {}", estimates.join(" + "))
+    };
+
+    Ok(format!(
+        "SELECT CASE WHEN __temps_max_cell <= {} AND __temps_row_size <= {} \
+             THEN TO_JSONB(__temps_source) ELSE NULL END AS __temps_row, \
+             __temps_row_size AS __temps_size, __temps_max_cell \
          FROM ({sql}) AS __temps_source \
-         CROSS JOIN LATERAL (SELECT TO_JSONB(__temps_source)::text AS __temps_payload) \
-             AS __temps_encoded"
-    )
+         CROSS JOIN LATERAL (SELECT {row_size}::bigint AS __temps_row_size, \
+             {max_cell}::bigint AS __temps_max_cell) AS __temps_admission",
+        budget.max_cell_bytes, budget.max_bytes
+    ))
 }
 
 /// A certificate verifier that accepts all server certificates (including self-signed).
@@ -1228,6 +1292,34 @@ impl PostgresSource {
             _ => FieldType::String, // Default fallback
         }
     }
+
+    async fn query_columns(
+        &self,
+        schema_name: &str,
+        entity_name: &str,
+    ) -> Result<Vec<PgQueryColumn>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT column_name, data_type FROM information_schema.columns \
+                 WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+                &[&schema_name, &entity_name],
+            )
+            .await
+            .map_err(|_error| {
+                DataError::SchemaError(format!(
+                    "Failed to inspect PostgreSQL query columns for '{}.{}'",
+                    schema_name, entity_name
+                ))
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PgQueryColumn {
+                name: row.get(0),
+                data_type: row.get(1),
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -1819,6 +1911,7 @@ impl Queryable for PostgresSource {
         }
 
         let schema_name = &container_path.segments[1];
+        let columns = self.query_columns(schema_name, entity_name).await?;
 
         let start = std::time::Instant::now();
 
@@ -1872,7 +1965,7 @@ impl Queryable for PostgresSource {
         let limit = options.limit.unwrap_or(100);
         let offset = options.offset.unwrap_or(0);
         sql.push_str(&format!(" LIMIT {} OFFSET {}", limit, offset));
-        let sql = with_wire_row_budget(&sql, options.budget.max_bytes);
+        let sql = with_wire_row_budget(&sql, &columns, options.budget)?;
 
         debug!(
             entity = entity_name,
@@ -1938,6 +2031,12 @@ impl Queryable for PostgresSource {
                     entity: entity_name.to_string(),
                 }
             })?;
+            let observed_cell = row
+                .try_get::<_, i64>("__temps_max_cell")
+                .map_err(|_error| DataError::BackendQueryFailed {
+                    backend: "PostgreSQL",
+                    entity: entity_name.to_string(),
+                })?;
             let payload = row
                 .try_get::<_, Option<serde_json::Value>>("__temps_row")
                 .map_err(|_error| {
@@ -1950,11 +2049,28 @@ impl Queryable for PostgresSource {
                         entity: entity_name.to_string(),
                     }
                 })?
-                .ok_or_else(|| DataError::ResultLimitExceeded {
-                    entity: entity_name.to_string(),
-                    limit_kind: "wire_row_bytes",
-                    limit: options.budget.max_bytes,
-                    observed: usize::try_from(observed).unwrap_or(usize::MAX),
+                .ok_or_else(|| {
+                    let observed_cell = usize::try_from(observed_cell).unwrap_or(usize::MAX);
+                    let (limit_kind, limit, observed) =
+                        if observed_cell > options.budget.max_cell_bytes {
+                            (
+                                "wire_cell_bytes",
+                                options.budget.max_cell_bytes,
+                                observed_cell,
+                            )
+                        } else {
+                            (
+                                "wire_row_bytes",
+                                options.budget.max_bytes,
+                                usize::try_from(observed).unwrap_or(usize::MAX),
+                            )
+                        };
+                    DataError::ResultLimitExceeded {
+                        entity: entity_name.to_string(),
+                        limit_kind,
+                        limit,
+                        observed,
+                    }
                 })?;
             let data_row = match payload {
                 serde_json::Value::Object(values) => values.into_iter().collect(),
@@ -2081,15 +2197,53 @@ impl Queryable for PostgresSource {
 
 #[cfg(test)]
 mod wire_budget_tests {
-    use super::with_wire_row_budget;
+    use super::{with_wire_row_budget, PgQueryColumn};
+    use temps_query::QueryBudget;
 
     #[test]
     fn generated_query_guards_encoded_row_before_wire_transfer() {
-        let sql = with_wire_row_budget("SELECT * FROM public.users", 262_144);
-        assert!(sql.contains("OCTET_LENGTH(__temps_payload) <= 262144"));
-        assert!(sql.contains("THEN __temps_payload::jsonb ELSE NULL"));
-        assert!(sql.contains("TO_JSONB(__temps_source)::text"));
+        let columns = vec![
+            PgQueryColumn {
+                name: "bio".to_string(),
+                data_type: "text".to_string(),
+            },
+            PgQueryColumn {
+                name: "payload".to_string(),
+                data_type: "jsonb".to_string(),
+            },
+        ];
+        let budget = QueryBudget {
+            max_bytes: 262_144,
+            max_cell_bytes: 65_536,
+            ..QueryBudget::default()
+        };
+        let sql = with_wire_row_budget("SELECT * FROM public.users", &columns, budget)
+            .expect("supported schema should build a bounded query");
+        assert!(sql.contains("OCTET_LENGTH(__temps_source.\"bio\")::bigint * 6"));
+        assert!(sql.contains("PG_COLUMN_COMPRESSION(__temps_source.\"payload\")"));
+        assert!(sql.contains("__temps_max_cell <= 65536"));
+        assert!(sql.contains("__temps_row_size <= 262144"));
+        assert!(sql.contains("THEN TO_JSONB(__temps_source) ELSE NULL"));
+        assert!(!sql.contains("TO_JSONB(__temps_source)::text"));
+        assert_eq!(sql.matches("TO_JSONB(__temps_source)").count(), 1);
         assert!(sql.contains("SELECT * FROM public.users"));
+    }
+
+    #[test]
+    fn unknown_types_are_rejected_before_query_execution() {
+        let error = with_wire_row_budget(
+            "SELECT * FROM public.widgets",
+            &[PgQueryColumn {
+                name: "shape".to_string(),
+                data_type: "USER-DEFINED".to_string(),
+            }],
+            QueryBudget::default(),
+        )
+        .expect_err("unknown output functions have no safe size upper bound");
+        assert!(matches!(
+            error,
+            temps_query::DataError::OperationNotSupported(_)
+        ));
     }
 }
 
@@ -2771,6 +2925,76 @@ mod tests {
             )
         };
         drop(source);
+    }
+
+    #[tokio::test]
+    async fn oversized_first_row_is_rejected_by_real_postgres_query() {
+        let container = match GenericImage::new("postgres", "18-alpine")
+            .with_exposed_port(ContainerPort::Tcp(5432))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!("Docker unavailable; skipping PostgreSQL row-budget test: {error}");
+                return;
+            }
+        };
+        let host = container
+            .get_host()
+            .await
+            .expect("started PostgreSQL container must expose its host")
+            .to_string();
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("started PostgreSQL container must expose port 5432");
+        let source = match PostgresSource::connect(&host, port, "postgres", "", "postgres").await {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("PostgreSQL container unavailable after startup; skipping: {error}");
+                return;
+            }
+        };
+        source
+            .client
+            .batch_execute(
+                "CREATE TABLE oversized_rows (id bigint, payload text); \
+                 INSERT INTO oversized_rows VALUES (1, repeat('x', 2097152));",
+            )
+            .await
+            .expect("oversized row fixture should be created");
+        let budget = QueryBudget {
+            max_bytes: 128 * 1024,
+            max_cell_bytes: 64 * 1024,
+            ..QueryBudget::default()
+        };
+        let error = source
+            .query(
+                &ContainerPath::from_slice(&["postgres", "public"]),
+                "oversized_rows",
+                None,
+                QueryOptions {
+                    limit: Some(1),
+                    budget,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect_err("the first oversized row must be rejected");
+        assert!(matches!(
+            error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "wire_cell_bytes",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
