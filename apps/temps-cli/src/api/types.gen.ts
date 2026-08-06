@@ -18914,6 +18914,76 @@ export type ZoneListResponse = {
 };
 
 /**
+ * Latency and error statistics for one operation, i.e. one
+ * `(project, service, span name)` triple over the queried window.
+ */
+export type SpanStats = {
+    avg_duration_ms: number;
+    /**
+     * `stddev / avg`, or `0` when `avg` is zero.
+     */
+    coefficient_of_variation: number;
+    /**
+     * Number of spans aggregated.
+     */
+    count: number;
+    error_count: number;
+    /**
+     * `error_count / count`, in `[0, 1]`.
+     */
+    error_rate: number;
+    /**
+     * The most common span kind for this operation.
+     */
+    kind: SpanKind;
+    /**
+     * Start time of the most recent span in this group.
+     */
+    last_seen: string;
+    max_duration_ms: number;
+    min_duration_ms: number;
+    p50_duration_ms: number;
+    p95_duration_ms: number;
+    p99_duration_ms: number;
+    project_id: number;
+    service_name: string;
+    /**
+     * The span name, which is the operation identity: `GET /api/checkout`,
+     * `SELECT carts`, `payments.charge`.
+     */
+    span_name: string;
+    /**
+     * Sample standard deviation. `0` when the operation has a single sample.
+     */
+    stddev_duration_ms: number;
+    /**
+     * `p99 / p50`, or `0` when `p50` is zero.
+     */
+    tail_ratio: number;
+    /**
+     * `SUM(duration_ms)` — total wall-clock attributable to this operation.
+     */
+    total_duration_ms: number;
+};
+
+/**
+ * Response for `GET /otel/span-stats`.
+ */
+export type SpanStatsResponse = {
+    data: Array<SpanStats>;
+    end_time: string;
+    /**
+     * The window actually aggregated, echoed back because it is defaulted
+     * server-side when the caller omits it.
+     */
+    start_time: string;
+    /**
+     * Total number of distinct operations matching the filters, for pagination.
+     */
+    total: number;
+};
+
+/**
  * Response type for S3 source
  */
 export type S3SourceResponseWritable = {
@@ -49741,3 +49811,113 @@ export type GetAuditLogResponses = {
 };
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
+export type QuerySpanStatsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Single project to report on
+         */
+        project_id?: number;
+        /**
+         * Comma-separated project ids, e.g. `4,5,6`
+         */
+        project_ids?: string;
+        /**
+         * Window start (RFC 3339); defaults to 24h before end_time
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); defaults to now
+         */
+        end_time?: string;
+        /**
+         * Restrict to one service
+         */
+        service_name?: string;
+        /**
+         * Restrict to one operation by exact span name
+         */
+        span_name?: string;
+        /**
+         * Case-insensitive substring match on the span name
+         */
+        name_pattern?: string;
+        /**
+         * server | client | internal | producer | consumer
+         */
+        kind?: string;
+        /**
+         * ok | error | unset
+         */
+        status?: string;
+        /**
+         * Restrict to one environment
+         */
+        environment_id?: number;
+        /**
+         * Restrict to one deployment
+         */
+        deployment_id?: number;
+        /**
+         * Comma-separated key=value span attribute filters
+         */
+        attributes?: string;
+        /**
+         * Ignore spans faster than this
+         */
+        min_duration_ms?: number;
+        /**
+         * Drop operations with fewer samples than this
+         */
+        min_count?: number;
+        /**
+         * total_time | p50 | p95 | p99 | max | avg | stddev | count | errors | error_rate | variability | tail_ratio
+         */
+        sort_by?: string;
+        /**
+         * asc | desc (default)
+         */
+        sort_order?: string;
+        /**
+         * Page size (default 20, max 100)
+         */
+        limit?: number;
+        /**
+         * Page offset
+         */
+        offset?: number;
+    };
+    url: '/otel/span-stats';
+};
+
+export type QuerySpanStatsErrors = {
+    /**
+     * Invalid query (no project, empty window)
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type QuerySpanStatsError = QuerySpanStatsErrors[keyof QuerySpanStatsErrors];
+
+export type QuerySpanStatsResponses = {
+    /**
+     * Per-operation latency statistics
+     */
+    200: SpanStatsResponse;
+};
+
+export type QuerySpanStatsResponse = QuerySpanStatsResponses[keyof QuerySpanStatsResponses];
