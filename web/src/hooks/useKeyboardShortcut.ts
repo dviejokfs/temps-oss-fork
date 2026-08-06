@@ -21,8 +21,21 @@ interface KeyboardShortcutOptions {
 }
 
 /**
+ * Selector for the Radix overlays that own the keyboard while they're open.
+ * A bare letter shortcut must not fire underneath one of these — otherwise
+ * pressing `N` inside an edit dialog navigates the page out from under it.
+ */
+const OPEN_OVERLAY_SELECTOR = [
+  '[role="dialog"][data-state="open"]',
+  '[role="alertdialog"][data-state="open"]',
+  '[role="menu"][data-state="open"]',
+  '[role="listbox"][data-state="open"]',
+].join(',')
+
+/**
  * Hook to register keyboard shortcuts that trigger navigation or callbacks.
- * Prevents triggering when user is typing in input fields.
+ * Prevents triggering when the user is typing in an input field or when a
+ * dialog, menu or select is open on top of the page.
  *
  * @example
  * // Navigate to create page on 'N' key
@@ -51,9 +64,13 @@ export function useKeyboardShortcut({
         target.tagName === 'TEXTAREA' ||
         target.isContentEditable
 
+      // A dialog, menu or select on top of the page owns the keyboard.
+      const overlayOpen = document.querySelector(OPEN_OVERLAY_SELECTOR) !== null
+
       // Only trigger if not typing and no modifier keys are pressed
       if (
         !isTyping &&
+        !overlayOpen &&
         e.key.toLowerCase() === key.toLowerCase() &&
         !e.metaKey &&
         !e.ctrlKey &&

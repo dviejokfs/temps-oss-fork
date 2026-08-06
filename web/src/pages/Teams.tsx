@@ -27,6 +27,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   Dialog,
   DialogContent,
@@ -260,10 +261,11 @@ export function Teams() {
             should reach. Projects with no grants stay open to everyone.
           </p>
         </div>
-        <Button onClick={() => setCreateOpen(true)}>
-          <Plus className="mr-2 h-4 w-4" />
-          <span className="hidden sm:inline">Create team</span>
-        </Button>
+        <CreateActionButton
+          onClick={() => setCreateOpen(true)}
+          label="Create team"
+          className="self-start"
+        />
       </div>
 
       <Card>
