@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router'
 
 interface KeyboardShortcutOptions {
@@ -53,6 +53,16 @@ export function useKeyboardShortcut({
 }: KeyboardShortcutOptions) {
   const navigate = useNavigate()
 
+  // Callers pass an inline arrow (`onClick={() => setOpen(true)}`), so a new
+  // identity every render. Keeping it in a ref stops the effect from tearing
+  // the keydown listener down and re-adding it on each render. The write is
+  // in an effect, not in render — mutating a ref during render is unsafe
+  // under concurrent rendering.
+  const callbackRef = useRef(callback)
+  useEffect(() => {
+    callbackRef.current = callback
+  }, [callback])
+
   useEffect(() => {
     if (!enabled) return
 
@@ -79,8 +89,8 @@ export function useKeyboardShortcut({
       ) {
         e.preventDefault()
 
-        if (callback) {
-          callback()
+        if (callbackRef.current) {
+          callbackRef.current()
         } else if (path) {
           navigate(path)
         }
@@ -89,5 +99,5 @@ export function useKeyboardShortcut({
 
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [key, path, callback, enabled, navigate])
+  }, [key, path, enabled, navigate])
 }

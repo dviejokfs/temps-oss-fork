@@ -73,6 +73,10 @@ export function ProjectDot({
       className={cn('h-2.5 w-2.5 shrink-0 rounded-full', className)}
       style={{ backgroundColor: projectColor(projectId) }}
       title={name}
+      // role="img" so the label is actually announced — an aria-label on a
+      // role-less generic element is ignored by most screen readers, which
+      // would leave the project unreadable once the slug text is gone.
+      role="img"
       aria-label={`Project: ${name}`}
     />
   )

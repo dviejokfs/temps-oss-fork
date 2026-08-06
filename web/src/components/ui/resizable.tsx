@@ -1,3 +1,4 @@
+import type { ComponentProps } from 'react'
 import { GripVertical } from 'lucide-react'
 import { Group, Panel, Separator } from 'react-resizable-panels'
 import { cn } from '@/lib/utils'
@@ -13,7 +14,7 @@ import { cn } from '@/lib/utils'
 function ResizablePanelGroup({
   className,
   ...props
-}: React.ComponentProps<typeof Group>) {
+}: ComponentProps<typeof Group>) {
   return (
     <Group
       className={cn(
@@ -36,7 +37,7 @@ function ResizableHandle({
   withHandle,
   className,
   ...props
-}: React.ComponentProps<typeof Separator> & { withHandle?: boolean }) {
+}: ComponentProps<typeof Separator> & { withHandle?: boolean }) {
   return (
     <Separator
       className={cn(
