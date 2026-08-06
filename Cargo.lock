@@ -12306,6 +12306,7 @@ version = "0.1.0-beta.55"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures-util",
  "rustls",
  "serde_json",
  "temps-query",

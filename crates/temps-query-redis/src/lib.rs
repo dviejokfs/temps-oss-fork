@@ -32,15 +32,33 @@ use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
 use std::collections::HashMap;
 use temps_query::{
-    Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataError,
-    DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType,
-    QueryOptions, QueryResult, Queryable, Result,
+    BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
+    DataError, DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef,
+    FieldType, QueryOptions, QueryResult, QueryStats, Queryable, Result,
 };
 use tracing::{debug, error};
 
 /// Redis data source implementation
 pub struct RedisSource {
     connection: ConnectionManager,
+}
+
+fn redis_aggregate_limit(options: &QueryOptions) -> usize {
+    // A JSON array/object consumes at least two structural elements per Redis
+    // item (container entry + scalar), and zset rows consume more. Dividing by
+    // four is deliberately conservative and keeps the shared structural
+    // limiter from accepting a backend page that was already too large.
+    let structural_limit = (options.budget.max_value_elements_per_row / 4).max(1);
+    options.limit.unwrap_or(100).min(structural_limit)
+}
+
+fn trim_extra<T>(values: &mut Vec<T>, limit: usize) -> bool {
+    if values.len() > limit {
+        values.truncate(limit);
+        true
+    } else {
+        false
+    }
 }
 
 impl RedisSource {
@@ -205,7 +223,12 @@ impl RedisSource {
     }
 
     /// Get the value of a specific key
-    async fn get_key_value(&self, db: i32, key: &str) -> Result<DataRow> {
+    async fn get_key_value(
+        &self,
+        db: i32,
+        key: &str,
+        options: &QueryOptions,
+    ) -> Result<(DataRow, bool)> {
         let mut conn = self.get_db_connection(db).await?;
 
         debug!("Getting value for key '{}' in database {}", key, db);
@@ -239,37 +262,102 @@ impl RedisSource {
             DataError::QueryFailed(format!("Failed to get key TTL: {}", e))
         })?;
 
+        // Reject a huge value before asking Redis to send it. Redis strings and
+        // collection members may each be hundreds of MiB; paging the collection
+        // alone does not protect the control plane from one giant member.
+        let memory_usage: Option<usize> = redis::cmd("MEMORY")
+            .arg("USAGE")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e: RedisError| {
+                error!(key_type, error = %e, "failed to inspect Redis value size");
+                DataError::BackendQueryFailed {
+                    backend: "Redis",
+                    entity: key.to_string(),
+                }
+            })?;
+        if let Some(observed) = memory_usage {
+            if observed > options.budget.max_cell_bytes {
+                return Err(DataError::ResultLimitExceeded {
+                    entity: key.to_string(),
+                    limit_kind: "redis_value_bytes",
+                    limit: options.budget.max_cell_bytes,
+                    observed,
+                });
+            }
+        }
+
+        let offset = options.offset.unwrap_or(0);
+        let aggregate_limit = redis_aggregate_limit(options);
+        let start = isize::try_from(offset).unwrap_or(isize::MAX);
+        let end = start.saturating_add(isize::try_from(aggregate_limit).unwrap_or(isize::MAX));
+        let mut truncated = false;
+
         // Get value based on type
         let value = match key_type.as_str() {
             "string" => {
-                let v: String = conn.get(key).await.map_err(|e: RedisError| {
-                    error!("Failed to get string value: {}", e);
-                    DataError::QueryFailed(format!("Failed to get string value: {}", e))
-                })?;
-                serde_json::Value::String(v)
+                let max_string_bytes = options.budget.max_cell_bytes.saturating_sub(2).max(1);
+                let end = i64::try_from(max_string_bytes.saturating_sub(1)).unwrap_or(i64::MAX);
+                let v: Vec<u8> = redis::cmd("GETRANGE")
+                    .arg(key)
+                    .arg(0)
+                    .arg(end)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e: RedisError| {
+                        error!("Failed to get string value: {}", e);
+                        DataError::BackendQueryFailed {
+                            backend: "Redis",
+                            entity: key.to_string(),
+                        }
+                    })?;
+                serde_json::Value::String(String::from_utf8_lossy(&v).into_owned())
             }
             "list" => {
-                let v: Vec<String> = conn.lrange(key, 0, -1).await.map_err(|e: RedisError| {
-                    error!("Failed to get list value: {}", e);
-                    DataError::QueryFailed(format!("Failed to get list value: {}", e))
-                })?;
+                let mut v: Vec<String> =
+                    conn.lrange(key, start, end)
+                        .await
+                        .map_err(|e: RedisError| {
+                            error!("Failed to get list value: {}", e);
+                            DataError::BackendQueryFailed {
+                                backend: "Redis",
+                                entity: key.to_string(),
+                            }
+                        })?;
+                truncated = trim_extra(&mut v, aggregate_limit);
                 serde_json::json!(v)
             }
             "set" => {
-                let v: Vec<String> = conn.smembers(key).await.map_err(|e: RedisError| {
-                    error!("Failed to get set value: {}", e);
-                    DataError::QueryFailed(format!("Failed to get set value: {}", e))
-                })?;
+                let (_cursor, mut v): (u64, Vec<String>) = redis::cmd("SSCAN")
+                    .arg(key)
+                    .arg(0)
+                    .arg("COUNT")
+                    .arg(aggregate_limit.saturating_add(1))
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e: RedisError| {
+                        error!(error = %e, "failed to page Redis set");
+                        DataError::BackendQueryFailed {
+                            backend: "Redis",
+                            entity: key.to_string(),
+                        }
+                    })?;
+                truncated = trim_extra(&mut v, aggregate_limit);
                 serde_json::json!(v)
             }
             "zset" => {
-                let v: Vec<(String, f64)> =
-                    conn.zrange_withscores(key, 0, -1)
-                        .await
-                        .map_err(|e: RedisError| {
-                            error!("Failed to get sorted set value: {}", e);
-                            DataError::QueryFailed(format!("Failed to get sorted set value: {}", e))
-                        })?;
+                let mut v: Vec<(String, f64)> = conn
+                    .zrange_withscores(key, start, end)
+                    .await
+                    .map_err(|e: RedisError| {
+                        error!("Failed to get sorted set value: {}", e);
+                        DataError::BackendQueryFailed {
+                            backend: "Redis",
+                            entity: key.to_string(),
+                        }
+                    })?;
+                truncated = trim_extra(&mut v, aggregate_limit);
                 serde_json::json!(v
                     .into_iter()
                     .map(|(member, score)| {
@@ -278,12 +366,22 @@ impl RedisSource {
                     .collect::<Vec<_>>())
             }
             "hash" => {
-                let v: HashMap<String, String> =
-                    conn.hgetall(key).await.map_err(|e: RedisError| {
-                        error!("Failed to get hash value: {}", e);
-                        DataError::QueryFailed(format!("Failed to get hash value: {}", e))
+                let (_cursor, mut values): (u64, Vec<(String, String)>) = redis::cmd("HSCAN")
+                    .arg(key)
+                    .arg(0)
+                    .arg("COUNT")
+                    .arg(aggregate_limit.saturating_add(1))
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e: RedisError| {
+                        error!(error = %e, "failed to page Redis hash");
+                        DataError::BackendQueryFailed {
+                            backend: "Redis",
+                            entity: key.to_string(),
+                        }
                     })?;
-                serde_json::json!(v)
+                truncated = trim_extra(&mut values, aggregate_limit);
+                serde_json::json!(values.into_iter().collect::<HashMap<_, _>>())
             }
             "stream" => {
                 // For streams, just indicate it's a stream - full stream reading is complex
@@ -301,7 +399,7 @@ impl RedisSource {
         row.insert("ttl".to_string(), serde_json::Value::Number(ttl.into()));
         row.insert("value".to_string(), value);
 
-        Ok(row)
+        Ok((row, truncated))
     }
 
     /// Get information about a specific key
@@ -383,7 +481,9 @@ impl RedisSource {
             row_count: Some(1),
             size_bytes: None,
             schema: Some(schema),
-            metadata: Some(serde_json::to_value(metadata_map).unwrap()),
+            metadata: Some(serde_json::Value::Object(
+                metadata_map.into_iter().collect(),
+            )),
         })
     }
 }
@@ -578,7 +678,7 @@ impl Queryable for RedisSource {
         container_path: &ContainerPath,
         entity_name: &str,
         _filters: Option<serde_json::Value>,
-        _options: QueryOptions,
+        options: QueryOptions,
     ) -> Result<QueryResult> {
         let start = std::time::Instant::now();
 
@@ -604,7 +704,7 @@ impl Queryable for RedisSource {
         }
 
         // Get the key value
-        let row = self.get_key_value(db_num, entity_name).await?;
+        let (row, value_truncated) = self.get_key_value(db_num, entity_name, &options).await?;
         let execution_ms = start.elapsed().as_millis() as u64;
 
         // Define schema for the result
@@ -639,7 +739,21 @@ impl Queryable for RedisSource {
             primary_key: Some(vec!["key".to_string()]),
         };
 
-        Ok(QueryResult::new(schema, vec![row], execution_ms))
+        let mut bounded = BoundedRows::new(options.budget);
+        bounded.push(entity_name, row)?;
+        let (rows, budget_truncated) = bounded.into_parts();
+        Ok(QueryResult {
+            schema,
+            stats: QueryStats {
+                row_count: rows.len(),
+                total_rows: Some(1),
+                execution_ms,
+                has_more: false,
+                next_cursor: None,
+                truncated: value_truncated || budget_truncated,
+            },
+            rows,
+        })
     }
 
     async fn count(
@@ -720,6 +834,7 @@ impl Queryable for RedisSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_query::QueryBudget;
 
     #[test]
     fn test_source_type() {
@@ -738,5 +853,22 @@ mod tests {
         assert!((0..=15).contains(&0));
         assert!((0..=15).contains(&15));
         assert!(!(0..=15).contains(&16));
+    }
+
+    #[test]
+    fn redis_aggregate_pages_are_capped_by_structural_budget() {
+        let options = QueryOptions {
+            limit: Some(10_000),
+            budget: QueryBudget {
+                max_value_elements_per_row: 40,
+                ..QueryBudget::default()
+            },
+            ..QueryOptions::default()
+        };
+        assert_eq!(redis_aggregate_limit(&options), 10);
+
+        let mut values = vec!["value"; 11];
+        assert!(trim_extra(&mut values, redis_aggregate_limit(&options)));
+        assert_eq!(values.len(), 10);
     }
 }

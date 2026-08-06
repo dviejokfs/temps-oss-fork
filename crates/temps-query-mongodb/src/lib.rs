@@ -34,8 +34,8 @@ use mongodb::{
 };
 use std::collections::HashMap;
 use temps_query::{
-    Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataError,
-    DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType, Result,
+    BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
+    DataError, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType, Result,
 };
 use tracing::{debug, error};
 
@@ -278,7 +278,9 @@ impl MongoDBSource {
                     row_count: None, // Would require counting documents
                     size_bytes: None,
                     schema: None,
-                    metadata: Some(serde_json::to_value(metadata_map).unwrap()),
+                    metadata: Some(serde_json::Value::Object(
+                        metadata_map.into_iter().collect(),
+                    )),
                 }
             })
             .collect();
@@ -361,7 +363,9 @@ impl MongoDBSource {
             row_count: doc_count.map(|c| c as usize),
             size_bytes,
             schema,
-            metadata: Some(serde_json::to_value(metadata_map).unwrap()),
+            metadata: Some(serde_json::Value::Object(
+                metadata_map.into_iter().collect(),
+            )),
         })
     }
 
@@ -630,8 +634,6 @@ impl temps_query::Queryable for MongoDBSource {
             Document::new()
         };
 
-        debug!("MongoDB filter: {:?}", filter_doc);
-
         // Apply pagination
         let limit = options.limit.unwrap_or(100) as i64;
         let skip = options.offset.unwrap_or(0) as u64;
@@ -648,8 +650,8 @@ impl temps_query::Queryable for MongoDBSource {
         };
 
         debug!(
-            "MongoDB query: filter={:?}, limit={}, skip={}, sort={:?}",
-            filter_doc, limit, skip, sort_doc
+            entity = entity_name,
+            limit, skip, "executing MongoDB data query"
         );
 
         let start_time = std::time::Instant::now();
@@ -671,20 +673,34 @@ impl temps_query::Queryable for MongoDBSource {
             .skip(skip)
             .max_time(max_time)
             .await
-            .map_err(|e| {
-                error!("MongoDB query failed: {}", e);
-                DataError::QueryFailed(format!("MongoDB query failed: {}", e))
+            .map_err(|_error| {
+                error!(entity = entity_name, limit, "MongoDB query failed");
+                DataError::BackendQueryFailed {
+                    backend: "MongoDB",
+                    entity: entity_name.to_string(),
+                }
             })?;
 
-        // Collect results
-        let mut rows = Vec::new();
-        while cursor.advance().await.map_err(|e| {
-            error!("Failed to iterate MongoDB cursor: {}", e);
-            DataError::QueryFailed(format!("Failed to iterate results: {}", e))
+        // Decode one cursor document at a time into the shared bounded
+        // collector. MongoDB itself caps one BSON document at 16 MiB; the
+        // tighter query budget rejects it before it can accumulate with peers.
+        let mut bounded = BoundedRows::new(options.budget);
+        while cursor.advance().await.map_err(|_error| {
+            error!(entity = entity_name, limit, "MongoDB cursor failed");
+            DataError::BackendQueryFailed {
+                backend: "MongoDB",
+                entity: entity_name.to_string(),
+            }
         })? {
-            let doc = cursor.deserialize_current().map_err(|e| {
-                error!("Failed to deserialize MongoDB document: {}", e);
-                DataError::QueryFailed(format!("Failed to deserialize document: {}", e))
+            let doc = cursor.deserialize_current().map_err(|_error| {
+                error!(
+                    entity = entity_name,
+                    limit, "MongoDB document decode failed"
+                );
+                DataError::BackendQueryFailed {
+                    backend: "MongoDB",
+                    entity: entity_name.to_string(),
+                }
             })?;
 
             // Convert Document to HashMap for DataRow
@@ -696,8 +712,11 @@ impl temps_query::Queryable for MongoDBSource {
                     row_map.insert(key, json_value);
                 }
             }
-            rows.push(row_map);
+            if !bounded.push(entity_name, row_map)? {
+                break;
+            }
         }
+        let (rows, truncated) = bounded.into_parts();
 
         // Get total count (expensive, but needed for pagination).
         //
@@ -709,9 +728,12 @@ impl temps_query::Queryable for MongoDBSource {
             .count_documents(filter_doc)
             .max_time(max_time)
             .await
-            .map_err(|e| {
-                error!("Failed to count MongoDB documents: {}", e);
-                DataError::QueryFailed(format!("Failed to count documents: {}", e))
+            .map_err(|_error| {
+                error!(entity = entity_name, limit, "MongoDB count failed");
+                DataError::BackendQueryFailed {
+                    backend: "MongoDB",
+                    entity: entity_name.to_string(),
+                }
             })?;
 
         let execution_time = start_time.elapsed();
@@ -769,6 +791,7 @@ impl temps_query::Queryable for MongoDBSource {
                 execution_ms: execution_time.as_millis() as u64,
                 has_more,
                 next_cursor: None, // MongoDB uses offset-based pagination, not cursors
+                truncated,
             },
         })
     }

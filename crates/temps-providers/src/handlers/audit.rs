@@ -111,9 +111,9 @@ pub struct AiRowsReadAudit {
     pub entity: String,
     pub returned_rows: usize,
     pub truncated: bool,
-    /// The filter the agent supplied, if any. Recorded because it is the part
-    /// of the request a prompt injection would be steering.
-    pub filter: Option<String>,
+    /// Bounded structural category only; literal filter values are never
+    /// persisted because they commonly contain emails, tokens, and other PII.
+    pub filter_shape: Option<String>,
 }
 
 impl AuditOperation for AiRowsReadAudit {
@@ -462,5 +462,33 @@ impl AuditOperation for ExternalServiceClusterMemberPromotedAudit {
     fn serialize(&self) -> Result<String> {
         serde_json::to_string(self)
             .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_row_read_audit_never_serializes_filter_literals() {
+        let audit = AiRowsReadAudit {
+            context: AuditContext {
+                user_id: 42,
+                ip_address: None,
+                user_agent: "test-agent".to_string(),
+            },
+            service_id: 7,
+            service_name: "postgres".to_string(),
+            container_path: "app/public".to_string(),
+            entity: "users".to_string(),
+            returned_rows: 1,
+            truncated: false,
+            filter_shape: Some("sql_where".to_string()),
+        };
+
+        let serialized = AuditOperation::serialize(&audit).expect("audit serializes");
+        assert!(serialized.contains("sql_where"));
+        assert!(!serialized.contains("alice@example.com"));
+        assert!(!serialized.contains("tok_live_secret"));
     }
 }

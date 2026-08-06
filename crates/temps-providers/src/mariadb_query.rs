@@ -1,12 +1,13 @@
 use async_trait::async_trait;
-use base64::Engine;
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
-use sqlx::{Column, Row, TypeInfo};
+use futures::TryStreamExt;
+use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
+use sqlx::Row;
 use std::collections::HashMap;
 use temps_query::{
-    Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataError,
-    DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType,
-    Introspect, QueryOptions, QueryResult, QuerySchemaProvider, QueryStats, Queryable, Result,
+    BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
+    DataError, DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef,
+    FieldType, Introspect, QueryOptions, QueryResult, QuerySchemaProvider, QueryStats, Queryable,
+    Result,
 };
 use tracing::{debug, error, warn};
 
@@ -130,83 +131,6 @@ impl MariaDbSource {
             "json" => FieldType::Json,
             _ => FieldType::String,
         }
-    }
-
-    fn row_to_datarow(row: &MySqlRow) -> Result<DataRow> {
-        let mut data_row = HashMap::new();
-        for (idx, column) in row.columns().iter().enumerate() {
-            let value = Self::extract_value(row, idx)?;
-            data_row.insert(column.name().to_string(), value);
-        }
-        Ok(data_row)
-    }
-
-    fn extract_value(row: &MySqlRow, idx: usize) -> Result<serde_json::Value> {
-        let column = &row.columns()[idx];
-        let type_name = column.type_info().name().to_ascii_lowercase();
-
-        let value = match type_name.as_str() {
-            "bool" | "boolean" => row
-                .try_get::<Option<bool>, _>(idx)
-                .ok()
-                .flatten()
-                .map(serde_json::Value::Bool)
-                .unwrap_or(serde_json::Value::Null),
-            "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "year" => row
-                .try_get::<Option<i32>, _>(idx)
-                .ok()
-                .flatten()
-                .map(|v| serde_json::Value::Number(v.into()))
-                .unwrap_or(serde_json::Value::Null),
-            "bigint" => row
-                .try_get::<Option<i64>, _>(idx)
-                .ok()
-                .flatten()
-                .map(|v| serde_json::Value::Number(v.into()))
-                .or_else(|| {
-                    row.try_get::<Option<u64>, _>(idx)
-                        .ok()
-                        .flatten()
-                        .map(|v| serde_json::Value::Number(v.into()))
-                })
-                .unwrap_or(serde_json::Value::Null),
-            "float" => row
-                .try_get::<Option<f32>, _>(idx)
-                .ok()
-                .flatten()
-                .and_then(|v| serde_json::Number::from_f64(v as f64))
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-            "double" | "real" => row
-                .try_get::<Option<f64>, _>(idx)
-                .ok()
-                .flatten()
-                .and_then(serde_json::Number::from_f64)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-            "json" => row
-                .try_get::<Option<String>, _>(idx)
-                .ok()
-                .flatten()
-                .and_then(|v| serde_json::from_str(&v).ok())
-                .unwrap_or(serde_json::Value::Null),
-            "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => row
-                .try_get::<Option<Vec<u8>>, _>(idx)
-                .ok()
-                .flatten()
-                .map(|v| {
-                    serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(v))
-                })
-                .unwrap_or(serde_json::Value::Null),
-            _ => row
-                .try_get::<Option<String>, _>(idx)
-                .ok()
-                .flatten()
-                .map(serde_json::Value::String)
-                .unwrap_or(serde_json::Value::Null),
-        };
-
-        Ok(value)
     }
 }
 
@@ -572,10 +496,12 @@ impl Queryable for MariaDbSource {
     ) -> Result<QueryResult> {
         let database_name = database_from_path(container_path, &self.database_name)?;
         validate_identifier("table", entity_name)?;
+        let schema = self.get_schema(container_path, entity_name).await?;
 
         let start = std::time::Instant::now();
+        let projection = mariadb_json_projection(&schema);
         let mut sql = format!(
-            "SELECT * FROM {}.{}",
+            "SELECT {projection} AS __temps_payload FROM {}.{}",
             quote_identifier(database_name),
             quote_identifier(entity_name)
         );
@@ -604,8 +530,12 @@ impl Queryable for MariaDbSource {
         let limit = options.limit.unwrap_or(100);
         let offset = options.offset.unwrap_or(0);
         sql.push_str(" LIMIT ? OFFSET ?");
+        let sql = with_wire_row_budget(&sql);
 
-        debug!("Executing MariaDB query: {}", sql);
+        debug!(
+            entity = entity_name,
+            limit, offset, "executing MariaDB data query"
+        );
 
         // SECURITY / AVAILABILITY: bound the query server-side.
         //
@@ -626,20 +556,65 @@ impl Queryable for MariaDbSource {
         })?;
         apply_statement_timeout(&mut conn, timeout_ms, database_name).await;
 
-        let rows = sqlx::query(&sql)
+        let mut stream = sqlx::query(&sql)
+            .bind(options.budget.max_bytes as u64)
             .bind(limit as i64)
             .bind(offset as i64)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| {
-                error!("MariaDB query failed: {}", e);
-                DataError::QueryFailed(format!("{}\n\nQuery: {}", e, sql))
+            .fetch(&mut *conn);
+        let mut bounded = BoundedRows::new(options.budget);
+        while let Some(row) = stream.try_next().await.map_err(|_error| {
+            error!(entity = entity_name, limit, "MariaDB row stream failed");
+            DataError::BackendQueryFailed {
+                backend: "MariaDB",
+                entity: entity_name.to_string(),
+            }
+        })? {
+            let observed = row.try_get::<u64, _>("__temps_size").map_err(|_error| {
+                error!(
+                    entity = entity_name,
+                    limit, "MariaDB bounded row size decode failed"
+                );
+                DataError::BackendQueryFailed {
+                    backend: "MariaDB",
+                    entity: entity_name.to_string(),
+                }
             })?;
+            let payload = row
+                .try_get::<Option<String>, _>("__temps_row")
+                .map_err(|_error| {
+                    error!(
+                        entity = entity_name,
+                        limit, "MariaDB bounded row decode failed"
+                    );
+                    DataError::BackendQueryFailed {
+                        backend: "MariaDB",
+                        entity: entity_name.to_string(),
+                    }
+                })?
+                .ok_or_else(|| DataError::ResultLimitExceeded {
+                    entity: entity_name.to_string(),
+                    limit_kind: "wire_row_bytes",
+                    limit: options.budget.max_bytes,
+                    observed: usize::try_from(observed).unwrap_or(usize::MAX),
+                })?;
+            let data_row = serde_json::from_str::<DataRow>(&payload).map_err(|_error| {
+                error!(
+                    entity = entity_name,
+                    limit, "MariaDB bounded JSON row decode failed"
+                );
+                DataError::BackendQueryFailed {
+                    backend: "MariaDB",
+                    entity: entity_name.to_string(),
+                }
+            })?;
+            if !bounded.push(entity_name, data_row)? {
+                break;
+            }
+        }
+        drop(stream);
         drop(conn);
 
-        let data_rows: Result<Vec<DataRow>> = rows.iter().map(Self::row_to_datarow).collect();
-        let data_rows = data_rows?;
-        let schema = self.get_schema(container_path, entity_name).await?;
+        let (data_rows, truncated) = bounded.into_parts();
         let row_count = data_rows.len();
 
         Ok(QueryResult {
@@ -651,6 +626,7 @@ impl Queryable for MariaDbSource {
                 execution_ms: start.elapsed().as_millis() as u64,
                 has_more: row_count >= limit,
                 next_cursor: None,
+                truncated,
             },
         })
     }
@@ -826,7 +802,43 @@ fn database_from_path<'a>(
 }
 
 fn quote_identifier(value: &str) -> String {
-    format!("`{}`", value)
+    format!("`{}`", value.replace('`', "``"))
+}
+
+/// Build one JSON value per source row so MariaDB can measure it before the
+/// driver sees any user-controlled cell contents. Binary values retain the
+/// previous API representation (base64 text).
+fn mariadb_json_projection(schema: &DatasetSchema) -> String {
+    let entries = schema.fields.iter().flat_map(|field| {
+        let key_hex = field
+            .name
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let key = format!("CONVERT(X'{key_hex}' USING utf8mb4)");
+        let column = quote_identifier(&field.name);
+        let value = if field.field_type == FieldType::Bytes {
+            format!("TO_BASE64({column})")
+        } else {
+            column
+        };
+        [key, value]
+    });
+
+    format!("JSON_OBJECT({})", entries.collect::<Vec<_>>().join(", "))
+}
+
+/// Apply the per-row response ceiling in the same statement that reads the
+/// row. Oversized JSON is replaced by NULL plus its length, so it never crosses
+/// the database wire into the control plane and there is no check/read race.
+fn with_wire_row_budget(sql: &str) -> String {
+    format!(
+        "SELECT CASE WHEN OCTET_LENGTH(__temps_payload) <= ? \
+             THEN __temps_payload ELSE NULL END AS __temps_row, \
+             OCTET_LENGTH(__temps_payload) AS __temps_size \
+         FROM ({sql}) AS __temps_bounded"
+    )
 }
 
 fn validate_identifier(label: &str, value: &str) -> Result<()> {
@@ -1190,6 +1202,38 @@ pub(crate) fn is_mariadb_compatible_image(image: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_query_guards_encoded_row_before_wire_transfer() {
+        let schema = DatasetSchema {
+            fields: vec![
+                FieldDef {
+                    name: "display_name".to_string(),
+                    field_type: FieldType::String,
+                    nullable: false,
+                    description: None,
+                },
+                FieldDef {
+                    name: "avatar".to_string(),
+                    field_type: FieldType::Bytes,
+                    nullable: true,
+                    description: None,
+                },
+            ],
+            partitions: None,
+            primary_key: None,
+        };
+        let projection = mariadb_json_projection(&schema);
+        let sql = with_wire_row_budget(&format!(
+            "SELECT {projection} AS __temps_payload FROM `app`.`users` LIMIT ? OFFSET ?"
+        ));
+
+        assert!(sql.contains("OCTET_LENGTH(__temps_payload) <= ?"));
+        assert!(sql.contains("THEN __temps_payload ELSE NULL"));
+        assert!(sql.contains("JSON_OBJECT("));
+        assert!(sql.contains("TO_BASE64(`avatar`)"));
+        assert!(sql.contains("FROM `app`.`users` LIMIT ? OFFSET ?"));
+    }
 
     fn assert_where_rejected(clause: &str) {
         assert!(

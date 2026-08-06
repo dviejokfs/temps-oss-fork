@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
-use temps_query::{ContainerInfo, ContainerPath, EntityInfo, QueryOptions};
+use temps_query::{ContainerInfo, ContainerPath, EntityInfo, QueryBudget, QueryOptions};
 use utoipa::ToSchema;
 
 use super::audit::{AiDataAccessChangedAudit, AiRowsReadAudit};
@@ -294,40 +294,95 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// that there is more.
 const AI_MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
-/// Serialise rows, stopping before the response exceeds `budget` bytes.
-///
-/// Returns the rows that fit and whether anything was dropped. Truncating here
-/// rather than letting a downstream layer cut the body in half keeps every
-/// response valid JSON, and the caller reports the truncation explicitly so a
-/// partial page is never mistaken for a complete one — by a human reading the
-/// console, by a script reading the CLI, or by a model reading a tool result.
-fn take_rows_within_budget(
-    rows: Vec<temps_query::DataRow>,
-    budget: usize,
-) -> (Vec<serde_json::Value>, bool) {
-    let mut out = Vec::with_capacity(rows.len());
-    let mut used = 0usize;
-    let mut truncated = false;
-
-    for row in rows {
-        let value = serde_json::to_value(row).unwrap_or_default();
-        // Cheap proxy for the serialised size. Exact to within the separators
-        // the array itself adds, which is far inside the slack in the budget.
-        let size = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
-
-        // Always emit at least one row. A single row larger than the whole
-        // budget would otherwise produce an empty page that looks like "no
-        // results" and cannot be paged past.
-        if !out.is_empty() && used + size > budget {
-            truncated = true;
-            break;
+fn query_budget(is_ai_call: bool) -> QueryBudget {
+    if is_ai_call {
+        QueryBudget {
+            max_bytes: AI_MAX_RESPONSE_BYTES,
+            max_cells: 4_096,
+            max_cells_per_row: 128,
+            max_cell_bytes: 64 * 1024,
+            max_value_elements_per_row: 1_000,
+            max_nesting_depth: 32,
         }
-
-        used += size;
-        out.push(value);
+    } else {
+        QueryBudget {
+            max_bytes: MAX_RESPONSE_BYTES,
+            ..QueryBudget::default()
+        }
     }
+}
 
-    (out, truncated)
+fn data_rows_to_json(rows: Vec<temps_query::DataRow>) -> Vec<serde_json::Value> {
+    rows.into_iter()
+        .map(|row| serde_json::Value::Object(row.into_iter().collect()))
+        .collect()
+}
+
+fn filter_shape(filter: Option<&serde_json::Value>) -> Option<String> {
+    filter
+        .map(|value| match value {
+            serde_json::Value::Object(object) if object.contains_key("where") => "sql_where",
+            serde_json::Value::Object(_) => "structured_object",
+            serde_json::Value::Array(_) => "structured_array",
+            _ => "scalar",
+        })
+        .map(str::to_string)
+}
+
+fn query_error_problem(
+    error: temps_query::DataError,
+    service_id: i32,
+    entity: &str,
+    limit: usize,
+) -> Problem {
+    let (status, title, kind, safe_detail) = match &error {
+        temps_query::DataError::ResultLimitExceeded { .. } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Query Result Too Large",
+            "result_limit_exceeded",
+            Some(error.to_string()),
+        ),
+        temps_query::DataError::InvalidQuery(_) => (
+            StatusCode::BAD_REQUEST,
+            "Invalid Query",
+            "invalid_query",
+            Some(error.to_string()),
+        ),
+        temps_query::DataError::QueryFailed(_)
+        | temps_query::DataError::BackendQueryFailed { .. } => (
+            StatusCode::BAD_REQUEST,
+            "Query Failed",
+            "backend_query_failed",
+            None,
+        ),
+        temps_query::DataError::NotFound(_) => {
+            (StatusCode::NOT_FOUND, "Not Found", "not_found", None)
+        }
+        temps_query::DataError::QueryTimeout(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "Query Timed Out",
+            "query_timeout",
+            None,
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Query Error",
+            "internal_query_error",
+            None,
+        ),
+    };
+    tracing::warn!(
+        service_id,
+        entity,
+        limit,
+        error_kind = kind,
+        "external-service data query failed"
+    );
+    let mut problem = temps_core::problemdetails::new(status).with_title(title);
+    if let Some(detail) = safe_detail {
+        problem = problem.with_detail(detail);
+    }
+    problem
 }
 
 /// Whether an agent-originated request may read this service's rows.
@@ -553,6 +608,7 @@ pub async fn read_entity_rows(
         .await
         .ok();
     let filters = parse_row_filter(query.filter.as_deref(), filter_schema.as_ref())?;
+    let audit_filter_shape = filter_shape(filters.as_ref());
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments);
@@ -567,29 +623,14 @@ pub async fn read_entity_rows(
         sort_order: query.sort_order,
         timeout_ms: Some(crate::query_service::effective_timeout_ms(None)),
         include_nulls: true,
+        budget: query_budget(is_ai_call),
     };
 
     let result = app_state
         .query_service
         .query_data(service_id, &path, &entity, filters, options)
         .await
-        .map_err(|e| {
-            let (status, title) = match &e {
-                temps_query::DataError::QueryFailed(_) => (StatusCode::BAD_REQUEST, "Query Failed"),
-                temps_query::DataError::InvalidQuery(_) => {
-                    (StatusCode::BAD_REQUEST, "Invalid Query")
-                }
-                temps_query::DataError::NotFound(_) => (StatusCode::NOT_FOUND, "Not Found"),
-                temps_query::DataError::QueryTimeout(_) => {
-                    (StatusCode::GATEWAY_TIMEOUT, "Query Timed Out")
-                }
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, "Query Error"),
-            };
-
-            temps_core::problemdetails::new(status)
-                .with_title(title)
-                .with_detail(e.to_string())
-        })?;
+        .map_err(|error| query_error_problem(error, service_id, &entity, limit))?;
 
     let total_count = result.stats.total_rows.unwrap_or(result.stats.row_count) as u64;
     let execution_time_ms = result.stats.execution_ms;
@@ -604,12 +645,8 @@ pub async fn read_entity_rows(
         })
         .collect();
 
-    let budget = if is_ai_call {
-        AI_MAX_RESPONSE_BYTES
-    } else {
-        MAX_RESPONSE_BYTES
-    };
-    let (rows, truncated) = take_rows_within_budget(result.rows, budget);
+    let truncated = result.stats.truncated;
+    let rows = data_rows_to_json(result.rows);
 
     // Record what the model actually read. The `ai_data_access` toggle is
     // audited, but that only says the door was opened; this says what went
@@ -628,7 +665,7 @@ pub async fn read_entity_rows(
             entity: entity.clone(),
             returned_rows: rows.len(),
             truncated,
-            filter: query.filter.clone(),
+            filter_shape: audit_filter_shape,
         };
         if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
             tracing::error!(service_id, error = %e, "Failed to write AI row-read audit log");
@@ -1364,36 +1401,14 @@ pub async fn query_data(
         sort_order: request.sort_order,
         timeout_ms: Some(crate::query_service::effective_timeout_ms(None)),
         include_nulls: true,
+        budget: query_budget(false),
     };
 
     let result = app_state
         .query_service
         .query_data(service_id, &path, &entity, request.filters, options)
         .await
-        .map_err(|e| {
-            // Determine if this is a user error (400) or server error (500)
-            let (status, title) = match &e {
-                temps_query::DataError::QueryFailed(_) => {
-                    // Query syntax errors are user errors
-                    (StatusCode::BAD_REQUEST, "Query Failed")
-                }
-                temps_query::DataError::InvalidQuery(_) => {
-                    (StatusCode::BAD_REQUEST, "Invalid Query")
-                }
-                temps_query::DataError::NotFound(_) => (StatusCode::NOT_FOUND, "Not Found"),
-                temps_query::DataError::QueryTimeout(_) => {
-                    (StatusCode::GATEWAY_TIMEOUT, "Query Timed Out")
-                }
-                _ => {
-                    // Other errors are server errors
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Query Error")
-                }
-            };
-
-            temps_core::problemdetails::new(status)
-                .with_title(title)
-                .with_detail(e.to_string()) // Use to_string() instead of format! to avoid extra nesting
-        })?;
+        .map_err(|error| query_error_problem(error, service_id, &entity, request.limit))?;
 
     let total_count = result.stats.total_rows.unwrap_or(result.stats.row_count) as u64;
     let execution_time_ms = result.stats.execution_ms;
@@ -1410,7 +1425,8 @@ pub async fn query_data(
 
     // This route is not reachable by the agent (it is absent from the write
     // allowlist), so the human budget always applies.
-    let (rows, truncated) = take_rows_within_budget(result.rows, MAX_RESPONSE_BYTES);
+    let truncated = result.stats.truncated;
+    let rows = data_rows_to_json(result.rows);
 
     let response = QueryDataResponse {
         fields,
@@ -1488,19 +1504,23 @@ pub async fn download_object(
 
     // Set response headers
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        content_type
-            .unwrap_or_else(|| "application/octet-stream".to_string())
-            .parse()
-            .unwrap(),
-    );
-    headers.insert(
-        header::CONTENT_DISPOSITION,
-        format!("attachment; filename=\"{}\"", entity)
-            .parse()
-            .unwrap(),
-    );
+    let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    let content_type = axum::http::HeaderValue::from_str(&content_type).map_err(|_| {
+        temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Invalid Object Content Type")
+            .with_detail("The object provider returned an invalid content type")
+    })?;
+    let content_disposition = axum::http::HeaderValue::from_str(&format!(
+        "attachment; filename=\"{}\"",
+        entity.replace(['"', '\\'], "_")
+    ))
+    .map_err(|_| {
+        temps_core::problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Object Name")
+            .with_detail("The object name cannot be represented in a download header")
+    })?;
+    headers.insert(header::CONTENT_TYPE, content_type);
+    headers.insert(header::CONTENT_DISPOSITION, content_disposition);
 
     Ok((headers, body))
 }
@@ -1772,45 +1792,39 @@ mod tests {
         assert_eq!(effective_row_offset(MAX_OFFSET), MAX_OFFSET);
     }
 
-    fn row_of_size(bytes: usize) -> temps_query::DataRow {
-        let mut row = temps_query::DataRow::new();
-        row.insert("blob".to_string(), serde_json::json!("x".repeat(bytes)));
-        row
+    #[test]
+    fn agent_budget_is_stricter_than_human_budget() {
+        let human = query_budget(false);
+        let agent = query_budget(true);
+        assert_eq!(human.max_bytes, MAX_RESPONSE_BYTES);
+        assert_eq!(agent.max_bytes, AI_MAX_RESPONSE_BYTES);
+        assert!(agent.max_cell_bytes < human.max_cell_bytes);
+        assert!(agent.max_value_elements_per_row < human.max_value_elements_per_row);
     }
 
     #[test]
-    fn take_rows_within_budget_stops_before_blowing_the_budget() {
-        // MAX_ROWS assumes rows are small. A bytea/jsonb column holding an
-        // upload or a session blob is megabytes on its own, so a page of them
-        // is the same OOM the row clamp exists to prevent, reached along the
-        // axis the row clamp does not measure.
-        let rows: Vec<_> = (0..10).map(|_| row_of_size(1000)).collect();
-        let (kept, truncated) = take_rows_within_budget(rows, 3_000);
-
-        assert!(truncated, "should have reported truncation");
-        assert!(kept.len() < 10, "should have dropped rows");
-        assert!(!kept.is_empty(), "should have kept what fit");
+    fn filter_shape_discards_email_and_token_literals() {
+        let filter = serde_json::json!({
+            "where": "email = 'alice@example.com' AND token = 'tok_live_secret'"
+        });
+        let shape = filter_shape(Some(&filter)).expect("filter shape");
+        assert_eq!(shape, "sql_where");
+        assert!(!shape.contains("alice@example.com"));
+        assert!(!shape.contains("tok_live_secret"));
     }
 
     #[test]
-    fn take_rows_within_budget_reports_complete_pages_as_complete() {
-        // `truncated` drives whether a caller believes the table ended here, so
-        // a false positive is as bad as a false negative.
-        let rows: Vec<_> = (0..3).map(|_| row_of_size(10)).collect();
-        let (kept, truncated) = take_rows_within_budget(rows, MAX_RESPONSE_BYTES);
-
-        assert_eq!(kept.len(), 3);
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn take_rows_within_budget_always_emits_at_least_one_row() {
-        // A single row bigger than the entire budget must not produce an empty
-        // page: that reads as "no results", and no amount of paging gets past
-        // it. Emit the one row and flag truncation instead.
-        let (kept, _) = take_rows_within_budget(vec![row_of_size(4096)], 16);
-
-        assert_eq!(kept.len(), 1, "must not return an unpageable empty page");
+    fn query_error_problem_does_not_echo_backend_diagnostics() {
+        let secret = "alice@example.com tok_live_secret";
+        let problem = query_error_problem(
+            temps_query::DataError::QueryFailed(format!("syntax near {secret}")),
+            7,
+            "users",
+            100,
+        );
+        let serialized = serde_json::to_string(&problem.body).expect("problem body serializes");
+        assert!(!serialized.contains("alice@example.com"));
+        assert!(!serialized.contains("tok_live_secret"));
     }
 
     #[test]

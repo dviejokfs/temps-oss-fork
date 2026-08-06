@@ -59,16 +59,22 @@ impl AuditService {
         operation: &T,
     ) -> anyhow::Result<temps_entities::audit_logs::Model> {
         let now = Utc::now();
+        let operation_type = operation.operation_type();
         let ip_address = operation.ip_address();
-        let ip_address_id_val = match ip_address {
-            Some(ip_address) => match self.ip_service.get_or_create_ip(&ip_address).await {
+        // Permission denials are attacker-amplifiable and already retain their
+        // safe origin string inside the bounded audit JSON. Creating a durable
+        // geolocation row for each rotating denial IP would outlive the 90-day
+        // audit row and turn the security signal into an unbounded side table.
+        let ip_address_id_val = match (operation_type.as_str(), ip_address) {
+            (PERMISSION_DENIED_OPERATION, _) => None,
+            (_, Some(ip_address)) => match self.ip_service.get_or_create_ip(&ip_address).await {
                 Ok(ip_address) => Some(ip_address.id),
                 Err(err) => {
                     warn!("Error getting ip address {:?}: {}", ip_address, err);
                     None
                 }
             },
-            None => None,
+            (_, None) => None,
         };
 
         // Serialize the operation to JSON
@@ -76,7 +82,7 @@ impl AuditService {
 
         let new_audit_log = audit_logs::ActiveModel {
             user_id: Set(operation.user_id()),
-            operation_type: Set(operation.operation_type()),
+            operation_type: Set(operation_type),
             user_agent: Set(operation.user_agent().to_string()),
             ip_address_id: Set(ip_address_id_val),
             audit_date: Set(now),
@@ -313,11 +319,13 @@ mod tests {
     #[derive(Serialize)]
     struct TestAuditOperation {
         user_id: Option<i32>,
+        operation_type: &'static str,
+        ip_address: Option<String>,
     }
 
     impl AuditOperation for TestAuditOperation {
         fn operation_type(&self) -> String {
-            "TEST_OPERATION".to_string()
+            self.operation_type.to_string()
         }
 
         fn user_id(&self) -> Option<i32> {
@@ -325,7 +333,7 @@ mod tests {
         }
 
         fn ip_address(&self) -> Option<String> {
-            None
+            self.ip_address.clone()
         }
 
         fn user_agent(&self) -> &str {
@@ -376,7 +384,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_audit_log_persists_null_actor() {
-        let operation = TestAuditOperation { user_id: None };
+        let operation = TestAuditOperation {
+            user_id: None,
+            operation_type: "TEST_OPERATION",
+            ip_address: None,
+        };
         assert_eq!(
             persisted_actor_value(&operation, operation.user_id()).await,
             Value::Int(None)
@@ -385,11 +397,103 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_audit_log_persists_known_actor() {
-        let operation = TestAuditOperation { user_id: Some(42) };
+        let operation = TestAuditOperation {
+            user_id: Some(42),
+            operation_type: "TEST_OPERATION",
+            ip_address: None,
+        };
         assert_eq!(
             persisted_actor_value(&operation, operation.user_id()).await,
             Value::Int(Some(42))
         );
+    }
+
+    #[tokio::test]
+    async fn permission_denial_keeps_ip_in_json_without_geolocation_row() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![log_row(Some(42))]])
+                .into_connection(),
+        );
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let ip_service = Arc::new(IpAddressService::new(db.clone(), geoip));
+        let service = AuditService::new(db.clone(), ip_service);
+        let operation = TestAuditOperation {
+            user_id: Some(42),
+            operation_type: PERMISSION_DENIED_OPERATION,
+            ip_address: Some("203.0.113.91".to_string()),
+        };
+
+        service
+            .create_audit_log_typed(&operation)
+            .await
+            .expect("permission denial audit should persist");
+        drop(service);
+        let transactions = Arc::try_unwrap(db)
+            .expect("audit service should release database")
+            .into_transaction_log();
+        let statements: Vec<_> = transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .collect();
+        assert_eq!(statements.len(), 1, "denial must only insert the audit row");
+        assert!(statements[0].sql.contains("INSERT INTO \"audit_logs\""));
+        assert!(!statements[0].sql.contains("ip_geolocations"));
+        assert!(AuditOperation::serialize(&operation)
+            .expect("test audit should serialize")
+            .contains("203.0.113.91"));
+    }
+
+    #[tokio::test]
+    async fn normal_audit_still_enriches_existing_ip() {
+        let now = Utc::now();
+        let ip = temps_entities::ip_geolocations::Model {
+            id: 77,
+            ip_address: "203.0.113.92".to_string(),
+            latitude: None,
+            longitude: None,
+            region: None,
+            city: None,
+            country: "".to_string(),
+            country_code: None,
+            timezone: None,
+            is_eu: false,
+            asn_org: None,
+            is_hosting_provider: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![ip]])
+                .append_query_results([vec![log_row(Some(42))]])
+                .into_connection(),
+        );
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let ip_service = Arc::new(IpAddressService::new(db.clone(), geoip));
+        let service = AuditService::new(db.clone(), ip_service);
+        let operation = TestAuditOperation {
+            user_id: Some(42),
+            operation_type: "NORMAL_AUDIT",
+            ip_address: Some("203.0.113.92".to_string()),
+        };
+
+        service
+            .create_audit_log_typed(&operation)
+            .await
+            .expect("normal audit should enrich IP");
+        drop(service);
+        let transactions = Arc::try_unwrap(db)
+            .expect("audit service should release database")
+            .into_transaction_log();
+        let sql = transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("FROM \"ip_geolocations\""));
+        assert!(sql.contains("INSERT INTO \"audit_logs\""));
     }
 
     #[tokio::test]
