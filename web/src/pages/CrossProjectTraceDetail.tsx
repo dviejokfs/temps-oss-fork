@@ -18,7 +18,11 @@ import {
   kindLabel,
   statusIcon,
 } from '@/components/traces/SpanWaterfall'
-import { ProjectBadge } from '@/components/traces/ProjectBadge'
+import {
+  ProjectBadge,
+  ProjectDot,
+  ProjectLegend,
+} from '@/components/traces/ProjectBadge'
 import { buildSpanTree, flattenTree } from '@/utils/spanTree'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
@@ -158,12 +162,10 @@ export default function CrossProjectTraceDetail() {
     [selectedSpanId, flatSpans]
   )
 
+  // Dot, not badge: the legend above decodes the colour, so each row keeps its
+  // width for the span name instead of repeating a truncated slug.
   const renderRowBadge = (span: SpanRecord) => (
-    <ProjectBadge
-      projectId={span.project_id}
-      name={projectName(span)}
-      className="shrink-0"
-    />
+    <ProjectDot projectId={span.project_id} name={projectName(span)} />
   )
 
   if (isPending) {
@@ -325,17 +327,8 @@ export default function CrossProjectTraceDetail() {
         </div>
       )}
 
-      {/* Project legend */}
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-xs text-muted-foreground">Projects:</span>
-        {data.projects.map((p) => (
-          <ProjectBadge
-            key={p.project_id}
-            projectId={p.project_id}
-            name={p.project_name}
-          />
-        ))}
-      </div>
+      {/* Project legend — decodes the per-span dots in the waterfall below. */}
+      <ProjectLegend projects={data.projects} />
 
       {/* Waterfall + selected-span detail */}
       <div
