@@ -31,6 +31,26 @@ bunx @temps-sdk/cli sandbox exec sbx_abc123 -- node --version
 # Remove the sandbox when done (aliases: \`stop\`, \`destroy\`)
 bunx @temps-sdk/cli sandbox rm sbx_abc123`
 
+const WORKSPACE_EXAMPLE = `# A persistent workspace on one of your projects' repos.
+# It suspends when idle and wakes on the next command — nothing
+# is destroyed until you ask for it.
+bunx @temps-sdk/cli sandbox create --workspace --project 12 --name my-workspace
+
+# ...or on any repo you can reach
+bunx @temps-sdk/cli sandbox create --workspace \\
+  --git-url https://github.com/org/repo.git \\
+  --git-connection 3
+
+# Come back days later — this wakes it automatically
+bunx @temps-sdk/cli sandbox exec sbx_abc123 -- git status
+
+# The image ships claude, codex, opencode, gh and glab. Supply your
+# own key at create time until credential injection lands (ADR-036).
+bunx @temps-sdk/cli sandbox create --workspace --project 12 \\
+  -e ANTHROPIC_API_KEY=sk-ant-...
+
+bunx @temps-sdk/cli sandbox list --workspace`
+
 const REST_EXAMPLE = `# Create
 curl -X POST https://your-temps-instance.com/v1/sandbox \\
   -H "Authorization: Bearer $TEMPS_API_TOKEN" \\
@@ -94,6 +114,7 @@ export function CreateSandboxDocs({ variant = 'full' }: CreateSandboxDocsProps) 
     <Tabs defaultValue="cli" className="space-y-3">
       <TabsList>
         <TabsTrigger value="cli">CLI</TabsTrigger>
+        <TabsTrigger value="workspace">Workspace</TabsTrigger>
         <TabsTrigger value="rest">REST</TabsTrigger>
         <TabsTrigger value="sdk">SDK</TabsTrigger>
       </TabsList>
@@ -107,6 +128,16 @@ export function CreateSandboxDocs({ variant = 'full' }: CreateSandboxDocsProps) 
           from the environment.
         </p>
         <CodeBlock code={CLI_EXAMPLE} language="bash" />
+      </TabsContent>
+      <TabsContent value="workspace" className="space-y-2">
+        <p className="text-xs text-muted-foreground">
+          A <strong>workspace</strong> is a sandbox you keep. It still
+          suspends after its idle timeout so it doesn't hold memory on the
+          host, but the next command wakes it automatically and your files
+          are exactly as you left them. Nothing deletes it until you run{' '}
+          <code className="bg-muted px-1 rounded">sandbox rm</code>.
+        </p>
+        <CodeBlock code={WORKSPACE_EXAMPLE} language="bash" />
       </TabsContent>
       <TabsContent value="rest" className="space-y-2">
         <p className="text-xs text-muted-foreground">

@@ -14,9 +14,14 @@ use crate::services::sandbox_service::SandboxService;
 
 /// Shared state for sandbox HTTP handlers. Intentionally minimal — the
 /// service already owns db/registry/jobs/config, so handlers need only
-/// the service itself.
+/// the service itself plus the project access checker.
 pub struct SandboxAppState {
     pub sandbox_service: Arc<SandboxService>,
+    /// Team-membership gate for `project_id`-scoped creates (ADR-028).
+    /// `None` when no checker is registered (OSS builds without the
+    /// teams plugin), in which case `project_access_guard!` is a no-op
+    /// and ownership/scope checks alone apply.
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 /// OpenAPI document for the `/v1/sandboxes/*` surface.

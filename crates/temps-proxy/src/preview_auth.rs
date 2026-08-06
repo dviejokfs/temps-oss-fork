@@ -998,6 +998,9 @@ mod tests {
             expires_at: now,
             preview_password_hash: password_hash.map(|s| s.to_string()),
             preview_password_hint: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
         }
     }
 

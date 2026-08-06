@@ -28,6 +28,10 @@ interface SandboxResponse {
   created_at: string
   expires_at: string
   preview_password_hint?: string | null
+  /** 'ephemeral' | 'workspace' — absent on servers older than ADR-036. */
+  lifecycle?: string
+  project_id?: number | null
+  source_repo_url?: string | null
 }
 
 interface SetPreviewPasswordResponse {
@@ -219,6 +223,14 @@ export function registerSandboxCommands(program: Command): void {
     .option('--git-password <token>', 'HTTP Basic password/token (paired with --git-username; injected via GIT_ASKPASS)')
     .option('--tarball-url <url>', 'Tarball URL to download and extract')
     .option(
+      '--workspace',
+      'Create a persistent workspace: suspends when idle, wakes automatically on the next command, and is never destroyed for you',
+    )
+    .option(
+      '--project <id>',
+      "Seed the work dir from a temps project's connected repo (and attribute the sandbox to it)",
+    )
+    .option(
       '--preview-password',
       'Generate a random preview-URL password and print it once on stdout',
     )
@@ -235,6 +247,9 @@ export function registerSandboxCommands(program: Command): void {
     .description('List your sandboxes')
     .option('--page <n>', 'Page (1-indexed)')
     .option('--page-size <n>', 'Items per page (default 20, max 100)')
+    .option('--workspace', 'Show only persistent workspaces')
+    .option('--lifecycle <class>', 'Filter by lifecycle class: ephemeral | workspace')
+    .option('--project <id>', 'Show only sandboxes created from this project')
     .option('--json', 'Output as JSON')
     .action(listAction)
 
@@ -370,6 +385,8 @@ interface CreateOptions {
   tarballUrl?: string
   previewPassword?: boolean
   previewPasswordLength?: string
+  workspace?: boolean
+  project?: string
   json?: boolean
 }
 
@@ -454,7 +471,17 @@ async function createAction(options: CreateOptions): Promise<void> {
   if (Object.keys(env).length > 0) body.env = env
   if (options.cpuLimit !== undefined) body.cpu_limit = Number(options.cpuLimit)
   if (options.memoryMb !== undefined) body.memory_limit_mb = Number(options.memoryMb)
+  if (options.workspace) body.lifecycle = 'workspace'
+  if (options.project !== undefined) {
+    const projectId = Number(options.project)
+    if (!Number.isInteger(projectId)) {
+      throw new Error('--project must be a numeric project ID')
+    }
+    body.project_id = projectId
+  }
 
+  // An explicit --git-url/--tarball-url wins over the project's repo,
+  // matching the server: --project is a convenience default, not a lock.
   const source = buildSource(options)
   if (source) body.source = source
 
@@ -489,12 +516,25 @@ async function createAction(options: CreateOptions): Promise<void> {
     return
   }
 
-  success(`Sandbox ${colors.primary(sbx.id)} created`)
+  const createdWorkspace = sbx.lifecycle === 'workspace'
+  success(
+    `${createdWorkspace ? 'Workspace' : 'Sandbox'} ${colors.primary(sbx.id)} created`,
+  )
   keyValue('Name', sbx.name)
   keyValue('Status', statusColor(sbx.status))
   keyValue('Image', sbx.image ?? '(default)')
   keyValue('Work dir', sbx.work_dir)
-  keyValue('Expires', sbx.expires_at)
+  keyValue(createdWorkspace ? 'Suspends at' : 'Expires', sbx.expires_at)
+  if (sbx.source_repo_url) {
+    keyValue('Repo', sbx.source_repo_url)
+  }
+  if (createdWorkspace) {
+    newline()
+    info(
+      `Run a command in it with: temps sandbox exec ${sbx.id} -- <command>\n` +
+        '  It suspends when idle and wakes on the next command — your files stay put.',
+    )
+  }
   if (generatedPassword) {
     newline()
     warning('Preview password (shown once — copy it now):')
@@ -577,6 +617,9 @@ async function passwordAction(
 interface ListOptions {
   page?: string
   pageSize?: string
+  workspace?: boolean
+  lifecycle?: string
+  project?: string
   json?: boolean
 }
 
@@ -586,6 +629,11 @@ async function listAction(options: ListOptions): Promise<void> {
   const qs: string[] = []
   if (options.page) qs.push(`page=${encodeURIComponent(options.page)}`)
   if (options.pageSize) qs.push(`page_size=${encodeURIComponent(options.pageSize)}`)
+  // `--workspace` is shorthand for `--lifecycle workspace`. If both are
+  // given, the explicit one wins rather than silently conflicting.
+  const lifecycle = options.lifecycle ?? (options.workspace ? 'workspace' : undefined)
+  if (lifecycle) qs.push(`lifecycle=${encodeURIComponent(lifecycle)}`)
+  if (options.project) qs.push(`project_id=${encodeURIComponent(options.project)}`)
   const path = qs.length ? `?${qs.join('&')}` : ''
 
   const data = await withSpinner('Fetching sandboxes...', () =>
@@ -611,10 +659,19 @@ async function listAction(options: ListOptions): Promise<void> {
     { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
     { header: 'Status', key: 'status', color: (v) => statusColor(v) },
     {
+      header: 'Kind',
+      // Older servers don't send `lifecycle`; everything there is ephemeral.
+      accessor: (s) => (s.lifecycle === 'workspace' ? 'workspace' : 'ephemeral'),
+      color: (v) => (v === 'workspace' ? colors.primary(v) : colors.muted(v)),
+    },
+    {
       header: 'Image',
       accessor: (s) => s.image ?? '(default)',
       color: (v) => colors.muted(v.length > 30 ? v.slice(0, 30) + '...' : v),
     },
+    // For a workspace this is when it suspends, not when it dies — the
+    // header would be misleading without that distinction, and the
+    // `sandbox show` output spells it out.
     { header: 'Expires', key: 'expires_at', color: (v) => colors.muted(v) },
   ]
 
@@ -640,9 +697,27 @@ async function showAction(id: string, options: { json?: boolean }): Promise<void
   keyValue('Image', sbx.image ?? '(default)')
   keyValue('Work dir', sbx.work_dir)
   keyValue('Created', sbx.created_at)
-  keyValue('Expires', sbx.expires_at)
+  const isWorkspace = sbx.lifecycle === 'workspace'
+  keyValue('Kind', isWorkspace ? 'workspace (persistent)' : 'ephemeral')
+  // Same column, two meanings. Spelling it out here is the difference
+  // between "my sandbox is about to be deleted" panic and understanding
+  // that a workspace just goes to sleep.
+  keyValue(isWorkspace ? 'Suspends at' : 'Expires', sbx.expires_at)
+  if (sbx.project_id !== undefined && sbx.project_id !== null) {
+    keyValue('Project', String(sbx.project_id))
+  }
+  if (sbx.source_repo_url) {
+    keyValue('Repo', sbx.source_repo_url)
+  }
   if (sbx.preview_password_hint) {
     keyValue('Preview password', `ends in …${sbx.preview_password_hint}`)
+  }
+  if (isWorkspace) {
+    newline()
+    info(
+      'Persistent workspace: it suspends after the idle timeout and wakes automatically ' +
+        'on the next exec or file operation. Your files persist until you run `sandbox rm`.',
+    )
   }
   newline()
 }

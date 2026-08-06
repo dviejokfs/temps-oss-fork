@@ -11,6 +11,19 @@
 //! state all survive so the owner can call `/resume` later. Destroying
 //! would be irreversible — that's reserved for explicit `/destroy` calls.
 //!
+//! Workspace-class sandboxes (ADR-036) are swept exactly like ephemeral
+//! ones — deliberately. "Permanent" means the *state* is permanent, not
+//! that the container pins RAM forever; a handful of idle workspaces
+//! holding memory would evict real deployments on the 3 vCPU / 4 GB
+//! reference host. The difference lives on the access path instead:
+//! `SandboxService::resolve_id` wakes a suspended workspace transparently,
+//! so from the user's side suspension is invisible apart from a slower
+//! first call.
+//!
+//! `expires_at` is an *idle* deadline: `SandboxService::touch` pushes it
+//! forward on every exec and filesystem operation, so a sandbox in active
+//! use is never swept. Only genuine inactivity reaches this loop.
+//!
 //! Loop shape: plain 60-second interval (not minute-aligned — we don't
 //! need clock phases, just periodic sweeping). Query is cheap thanks to
 //! the partial index on `(expires_at) WHERE status = 'running'` added by
@@ -164,6 +177,9 @@ mod tests {
             expires_at: now + chrono::Duration::seconds(expires_in_secs),
             preview_password_hash: None,
             preview_password_hint: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
         }
     }
 

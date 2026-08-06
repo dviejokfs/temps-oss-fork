@@ -95,8 +95,8 @@ impl SandboxService {
         options: ExecOptions,
     ) -> Result<ExecResult, SandboxError> {
         options.validate()?;
-        let (_row, internal_id) = self.resolve_id(public_id, user_id).await?;
-        self.touch(internal_id).await;
+        let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        self.touch(internal_id, row.timeout_secs).await;
         let handle = self
             .registry()
             .get(internal_id, public_id)
@@ -124,8 +124,8 @@ impl SandboxService {
         options: ExecOptions,
     ) -> Result<String, SandboxError> {
         options.validate()?;
-        let (_row, internal_id) = self.resolve_id(public_id, user_id).await?;
-        self.touch(internal_id).await;
+        let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        self.touch(internal_id, row.timeout_secs).await;
 
         // Verify the sandbox is alive *before* spawning the background task,
         // so callers get a synchronous NotFound/ExecFailed instead of a
