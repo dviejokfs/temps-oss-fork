@@ -1020,11 +1020,6 @@ export type AppSettings = {
      */
     build_limits?: BuildLimitsSettings;
     /**
-     * Managed control-plane connection. Credentials are deliberately not
-     * stored here; they live in the owner-only cloud-link state file.
-     */
-    cloud?: CloudSettings;
-    /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). Off by
      * default — see `ClusterDnsSettings` for the incident background and
      * trade-offs. Must be explicitly enabled by operators who need
@@ -1117,6 +1112,11 @@ export type AppSettings = {
      * from appearing on installs that were already configured via the CLI.
      */
     setup_complete?: boolean;
+    /**
+     * Managed control-plane connection. Credentials are deliberately not
+     * stored here; they live in the owner-only cloud-link state file.
+     */
+    cloud?: CloudSettings;
 };
 
 /**
@@ -1350,10 +1350,7 @@ export type AuthFlavorDto = {
 
 export type AuthResponse = {
     message: string;
-    mfa_enrollment_required: boolean;
     mfa_required: boolean;
-    mfa_setup?: null | MfaSetupResponse;
-    password_change_required: boolean;
     success: boolean;
     user_id?: number | null;
 };
@@ -2140,37 +2137,10 @@ export type CliLoginRequest = {
     username: string;
 };
 
-export type CloudCapability = {
-    configured: boolean;
-    reason?: string | null;
-    setup_path: string;
-};
-
 /**
  * Cloud provider detected from node metadata
  */
 export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'hetzner' | 'digitalocean' | 'other';
-
-/**
- * Non-secret managed control-plane settings stored with application settings.
- */
-export type CloudSettings = {
-    /**
-     * HTTPS origin used for enrollment and telemetry mirroring.
-     */
-    backend_url?: string;
-};
-
-export type CloudStatus = {
-    account_email?: string | null;
-    backend_url: string;
-    health: string;
-    health_message: string;
-    instance_id?: string | null;
-    spooled_spans: number;
-    status: string;
-    status_message: string;
-};
 
 /**
  * Configuration for a Cloudflare Email Sending notification provider.
@@ -3973,7 +3943,6 @@ export type CreateTeamRequest = {
 
 export type CreateUserRequest = {
     email?: string | null;
-    must_change_password?: boolean;
     password?: string | null;
     roles: Array<string>;
     username: string;
@@ -4784,19 +4753,6 @@ export type DeploymentMetadata = {
      * ID of the deployment this was rolled back from (if applicable)
      */
     rolledBackFromId?: number | null;
-    /**
-     * Uploaded source archive content type.
-     */
-    sourceBundleContentType?: string | null;
-    /**
-     * Uploaded source archive ID. Source archives are extracted before the
-     * regular preset build pipeline and do not require Git metadata.
-     */
-    sourceBundleId?: number | null;
-    /**
-     * Uploaded source archive path in the Temps data directory.
-     */
-    sourceBundlePath?: string | null;
     /**
      * Static bundle content type (for proper extraction: application/gzip or application/zip)
      */
@@ -6059,10 +6015,6 @@ export type EnrichVisitorResponse = {
     message: string;
     success: boolean;
     visitor_id: string;
-};
-
-export type EnrollCloudRequest = {
-    enrollment_code: string;
 };
 
 export type EnrollmentTokenInfo = {
@@ -12444,12 +12396,6 @@ export type PropertyBreakdownQuery = {
      */
     group_by: PropertyColumn;
     /**
-     * Include crawler/bot traffic (default: false). Off by default so the
-     * breakdown percentages share a denominator with the headline counts,
-     * which always exclude crawlers.
-     */
-    include_crawlers?: boolean | null;
-    /**
      * Maximum number of results to return (default: 20, max: 100)
      */
     limit?: number | null;
@@ -12505,11 +12451,6 @@ export type PropertyTimelineQuery = {
      * Property column to group by
      */
     group_by: PropertyColumn;
-    /**
-     * Include crawler/bot traffic (default: false). See
-     * [`PropertyBreakdownQuery::include_crawlers`].
-     */
-    include_crawlers?: boolean | null;
     /**
      * Start date for the query range
      */
@@ -12870,14 +12811,9 @@ export type QueryDataResponse = {
      */
     total_count: number;
     /**
-     * Whether rows were dropped from this response to stay inside the byte
-     * budget.
+     * Whether rows were dropped from this response to stay inside the byte budget.
      *
-     * `returned_count` is always the number of rows actually present, so a
-     * truncated page is still internally consistent — but a caller comparing
-     * it against the requested limit would otherwise conclude the table simply
-     * ended. Reported explicitly so a partial page is never mistaken for a
-     * complete one, by a human, a script, or a model reading a tool result.
+     * `returned_count` is always the number of rows actually present, so a truncated page is still internally consistent — but a caller comparing it against the requested limit would otherwise conclude the table simply ended. Reported explicitly so a partial page is never mistaken for a complete one, by a human, a script, or a model reading a tool result.
      */
     truncated: boolean;
 };
@@ -13394,18 +13330,6 @@ export type RequestRow = {
     user_agent?: string | null;
 };
 
-export type RequiredPasswordChangeRequest = {
-    new_password: string;
-};
-
-export type RequiredPasswordChangeResponse = {
-    message: string;
-    mfa_enrollment_required: boolean;
-    mfa_setup?: null | MfaSetupResponse;
-    success: boolean;
-    user_id: number;
-};
-
 export type ResetPasswordRequest = {
     new_password: string;
     token: string;
@@ -13914,7 +13838,6 @@ export type RouteUser = {
     id: number;
     image: string;
     mfa_enabled: boolean;
-    must_change_password: boolean;
     name: string;
     updated_at: number;
     username: string;
@@ -18995,6 +18918,37 @@ export type ZoneListResponse = {
     zones: Array<DnsZone>;
 };
 
+export type CloudCapability = {
+    configured: boolean;
+    reason?: string | null;
+    setup_path: string;
+};
+
+/**
+ * Non-secret managed control-plane settings stored with application settings.
+ */
+export type CloudSettings = {
+    /**
+     * HTTPS origin used for enrollment and telemetry mirroring.
+     */
+    backend_url?: string;
+};
+
+export type CloudStatus = {
+    account_email?: string | null;
+    backend_url: string;
+    health: string;
+    health_message: string;
+    instance_id?: string | null;
+    spooled_spans: number;
+    status: string;
+    status_message: string;
+};
+
+export type EnrollCloudRequest = {
+    enrollment_code: string;
+};
+
 /**
  * Response type for S3 source
  */
@@ -22481,37 +22435,6 @@ export type ListPublicProvidersResponses = {
 
 export type ListPublicProvidersResponse = ListPublicProvidersResponses[keyof ListPublicProvidersResponses];
 
-export type ChangeRequiredPasswordData = {
-    body: RequiredPasswordChangeRequest;
-    path?: never;
-    query?: never;
-    url: '/auth/password-change-required';
-};
-
-export type ChangeRequiredPasswordErrors = {
-    /**
-     * Password does not meet requirements
-     */
-    400: unknown;
-    /**
-     * Password-change session is missing or expired
-     */
-    401: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type ChangeRequiredPasswordResponses = {
-    /**
-     * Required password change completed
-     */
-    200: RequiredPasswordChangeResponse;
-};
-
-export type ChangeRequiredPasswordResponse = ChangeRequiredPasswordResponses[keyof ChangeRequiredPasswordResponses];
-
 export type RequestPasswordResetData = {
     body: EmailRequest;
     path?: never;
@@ -24242,58 +24165,6 @@ export type BlobHeadResponses = {
      */
     200: unknown;
 };
-
-export type DisconnectCloudData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/cloud';
-};
-
-export type DisconnectCloudResponses = {
-    200: CloudStatus;
-};
-
-export type DisconnectCloudResponse = DisconnectCloudResponses[keyof DisconnectCloudResponses];
-
-export type GetCloudCapabilityData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/cloud/capability';
-};
-
-export type GetCloudCapabilityResponses = {
-    200: CloudCapability;
-};
-
-export type GetCloudCapabilityResponse = GetCloudCapabilityResponses[keyof GetCloudCapabilityResponses];
-
-export type EnrollCloudData = {
-    body: EnrollCloudRequest;
-    path?: never;
-    query?: never;
-    url: '/cloud/enroll';
-};
-
-export type EnrollCloudResponses = {
-    200: CloudStatus;
-};
-
-export type EnrollCloudResponse = EnrollCloudResponses[keyof EnrollCloudResponses];
-
-export type GetCloudStatusData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/cloud/status';
-};
-
-export type GetCloudStatusResponses = {
-    200: CloudStatus;
-};
-
-export type GetCloudStatusResponse = GetCloudStatusResponses[keyof GetCloudStatusResponses];
 
 export type GetDashboardProjectsAnalyticsData = {
     body?: never;
@@ -41180,10 +41051,6 @@ export type GetPropertyBreakdownData = {
          */
         limit?: number;
         /**
-         * Include crawler/bot traffic (default: false)
-         */
-        include_crawlers?: boolean;
-        /**
          * Filter by country (for region/city drill-downs)
          */
         filter_country?: string;
@@ -41276,10 +41143,6 @@ export type GetPropertyTimelineData = {
          * Time bucket: hour, day, week, month (default: auto-detect)
          */
         bucket_size?: string;
-        /**
-         * Include crawler/bot traffic (default: false)
-         */
-        include_crawlers?: boolean;
     };
     url: '/projects/{project_id}/events/properties/timeline';
 };
@@ -44234,7 +44097,7 @@ export type GetUniqueCountsResponses = {
 export type GetUniqueCountsResponse = GetUniqueCountsResponses[keyof GetUniqueCountsResponses];
 
 export type UploadStaticBundleData = {
-    body: SourceArchiveUpload;
+    body?: never;
     path: {
         project_id: number;
     };
@@ -48053,10 +47916,6 @@ export type SetupMfaErrors = {
      */
     401: unknown;
     /**
-     * MFA is already enabled; verify and disable it before re-enrollment
-     */
-    409: unknown;
-    /**
      * Internal server error
      */
     500: unknown;
@@ -49918,3 +49777,55 @@ export type GetAuditLogResponses = {
 };
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
+export type DisconnectCloudData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud';
+};
+
+export type DisconnectCloudResponses = {
+    200: CloudStatus;
+};
+
+export type DisconnectCloudResponse = DisconnectCloudResponses[keyof DisconnectCloudResponses];
+
+export type GetCloudCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/capability';
+};
+
+export type GetCloudCapabilityResponses = {
+    200: CloudCapability;
+};
+
+export type GetCloudCapabilityResponse = GetCloudCapabilityResponses[keyof GetCloudCapabilityResponses];
+
+export type EnrollCloudData = {
+    body: EnrollCloudRequest;
+    path?: never;
+    query?: never;
+    url: '/cloud/enroll';
+};
+
+export type EnrollCloudResponses = {
+    200: CloudStatus;
+};
+
+export type EnrollCloudResponse = EnrollCloudResponses[keyof EnrollCloudResponses];
+
+export type GetCloudStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/status';
+};
+
+export type GetCloudStatusResponses = {
+    200: CloudStatus;
+};
+
+export type GetCloudStatusResponse = GetCloudStatusResponses[keyof GetCloudStatusResponses];
