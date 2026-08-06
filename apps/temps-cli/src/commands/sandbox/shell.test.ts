@@ -1,7 +1,43 @@
 import { describe, expect, test } from 'bun:test'
 
-import { sandboxUrl } from './index.js'
+import { sandboxUrl, toSandboxView } from './index.js'
 import { terminalWsUrl } from './shell.js'
+
+describe('toSandboxView', () => {
+  // The response types in this module were written against an older, flat
+  // contract and never corrected — the 404-ing URL meant nothing ever came
+  // back to contradict them. These assertions pin the three fields that
+  // were actually wrong.
+  const inner = {
+    id: 'sbx_abc',
+    name: 'ws',
+    status: 'running',
+    image: 'node:22',
+    cwd: '/home/temps/workspace',
+    createdAt: 1_700_000_000_000,
+    timeout: 3_600_000,
+    lifecycle: 'workspace',
+  }
+
+  test('maps cwd to work_dir', () => {
+    // Not `work_dir` on the wire — reading that gave `undefined`, which the
+    // terminal then passed as a PTY cwd.
+    expect(toSandboxView(inner).work_dir).toBe('/home/temps/workspace')
+  })
+
+  test('derives expires_at from createdAt + timeout', () => {
+    // The server sends a duration in ms, not a deadline. There is no
+    // `expires_at` field to read.
+    const view = toSandboxView(inner)
+    expect(view.created_at).toBe('2023-11-14T22:13:20.000Z')
+    expect(view.expires_at).toBe('2023-11-14T23:13:20.000Z')
+  })
+
+  test('carries lifecycle through for the Kind column', () => {
+    expect(toSandboxView(inner).lifecycle).toBe('workspace')
+    expect(toSandboxView({ ...inner, lifecycle: undefined }).lifecycle).toBeUndefined()
+  })
+})
 
 describe('sandboxUrl', () => {
   // This is the regression guard for a real bug: every command in this

@@ -190,7 +190,12 @@ pub async fn terminal(
     let cmd = params.cmd.unwrap_or_else(default_shell_cmd);
     let cols = params.cols.unwrap_or(80);
     let rows = params.rows.unwrap_or(24);
-    let work_dir = row.work_dir.clone();
+    // Take the working directory from the provider handle, not the DB row.
+    // The handle is what the backend actually created; rows written before
+    // the work_dir fix carry a "/workspace" that does not exist in the
+    // image, and spawning a shell there fails with a bare
+    // "spawn_failed: No such file or directory".
+    let work_dir = handle.work_dir.to_string_lossy().to_string();
 
     Ok(ws.on_upgrade(move |socket| async move {
         let session = TerminalSession {

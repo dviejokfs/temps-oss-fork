@@ -832,7 +832,15 @@ impl SandboxService {
             name: Set(name.clone()),
             status: Set("running".to_string()),
             image: Set(req.image.clone()),
-            work_dir: Set("/workspace".to_string()),
+            // The real directory inside the container, not a nominal
+            // "/workspace" — that path does not exist in the sandbox image
+            // and never has. The agent-run path above already used this
+            // constant; this one was hardcoded and wrong, which stayed
+            // invisible because `exec` and the filesystem ops take the work
+            // dir from the provider handle rather than from this row. It
+            // only surfaced once the terminal used the row's value as a
+            // PTY cwd and every shell died with ENOENT.
+            work_dir: Set(temps_agents::sandbox::SANDBOX_WORK_DIR.to_string()),
             timeout_secs: Set(timeout as i32),
             metadata: Set(metadata_value),
             created_at: Set(now),

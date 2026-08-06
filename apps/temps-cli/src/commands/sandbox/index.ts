@@ -24,7 +24,52 @@ import { shellAction } from './shell.js'
 
 // ── Types mirroring /v1/sandbox/* responses ─────────────────────────────────
 
+/**
+ * The `sandbox` object the server actually returns — the
+ * `@vercel/sandbox`-compatible shape, not the flat one this file used to
+ * assume.
+ *
+ * These types were written against an older contract and never corrected,
+ * because the singular-vs-plural URL bug meant no request ever came back
+ * 200 for anyone to notice. Two traps worth naming:
+ *
+ * - `cwd`, not `work_dir`.
+ * - `createdAt` / `timeout` are **epoch milliseconds** and a **duration in
+ *   milliseconds**. There is no `expires_at` on the wire; it is derived.
+ */
+interface SandboxInner {
+  id: string
+  name: string
+  status: string
+  image: string | null
+  cwd: string
+  /** Epoch milliseconds. */
+  createdAt: number
+  /** Idle timeout in milliseconds. */
+  timeout: number
+  backend?: string | null
+  disk_size_mb?: number | null
+  preview_url_template?: string
+  preview_password_hint?: string | null
+  agent_run_id?: number | null
+  /** 'ephemeral' | 'workspace' — absent on servers older than ADR-036. */
+  lifecycle?: string
+  project_id?: number | null
+  source_repo_url?: string | null
+}
+
+/** Single-sandbox responses are wrapped: `{ sandbox, routes }`. */
 interface SandboxResponse {
+  sandbox: SandboxInner
+  routes?: Array<{ url: string; subdomain: string; port: number }>
+}
+
+/**
+ * Flattened view for display, mirroring
+ * `web/src/components/sandboxes/helpers.ts` so the CLI and the console
+ * derive `expires_at` identically instead of drifting apart again.
+ */
+interface SandboxView {
   id: string
   name: string
   status: string
@@ -33,10 +78,26 @@ interface SandboxResponse {
   created_at: string
   expires_at: string
   preview_password_hint?: string | null
-  /** 'ephemeral' | 'workspace' — absent on servers older than ADR-036. */
   lifecycle?: string
   project_id?: number | null
   source_repo_url?: string | null
+}
+
+export function toSandboxView(inner: SandboxInner): SandboxView {
+  return {
+    id: inner.id,
+    name: inner.name,
+    status: inner.status,
+    image: inner.image ?? null,
+    work_dir: inner.cwd,
+    created_at: new Date(inner.createdAt).toISOString(),
+    // The server sends a duration, not a deadline.
+    expires_at: new Date(inner.createdAt + inner.timeout).toISOString(),
+    preview_password_hint: inner.preview_password_hint ?? undefined,
+    lifecycle: inner.lifecycle,
+    project_id: inner.project_id ?? null,
+    source_repo_url: inner.source_repo_url ?? null,
+  }
 }
 
 interface SetPreviewPasswordResponse {
@@ -44,10 +105,8 @@ interface SetPreviewPasswordResponse {
 }
 
 interface ListSandboxesResponse {
-  items: SandboxResponse[]
-  total: number
-  page: number
-  page_size: number
+  sandboxes: SandboxInner[]
+  pagination: { count: number; next: number | null; prev: number | null }
 }
 
 interface ExecResponse {
@@ -555,7 +614,7 @@ async function createAction(options: CreateOptions): Promise<void> {
     body.preview_password = generatedPassword
   }
 
-  const sbx = await withSpinner(
+  const envelope = await withSpinner(
     options.workspace ? 'Creating workspace...' : 'Creating sandbox...',
     () =>
       apiRequest<SandboxResponse>(api, '', {
@@ -563,6 +622,7 @@ async function createAction(options: CreateOptions): Promise<void> {
         body: JSON.stringify(body),
       }),
   )
+  const sbx = toSandboxView(envelope.sandbox)
 
   // Branch creation is a post-clone step: the server seeds the work dir at
   // whatever ref was requested, then we branch off it. Non-fatal — the
@@ -594,7 +654,11 @@ async function createAction(options: CreateOptions): Promise<void> {
     // In JSON mode the generated plaintext is part of the payload so
     // scripts can capture it in one call. Caller is responsible for
     // handling it safely.
-    json(generatedPassword ? { ...sbx, preview_password: generatedPassword } : sbx)
+    json(
+      generatedPassword
+        ? { ...envelope, preview_password: generatedPassword }
+        : envelope,
+    )
     return
   }
 
@@ -750,16 +814,18 @@ async function listAction(options: ListOptions): Promise<void> {
     return
   }
 
-  newline()
-  header(`${icons.info} Sandboxes (${data.total})`)
+  const items = (data.sandboxes ?? []).map(toSandboxView)
 
-  if (data.items.length === 0) {
+  newline()
+  header(`${icons.info} Sandboxes (${data.pagination?.count ?? items.length})`)
+
+  if (items.length === 0) {
     info('No sandboxes found. Create one with `temps sandbox create`.')
     newline()
     return
   }
 
-  const columns: TableColumn<SandboxResponse>[] = [
+  const columns: TableColumn<SandboxView>[] = [
     { header: 'ID', key: 'id', color: (v) => colors.primary(v) },
     { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
     { header: 'Status', key: 'status', color: (v) => statusColor(v) },
@@ -780,20 +846,24 @@ async function listAction(options: ListOptions): Promise<void> {
     { header: 'Expires', key: 'expires_at', color: (v) => colors.muted(v) },
   ]
 
-  printTable(data.items, columns, { style: 'minimal' })
+  printTable(items, columns, { style: 'minimal' })
   newline()
 }
 
 async function showAction(id: string, options: { json?: boolean }): Promise<void> {
   const api = await auth()
-  const sbx = await withSpinner('Fetching sandbox...', () =>
+  const envelope = await withSpinner('Fetching sandbox...', () =>
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}`),
   )
 
   if (options.json) {
-    json(sbx)
+    // JSON mode passes the server's envelope through untouched — scripts
+    // should see the real API shape, not our display projection.
+    json(envelope)
     return
   }
+
+  const sbx = toSandboxView(envelope.sandbox)
 
   newline()
   header(`${icons.info} ${sbx.id}`)
@@ -849,26 +919,29 @@ async function rmAction(id: string, options: { force?: boolean }): Promise<void>
 
 async function pauseAction(id: string): Promise<void> {
   const api = await auth()
-  const sbx = await withSpinner('Pausing sandbox...', () =>
+  const envelope = await withSpinner('Pausing sandbox...', () =>
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/pause`, { method: 'POST' }),
   )
+  const sbx = toSandboxView(envelope.sandbox)
   success(`Sandbox ${colors.primary(id)} paused — status: ${statusColor(sbx.status)}`)
   info(`Resume with: temps sandbox resume ${id}`)
 }
 
 async function resumeAction(id: string): Promise<void> {
   const api = await auth()
-  const sbx = await withSpinner('Resuming sandbox...', () =>
+  const envelope = await withSpinner('Resuming sandbox...', () =>
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/resume`, { method: 'POST' }),
   )
+  const sbx = toSandboxView(envelope.sandbox)
   success(`Sandbox ${colors.primary(id)} resumed — expires: ${sbx.expires_at}`)
 }
 
 async function restartAction(id: string): Promise<void> {
   const api = await auth()
-  const sbx = await withSpinner('Restarting sandbox...', () =>
+  const envelope = await withSpinner('Restarting sandbox...', () =>
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/restart`, { method: 'POST' }),
   )
+  const sbx = toSandboxView(envelope.sandbox)
   success(`Sandbox ${colors.primary(id)} restarted — status: ${statusColor(sbx.status)}`)
 }
 
@@ -894,8 +967,9 @@ async function cloneAction(id: string, options: CloneOptions): Promise<void> {
       body: JSON.stringify(source),
     }),
   )
-  success(`Source seeded into ${colors.primary(sbx.id)}`)
-  keyValue('Work dir', sbx.work_dir)
+  const view = toSandboxView(sbx.sandbox)
+  success(`Source seeded into ${colors.primary(view.id)}`)
+  keyValue('Work dir', view.work_dir)
 }
 
 async function extendAction(id: string, options: { secs: string }): Promise<void> {
@@ -911,7 +985,7 @@ async function extendAction(id: string, options: { secs: string }): Promise<void
       body: JSON.stringify({ extra_secs: extra }),
     }),
   )
-  success(`Extended by ${extra}s — new expiry: ${sbx.expires_at}`)
+  success(`Extended by ${extra}s — new expiry: ${toSandboxView(sbx.sandbox).expires_at}`)
 }
 
 interface ExecOptions {
