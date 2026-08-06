@@ -1311,10 +1311,10 @@ export function ServiceDataBrowser() {
         !hasLoadedChildren
 
       if (isLeafContainer) {
-        // navigateTo (not a bare setSearchParams) so the previous container's
-        // sort column and filter don't follow us to a container that has no
-        // such field.
-        navigateTo(node.path)
+        // Update URL params - use replace to avoid page reload
+        setSearchParams({ path: node.path }, { replace: true })
+        setPage(1)
+        commitActiveTab({ path: node.path, entity: undefined, page: 1 })
 
         // Don't expand in tree, just select it
         // The main content area will show the entities table via ContainerEntitiesView
@@ -1357,7 +1357,9 @@ export function ServiceDataBrowser() {
           }
         } else {
           // Different container - select it and expand if not already expanded
-          navigateTo(node.path)
+          setSearchParams({ path: node.path }, { replace: true })
+          setPage(1)
+          commitActiveTab({ path: node.path, entity: undefined, page: 1 })
 
           // If not currently expanded, expand it
           if (!isCurrentlyExpanded) {
@@ -1385,13 +1387,17 @@ export function ServiceDataBrowser() {
         }
       }
     } else if (node.type === 'entity') {
-      // Switching tables must drop the outgoing table's sort column and
-      // filter: they name fields the incoming table may not have, and the
-      // query then sorts/filters on something that doesn't exist. navigateTo
-      // resets sort/filter/page for the new target; a bare setSearchParams
-      // only moved the selection and left both behind.
+      // Update URL params for entity selection - use replace to avoid page reload
       const parentPath = node.path.split('/').slice(0, -1).join('/')
-      navigateTo(parentPath, node.name)
+      setSearchParams(
+        {
+          path: parentPath,
+          entity: node.name,
+        },
+        { replace: true }
+      )
+      setPage(1)
+      commitActiveTab({ path: parentPath, entity: node.name, page: 1 })
 
       // Close sidebar on mobile when selecting an entity
       if (window.innerWidth < 768) {
