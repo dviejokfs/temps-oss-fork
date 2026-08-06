@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use temps_cloud_client::{BackendUrl, CloudError, CloudLink};
+use temps_cloud_protocol::{ManagedNotificationAccepted, ManagedNotificationRequest};
 use temps_config::{ConfigService, ConfigServiceError};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -37,6 +38,7 @@ pub struct CloudStatus {
     pub health_message: String,
     #[schema(value_type = Option<String>)]
     pub instance_id: Option<Uuid>,
+    pub account_email: Option<String>,
     pub spooled_spans: usize,
     pub backend_url: String,
 }
@@ -127,6 +129,7 @@ impl CloudService {
             health: health_name(&health).to_string(),
             health_message: health.message(),
             instance_id: self.link.instance_id(),
+            account_email: self.link.account_email(),
             spooled_spans: self.link.spooled(),
             backend_url: settings.cloud.backend_url,
         })
@@ -155,6 +158,16 @@ impl CloudService {
         }
         self.link.disconnect().map_err(CloudServiceError::State)?;
         self.status().await
+    }
+
+    pub async fn send_notification(
+        &self,
+        request: &ManagedNotificationRequest,
+    ) -> Result<ManagedNotificationAccepted, CloudServiceError> {
+        self.link
+            .send_notification(request)
+            .await
+            .map_err(CloudServiceError::Client)
     }
 
     pub async fn shutdown(&self) {

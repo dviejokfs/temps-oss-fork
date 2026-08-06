@@ -71,6 +71,10 @@ impl std::fmt::Debug for EnrollRequest {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EnrollResponse {
     pub tenant_id: Uuid,
+    /// Human-readable Cloud account identity for the local connection UI.
+    /// Optional for compatibility with older managed backends.
+    #[serde(default)]
+    pub account_email: Option<String>,
     /// Bearer token for the management channel and the ingest endpoint.
     /// Scoped to this instance and this tenant, nothing else.
     pub instance_token: String,
@@ -88,6 +92,7 @@ impl std::fmt::Debug for EnrollResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EnrollResponse")
             .field("tenant_id", &self.tenant_id)
+            .field("account_email", &self.account_email)
             .field("instance_token", &"[REDACTED]")
             .field("capabilities", &self.capabilities)
             .finish()
@@ -161,6 +166,11 @@ pub struct BackupTargetRequest {
     /// What is being backed up, e.g. a service or database name.
     pub source: String,
     pub estimated_bytes: u64,
+    /// SHA-256 of the finished artifact. New clients compute the backup before
+    /// requesting a target so object storage can validate the bytes during the
+    /// direct PUT. Optional only for wire compatibility; Cloud may require it.
+    #[serde(default)]
+    pub checksum_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +180,10 @@ pub struct BackupTarget {
     pub upload_url: String,
     pub object_key: String,
     pub expires_at_millis: i64,
+    /// Headers covered by the presigned request. The uploader must send these
+    /// exact values; notably the provider-verified content checksum.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 /// Instance reports the upload finished. Until this arrives the object is not
@@ -181,6 +195,112 @@ pub struct BackupCompleted {
     /// SHA-256 of the uploaded object, so restore can detect corruption before
     /// the customer discovers it during an actual disaster.
     pub checksum_sha256: String,
+}
+
+// ---------------------------------------------------------------------------
+// Managed AI — context is assembled and approved on the OSS instance
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedAiTask {
+    Standard,
+    Deep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiEvidence {
+    /// Tenant-keyed opaque aliases. Raw application trace/span identifiers do
+    /// not cross the managed boundary.
+    pub trace_id: String,
+    pub span_id: String,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    /// One fixed category from the protocol allow-list, never a raw span name.
+    pub operation: String,
+    pub duration_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiAnalysisRequest {
+    pub analysis_id: Uuid,
+    pub question: String,
+    pub range_start: chrono::DateTime<chrono::Utc>,
+    pub range_end: chrono::DateTime<chrono::Utc>,
+    pub context_manifest_sha256: String,
+    pub task: ManagedAiTask,
+    pub evidence: Vec<ManagedAiEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiCitation {
+    pub trace_id: String,
+    pub span_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiAnalysisResponse {
+    pub id: Uuid,
+    pub state: String,
+    pub task: ManagedAiTask,
+    pub estimated_credits: u64,
+    pub settled_credits: u64,
+    pub provider: String,
+    pub model: String,
+    pub rate_card_version: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub answer: Option<String>,
+    pub grounded: Option<bool>,
+    pub citations: Vec<ManagedAiCitation>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiCapability {
+    pub configured: bool,
+    pub managed_provider: Option<String>,
+    pub managed_model: Option<String>,
+    pub destination_origin: Option<String>,
+    pub inference_region: Option<String>,
+    pub reason: Option<String>,
+    pub setup_path: String,
+}
+
+// ---------------------------------------------------------------------------
+// Managed notifications — Cloud fans one local provider out to many sinks
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedNotificationSeverity {
+    Debug,
+    Info,
+    Warning,
+    Error,
+    Critical,
+    Emergency,
+}
+
+/// A bounded notification produced by OSS and durably accepted by Cloud.
+///
+/// The stable source id makes retries safe. Cloud never trusts the timestamp
+/// for ordering, billing, or retry decisions; it records server receive time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedNotificationRequest {
+    pub source_notification_id: String,
+    pub title: String,
+    pub message: String,
+    pub severity: ManagedNotificationSeverity,
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedNotificationAccepted {
+    pub event_id: Uuid,
+    pub queued_deliveries: u32,
+    pub duplicate: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +319,15 @@ pub struct Heartbeat {
     pub pending_spool_bytes: u64,
 }
 
+/// Cloud acknowledgement for a durably recorded heartbeat.
+///
+/// The instance may use the Cloud timestamp for skew diagnostics, but never
+/// for a local authorization or billing decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatAck {
+    pub received_at_millis: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +342,32 @@ mod tests {
         let env = Envelope::new("heartbeat", &hb).unwrap();
         let back: Heartbeat = env.decode("heartbeat").unwrap();
         assert_eq!(back.pending_spool_bytes, 42);
+    }
+
+    #[test]
+    fn managed_notification_round_trips_without_provider_details() {
+        let request = ManagedNotificationRequest {
+            source_notification_id: "alert-42".into(),
+            title: "Database unavailable".into(),
+            message: "postgres did not answer its health check".into(),
+            severity: ManagedNotificationSeverity::Critical,
+            metadata: [("service".into(), "postgres".into())].into(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("slack"));
+        assert!(!json.contains("email"));
+        let decoded: ManagedNotificationRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.source_notification_id, "alert-42");
+    }
+
+    #[test]
+    fn heartbeat_ack_is_additive_and_round_trips() {
+        let ack = HeartbeatAck {
+            received_at_millis: 1_700_000_000_000,
+        };
+        let env = Envelope::new("heartbeat_ack", &ack).unwrap();
+        let decoded: HeartbeatAck = env.decode("heartbeat_ack").unwrap();
+        assert_eq!(decoded.received_at_millis, ack.received_at_millis);
     }
 
     #[test]
@@ -259,11 +414,26 @@ mod tests {
         };
         let response = EnrollResponse {
             tenant_id: Uuid::new_v4(),
+            account_email: Some("owner@example.com".into()),
             instance_token: "inst_secret".into(),
             capabilities: vec![],
         };
 
         assert!(!format!("{request:?}").contains("secret-code"));
         assert!(!format!("{response:?}").contains("inst_secret"));
+    }
+
+    #[test]
+    fn enrollment_response_accepts_backends_without_an_account_email() {
+        let tenant_id = Uuid::new_v4();
+        let response: EnrollResponse = serde_json::from_value(serde_json::json!({
+            "tenant_id": tenant_id,
+            "instance_token": "inst_legacy"
+        }))
+        .unwrap();
+
+        assert_eq!(response.tenant_id, tenant_id);
+        assert!(response.account_email.is_none());
+        assert!(response.capabilities.is_empty());
     }
 }

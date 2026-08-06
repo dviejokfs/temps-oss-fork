@@ -159,6 +159,11 @@ export function CloudSettingsPage() {
                 <div>
                   <h2 className="font-semibold">Connected</h2>
                   <p className="text-sm text-muted-foreground">
+                    {status.data?.account_email
+                      ? `Cloud account: ${status.data.account_email}`
+                      : 'Cloud account unavailable — reconnect to refresh it'}
+                  </p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
                     {status.data?.status_message}
                   </p>
                 </div>

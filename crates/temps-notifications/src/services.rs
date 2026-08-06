@@ -13,6 +13,8 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_cloud::CloudService;
+use temps_cloud_protocol::{ManagedNotificationRequest, ManagedNotificationSeverity};
 use temps_core::notifications::{
     EmailMessage, NotificationData, NotificationError as CoreNotificationError,
     NotificationService as CoreNotificationService,
@@ -503,6 +505,50 @@ pub trait NotificationProvider: Send + Sync {
     async fn initialize(&mut self, db: Arc<DatabaseConnection>) -> Result<()>;
     async fn send(&self, notification: &Notification) -> Result<()>;
     async fn health_check(&self) -> Result<bool>;
+}
+
+/// The only managed provider exposed by OSS. Cloud owns all concrete sinks.
+pub struct TempsCloudProvider {
+    cloud: Arc<CloudService>,
+}
+
+#[async_trait]
+impl NotificationProvider for TempsCloudProvider {
+    async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn send(&self, notification: &Notification) -> Result<()> {
+        let severity = match notification.effective_severity() {
+            NotificationSeverity::Debug => ManagedNotificationSeverity::Debug,
+            NotificationSeverity::Info => ManagedNotificationSeverity::Info,
+            NotificationSeverity::Warning => ManagedNotificationSeverity::Warning,
+            NotificationSeverity::Error => ManagedNotificationSeverity::Error,
+            NotificationSeverity::Critical => ManagedNotificationSeverity::Critical,
+            NotificationSeverity::Emergency => ManagedNotificationSeverity::Emergency,
+        };
+        let metadata = notification
+            .metadata
+            .iter()
+            .filter(|(key, _)| !key.starts_with('_'))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        self.cloud
+            .send_notification(&ManagedNotificationRequest {
+                source_notification_id: notification.id.clone(),
+                title: notification.title.clone(),
+                message: notification.message.clone(),
+                severity,
+                metadata,
+            })
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        Ok(self.cloud.status().await?.status == "linked")
+    }
 }
 
 impl EmailProvider {
@@ -1337,6 +1383,7 @@ impl NotificationProvider for WebhookProvider {
 pub struct NotificationService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    cloud: Option<Arc<CloudService>>,
 }
 
 impl NotificationService {
@@ -1347,7 +1394,61 @@ impl NotificationService {
         Self {
             db,
             encryption_service,
+            cloud: None,
         }
+    }
+
+    pub fn new_with_cloud(
+        db: Arc<DatabaseConnection>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+        cloud: Arc<CloudService>,
+    ) -> Self {
+        Self {
+            db,
+            encryption_service,
+            cloud: Some(cloud),
+        }
+    }
+
+    async fn sync_cloud_provider(&self) -> Result<()> {
+        let Some(cloud) = &self.cloud else {
+            return Ok(());
+        };
+        let linked = cloud
+            .status()
+            .await
+            .map(|status| status.status == "linked")?;
+        let existing = notification_providers::Entity::find()
+            .filter(notification_providers::Column::ProviderType.eq("cloud"))
+            .one(self.db.as_ref())
+            .await?;
+        if let Some(existing) = existing {
+            if existing.enabled != linked || existing.name != "Temps Cloud" {
+                let mut active: notification_providers::ActiveModel = existing.into();
+                active.name = Set("Temps Cloud".to_string());
+                active.enabled = Set(linked);
+                active.update(self.db.as_ref()).await?;
+            }
+        } else if linked {
+            let encrypted = self
+                .encryption_service
+                .encrypt_string("{}")
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to encrypt Cloud provider marker: {error}")
+                })?;
+            notification_providers::ActiveModel {
+                name: Set("Temps Cloud".to_string()),
+                provider_type: Set("cloud".to_string()),
+                config: Set(encrypted),
+                enabled: Set(true),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(self.db.as_ref())
+            .await?;
+        }
+        Ok(())
     }
 
     fn get_batch_key(notification: &Notification) -> String {
@@ -1358,6 +1459,9 @@ impl NotificationService {
     }
 
     async fn get_enabled_providers(&self) -> Result<Vec<Box<dyn NotificationProvider>>> {
+        if let Err(error) = self.sync_cloud_provider().await {
+            error!(%error, "Could not synchronize the optional Temps Cloud provider");
+        }
         let db_providers = notification_providers::Entity::find()
             .filter(notification_providers::Column::Enabled.eq(true))
             .all(self.db.as_ref())
@@ -1559,6 +1663,9 @@ impl NotificationService {
     }
 
     pub async fn is_configured(&self) -> Result<bool> {
+        if let Err(error) = self.sync_cloud_provider().await {
+            error!(%error, "Could not synchronize the optional Temps Cloud provider");
+        }
         let count = notification_providers::Entity::find()
             .filter(notification_providers::Column::Enabled.eq(true))
             .paginate(self.db.as_ref(), 1)
@@ -1573,6 +1680,9 @@ impl NotificationService {
     }
 
     pub async fn list_providers(&self) -> Result<Vec<notification_providers::Model>> {
+        if let Err(error) = self.sync_cloud_provider().await {
+            error!(%error, "Could not synchronize the optional Temps Cloud provider");
+        }
         let providers = notification_providers::Entity::find()
             .all(self.db.as_ref())
             .await?;
@@ -1584,6 +1694,9 @@ impl NotificationService {
         page: u64,
         page_size: u64,
     ) -> Result<Vec<notification_providers::Model>> {
+        if let Err(error) = self.sync_cloud_provider().await {
+            error!(%error, "Could not synchronize the optional Temps Cloud provider");
+        }
         let providers = notification_providers::Entity::find()
             .paginate(self.db.as_ref(), page_size)
             .fetch_page(page - 1)
@@ -1765,6 +1878,13 @@ impl NotificationService {
         &self,
         record: &notification_providers::Model,
     ) -> Result<Box<dyn NotificationProvider>> {
+        if record.provider_type == "cloud" {
+            let cloud = self
+                .cloud
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Temps Cloud service is unavailable"))?;
+            return Ok(Box::new(TempsCloudProvider { cloud }));
+        }
         // Decrypt the config before parsing
         let decrypted_config = self
             .encryption_service
@@ -1899,8 +2019,15 @@ impl NotificationService {
 
         if let Some(provider) = provider {
             let notification_provider = self.load_provider(&provider).await?;
-            // Let the error propagate instead of swallowing it
-            notification_provider.health_check().await
+            let notification = Notification::new(
+                "Temps test notification",
+                "This is a test alert from your Temps notification settings. No action is required.",
+            );
+            // A provider test must exercise delivery, not only configuration.
+            // Otherwise the UI can report success while credentials, routing,
+            // or the remote destination are unable to accept a message.
+            notification_provider.send(&notification).await?;
+            Ok(true)
         } else {
             Err(anyhow::anyhow!(
                 "Notification provider with ID {} not found",

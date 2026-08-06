@@ -41,6 +41,11 @@ pub struct EnrollmentState {
     pub token: Option<String>,
 
     pub tenant_id: Option<Uuid>,
+
+    /// Cloud account shown in the local UI. Older state files legitimately do
+    /// not contain it and can refresh it by reconnecting.
+    #[serde(default)]
+    pub account_email: Option<String>,
 }
 
 impl std::fmt::Debug for EnrollmentState {
@@ -50,6 +55,7 @@ impl std::fmt::Debug for EnrollmentState {
             .field("base_url", &self.base_url)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .field("tenant_id", &self.tenant_id)
+            .field("account_email", &self.account_email)
             .finish()
     }
 }
@@ -62,6 +68,7 @@ impl EnrollmentState {
             base_url: base_url.into(),
             token: None,
             tenant_id: None,
+            account_email: None,
         }
     }
 
@@ -172,6 +179,7 @@ impl EnrollmentState {
     pub fn unlink(&mut self) {
         self.token = None;
         self.tenant_id = None;
+        self.account_email = None;
     }
 }
 
@@ -198,6 +206,7 @@ mod tests {
         let mut s = EnrollmentState::new("https://cloud.test");
         s.token = Some("inst_abc".into());
         s.tenant_id = Some(Uuid::new_v4());
+        s.account_email = Some("owner@example.com".into());
 
         s.save(&p).unwrap();
         assert_eq!(EnrollmentState::load(&p).unwrap(), Some(s));
@@ -230,12 +239,36 @@ mod tests {
         let id = s.instance_id;
         s.token = Some("inst_abc".into());
         s.tenant_id = Some(Uuid::new_v4());
+        s.account_email = Some("owner@example.com".into());
 
         s.unlink();
 
         assert!(!s.is_linked());
         assert!(s.tenant_id.is_none());
+        assert!(s.account_email.is_none());
         assert_eq!(s.instance_id, id, "re-linking must reattach, not orphan");
+    }
+
+    #[test]
+    fn legacy_state_without_an_account_email_still_loads() {
+        let (_d, p) = temp();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let instance_id = Uuid::new_v4();
+        std::fs::write(
+            &p,
+            serde_json::json!({
+                "instance_id": instance_id,
+                "base_url": "https://cloud.test",
+                "token": "inst_legacy",
+                "tenant_id": Uuid::new_v4()
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let state = EnrollmentState::load(&p).unwrap().unwrap();
+        assert_eq!(state.instance_id, instance_id);
+        assert!(state.account_email.is_none());
     }
 
     #[test]

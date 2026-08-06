@@ -2,6 +2,7 @@ import type { Page } from '@playwright/test'
 import { expect, expectAppMounted, test } from '../fixtures'
 
 const cloudStatus = (linked: boolean) => ({
+  account_email: linked ? 'owner@example.com' : null,
   backend_url: 'http://localhost:19200',
   health: linked ? 'healthy' : 'disconnected',
   health_message: linked ? 'Signals are reaching Temps Cloud' : 'Not linked',
@@ -72,14 +73,16 @@ test.describe('Temps Cloud activation onboarding', () => {
     await expect(
       page.getByRole('heading', { name: 'Connect this instance' })
     ).toBeVisible()
-    await expect(page.getByRole('link', { name: 'Get a code' })).toHaveAttribute(
-      'href',
-      'http://localhost:19200'
-    )
+    await expect(
+      page.getByRole('link', { name: 'Get a code' })
+    ).toHaveAttribute('href', 'http://localhost:19200')
     await page.getByLabel('1. Paste enrollment code').fill('ABCD-EFGH')
     await page.getByRole('button', { name: '2. Connect' }).click()
 
     await expect(page.getByRole('heading', { name: 'Connected' })).toBeVisible()
+    await expect(
+      page.getByText('Cloud account: owner@example.com')
+    ).toBeVisible()
     await expect(page.getByText('instance-e2')).toBeVisible()
     expect(cloud.enrollmentCodes).toEqual(['ABCD-EFGH'])
 

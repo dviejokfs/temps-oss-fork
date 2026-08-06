@@ -30,7 +30,10 @@ pub mod messages;
 
 pub use messages::{
     BackupCompleted, BackupTarget, BackupTargetRequest, EnrollRequest, EnrollResponse, Envelope,
-    Heartbeat, IngestAck, SpanRecord, TelemetryBatch,
+    Heartbeat, HeartbeatAck, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
+    ManagedAiCapability, ManagedAiCitation, ManagedAiEvidence, ManagedAiTask,
+    ManagedNotificationAccepted, ManagedNotificationRequest, ManagedNotificationSeverity,
+    SpanRecord, TelemetryBatch,
 };
 
 use serde::{Deserialize, Serialize};
@@ -53,6 +56,9 @@ pub enum Capability {
     /// Instance accepts managed DNS records and certificate material for a
     /// subdomain issued by the backend.
     ManagedSubdomain,
+    /// Instance may submit an operator-approved, locally redacted manifest for
+    /// credit-backed managed inference. Source telemetry never moves implicitly.
+    ManagedAiInference,
 }
 
 /// First frame on every connection, sent by both sides.

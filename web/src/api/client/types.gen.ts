@@ -2151,6 +2151,7 @@ export type CloudSettings = {
 };
 
 export type CloudStatus = {
+    account_email?: string | null;
     backend_url: string;
     health: string;
     health_message: string;

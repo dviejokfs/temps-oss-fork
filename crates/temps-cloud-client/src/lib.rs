@@ -32,7 +32,11 @@ pub use status::{LinkStatus, MirrorHealth};
 
 use std::time::Duration;
 
-use temps_cloud_protocol::{EnrollRequest, EnrollResponse, IngestAck, SpanRecord, TelemetryBatch};
+use temps_cloud_protocol::{
+    EnrollRequest, EnrollResponse, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
+    ManagedAiCapability, ManagedNotificationAccepted, ManagedNotificationRequest, SpanRecord,
+    TelemetryBatch,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -116,6 +120,7 @@ impl BackendUrl {
 /// Deliberately short. This runs alongside the instance's own work, and a slow
 /// backend must never become the instance's latency.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const AI_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Error)]
 pub enum CloudError {
@@ -254,6 +259,68 @@ impl CloudClient {
         }
     }
 
+    /// Describe managed inference without reading or uploading local context.
+    pub async fn managed_ai_capability(
+        &self,
+        token: &str,
+    ) -> Result<ManagedAiCapability, CloudError> {
+        let response = self
+            .http
+            .get(self.backend.endpoint("/v1/ai/capability"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|error| CloudError::Unreachable {
+                reason: error.to_string(),
+                spooled_bytes: 0,
+            })?;
+        decode_managed_response(response).await
+    }
+
+    /// Submit the exact manifest the operator approved in the OSS AI surface.
+    /// Source telemetry is never fetched by Cloud and BYO credentials never use
+    /// this path; local BYO continues through the OSS AI gateway directly.
+    pub async fn managed_ai_analysis(
+        &self,
+        token: &str,
+        request: &ManagedAiAnalysisRequest,
+    ) -> Result<ManagedAiAnalysisResponse, CloudError> {
+        let response = self
+            .http
+            .post(self.backend.endpoint("/v1/ai/analyses"))
+            .bearer_auth(token)
+            .timeout(AI_REQUEST_TIMEOUT)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| CloudError::Unreachable {
+                reason: error.to_string(),
+                spooled_bytes: 0,
+            })?;
+        decode_managed_response(response).await
+    }
+
+    /// Queue one OSS alert for Cloud-owned fan-out. A retry with the same
+    /// source id is idempotent at the backend.
+    pub async fn send_notification(
+        &self,
+        token: &str,
+        request: &ManagedNotificationRequest,
+    ) -> Result<ManagedNotificationAccepted, CloudError> {
+        let response = self
+            .http
+            .post(self.backend.endpoint("/v1/notifications"))
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| CloudError::Unreachable {
+                reason: error.to_string(),
+                spooled_bytes: 0,
+            })?;
+        decode_managed_response(response).await
+    }
+
     /// Mirror a batch of spans. Never called on a request path.
     pub async fn ship(
         &self,
@@ -319,6 +386,36 @@ impl CloudClient {
             }
         }
     }
+}
+
+async fn decode_managed_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, CloudError> {
+    let status = response.status();
+    if status.is_success() {
+        return response
+            .json::<T>()
+            .await
+            .map_err(|error| CloudError::Rejected {
+                detail: format!("managed backend returned an unreadable response: {error}"),
+            });
+    }
+    if matches!(status.as_u16(), 401 | 403) {
+        return Err(CloudError::CredentialRejected);
+    }
+    if matches!(status.as_u16(), 429 | 500..=599) {
+        return Err(CloudError::Unreachable {
+            reason: format!("managed backend returned {status}"),
+            spooled_bytes: 0,
+        });
+    }
+    let detail = response
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|value| value["detail"].as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("managed backend returned {status}"));
+    Err(CloudError::Rejected { detail })
 }
 
 #[cfg(test)]

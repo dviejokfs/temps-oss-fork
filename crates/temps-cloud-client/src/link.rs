@@ -19,7 +19,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 use tokio::sync::mpsc;
 
-use temps_cloud_protocol::SpanRecord;
+use temps_cloud_protocol::{
+    ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability,
+    ManagedNotificationAccepted, ManagedNotificationRequest, SpanRecord,
+};
 use uuid::Uuid;
 
 use crate::spool::Spool;
@@ -195,6 +198,14 @@ impl CloudLink {
             .map(|s| s.instance_id)
     }
 
+    pub fn account_email(&self) -> Option<String> {
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|state| state.account_email.clone())
+    }
+
     /// Lock-free fast-path hint for telemetry producers. Enrollment can race
     /// with an offer; generation tagging prevents a raced batch crossing links.
     pub fn is_linked(&self) -> bool {
@@ -286,6 +297,7 @@ impl CloudLink {
         let mut next = current.clone();
         next.token = Some(res.instance_token);
         next.tenant_id = Some(res.tenant_id);
+        next.account_email = res.account_email;
         // Clone → save → swap: a failed disk write cannot leave a credential
         // alive only in memory.
         next.save(&self.state_path)
@@ -314,6 +326,43 @@ impl CloudLink {
         };
         let backend = self.parse_backend(&base_url)?;
         CloudClient::new(backend)?.revoke(&token).await
+    }
+
+    pub async fn managed_ai_capability(&self) -> Result<ManagedAiCapability, CloudError> {
+        let (base_url, token) = self.linked_credential()?;
+        let backend = self.parse_backend(&base_url)?;
+        CloudClient::new(backend)?
+            .managed_ai_capability(&token)
+            .await
+    }
+
+    pub async fn managed_ai_analysis(
+        &self,
+        request: &ManagedAiAnalysisRequest,
+    ) -> Result<ManagedAiAnalysisResponse, CloudError> {
+        let (base_url, token) = self.linked_credential()?;
+        let backend = self.parse_backend(&base_url)?;
+        CloudClient::new(backend)?
+            .managed_ai_analysis(&token, request)
+            .await
+    }
+
+    pub async fn send_notification(
+        &self,
+        request: &ManagedNotificationRequest,
+    ) -> Result<ManagedNotificationAccepted, CloudError> {
+        let (base_url, token) = self.linked_credential()?;
+        let backend = self.parse_backend(&base_url)?;
+        CloudClient::new(backend)?
+            .send_notification(&token, request)
+            .await
+    }
+
+    fn linked_credential(&self) -> Result<(String, String), CloudError> {
+        let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
+        let state = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
+        let token = state.token.clone().ok_or(CloudError::NotEnrolled)?;
+        Ok((state.base_url.clone(), token))
     }
 
     /// Forget the credential. Keeps the instance identity so re-linking later
