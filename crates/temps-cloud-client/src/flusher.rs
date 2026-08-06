@@ -17,6 +17,13 @@ pub const BASE_INTERVAL: Duration = Duration::from_secs(15);
 /// polled, or recovery would need a restart to notice.
 pub const MAX_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Maximum time a clean shutdown may spend on its final delivery attempt.
+///
+/// The pending submission remains owned by [`CloudLink`] if the future is
+/// cancelled, so timing out cannot corrupt the in-memory queue while shutdown
+/// completes. Source telemetry remains authoritative in local Temps storage.
+pub const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Next interval after an outcome.
 ///
 /// Separated from the loop so the policy is testable without waiting on real
@@ -43,6 +50,14 @@ pub fn next_interval(current: Duration, outcome: &FlushOutcome) -> Duration {
 
 /// Run until cancelled. Spawn this once at instance startup.
 pub async fn run(link: Arc<CloudLink>, mut cancel: tokio::sync::watch::Receiver<bool>) {
+    run_with_shutdown_timeout(link, &mut cancel, SHUTDOWN_FLUSH_TIMEOUT).await;
+}
+
+async fn run_with_shutdown_timeout(
+    link: Arc<CloudLink>,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+    shutdown_flush_timeout: Duration,
+) {
     let mut interval = BASE_INTERVAL;
 
     loop {
@@ -53,7 +68,27 @@ pub async fn run(link: Arc<CloudLink>, mut cancel: tokio::sync::watch::Receiver<
                     // One last attempt on the way out, bounded: a clean
                     // shutdown should not lose a spool we could have delivered,
                     // but it also must not hang the process.
-                    let _ = tokio::time::timeout(Duration::from_secs(5), link.flush()).await;
+                    match tokio::time::timeout(shutdown_flush_timeout, link.flush()).await {
+                        Ok(FlushOutcome::Shipped { spans }) => {
+                            tracing::info!(spans, "mirrored telemetry during shutdown");
+                        }
+                        Ok(FlushOutcome::Retained { spans, reason })
+                        | Ok(FlushOutcome::Blocked { spans, reason }) => {
+                            tracing::warn!(
+                                spans,
+                                reason,
+                                "shutdown flush could not mirror telemetry; source remains in local storage"
+                            );
+                        }
+                        Ok(FlushOutcome::Idle | FlushOutcome::NotLinked) => {}
+                        Err(_) => {
+                            tracing::warn!(
+                                timeout_ms = shutdown_flush_timeout.as_millis(),
+                                spooled_spans = link.spooled(),
+                                "shutdown flush timed out; source telemetry remains in local storage"
+                            );
+                        }
+                    }
                     tracing::info!("cloud mirror stopped");
                     return;
                 }
@@ -85,7 +120,116 @@ pub async fn run(link: Arc<CloudLink>, mut cancel: tokio::sync::watch::Receiver<
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+
+    use axum::{extract::State, routing::post, Json, Router};
+    use temps_cloud_protocol::{SpanRecord, TelemetryBatch};
+    use uuid::Uuid;
+
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct Stub {
+        status: Arc<AtomicU16>,
+        telemetry_delay_ms: Arc<AtomicU64>,
+        received: Arc<AtomicUsize>,
+    }
+
+    async fn serve(stub: Stub) -> String {
+        let app = Router::new()
+            .route(
+                "/v1/enroll",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "tenant_id": Uuid::new_v4(),
+                        "instance_token": "inst_shutdown_test"
+                    }))
+                }),
+            )
+            .route(
+                "/v1/telemetry",
+                post(
+                    |State(stub): State<Stub>, Json(batch): Json<TelemetryBatch>| async move {
+                        let delay = stub.telemetry_delay_ms.load(Ordering::SeqCst);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        let status = stub.status.load(Ordering::SeqCst);
+                        if status != 200 {
+                            return (
+                                axum::http::StatusCode::from_u16(status)
+                                    .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+                                Json(serde_json::json!({"detail": "stub failure"})),
+                            );
+                        }
+                        let spans = batch.spans.len();
+                        stub.received.fetch_add(spans, Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::json!({
+                                "submission_id": batch.submission_id,
+                                "processed_spans": spans,
+                                "stored_spans": spans,
+                                "metered_bytes": 1
+                            })),
+                        )
+                    },
+                ),
+            )
+            .with_state(stub);
+        let listener = tokio::net::TcpListener::bind::<SocketAddr>(
+            "127.0.0.1:0".parse().expect("loopback address must parse"),
+        )
+        .await
+        .expect("test server must bind");
+        let address = listener.local_addr().expect("test server has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    fn span() -> SpanRecord {
+        SpanRecord {
+            trace_id: "shutdown-trace".into(),
+            span_id: "shutdown-span".into(),
+            name: "shutdown".into(),
+            ts_millis: 1,
+            duration_ms: 1.0,
+            attributes: Default::default(),
+        }
+    }
+
+    async fn linked_test_link(stub: Stub) -> (Arc<CloudLink>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let backend = serve(stub).await;
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            directory.path().to_path_buf(),
+            "shutdown-test",
+        ));
+        link.configure(
+            crate::BackendUrl::loopback_development(&backend)
+                .expect("stub backend URL must be accepted"),
+        )
+        .expect("test link must be configured");
+        link.enroll("shutdown-code")
+            .await
+            .expect("test link must enroll");
+        (link, directory)
+    }
+
+    async fn cancel_and_join(link: Arc<CloudLink>, timeout: Duration) {
+        let (cancel, mut receiver) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            run_with_shutdown_timeout(link, &mut receiver, timeout).await;
+        });
+        cancel.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown must remain bounded")
+            .expect("flusher task must exit cleanly");
+    }
 
     #[test]
     fn a_transient_failure_backs_off_and_is_capped() {
@@ -141,5 +285,59 @@ mod tests {
         let d = next_interval(BASE_INTERVAL, &FlushOutcome::NotLinked);
         assert_eq!(d, MAX_INTERVAL);
         assert!(d < Duration::from_secs(3600), "must still poll");
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_queued_spans_before_stopping() {
+        let stub = Stub {
+            status: Arc::new(AtomicU16::new(200)),
+            ..Default::default()
+        };
+        let (link, _directory) = linked_test_link(stub.clone()).await;
+        link.record(vec![span()]);
+
+        cancel_and_join(link.clone(), Duration::from_secs(1)).await;
+
+        assert_eq!(stub.received.load(Ordering::SeqCst), 1);
+        assert_eq!(link.spooled(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_retains_spans_when_the_backend_rejects_the_attempt() {
+        let stub = Stub {
+            status: Arc::new(AtomicU16::new(200)),
+            ..Default::default()
+        };
+        let (link, _directory) = linked_test_link(stub.clone()).await;
+        stub.status.store(503, Ordering::SeqCst);
+        link.record(vec![span()]);
+
+        cancel_and_join(link.clone(), Duration::from_secs(1)).await;
+
+        assert_eq!(stub.received.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            link.spooled(),
+            1,
+            "a failed final attempt must remain queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_is_bounded_without_corrupting_the_pending_submission() {
+        let stub = Stub {
+            status: Arc::new(AtomicU16::new(200)),
+            telemetry_delay_ms: Arc::new(AtomicU64::new(500)),
+            ..Default::default()
+        };
+        let (link, _directory) = linked_test_link(stub).await;
+        link.record(vec![span()]);
+
+        cancel_and_join(link.clone(), Duration::from_millis(20)).await;
+
+        assert_eq!(
+            link.spooled(),
+            1,
+            "timing out must not corrupt the in-memory submission"
+        );
     }
 }
