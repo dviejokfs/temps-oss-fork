@@ -4,6 +4,7 @@ pub(crate) mod admin_gate_service;
 pub mod console;
 pub(crate) mod on_demand_cert;
 pub(crate) mod proxy;
+pub(crate) mod self_update;
 mod shutdown;
 
 use clap::{Args, ValueEnum};
@@ -71,6 +72,18 @@ pub struct ServeCommand {
     /// defense-in-depth allowlist on top of the network-layer isolation.
     #[arg(long, env = "TEMPS_CONSOLE_ADMIN_ADDRESS")]
     pub console_admin_address: Option<String>,
+
+    /// Forbid applying release updates from the console, permanently for the
+    /// lifetime of this process.
+    ///
+    /// The console also has a Settings toggle for the same thing, but that one
+    /// lives in the database and can be switched back on by anyone who can
+    /// write settings. This flag cannot: it is set at launch, so an operator
+    /// who keeps upgrades under configuration management (or policy) can rule
+    /// the API path out entirely. The update banner still appears and still
+    /// shows the manual command — only the "Update now" action is refused.
+    #[arg(long)]
+    pub disable_self_update: bool,
 
     /// Screenshot provider to use: "local" (headless Chrome), "remote", or "noop" (disabled)
     /// Use "noop" on servers without Chrome installed to skip screenshot functionality
@@ -323,6 +336,27 @@ impl ServeCommand {
             update_check_interval,
         ));
 
+        // Companion to the notifier above: the notifier says a release exists,
+        // this applies it when an admin asks. Constructed here (not in the
+        // console) so it resolves the journal of a previous update attempt
+        // exactly once per process, before any request can observe it.
+        //
+        // In split topology (ADR-017) only the CONSOLE process restarts. The
+        // sibling `temps proxy` keeps serving :80/:443 on the binary it already
+        // exec'd, so the operator has to restart it separately to converge —
+        // stated up front rather than discovered as version skew later.
+        let self_update_caveat = (self.role == ServeRole::Console).then(|| {
+            "This process runs the console only (ADR-017 split topology). The separate \
+             `temps proxy` service keeps serving traffic on the binary it started with — \
+             restart it too once the console is back to finish the upgrade."
+                .to_string()
+        });
+        let self_updater = Arc::new(self_update::BinarySelfUpdater::new(
+            serve_config.data_dir.clone(),
+            self.disable_self_update,
+            self_update_caveat,
+        ));
+
         // Connect to Docker once and share the handle between:
         //   1. OnDemandManager (wake-on-request scale-to-zero)
         //   2. Preview gateway reconciler (workspace preview routing)
@@ -524,6 +558,7 @@ impl ServeCommand {
             admin_gate_handle: Some(admin_gate_handle.clone()),
             retention_resolver_slot: retention_resolver_slot.clone(),
             update_status,
+            self_updater,
         };
 
         if self.role == ServeRole::Console {

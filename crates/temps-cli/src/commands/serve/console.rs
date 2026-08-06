@@ -1215,6 +1215,12 @@ pub struct ConsoleApiParams {
     /// banner (`GET /settings/update-status`). Advisory read-only metadata —
     /// it never influences routing, auth, or connection handling.
     pub update_status: Arc<temps_core::UpdateStatusSlot>,
+    /// Applies a release update on request from the settings API and exits so
+    /// the supervisor restarts temps on the new binary. Owned by the caller
+    /// (`commands/serve/mod.rs`) so the journal of a previous attempt is
+    /// resolved exactly once per process; registered below for ConfigPlugin's
+    /// `GET/POST /settings/update`.
+    pub self_updater: Arc<crate::commands::serve::self_update::BinarySelfUpdater>,
 }
 
 /// Build a ClickHouse-backed metrics store from the server config, or `None`
@@ -1747,6 +1753,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         admin_gate_handle: provided_admin_gate_handle,
         retention_resolver_slot,
         update_status,
+        self_updater,
     } = params;
 
     // Count panics for the anonymous `error_summary` telemetry event. Only
@@ -1855,6 +1862,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // it; ConfigPlugin's `GET /settings/update-status` reads it so the web
     // console can render the upgrade banner.
     service_context.register_service(update_status.clone());
+    // Registered behind the trait so temps-config depends only on the
+    // temps-core contract, never on the CLI crate that implements it.
+    service_context.register_service(self_updater.clone() as Arc<dyn temps_core::SelfUpdater>);
 
     // Register the shared route table (created in serve/mod.rs)
     // This is used by analytics-events and other plugins that need to resolve hosts

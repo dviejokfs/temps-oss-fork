@@ -24,6 +24,7 @@ pub mod public_hostname_resolver;
 pub mod retention;
 pub mod retry;
 pub mod secrets_manager;
+pub mod self_update;
 pub mod sensitive_action;
 pub mod telemetry;
 pub mod time_window;
@@ -31,6 +32,10 @@ pub mod tls;
 pub mod traces;
 pub mod update_status;
 pub use problemdetails::ProblemDetails;
+pub use self_update::{
+    SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability, SelfUpdateError, SelfUpdatePhase,
+    SelfUpdateStatus, SelfUpdater, StartedSelfUpdate, SupervisorKind, SELF_UPDATE_JOURNAL_FILE,
+};
 pub use update_status::{AvailableUpdate, UpdateStatusSlot, UPGRADE_DOCS_URL};
 mod app_settings;
 mod constants;
@@ -96,7 +101,7 @@ pub use app_settings::{
     DockerRegistrySettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
     MultiNodeSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
     PreviewGatewaySettings, ProviderConfig, RateLimitSettings, ScreenshotSettings,
-    SecurityHeadersSettings,
+    SecurityHeadersSettings, SelfUpdateSettings,
 };
 pub use async_trait;
 pub use chrono;

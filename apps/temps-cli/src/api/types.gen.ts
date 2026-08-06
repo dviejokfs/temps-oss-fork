@@ -1095,6 +1095,16 @@ export type AppSettings = {
     screenshots?: ScreenshotSettings;
     security_headers?: SecurityHeadersSettings;
     /**
+     * One-click "Update now" from the console. Enabled by default; an admin
+     * can turn it off here to keep upgrades on the CLI/config-management path.
+     *
+     * This is the *soft* switch — it is stored in the database, so whoever can
+     * write settings can also turn it back on. Operators who need an upgrade
+     * path that no console session can re-open should start the server with
+     * `--disable-self-update`, which wins over this field unconditionally.
+     */
+    self_update?: SelfUpdateSettings;
+    /**
      * Set to `true` by `temps setup` (all modes) once initial configuration
      * has been applied. The web onboarding wizard reads this from the server
      * and skips itself when true, preventing the "Configure Base Domain" wall
@@ -1178,6 +1188,13 @@ export type AppSettingsResponse = {
     require_mfa_for_admins: boolean;
     screenshots: ScreenshotSettings;
     security_headers: SecurityHeadersSettings;
+    /**
+     * Whether admins may apply a release from the console. This is the
+     * database-backed toggle only — a server started with
+     * `--disable-self-update` refuses regardless of what this says, which
+     * `GET /settings/update` reports as the authoritative answer.
+     */
+    self_update: SelfUpdateSettings;
     /**
      * Whether `temps setup` has been run at least once. The web onboarding
      * wizard checks this field on load and skips itself when true.
@@ -1334,7 +1351,10 @@ export type AuthFlavorDto = {
 
 export type AuthResponse = {
     message: string;
+    mfa_enrollment_required: boolean;
     mfa_required: boolean;
+    mfa_setup?: null | MfaSetupResponse;
+    password_change_required: boolean;
     success: boolean;
     user_id?: number | null;
 };
@@ -3927,6 +3947,7 @@ export type CreateTeamRequest = {
 
 export type CreateUserRequest = {
     email?: string | null;
+    must_change_password?: boolean;
     password?: string | null;
     roles: Array<string>;
     username: string;
@@ -4737,6 +4758,19 @@ export type DeploymentMetadata = {
      * ID of the deployment this was rolled back from (if applicable)
      */
     rolledBackFromId?: number | null;
+    /**
+     * Uploaded source archive content type.
+     */
+    sourceBundleContentType?: string | null;
+    /**
+     * Uploaded source archive ID. Source archives are extracted before the
+     * regular preset build pipeline and do not require Git metadata.
+     */
+    sourceBundleId?: number | null;
+    /**
+     * Uploaded source archive path in the Temps data directory.
+     */
+    sourceBundlePath?: string | null;
     /**
      * Static bundle content type (for proper extraction: application/gzip or application/zip)
      */
@@ -12380,6 +12414,12 @@ export type PropertyBreakdownQuery = {
      */
     group_by: PropertyColumn;
     /**
+     * Include crawler/bot traffic (default: false). Off by default so the
+     * breakdown percentages share a denominator with the headline counts,
+     * which always exclude crawlers.
+     */
+    include_crawlers?: boolean | null;
+    /**
      * Maximum number of results to return (default: 20, max: 100)
      */
     limit?: number | null;
@@ -12435,6 +12475,11 @@ export type PropertyTimelineQuery = {
      * Property column to group by
      */
     group_by: PropertyColumn;
+    /**
+     * Include crawler/bot traffic (default: false). See
+     * [`PropertyBreakdownQuery::include_crawlers`].
+     */
+    include_crawlers?: boolean | null;
     /**
      * Start date for the query range
      */
@@ -13274,6 +13319,18 @@ export type RequestRow = {
     user_agent?: string | null;
 };
 
+export type RequiredPasswordChangeRequest = {
+    new_password: string;
+};
+
+export type RequiredPasswordChangeResponse = {
+    message: string;
+    mfa_enrollment_required: boolean;
+    mfa_setup?: null | MfaSetupResponse;
+    success: boolean;
+    user_id: number;
+};
+
 export type ResetPasswordRequest = {
     new_password: string;
     token: string;
@@ -13782,6 +13839,7 @@ export type RouteUser = {
     id: number;
     image: string;
     mfa_enabled: boolean;
+    must_change_password: boolean;
     name: string;
     updated_at: number;
     username: string;
@@ -14410,6 +14468,73 @@ export type SecurityHeadersSettings = {
     x_frame_options?: string;
     x_xss_protection?: string;
 };
+
+/**
+ * A single update attempt. Persisted to `<data_dir>/self-update.json` so the
+ * result survives the restart it causes.
+ */
+export type SelfUpdateAttempt = {
+    /**
+     * Operator-facing failure reason. Always set when `status` is `Failed`.
+     */
+    error?: string | null;
+    /**
+     * When the outcome was decided. `None` while still `Pending`.
+     */
+    finished_at?: string | null;
+    /**
+     * Version the attempt started from.
+     */
+    from_version: string;
+    /**
+     * Where the replaced binary was kept, so a bad release can be reverted by
+     * hand (`mv <path> <binary>`). Set once the swap completes.
+     */
+    previous_binary_path?: string | null;
+    started_at: string;
+    status: SelfUpdateStatus;
+    /**
+     * Version the attempt targeted. `None` if it failed before resolving one.
+     */
+    to_version?: string | null;
+    /**
+     * User who clicked the button. `None` for attempts started by the CLI.
+     */
+    triggered_by_user_id?: number | null;
+};
+
+/**
+ * Why a one-click update is unavailable. Exactly one is reported — the most
+ * fundamental blocker wins, so the operator fixes the real problem first
+ * rather than clearing one only to hit the next.
+ */
+export type SelfUpdateBlocker = 'disabled_by_flag' | 'disabled_by_setting' | 'container' | 'no_supervisor' | 'binary_not_writable' | 'unsupported_platform' | 'in_progress';
+
+/**
+ * Where an in-flight update has got to. Polled by the console so a long
+ * download shows progress instead of an indefinite spinner.
+ */
+export type SelfUpdatePhase = 'idle' | 'resolving' | 'downloading' | 'verifying' | 'installing' | 'restarting' | 'failed';
+
+/**
+ * Controls the console's one-click "Update now" action.
+ */
+export type SelfUpdateSettings = {
+    /**
+     * Allow admins to apply a release and restart the server from the console.
+     * `true` by default: the action is permission-gated, audited, and only
+     * ever installs an official release whose published SHA-256 matches.
+     *
+     * Turning this off hides nothing — the console still shows the update
+     * banner and the manual command, it just refuses to run it for you.
+     */
+    enabled?: boolean;
+};
+
+/**
+ * Outcome of an update attempt, as persisted in the journal.
+ */
+export type SelfUpdateStatus = 'pending' | 'succeeded' | 'failed';
 
 export type SendEmailRequestBody = {
     /**
@@ -15980,6 +16105,33 @@ export type StartRestoreRequest = RestoreRequestMode & {
     s3_source_id?: number | null;
 };
 
+/**
+ * Optional pin for the version to install.
+ */
+export type StartUpdateRequest = {
+    /**
+     * Release tag to install (e.g. `v0.2.0`). Omit to take the newest release
+     * on the channel this install already tracks.
+     */
+    version?: string | null;
+};
+
+/**
+ * Acknowledgement that an update was accepted and is running.
+ */
+export type StartUpdateResponse = {
+    /**
+     * Version the server is running as it accepts this request.
+     */
+    current_version: string;
+    /**
+     * How long to allow for the server to come back before treating the
+     * restart as failed.
+     */
+    estimated_restart_secs: number;
+    message: string;
+};
+
 export type StatResponse = {
     exists: boolean;
     is_dir: boolean;
@@ -16205,6 +16357,11 @@ export type StripeConfig = {
      */
     product_allowlist?: Array<string>;
 };
+
+/**
+ * What (if anything) will restart the process after it exits.
+ */
+export type SupervisorKind = 'systemd' | 'launchd' | 'container' | 'none';
 
 export type SyncedRepositoryListQuery = {
     direction?: string | null;
@@ -17130,6 +17287,57 @@ export type UpdateBlobResponse = {
      * Whether the operation succeeded
      */
     success: boolean;
+};
+
+/**
+ * Whether this install can apply a release update on request, and how the last
+ * attempt went.
+ *
+ * Deliberately answerable even when the answer is "no": an operator who cannot
+ * use the button still needs to know *why* and what to run instead, so this
+ * never 404s or returns an empty body when the feature is unavailable.
+ */
+export type UpdateCapabilityResponse = {
+    /**
+     * Whether the *caller* holds `platform:update`. Distinct from `can_apply`,
+     * which describes the server: the console shows the action only when both
+     * are true, so a reader is never offered a button that would 403.
+     */
+    allowed: boolean;
+    /**
+     * Binary that would be replaced.
+     */
+    binary_path: string;
+    blocker?: null | SelfUpdateBlocker;
+    /**
+     * True only when a request would actually download, install and restart.
+     */
+    can_apply: boolean;
+    /**
+     * Non-blocking warning to show with the confirmation (split topology).
+     */
+    caveat?: string | null;
+    last_attempt?: null | SelfUpdateAttempt;
+    /**
+     * The equivalent command to run by hand. Always present.
+     */
+    manual_command: string;
+    /**
+     * Phase of an in-flight attempt: `idle` when none is running.
+     */
+    phase: SelfUpdatePhase;
+    /**
+     * Failure detail while `phase` is `failed`.
+     */
+    phase_error?: string | null;
+    /**
+     * Operator-facing explanation of `blocker`.
+     */
+    reason?: string | null;
+    /**
+     * What would restart the process: `systemd`, `launchd`, `container`, `none`.
+     */
+    supervisor: SupervisorKind;
 };
 
 export type UpdateCloudflareProviderRequest = {
@@ -22340,6 +22548,37 @@ export type ListPublicProvidersResponses = {
 };
 
 export type ListPublicProvidersResponse = ListPublicProvidersResponses[keyof ListPublicProvidersResponses];
+
+export type ChangeRequiredPasswordData = {
+    body: RequiredPasswordChangeRequest;
+    path?: never;
+    query?: never;
+    url: '/auth/password-change-required';
+};
+
+export type ChangeRequiredPasswordErrors = {
+    /**
+     * Password does not meet requirements
+     */
+    400: unknown;
+    /**
+     * Password-change session is missing or expired
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ChangeRequiredPasswordResponses = {
+    /**
+     * Required password change completed
+     */
+    200: RequiredPasswordChangeResponse;
+};
+
+export type ChangeRequiredPasswordResponse = ChangeRequiredPasswordResponses[keyof ChangeRequiredPasswordResponses];
 
 export type RequestPasswordResetData = {
     body: EmailRequest;
@@ -40808,6 +41047,10 @@ export type GetPropertyBreakdownData = {
          */
         limit?: number;
         /**
+         * Include crawler/bot traffic (default: false)
+         */
+        include_crawlers?: boolean;
+        /**
          * Filter by country (for region/city drill-downs)
          */
         filter_country?: string;
@@ -40900,6 +41143,10 @@ export type GetPropertyTimelineData = {
          * Time bucket: hour, day, week, month (default: auto-detect)
          */
         bucket_size?: string;
+        /**
+         * Include crawler/bot traffic (default: false)
+         */
+        include_crawlers?: boolean;
     };
     url: '/projects/{project_id}/events/properties/timeline';
 };
@@ -43854,7 +44101,7 @@ export type GetUniqueCountsResponses = {
 export type GetUniqueCountsResponse = GetUniqueCountsResponses[keyof GetUniqueCountsResponses];
 
 export type UploadStaticBundleData = {
-    body?: never;
+    body: SourceArchiveUpload;
     path: {
         project_id: number;
     };
@@ -47072,6 +47319,70 @@ export type DownloadGlobalSkillArchiveResponses = {
 
 export type DownloadGlobalSkillArchiveResponse = DownloadGlobalSkillArchiveResponses[keyof DownloadGlobalSkillArchiveResponses];
 
+export type GetUpdateCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/update';
+};
+
+export type GetUpdateCapabilityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetUpdateCapabilityResponses = {
+    /**
+     * Self-update capability for this install
+     */
+    200: UpdateCapabilityResponse;
+};
+
+export type GetUpdateCapabilityResponse = GetUpdateCapabilityResponses[keyof GetUpdateCapabilityResponses];
+
+export type StartUpdateData = {
+    body: StartUpdateRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/update';
+};
+
+export type StartUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Update unavailable or already running
+     */
+    409: ProblemDetails;
+    /**
+     * This process cannot apply updates
+     */
+    501: ProblemDetails;
+};
+
+export type StartUpdateError = StartUpdateErrors[keyof StartUpdateErrors];
+
+export type StartUpdateResponses = {
+    /**
+     * Update accepted; the server will restart
+     */
+    202: StartUpdateResponse;
+};
+
+export type StartUpdateResponse2 = StartUpdateResponses[keyof StartUpdateResponses];
+
 export type GetUpdateStatusData = {
     body?: never;
     path?: never;
@@ -47672,6 +47983,10 @@ export type SetupMfaErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * MFA is already enabled; verify and disable it before re-enrollment
+     */
+    409: unknown;
     /**
      * Internal server error
      */

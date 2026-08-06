@@ -184,9 +184,9 @@ pub struct GitHubRelease {
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-    size: u64,
+    pub(crate) name: String,
+    pub(crate) browser_download_url: String,
+    pub(crate) size: u64,
 }
 
 impl UpgradeCommand {
@@ -843,7 +843,7 @@ pub async fn update_notifier_loop(
 }
 
 /// Determine the platform target string matching release asset names.
-fn platform_target() -> anyhow::Result<String> {
+pub(crate) fn platform_target() -> anyhow::Result<String> {
     let target = match (OS, ARCH) {
         ("macos", "x86_64") => "darwin-amd64",
         ("macos", "aarch64") => "darwin-arm64",
@@ -921,7 +921,7 @@ fn pick_release_for_channel(
 }
 
 /// Fetch a specific release by tag from GitHub.
-async fn fetch_specific_release(version: &str) -> anyhow::Result<GitHubRelease> {
+pub(crate) async fn fetch_specific_release(version: &str) -> anyhow::Result<GitHubRelease> {
     // Ensure the version starts with 'v'
     let tag = if version.starts_with('v') {
         version.to_string()
@@ -1037,7 +1037,7 @@ pub(crate) fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Resul
 }
 
 /// Extract the `temps` binary from a gzipped tarball.
-fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -1061,7 +1061,7 @@ fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Result<Vec<u8>> 
 }
 
 /// Check we have write permission to the binary path.
-fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()> {
+pub(crate) fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()> {
     // Check the parent directory is writable (for atomic rename)
     let parent = binary_path
         .parent()
@@ -1098,7 +1098,7 @@ fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()> {
 /// 1. Write new binary to a temp file next to the target
 /// 2. Set executable permissions
 /// 3. Rename temp file over the target (atomic on the same filesystem)
-fn replace_binary(binary_path: &PathBuf, new_binary: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn replace_binary(binary_path: &PathBuf, new_binary: &[u8]) -> anyhow::Result<()> {
     let parent = binary_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory"))?;

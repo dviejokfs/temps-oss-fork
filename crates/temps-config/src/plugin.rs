@@ -74,6 +74,10 @@ impl TempsPlugin for ConfigPlugin {
         // not). Optional: without it, update-status just reports "no update".
         let update_status = context.get_service::<temps_core::UpdateStatusSlot>();
 
+        // Same optionality as the slot above, for the same reason: only a host
+        // that owns the binary and the process lifecycle registers an updater.
+        let self_updater = context.get_service::<dyn temps_core::SelfUpdater>();
+
         // Create SettingsState
         let settings_state = Arc::new(SettingsState {
             config_service,
@@ -81,6 +85,7 @@ impl TempsPlugin for ConfigPlugin {
             route_table_refresher,
             enrollment_token_service,
             update_status,
+            self_updater,
         });
 
         // Configure routes with the state

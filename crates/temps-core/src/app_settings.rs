@@ -121,6 +121,16 @@ pub struct AppSettings {
     #[serde(default)]
     pub require_mfa_for_admins: bool,
 
+    /// One-click "Update now" from the console. Enabled by default; an admin
+    /// can turn it off here to keep upgrades on the CLI/config-management path.
+    ///
+    /// This is the *soft* switch — it is stored in the database, so whoever can
+    /// write settings can also turn it back on. Operators who need an upgrade
+    /// path that no console session can re-open should start the server with
+    /// `--disable-self-update`, which wins over this field unconditionally.
+    #[serde(default)]
+    pub self_update: SelfUpdateSettings,
+
     /// Binary version tag (e.g. "v0.1.0") of the *console* process
     /// (`temps serve`, role=all or role=console) that last started. Written
     /// on console startup; read by the standalone `temps proxy` to detect
@@ -905,8 +915,29 @@ impl Default for AppSettings {
             observability_retention: ObservabilityRetentionSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
+            self_update: SelfUpdateSettings::default(),
             console_version: None,
         }
+    }
+}
+
+/// Controls the console's one-click "Update now" action.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct SelfUpdateSettings {
+    /// Allow admins to apply a release and restart the server from the console.
+    /// `true` by default: the action is permission-gated, audited, and only
+    /// ever installs an official release whose published SHA-256 matches.
+    ///
+    /// Turning this off hides nothing — the console still shows the update
+    /// banner and the manual command, it just refuses to run it for you.
+    #[schema(example = true)]
+    pub enabled: bool,
+}
+
+impl Default for SelfUpdateSettings {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

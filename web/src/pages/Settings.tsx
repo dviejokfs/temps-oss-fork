@@ -25,6 +25,7 @@ import {
   type PlatformSettings,
 } from '@/hooks/useSettings'
 import { client } from '@/api/client/client.gen'
+import { PlatformUpdatesCard } from '@/components/settings/PlatformUpdatesCard'
 import {
   AlertCircle,
   Globe,
@@ -498,6 +499,9 @@ export function Settings() {
           </Button>
         </CardContent>
       </Card>
+
+      {/* Saves on toggle, so it stays out of this form's dirty tracking. */}
+      <PlatformUpdatesCard />
 
       {isDirty && (
         <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">

@@ -34,6 +34,11 @@ pub struct SettingsState {
     /// (e.g. the standalone proxy's plugin context) — the update-status
     /// endpoint then reports "no update known".
     pub update_status: Option<Arc<temps_core::UpdateStatusSlot>>,
+    /// Applies a release and restarts the server. `None` in hosts that cannot
+    /// meaningfully restart themselves (e.g. the standalone proxy) — the
+    /// update endpoints then report the feature as unsupported here rather
+    /// than pretending it is merely misconfigured.
+    pub self_updater: Option<Arc<dyn temps_core::SelfUpdater>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -44,6 +49,36 @@ struct SettingsUpdatedAudit {
 impl AuditOperation for SettingsUpdatedAudit {
     fn operation_type(&self) -> String {
         "SETTINGS_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// Audit record for a console-triggered platform update. Written before the
+/// process exits, so the trail survives the restart it causes.
+#[derive(Debug, Clone, serde::Serialize)]
+struct PlatformUpdateStartedAudit {
+    context: AuditContext,
+    /// Version the server was running when the update was requested.
+    from_version: String,
+    /// Explicitly pinned target, or `None` for "newest on this channel".
+    target_version: Option<String>,
+}
+
+impl AuditOperation for PlatformUpdateStartedAudit {
+    fn operation_type(&self) -> String {
+        "PLATFORM_UPDATE_STARTED".to_string()
     }
     fn user_id(&self) -> Option<i32> {
         Some(self.context.user_id)
@@ -175,6 +210,11 @@ pub struct AppSettingsResponse {
 
     /// Per-turn limits for the AI chat. No sensitive content.
     pub ai_chat_limits: AiChatLimitsSettings,
+    /// Whether admins may apply a release from the console. This is the
+    /// database-backed toggle only — a server started with
+    /// `--disable-self-update` refuses regardless of what this says, which
+    /// `GET /settings/update` reports as the authoritative answer.
+    pub self_update: temps_core::SelfUpdateSettings,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -387,6 +427,7 @@ impl From<AppSettings> for AppSettingsResponse {
             cluster_dns: settings.cluster_dns,
             build_limits: settings.build_limits,
             ai_chat_limits: settings.ai_chat_limits,
+            self_update: settings.self_update,
         }
     }
 }
@@ -465,6 +506,8 @@ impl AppSettingsResponse {
     paths(
         get_settings,
         get_update_status,
+        get_update_capability,
+        start_update,
         get_disk_status,
         update_settings,
         generate_join_token,
@@ -503,6 +546,15 @@ impl AppSettingsResponse {
         EnrollmentTokenListResponse,
         RouteRefreshResponse,
         UpdateStatusResponse,
+        UpdateCapabilityResponse,
+        StartUpdateRequest,
+        StartUpdateResponse,
+        temps_core::SelfUpdateSettings,
+        temps_core::SelfUpdateAttempt,
+        temps_core::SelfUpdateBlocker,
+        temps_core::SelfUpdatePhase,
+        temps_core::SelfUpdateStatus,
+        temps_core::SupervisorKind,
     )),
     info(
         title = "Settings API",
@@ -518,6 +570,10 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
         .route("/settings", get(get_settings))
         .route("/settings", put(update_settings))
         .route("/settings/update-status", get(get_update_status))
+        .route(
+            "/settings/update",
+            get(get_update_capability).post(start_update),
+        )
         .route("/settings/disk-status", get(get_disk_status))
         .route("/settings/join-token/generate", post(generate_join_token))
         .route("/settings/join-token", delete(revoke_join_token))
@@ -821,6 +877,273 @@ async fn get_update_status(
     };
 
     Ok(Json(response))
+}
+
+// ── Applying a release from the console ──────────────────────────────────────
+
+/// Whether this install can apply a release update on request, and how the last
+/// attempt went.
+///
+/// Deliberately answerable even when the answer is "no": an operator who cannot
+/// use the button still needs to know *why* and what to run instead, so this
+/// never 404s or returns an empty body when the feature is unavailable.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UpdateCapabilityResponse {
+    /// True only when a request would actually download, install and restart.
+    pub can_apply: bool,
+    /// Whether the *caller* holds `platform:update`. Distinct from `can_apply`,
+    /// which describes the server: the console shows the action only when both
+    /// are true, so a reader is never offered a button that would 403.
+    pub allowed: bool,
+    /// Machine-readable reason `can_apply` is false (`disabled_by_flag`,
+    /// `disabled_by_setting`, `container`, `no_supervisor`, `binary_not_writable`,
+    /// `unsupported_platform`, `in_progress`).
+    pub blocker: Option<temps_core::SelfUpdateBlocker>,
+    /// Operator-facing explanation of `blocker`.
+    pub reason: Option<String>,
+    /// Non-blocking warning to show with the confirmation (split topology).
+    pub caveat: Option<String>,
+    /// The equivalent command to run by hand. Always present.
+    pub manual_command: String,
+    /// What would restart the process: `systemd`, `launchd`, `container`, `none`.
+    pub supervisor: temps_core::SupervisorKind,
+    /// Binary that would be replaced.
+    pub binary_path: String,
+    /// Phase of an in-flight attempt: `idle` when none is running.
+    pub phase: temps_core::SelfUpdatePhase,
+    /// Failure detail while `phase` is `failed`.
+    pub phase_error: Option<String>,
+    /// Most recent attempt, including one resolved during this boot — this is
+    /// how the console reports the outcome of an update that restarted it.
+    pub last_attempt: Option<temps_core::SelfUpdateAttempt>,
+}
+
+/// Optional pin for the version to install.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct StartUpdateRequest {
+    /// Release tag to install (e.g. `v0.2.0`). Omit to take the newest release
+    /// on the channel this install already tracks.
+    pub version: Option<String>,
+}
+
+/// Acknowledgement that an update was accepted and is running.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StartUpdateResponse {
+    /// Version the server is running as it accepts this request.
+    pub current_version: String,
+    /// How long to allow for the server to come back before treating the
+    /// restart as failed.
+    pub estimated_restart_secs: u64,
+    pub message: String,
+}
+
+/// Build the "no updater registered in this process" answer.
+///
+/// Reached in hosts that run the settings API without owning the process
+/// lifecycle. Reported as a capability with a reason rather than an error, so
+/// the console renders the same explain-and-point-at-the-CLI surface it uses
+/// for every other blocked state.
+fn updater_unavailable_response(allowed: bool) -> UpdateCapabilityResponse {
+    UpdateCapabilityResponse {
+        can_apply: false,
+        allowed,
+        blocker: Some(temps_core::SelfUpdateBlocker::NoSupervisor),
+        reason: Some(
+            "This process does not manage the temps binary, so it cannot apply an update. \
+             Upgrade from the command line on the host instead."
+                .to_string(),
+        ),
+        caveat: None,
+        manual_command: "temps upgrade".to_string(),
+        supervisor: temps_core::SupervisorKind::None,
+        binary_path: String::new(),
+        phase: temps_core::SelfUpdatePhase::Idle,
+        phase_error: None,
+        last_attempt: None,
+    }
+}
+
+/// Report whether a release update can be applied from the console.
+#[utoipa::path(
+    tag = "Settings",
+    get,
+    path = "/settings/update",
+    responses(
+        (status = 200, description = "Self-update capability for this install", body = UpdateCapabilityResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_update_capability(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+) -> Result<impl IntoResponse, Problem> {
+    // Readable by anyone who can read settings: the banner needs this to decide
+    // what to render. Actually *starting* an update needs `platform:update`,
+    // reported separately as `allowed`.
+    permission_guard!(auth, SettingsRead);
+
+    let allowed = auth.has_permission(&temps_auth::Permission::PlatformUpdate);
+
+    let Some(updater) = app_state.self_updater.as_ref() else {
+        return Ok(Json(updater_unavailable_response(allowed)));
+    };
+
+    // The database toggle is only half the answer; the updater combines it with
+    // the launch flag and the environment to decide what is actually possible.
+    let enabled_in_settings = app_state
+        .config_service
+        .get_settings()
+        .await
+        .map(|s| s.self_update.enabled)
+        // Fail closed: if the setting cannot be read we must not report a
+        // capability the operator may have turned off.
+        .unwrap_or(false);
+
+    let capability = updater.capability(enabled_in_settings);
+    Ok(Json(UpdateCapabilityResponse {
+        // Describes the SERVER only. Permission is reported separately as
+        // `allowed` so a blocked install and an under-privileged caller stay
+        // distinguishable — collapsing them would leave the UI unable to say
+        // which of the two it is looking at.
+        can_apply: capability.can_apply,
+        allowed,
+        blocker: capability.blocker,
+        reason: capability.reason,
+        caveat: capability.caveat,
+        manual_command: capability.manual_command,
+        supervisor: capability.supervisor,
+        binary_path: capability.binary_path,
+        phase: capability.phase,
+        phase_error: capability.phase_error,
+        last_attempt: capability.last_attempt,
+    }))
+}
+
+/// Install a release and restart the server.
+///
+/// Returns as soon as the attempt is accepted: the download and swap run in the
+/// background and the process then exits so its supervisor restarts it on the
+/// new binary. Poll `GET /settings/update` for progress — after the restart,
+/// `last_attempt` carries the outcome.
+#[utoipa::path(
+    tag = "Settings",
+    post,
+    path = "/settings/update",
+    request_body = StartUpdateRequest,
+    responses(
+        (status = 202, description = "Update accepted; the server will restart", body = StartUpdateResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "Update unavailable or already running", body = temps_core::ProblemDetails),
+        (status = 501, description = "This process cannot apply updates", body = temps_core::ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn start_update(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<StartUpdateRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    // NOT SettingsWrite: replacing the running binary and dropping every
+    // in-flight request is a different class of action from editing a config
+    // value, so it carries its own permission.
+    permission_guard!(auth, PlatformUpdate);
+
+    let Some(updater) = app_state.self_updater.as_ref() else {
+        return Err(ErrorBuilder::new(StatusCode::NOT_IMPLEMENTED)
+            .title("Self-Update Not Supported Here")
+            .detail(
+                "This process does not manage the temps binary. Upgrade from the command line \
+                 on the host with `temps upgrade`.",
+            )
+            .build());
+    };
+
+    let enabled_in_settings = app_state
+        .config_service
+        .get_settings()
+        .await
+        .map(|s| s.self_update.enabled)
+        .unwrap_or(false);
+
+    let started = updater
+        .start(
+            request.version.clone(),
+            Some(auth.user_id()),
+            enabled_in_settings,
+        )
+        .map_err(self_update_error_to_problem)?;
+
+    // Audited BEFORE the restart — the process is about to exit, and an update
+    // that leaves no trace of who triggered it is exactly the record an
+    // operator needs afterwards.
+    let audit = PlatformUpdateStartedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        from_version: started.current_version.clone(),
+        target_version: request.version.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log for platform update: {}", e);
+    }
+
+    info!(
+        user_id = auth.user_id(),
+        from = %started.current_version,
+        target = ?request.version,
+        "Platform update started from the console"
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(StartUpdateResponse {
+            current_version: started.current_version,
+            estimated_restart_secs: started.estimated_restart_secs,
+            message: "Update started. The server will restart when the new binary is installed."
+                .to_string(),
+        }),
+    ))
+}
+
+fn self_update_error_to_problem(error: temps_core::SelfUpdateError) -> Problem {
+    use temps_core::{SelfUpdateBlocker, SelfUpdateError};
+    let status = match error {
+        // Every blocker describes current state that the caller can change
+        // (a flag, a setting, a running attempt, the host itself) rather than a
+        // malformed request, so they are all conflicts.
+        SelfUpdateError::Unavailable { .. } | SelfUpdateError::AlreadyRunning { .. } => {
+            StatusCode::CONFLICT
+        }
+    };
+    let blocker = error.blocker();
+    let title = match blocker {
+        SelfUpdateBlocker::DisabledByFlag | SelfUpdateBlocker::DisabledBySetting => {
+            "Self-Update Disabled"
+        }
+        SelfUpdateBlocker::InProgress => "Update Already Running",
+        SelfUpdateBlocker::Container => "Self-Update Not Possible In A Container",
+        SelfUpdateBlocker::NoSupervisor => "No Process Supervisor",
+        SelfUpdateBlocker::BinaryNotWritable => "Binary Not Writable",
+        SelfUpdateBlocker::UnsupportedPlatform => "Unsupported Platform",
+    };
+    ErrorBuilder::new(status)
+        .title(title)
+        .detail(error.to_string())
+        .value(
+            "blocker",
+            serde_json::to_value(blocker)
+                .unwrap_or(serde_json::Value::Null)
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+        .build()
 }
 
 /// Get application settings
