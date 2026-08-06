@@ -65,6 +65,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useMemo, type ReactNode } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
+import { useGoBack } from '@/hooks/useGoBack'
 
 interface TraceDetailProps {
   project: ProjectResponse
@@ -476,6 +477,7 @@ function CrossProjectBar({
 export default function TraceDetail({ project }: TraceDetailProps) {
   const { traceId } = useParams()
   const navigate = useNavigate()
+  const goBack = useGoBack(`/projects/${project.slug}/traces`)
 
   const { data, isLoading, isFetching, error, refetch } = useQuery({
     ...getTraceOptions({
@@ -673,7 +675,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate(-1)}
+          onClick={() => goBack()}
           className="gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
@@ -700,7 +702,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate(-1)}
+          onClick={() => goBack()}
           className="gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
@@ -724,7 +726,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate(-1)}
+          onClick={() => goBack()}
           className="shrink-0 gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
