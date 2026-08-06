@@ -197,11 +197,10 @@ pub struct BackupTargetRequest {
     /// What is being backed up, e.g. a service or database name.
     pub source: String,
     pub estimated_bytes: u64,
-    /// SHA-256 of the finished artifact. New clients compute the backup before
+    /// SHA-256 of the finished artifact. Clients compute the backup before
     /// requesting a target so object storage can validate the bytes during the
-    /// direct PUT. Optional only for wire compatibility; Cloud may require it.
-    #[serde(default)]
-    pub checksum_sha256: Option<String>,
+    /// direct PUT and the restore worker can verify the recovery read.
+    pub checksum_sha256: String,
     pub artifact: BackupArtifact,
 }
 
@@ -482,12 +481,29 @@ mod tests {
     }
 
     #[test]
+    fn backup_target_request_requires_a_checksum() {
+        let request = serde_json::from_value::<BackupTargetRequest>(serde_json::json!({
+            "instance_id": Uuid::new_v4(),
+            "source": "postgres/main",
+            "estimated_bytes": 42,
+            "artifact": {
+                "engine": "postgres",
+                "format": "pg_dump_plain",
+                "compression": "gzip",
+                "postgres_major": 18
+            }
+        }));
+
+        assert!(request.is_err());
+    }
+
+    #[test]
     fn backup_restore_contract_uses_stable_wire_names() {
         let request = BackupTargetRequest {
             instance_id: Uuid::new_v4(),
             source: "timescaledb/telemetry".into(),
             estimated_bytes: 42,
-            checksum_sha256: Some("00".into()),
+            checksum_sha256: "00".into(),
             artifact: BackupArtifact {
                 engine: BackupEngine::TimescaleDb,
                 format: BackupFormat::PgDumpPlain,
