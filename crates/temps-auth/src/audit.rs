@@ -688,6 +688,9 @@ pub struct PermissionDeniedAudit {
     pub user_id: Option<i32>,
     pub auth_source: String,
     pub credential_id: Option<i32>,
+    /// True when attempts in this aggregate used more than one credential.
+    /// In that case `credential_id` is cleared to avoid false attribution.
+    pub multiple_credentials: bool,
     pub method: String,
     /// Axum route template (for example `/projects/{project_id}`), or the
     /// fixed value `unmatched`. Never a raw request URI.
@@ -695,6 +698,12 @@ pub struct PermissionDeniedAudit {
     pub denial_kind: String,
     pub required_permission: Option<String>,
     pub attempt_count: u64,
+    /// True when the aggregate spans multiple IPs or user agents. Singular
+    /// origin fields are neutralized when this is set.
+    pub multiple_origins: bool,
+    /// Identifies the single reserved row summarizing attempts omitted by the
+    /// per-window persistence budgets.
+    pub suppressed_by_budget: bool,
     pub ip_address: Option<String>,
     pub user_agent: String,
 }
@@ -886,11 +895,14 @@ mod failure_audit_tests {
             user_id: None,
             auth_source: "deployment_token".to_string(),
             credential_id: Some(17),
+            multiple_credentials: false,
             method: "POST".to_string(),
             route: "/projects/{project_id}/deployments".to_string(),
             denial_kind: "cross_project_scope".to_string(),
             required_permission: None,
             attempt_count: 4,
+            multiple_origins: false,
+            suppressed_by_budget: false,
             ip_address: Some("203.0.113.8".to_string()),
             user_agent: "test-agent".to_string(),
         };

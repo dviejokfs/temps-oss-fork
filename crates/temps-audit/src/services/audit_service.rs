@@ -1,5 +1,8 @@
 use chrono::Utc;
-use sea_orm::{prelude::*, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
+use sea_orm::{
+    prelude::*, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, Statement,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use temps_core::{AuditLogger, AuditOperation, UtcDateTime};
@@ -7,6 +10,31 @@ use temps_database::DbConnection;
 use temps_entities::{audit_logs, ip_geolocations, users};
 use temps_geo::IpAddressService;
 use tracing::warn;
+
+pub const PERMISSION_DENIED_RETENTION_DAYS: i64 = 90;
+pub const PERMISSION_DENIED_PRUNE_BATCH_SIZE: u64 = 2_048;
+pub const PERMISSION_DENIED_PRUNE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
+const PERMISSION_DENIED_OPERATION: &str = "PERMISSION_DENIED";
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuditMaintenanceError {
+    #[error("permission-denied retention batch size {batch_size} is outside 1..={max_batch_size}")]
+    InvalidBatchSize {
+        batch_size: u64,
+        max_batch_size: u64,
+    },
+    #[error(
+        "failed to prune permission-denied audit rows older than {cutoff} with batch size \
+         {batch_size}: {source}"
+    )]
+    PrunePermissionDenied {
+        cutoff: DateTimeUtc,
+        batch_size: u64,
+        #[source]
+        source: DbErr,
+    },
+}
 
 /// Audit log with enriched user and IP geolocation data
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +91,54 @@ impl AuditService {
             .map_err(|e| anyhow::anyhow!("Failed to create audit log: {}", e))?;
 
         Ok(result)
+    }
+
+    /// Delete one bounded batch of expired permission-denial rows.
+    ///
+    /// Production runs this hourly with a 2,048-row batch and 90-day cutoff.
+    /// The recorder can persist at most 17 rows/minute (1,020/hour), so one
+    /// successful pass removes more than twice the maximum rows created in a
+    /// cadence interval while keeping every delete transaction bounded.
+    pub async fn prune_permission_denied_before(
+        &self,
+        cutoff: DateTimeUtc,
+        batch_size: u64,
+    ) -> Result<u64, AuditMaintenanceError> {
+        if batch_size == 0 || batch_size > PERMISSION_DENIED_PRUNE_BATCH_SIZE {
+            return Err(AuditMaintenanceError::InvalidBatchSize {
+                batch_size,
+                max_batch_size: PERMISSION_DENIED_PRUNE_BATCH_SIZE,
+            });
+        }
+
+        let statement = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+WITH expired AS (
+    SELECT id
+    FROM audit_logs
+    WHERE operation_type = $1 AND audit_date < $2
+    ORDER BY audit_date ASC, id ASC
+    LIMIT $3
+)
+DELETE FROM audit_logs
+WHERE id IN (SELECT id FROM expired)
+"#,
+            vec![
+                PERMISSION_DENIED_OPERATION.into(),
+                cutoff.into(),
+                (batch_size as i64).into(),
+            ],
+        );
+        self.db
+            .execute(statement)
+            .await
+            .map(|result| result.rows_affected())
+            .map_err(|source| AuditMaintenanceError::PrunePermissionDenied {
+                cutoff,
+                batch_size,
+                source,
+            })
     }
 
     pub async fn get_user_audit_logs(
@@ -210,7 +286,7 @@ impl AuditLogger for AuditService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{DatabaseBackend, MockDatabase, Value};
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Value};
     use temps_geo::geoip_service::{GeoIpService, MockGeoIpService};
 
     fn service_with(db: sea_orm::DatabaseConnection) -> AuditService {
@@ -355,5 +431,103 @@ mod tests {
 
         assert_eq!(details.log.user_id, Some(7));
         assert!(details.user.is_none());
+    }
+
+    #[tokio::test]
+    async fn permission_denied_retention_is_bounded_and_parameterized() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 37,
+                }])
+                .into_connection(),
+        );
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let ip_service = Arc::new(IpAddressService::new(db.clone(), geoip));
+        let service = AuditService::new(db.clone(), ip_service);
+        let cutoff = Utc::now() - chrono::Duration::days(PERMISSION_DENIED_RETENTION_DAYS);
+
+        let deleted = service
+            .prune_permission_denied_before(cutoff, 128)
+            .await
+            .expect("bounded retention delete should succeed");
+        assert_eq!(deleted, 37);
+
+        drop(service);
+        let transactions = Arc::try_unwrap(db)
+            .expect("audit service should release the database connection")
+            .into_transaction_log();
+        let statement = &transactions
+            .first()
+            .expect("retention should execute one statement")
+            .statements()[0];
+        assert!(statement.sql.contains("operation_type = $1"));
+        assert!(statement.sql.contains("audit_date < $2"));
+        assert!(statement.sql.contains("LIMIT $3"));
+        assert!(statement.sql.contains("ORDER BY audit_date ASC, id ASC"));
+        assert_eq!(
+            statement
+                .values
+                .as_ref()
+                .expect("retention statement binds values")
+                .0
+                .len(),
+            3
+        );
+        assert!(!statement.sql.contains(PERMISSION_DENIED_OPERATION));
+    }
+
+    #[tokio::test]
+    async fn permission_denied_retention_rejects_unbounded_batches() {
+        let service = service_with(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+
+        for batch_size in [0, PERMISSION_DENIED_PRUNE_BATCH_SIZE + 1] {
+            let error = service
+                .prune_permission_denied_before(Utc::now(), batch_size)
+                .await
+                .expect_err("invalid batch must fail before querying");
+            assert!(matches!(
+                error,
+                AuditMaintenanceError::InvalidBatchSize {
+                    batch_size: actual,
+                    max_batch_size: PERMISSION_DENIED_PRUNE_BATCH_SIZE,
+                } if actual == batch_size
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_denied_retention_database_error_has_context() {
+        let service = service_with(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_errors([DbErr::Custom("retention unavailable".to_string())])
+                .into_connection(),
+        );
+        let cutoff = Utc::now() - chrono::Duration::days(PERMISSION_DENIED_RETENTION_DAYS);
+
+        let error = service
+            .prune_permission_denied_before(cutoff, 256)
+            .await
+            .expect_err("database failure should be typed");
+        assert!(matches!(
+            error,
+            AuditMaintenanceError::PrunePermissionDenied {
+                cutoff: actual_cutoff,
+                batch_size: 256,
+                ..
+            } if actual_cutoff == cutoff
+        ));
+    }
+
+    #[test]
+    fn retention_capacity_exceeds_maximum_permission_denied_creation_rate() {
+        const MAX_ROWS_PER_MINUTE: u64 = 17;
+        let intervals_per_hour = PERMISSION_DENIED_PRUNE_INTERVAL.as_secs() / 60;
+        assert_eq!(intervals_per_hour, 60);
+        assert!(
+            PERMISSION_DENIED_PRUNE_BATCH_SIZE > MAX_ROWS_PER_MINUTE * intervals_per_hour,
+            "cleanup must delete faster than the recorder can create rows"
+        );
     }
 }

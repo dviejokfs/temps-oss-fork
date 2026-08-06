@@ -9,7 +9,12 @@ use crate::audit::PermissionDeniedAudit;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 1_024;
 const DEFAULT_MAX_AGGREGATIONS: usize = 1_024;
-const DEFAULT_WINDOW: Duration = Duration::from_secs(5);
+/// A one-minute window limits normal persistence to at most 16 detailed rows
+/// plus one reserved suppression-summary row (17 writes/minute globally).
+const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
+const DEFAULT_MAX_DETAIL_ROWS: usize = 16;
+const DEFAULT_MAX_DETAIL_ROWS_PER_ACTOR: usize = 4;
+const MIXED_VALUE: &str = "multiple";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AuthSourceKind {
@@ -64,7 +69,6 @@ pub(crate) struct PermissionDenialEvent {
 struct AggregationKey {
     user_id: Option<i32>,
     source: AuthSourceKind,
-    credential_id: Option<i32>,
     method: String,
     route: String,
     denial_kind: String,
@@ -76,7 +80,6 @@ impl From<&PermissionDenialEvent> for AggregationKey {
         Self {
             user_id: event.principal.user_id,
             source: event.principal.source,
-            credential_id: event.principal.credential_id,
             method: event.method.clone(),
             route: event.route.clone(),
             denial_kind: event.denial_kind.clone(),
@@ -91,11 +94,14 @@ impl PermissionDenialEvent {
             user_id: self.principal.user_id,
             auth_source: self.principal.source.as_str().to_string(),
             credential_id: self.principal.credential_id,
+            multiple_credentials: false,
             method: self.method,
             route: self.route,
             denial_kind: self.denial_kind,
             required_permission: self.required_permission,
             attempt_count: 1,
+            multiple_origins: false,
+            suppressed_by_budget: false,
             ip_address: self.ip_address,
             user_agent: self.user_agent,
         }
@@ -106,6 +112,7 @@ struct RecorderCounters {
     queue_drops: AtomicU64,
     aggregation_overflows: AtomicU64,
     write_failures: AtomicU64,
+    budget_suppressed_attempts: AtomicU64,
 }
 
 impl RecorderCounters {
@@ -114,6 +121,7 @@ impl RecorderCounters {
             queue_drops: AtomicU64::new(0),
             aggregation_overflows: AtomicU64::new(0),
             write_failures: AtomicU64::new(0),
+            budget_suppressed_attempts: AtomicU64::new(0),
         }
     }
 }
@@ -123,6 +131,8 @@ struct RecorderConfig {
     queue_capacity: usize,
     max_aggregations: usize,
     window: Duration,
+    max_detail_rows: usize,
+    max_detail_rows_per_actor: usize,
 }
 
 /// Non-blocking, explicitly bounded entry point for permission-denial audit
@@ -141,6 +151,8 @@ impl PermissionDenialRecorder {
                 queue_capacity: DEFAULT_QUEUE_CAPACITY,
                 max_aggregations: DEFAULT_MAX_AGGREGATIONS,
                 window: DEFAULT_WINDOW,
+                max_detail_rows: DEFAULT_MAX_DETAIL_ROWS,
+                max_detail_rows_per_actor: DEFAULT_MAX_DETAIL_ROWS_PER_ACTOR,
             },
         )
     }
@@ -154,6 +166,8 @@ impl PermissionDenialRecorder {
             counters: counters.clone(),
             max_aggregations: config.max_aggregations,
             window: config.window,
+            max_detail_rows: config.max_detail_rows,
+            max_detail_rows_per_actor: config.max_detail_rows_per_actor,
             pending: HashMap::with_capacity(config.max_aggregations),
         };
         tokio::spawn(worker.run());
@@ -192,6 +206,8 @@ struct PermissionDenialWorker {
     counters: Arc<RecorderCounters>,
     max_aggregations: usize,
     window: Duration,
+    max_detail_rows: usize,
+    max_detail_rows_per_actor: usize,
     pending: HashMap<AggregationKey, PermissionDeniedAudit>,
 }
 
@@ -220,6 +236,7 @@ impl PermissionDenialWorker {
         let key = AggregationKey::from(&event);
         if let Some(audit) = self.pending.get_mut(&key) {
             audit.attempt_count = audit.attempt_count.saturating_add(1);
+            merge_attribution(audit, &event);
             return;
         }
 
@@ -252,7 +269,54 @@ impl PermissionDenialWorker {
     async fn flush(&mut self) {
         // At most `max_aggregations` entries are moved into this temporary
         // vector. The queue and map remain bounded while logger I/O is in flight.
-        let audits: Vec<_> = self.pending.drain().map(|(_, audit)| audit).collect();
+        let mut audits: Vec<_> = self.pending.drain().map(|(_, audit)| audit).collect();
+        audits.sort_by(|left, right| {
+            right
+                .attempt_count
+                .cmp(&left.attempt_count)
+                .then_with(|| left.user_id.cmp(&right.user_id))
+                .then_with(|| left.auth_source.cmp(&right.auth_source))
+                .then_with(|| left.method.cmp(&right.method))
+                .then_with(|| left.route.cmp(&right.route))
+                .then_with(|| left.denial_kind.cmp(&right.denial_kind))
+                .then_with(|| left.required_permission.cmp(&right.required_permission))
+        });
+
+        let mut actor_rows: HashMap<(Option<i32>, String), usize> = HashMap::new();
+        let mut selected = Vec::with_capacity(self.max_detail_rows);
+        let mut suppressed_attempts = 0_u64;
+        for audit in audits {
+            let actor = (audit.user_id, audit.auth_source.clone());
+            let actor_count = actor_rows.entry(actor).or_default();
+            if selected.len() < self.max_detail_rows
+                && *actor_count < self.max_detail_rows_per_actor
+            {
+                *actor_count += 1;
+                selected.push(audit);
+            } else {
+                suppressed_attempts = suppressed_attempts.saturating_add(audit.attempt_count);
+            }
+        }
+
+        if suppressed_attempts > 0 {
+            let total = self
+                .counters
+                .budget_suppressed_attempts
+                .fetch_add(suppressed_attempts, Ordering::Relaxed)
+                .saturating_add(suppressed_attempts);
+            if should_log_counter(total) || total == suppressed_attempts {
+                tracing::warn!(
+                    suppressed_attempts,
+                    total_budget_suppressed_attempts = total,
+                    max_detail_rows = self.max_detail_rows,
+                    max_detail_rows_per_actor = self.max_detail_rows_per_actor,
+                    "permission-denial detail persistence budget reached"
+                );
+            }
+            selected.push(suppression_summary(suppressed_attempts));
+        }
+
+        let audits = selected;
         for audit in audits {
             if let Err(error) = self.logger.create_audit_log(&audit).await {
                 let total = self.counters.write_failures.fetch_add(1, Ordering::Relaxed) + 1;
@@ -272,6 +336,39 @@ impl PermissionDenialWorker {
                 }
             }
         }
+    }
+}
+
+fn merge_attribution(audit: &mut PermissionDeniedAudit, event: &PermissionDenialEvent) {
+    if !audit.multiple_credentials && audit.credential_id != event.principal.credential_id {
+        audit.credential_id = None;
+        audit.multiple_credentials = true;
+    }
+
+    let mixed_ip = audit.ip_address != event.ip_address;
+    let mixed_user_agent = audit.user_agent != event.user_agent;
+    if mixed_ip || mixed_user_agent {
+        audit.ip_address = None;
+        audit.user_agent = MIXED_VALUE.to_string();
+        audit.multiple_origins = true;
+    }
+}
+
+fn suppression_summary(attempt_count: u64) -> PermissionDeniedAudit {
+    PermissionDeniedAudit {
+        user_id: None,
+        auth_source: MIXED_VALUE.to_string(),
+        credential_id: None,
+        multiple_credentials: true,
+        method: MIXED_VALUE.to_string(),
+        route: MIXED_VALUE.to_string(),
+        denial_kind: "persistence_budget_suppressed".to_string(),
+        required_permission: None,
+        attempt_count,
+        multiple_origins: true,
+        suppressed_by_budget: true,
+        ip_address: None,
+        user_agent: MIXED_VALUE.to_string(),
     }
 }
 
@@ -332,11 +429,13 @@ mod tests {
             queue_capacity,
             max_aggregations,
             window: Duration::from_millis(20),
+            max_detail_rows: 8,
+            max_detail_rows_per_actor: 8,
         }
     }
 
     #[tokio::test]
-    async fn repeated_safe_key_is_aggregated_and_ip_is_not_part_of_key() {
+    async fn mixed_ip_clears_singular_origin_attribution() {
         let logger = Arc::new(RecordingLogger::default());
         let recorder = PermissionDenialRecorder::with_config(logger.clone(), test_config(8, 8));
         recorder.record(event("/projects/{project_id}"));
@@ -351,8 +450,97 @@ mod tests {
         assert_eq!(records[0]["route"], "/projects/{project_id}");
         assert_eq!(records[0]["auth_source"], "api_key");
         assert_eq!(records[0]["credential_id"], 9);
+        assert_eq!(records[0]["ip_address"], serde_json::Value::Null);
+        assert_eq!(records[0]["user_agent"], MIXED_VALUE);
+        assert_eq!(records[0]["multiple_origins"], true);
         assert!(records[0].get("key_name").is_none());
         assert!(records[0].get("token_name").is_none());
+    }
+
+    #[tokio::test]
+    async fn mixed_user_agent_clears_singular_origin_attribution() {
+        let logger = Arc::new(RecordingLogger::default());
+        let recorder = PermissionDenialRecorder::with_config(logger.clone(), test_config(8, 8));
+        recorder.record(event("/projects/{project_id}"));
+        let mut second = event("/projects/{project_id}");
+        second.user_agent = "different-agent".to_string();
+        recorder.record(second);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let records = logger.records.lock().expect("test logger lock");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["ip_address"], serde_json::Value::Null);
+        assert_eq!(records[0]["user_agent"], MIXED_VALUE);
+        assert_eq!(records[0]["multiple_origins"], true);
+    }
+
+    #[tokio::test]
+    async fn mixed_credential_ids_cannot_multiply_aggregation_keys() {
+        let logger = Arc::new(RecordingLogger::default());
+        let recorder = PermissionDenialRecorder::with_config(logger.clone(), test_config(8, 8));
+        recorder.record(event("/projects/{project_id}"));
+        let mut second = event("/projects/{project_id}");
+        second.principal.credential_id = Some(10);
+        recorder.record(second);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let records = logger.records.lock().expect("test logger lock");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["attempt_count"], 2);
+        assert_eq!(records[0]["credential_id"], serde_json::Value::Null);
+        assert_eq!(records[0]["multiple_credentials"], true);
+    }
+
+    #[tokio::test]
+    async fn adversarial_cardinality_obeys_actor_and_global_write_budgets() {
+        let logger = Arc::new(RecordingLogger::default());
+        let recorder = PermissionDenialRecorder::with_config(
+            logger.clone(),
+            RecorderConfig {
+                queue_capacity: 256,
+                max_aggregations: 256,
+                window: Duration::from_millis(30),
+                max_detail_rows: 16,
+                max_detail_rows_per_actor: 4,
+            },
+        );
+
+        for actor_offset in 0..5 {
+            for route_offset in 0..10 {
+                let mut attempt = event(&format!("/route/{actor_offset}/{route_offset}"));
+                attempt.principal.user_id = Some(40 + actor_offset);
+                attempt.principal.credential_id = Some(1_000 + actor_offset * 10 + route_offset);
+                recorder.record(attempt);
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let records = logger.records.lock().expect("test logger lock");
+        let details: Vec<_> = records
+            .iter()
+            .filter(|record| record["suppressed_by_budget"] == false)
+            .collect();
+        let summaries: Vec<_> = records
+            .iter()
+            .filter(|record| record["suppressed_by_budget"] == true)
+            .collect();
+
+        assert_eq!(details.len(), 16, "global detail ceiling must hold");
+        let mut rows_by_actor = HashMap::<i64, usize>::new();
+        for detail in details {
+            let actor = detail["user_id"].as_i64().expect("detail has actor");
+            *rows_by_actor.entry(actor).or_default() += 1;
+        }
+        assert!(rows_by_actor.values().all(|count| *count <= 4));
+        assert_eq!(summaries.len(), 1, "summary uses one reserved row");
+        assert_eq!(summaries[0]["attempt_count"], 34);
+        assert_eq!(
+            recorder
+                .counters
+                .budget_suppressed_attempts
+                .load(Ordering::Relaxed),
+            34
+        );
     }
 
     #[tokio::test]
