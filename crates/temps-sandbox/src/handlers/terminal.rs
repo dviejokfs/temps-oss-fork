@@ -233,6 +233,32 @@ fn default_shell_cmd() -> String {
     "/bin/bash -l".to_string()
 }
 
+/// Wrap the requested program so the PTY is in a sane line discipline before
+/// it starts.
+///
+/// The in-sandbox agent used to call `cfmakeraw()` when creating the PTY,
+/// which clears `ECHO`. Bash's readline assumes something else is echoing, so
+/// the user typed completely blind: commands ran, output appeared, keystrokes
+/// were invisible.
+///
+/// That is fixed in the agent, **but the agent binary is compiled into the
+/// sandbox image**. Every sandbox built from an image that predates the fix
+/// carries the old behaviour, and rebuilding the image is an operator action
+/// the person trying to use a terminal should not have to perform first. So
+/// the host normalises the terminal itself, which costs one `stty` per tab and
+/// works on every image.
+///
+/// `stty sane` is safe in front of anything: full-screen programs (claude,
+/// vim) set their own termios on startup regardless, and starting them from a
+/// sane state is what a normal terminal would give them anyway. Failures are
+/// swallowed — a sandbox image without `stty` should still get a shell.
+///
+/// Once no supported image ships the old agent this wrapper can go; until
+/// then, removing it silently reintroduces a shell you cannot type into.
+fn wrap_with_sane_termios(cmd: &str) -> String {
+    format!("stty sane 2>/dev/null; exec {cmd}")
+}
+
 /// Attach an interactive terminal to a sandbox.
 #[utoipa::path(
     tag = "Sandboxes",
@@ -332,7 +358,7 @@ pub async fn terminal(
 
     let service = state.sandbox_service.clone();
     let timeout_secs = row.timeout_secs;
-    let cmd = params.cmd.unwrap_or_else(default_shell_cmd);
+    let cmd = wrap_with_sane_termios(&params.cmd.unwrap_or_else(default_shell_cmd));
     let cols = params.cols.unwrap_or(80);
     let rows = params.rows.unwrap_or(24);
     // Take the working directory from the provider handle, not the DB row.
@@ -719,6 +745,38 @@ mod tests {
         })
         .expect("serialize");
         assert!(exit.contains(r#""type":"exit""#), "{}", exit);
+    }
+
+    #[test]
+    fn shell_command_is_wrapped_so_the_pty_echoes() {
+        // The regression guard for a terminal you cannot type into. Images
+        // predating the agent's `cfmakeraw` removal start the PTY with ECHO
+        // off; without this wrapper the user types blind on every one of
+        // them, and rebuilding the image is not something they can do from
+        // inside a shell that does not work.
+        let wrapped = wrap_with_sane_termios(&default_shell_cmd());
+        assert!(wrapped.starts_with("stty sane"), "{wrapped}");
+        assert!(wrapped.contains("exec /bin/bash -l"), "{wrapped}");
+    }
+
+    #[test]
+    fn wrapping_preserves_a_custom_command_verbatim() {
+        // `--cmd claude` must still start claude, arguments intact.
+        let wrapped = wrap_with_sane_termios("claude --resume");
+        assert!(wrapped.ends_with("exec claude --resume"), "{wrapped}");
+        // `exec` matters: the wrapper shell must be replaced, not left as a
+        // parent, or signals and exit codes get an extra hop.
+        assert!(wrapped.contains("; exec "), "{wrapped}");
+    }
+
+    #[test]
+    fn wrapping_tolerates_images_without_stty() {
+        // A minimal image with no `stty` must still get a shell, not a tab
+        // that dies on the first command.
+        assert!(
+            wrap_with_sane_termios("sh").contains("2>/dev/null"),
+            "stty failure must be swallowed"
+        );
     }
 
     #[test]
