@@ -439,7 +439,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    async fn advance_past_flush_window(window: Duration) {
+        // Give the detached worker a chance to receive queued events and arm
+        // its interval before advancing deterministic Tokio test time.
+        tokio::task::yield_now().await;
+        tokio::time::advance(window.saturating_add(Duration::from_millis(1))).await;
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn mixed_ip_clears_singular_origin_attribution() {
         let logger = Arc::new(RecordingLogger::default());
         let recorder = PermissionDenialRecorder::with_config(logger.clone(), test_config(8, 8));
@@ -448,7 +456,7 @@ mod tests {
         second.ip_address = Some("198.51.100.99".to_string());
         recorder.record(second);
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        advance_past_flush_window(Duration::from_millis(20)).await;
         let records = logger.records.lock().expect("test logger lock");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["attempt_count"], 2);
@@ -465,7 +473,7 @@ mod tests {
         assert!(records[0].get("token_name").is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn mixed_user_agent_clears_singular_origin_attribution() {
         let logger = Arc::new(RecordingLogger::default());
         let recorder = PermissionDenialRecorder::with_config(logger.clone(), test_config(8, 8));
@@ -474,7 +482,7 @@ mod tests {
         second.user_agent = "different-agent".to_string();
         recorder.record(second);
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        advance_past_flush_window(Duration::from_millis(20)).await;
         let records = logger.records.lock().expect("test logger lock");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["ip_address"], serde_json::Value::Null);
@@ -485,7 +493,7 @@ mod tests {
         assert_eq!(records[0]["multiple_origins"], true);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn mixed_credential_ids_cannot_multiply_aggregation_keys() {
         let logger = Arc::new(RecordingLogger::default());
         let recorder = PermissionDenialRecorder::with_config(logger.clone(), test_config(8, 8));
@@ -494,7 +502,7 @@ mod tests {
         second.principal.credential_id = Some(10);
         recorder.record(second);
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        advance_past_flush_window(Duration::from_millis(20)).await;
         let records = logger.records.lock().expect("test logger lock");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["attempt_count"], 2);
@@ -502,7 +510,7 @@ mod tests {
         assert_eq!(records[0]["multiple_credentials"], true);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn adversarial_cardinality_obeys_actor_and_global_write_budgets() {
         let logger = Arc::new(RecordingLogger::default());
         let recorder = PermissionDenialRecorder::with_config(
@@ -525,7 +533,7 @@ mod tests {
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        advance_past_flush_window(Duration::from_millis(30)).await;
         let records = logger.records.lock().expect("test logger lock");
         let details: Vec<_> = records
             .iter()
@@ -554,14 +562,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn aggregation_cardinality_is_bounded() {
         let logger = Arc::new(RecordingLogger::default());
         let recorder = PermissionDenialRecorder::with_config(logger.clone(), test_config(8, 1));
         recorder.record(event("/first"));
         recorder.record(event("/second"));
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        advance_past_flush_window(Duration::from_millis(20)).await;
         assert_eq!(
             recorder
                 .counters
@@ -586,16 +594,16 @@ mod tests {
         assert_eq!(counters.queue_drops.load(Ordering::Relaxed), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn logger_failure_is_counted_and_worker_continues() {
         let recorder =
             PermissionDenialRecorder::with_config(Arc::new(FailingLogger), test_config(8, 8));
         recorder.record(event("/first"));
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        advance_past_flush_window(Duration::from_millis(20)).await;
         assert_eq!(recorder.counters.write_failures.load(Ordering::Relaxed), 1);
 
         recorder.record(event("/second"));
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        advance_past_flush_window(Duration::from_millis(20)).await;
         assert_eq!(recorder.counters.write_failures.load(Ordering::Relaxed), 2);
     }
 }

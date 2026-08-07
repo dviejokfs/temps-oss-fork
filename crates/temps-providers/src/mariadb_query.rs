@@ -880,6 +880,26 @@ struct MariaQueryColumn {
     data_type: String,
 }
 
+fn mariadb_binary_json_type(data_type: &str) -> bool {
+    matches!(
+        data_type,
+        "binary"
+            | "varbinary"
+            | "tinyblob"
+            | "blob"
+            | "mediumblob"
+            | "longblob"
+            | "geometry"
+            | "point"
+            | "linestring"
+            | "polygon"
+            | "multipoint"
+            | "multilinestring"
+            | "multipolygon"
+            | "geometrycollection"
+    )
+}
+
 fn mariadb_json_projection(columns: &[MariaQueryColumn]) -> String {
     let entries = columns.iter().flat_map(|column| {
         let key_hex = column
@@ -890,11 +910,10 @@ fn mariadb_json_projection(columns: &[MariaQueryColumn]) -> String {
             .collect::<String>();
         let key = format!("CONVERT(X'{key_hex}' USING utf8mb4)");
         let column_ref = format!("__temps_source.{}", quote_identifier(&column.name));
-        let value = if matches!(
-            column.data_type.as_str(),
-            "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
-        ) {
+        let value = if mariadb_binary_json_type(&column.data_type) {
             format!("TO_BASE64({column_ref})")
+        } else if column.data_type == "bit" {
+            format!("CAST({column_ref} AS UNSIGNED)")
         } else {
             column_ref
         };
@@ -907,7 +926,7 @@ fn mariadb_json_projection(columns: &[MariaQueryColumn]) -> String {
 fn mariadb_column_admission(column: &MariaQueryColumn) -> Result<String> {
     let value = format!("__temps_source.{}", quote_identifier(&column.name));
     let estimate = match column.data_type.as_str() {
-        "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => {
+        data_type if mariadb_binary_json_type(data_type) => {
             format!("OCTET_LENGTH({value}) * 5 + 8")
         }
         "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set" => {
@@ -916,7 +935,7 @@ fn mariadb_column_admission(column: &MariaQueryColumn) -> Result<String> {
         "json" => format!("JSON_STORAGE_SIZE({value}) * 6 + 8"),
         "bool" | "boolean" | "tinyint" | "smallint" | "mediumint" | "int" | "integer"
         | "bigint" | "float" | "double" | "real" | "decimal" | "numeric" | "date" | "datetime"
-        | "timestamp" | "time" | "year" => "128".to_string(),
+        | "timestamp" | "time" | "year" | "bit" => "128".to_string(),
         unsupported => {
             return Err(DataError::OperationNotSupported(format!(
                 "MariaDB column '{}' uses unsupported type '{}'",
@@ -1385,12 +1404,33 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_mariadb_types_are_rejected_before_query_execution() {
+    fn spatial_and_bit_types_use_bounded_json_encodings() {
+        let sql = with_wire_row_budget(
+            "SELECT * FROM `app`.`places`",
+            &[
+                MariaQueryColumn {
+                    name: "shape".to_string(),
+                    data_type: "geometry".to_string(),
+                },
+                MariaQueryColumn {
+                    name: "flags".to_string(),
+                    data_type: "bit".to_string(),
+                },
+            ],
+            QueryBudget::default(),
+        )
+        .expect("spatial and bit columns should remain browsable through bounded encodings");
+        assert!(sql.contains("TO_BASE64(__temps_source.`shape`)"));
+        assert!(sql.contains("CAST(__temps_source.`flags` AS UNSIGNED)"));
+    }
+
+    #[test]
+    fn unknown_mariadb_types_are_rejected_before_query_execution() {
         let error = with_wire_row_budget(
             "SELECT * FROM `app`.`places`",
             &[MariaQueryColumn {
                 name: "shape".to_string(),
-                data_type: "geometry".to_string(),
+                data_type: "unregistered_extension_type".to_string(),
             }],
             QueryBudget::default(),
         )
@@ -1470,6 +1510,22 @@ mod tests {
                 ..
             }
         ));
+
+        sqlx::query(
+            "CREATE TABLE compatibility_types (id BIGINT PRIMARY KEY, shape POINT, flags BIT(4))",
+        )
+        .execute(&source.pool)
+        .await?;
+        sqlx::query("INSERT INTO compatibility_types VALUES (1, POINT(1, 2), B'1010')")
+            .execute(&source.pool)
+            .await?;
+        let compatible = source
+            .query(&path, "compatibility_types", None, QueryOptions::default())
+            .await?;
+        assert!(compatible.rows[0]["shape"]
+            .as_str()
+            .is_some_and(|encoded| !encoded.is_empty()));
+        assert_eq!(compatible.rows[0]["flags"], serde_json::json!(10));
 
         Ok(())
     }

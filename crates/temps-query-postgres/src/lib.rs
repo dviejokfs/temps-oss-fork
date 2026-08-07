@@ -37,26 +37,25 @@ fn escape_ident(name: &str) -> String {
 struct PgQueryColumn {
     name: String,
     data_type: String,
+    udt_kind: Option<String>,
 }
 
 fn pg_column_admission(column: &PgQueryColumn, row_budget: usize) -> Result<String> {
     let value = format!("__temps_source.\"{}\"", escape_ident(&column.name));
+    let compression_aware_size = || {
+        format!(
+            "CASE WHEN {value} IS NULL THEN 4 WHEN PG_COLUMN_COMPRESSION({value}) IS NOT NULL \
+             THEN {} ELSE PG_COLUMN_SIZE({value})::bigint * 8 + 64 END",
+            row_budget.saturating_add(1)
+        )
+    };
     let expression = match column.data_type.as_str() {
-        "character varying" | "character" | "text" => {
+        "character varying" | "character" | "text" | "xml" => {
             format!("COALESCE(OCTET_LENGTH({value})::bigint * 6 + 2, 4)")
         }
         "bytea" => format!("COALESCE(OCTET_LENGTH({value})::bigint * 2 + 8, 4)"),
         "json" => format!("COALESCE(OCTET_LENGTH({value}::text)::bigint * 6 + 8, 4)"),
-        "jsonb" => format!(
-            "CASE WHEN {value} IS NULL THEN 4 WHEN PG_COLUMN_COMPRESSION({value}) IS NOT NULL \
-             THEN {} ELSE PG_COLUMN_SIZE({value})::bigint * 8 + 64 END",
-            row_budget.saturating_add(1)
-        ),
-        "ARRAY" => format!(
-            "CASE WHEN {value} IS NULL THEN 4 WHEN PG_COLUMN_COMPRESSION({value}) IS NOT NULL \
-             THEN {} ELSE PG_COLUMN_SIZE({value})::bigint * 8 + 64 END",
-            row_budget.saturating_add(1)
-        ),
+        "jsonb" | "ARRAY" => compression_aware_size(),
         "boolean"
         | "smallint"
         | "integer"
@@ -66,11 +65,47 @@ fn pg_column_admission(column: &PgQueryColumn, row_budget: usize) -> Result<Stri
         | "numeric"
         | "decimal"
         | "date"
+        | "time without time zone"
+        | "time with time zone"
+        | "interval"
         | "timestamp without time zone"
         | "timestamp with time zone"
-        | "uuid" => {
-            format!("COALESCE(PG_COLUMN_SIZE({value})::bigint * 8 + 64, 4)")
+        | "uuid"
+        | "money"
+        | "inet"
+        | "cidr"
+        | "macaddr"
+        | "macaddr8"
+        | "bit"
+        | "bit varying"
+        | "oid"
+        | "regclass"
+        | "regtype"
+        | "tsvector"
+        | "tsquery"
+        | "int4range"
+        | "int8range"
+        | "numrange"
+        | "tsrange"
+        | "tstzrange"
+        | "daterange"
+        | "int4multirange"
+        | "int8multirange"
+        | "nummultirange"
+        | "tsmultirange"
+        | "tstzmultirange"
+        | "datemultirange" => {
+            // Several apparently scalar PostgreSQL types are varlena and may
+            // be TOAST-compressed (notably bit varying, ranges, tsvector, and
+            // extension-backed domains). A compressed on-disk size is not a
+            // safe upper bound for JSON expansion, so fail closed before
+            // TO_JSONB just as we do for JSONB and arrays.
+            compression_aware_size()
         }
+        // PostgreSQL enum labels are limited to NAMEDATALEN (normally 63
+        // bytes). Their JSON representation is therefore safely bounded
+        // without invoking an arbitrary user-defined output function.
+        "USER-DEFINED" if column.udt_kind.as_deref() == Some("e") => "386".to_string(),
         unsupported => {
             return Err(DataError::OperationNotSupported(format!(
                 "PostgreSQL column '{}' uses unsupported type '{}'",
@@ -1330,8 +1365,14 @@ impl PostgresSource {
         let rows = self
             .client
             .query(
-                "SELECT column_name, data_type FROM information_schema.columns \
-                 WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+                "SELECT columns.column_name, columns.data_type, types.typtype::text \
+                 FROM information_schema.columns AS columns \
+                 LEFT JOIN pg_catalog.pg_namespace AS namespaces \
+                   ON namespaces.nspname = columns.udt_schema \
+                 LEFT JOIN pg_catalog.pg_type AS types \
+                   ON types.typnamespace = namespaces.oid AND types.typname = columns.udt_name \
+                 WHERE columns.table_schema = $1 AND columns.table_name = $2 \
+                 ORDER BY columns.ordinal_position",
                 &[&schema_name, &entity_name],
             )
             .await
@@ -1346,6 +1387,7 @@ impl PostgresSource {
             .map(|row| PgQueryColumn {
                 name: row.get(0),
                 data_type: row.get(1),
+                udt_kind: row.get(2),
             })
             .collect())
     }
@@ -2236,10 +2278,12 @@ mod wire_budget_tests {
             PgQueryColumn {
                 name: "bio".to_string(),
                 data_type: "text".to_string(),
+                udt_kind: Some("b".to_string()),
             },
             PgQueryColumn {
                 name: "payload".to_string(),
                 data_type: "jsonb".to_string(),
+                udt_kind: Some("b".to_string()),
             },
         ];
         let budget = QueryBudget {
@@ -2266,6 +2310,7 @@ mod wire_budget_tests {
             &[PgQueryColumn {
                 name: "shape".to_string(),
                 data_type: "USER-DEFINED".to_string(),
+                udt_kind: Some("b".to_string()),
             }],
             QueryBudget::default(),
         )
@@ -2274,6 +2319,29 @@ mod wire_budget_tests {
             error,
             temps_query::DataError::OperationNotSupported(_)
         ));
+    }
+
+    #[test]
+    fn common_builtin_and_enum_types_remain_browsable() {
+        for (data_type, udt_kind) in [
+            ("inet", Some("b")),
+            ("interval", Some("b")),
+            ("time with time zone", Some("b")),
+            ("bit varying", Some("b")),
+            ("USER-DEFINED", Some("e")),
+        ] {
+            let sql = with_wire_row_budget(
+                "SELECT * FROM public.compatibility_types",
+                &[PgQueryColumn {
+                    name: "value".to_string(),
+                    data_type: data_type.to_string(),
+                    udt_kind: udt_kind.map(str::to_string),
+                }],
+                QueryBudget::default(),
+            )
+            .expect("common bounded PostgreSQL types should remain browsable");
+            assert!(sql.contains("TO_JSONB(__temps_source)"));
+        }
     }
 
     #[test]
@@ -2288,6 +2356,7 @@ mod wire_budget_tests {
                 &[PgQueryColumn {
                     name: name.to_string(),
                     data_type: "ARRAY".to_string(),
+                    udt_kind: Some("b".to_string()),
                 }],
                 QueryBudget::default(),
             )
@@ -3084,6 +3153,70 @@ mod tests {
             .await
             .expect("bounded PostgreSQL arrays should remain browsable");
         assert_eq!(result.rows[0]["tags"], serde_json::json!(["alpha", "beta"]));
+
+        source
+            .client
+            .batch_execute(
+                "CREATE TYPE browse_state AS ENUM ('ready', 'paused'); \
+                 CREATE TABLE compatibility_types (\
+                     state browse_state, address inet, duration interval, \
+                     clock time with time zone, flags bit varying\
+                 ); \
+                 INSERT INTO compatibility_types VALUES (\
+                     'ready', '192.0.2.1', interval '1 hour', '12:34:56+00', B'1010'\
+                 );",
+            )
+            .await
+            .expect("common PostgreSQL type fixture should be created");
+        let compatible = source
+            .query(
+                &ContainerPath::from_slice(&["postgres", "public"]),
+                "compatibility_types",
+                None,
+                QueryOptions {
+                    limit: Some(1),
+                    budget,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect("common PostgreSQL built-ins and enums should remain browsable");
+        assert_eq!(compatible.rows[0]["state"], serde_json::json!("ready"));
+        assert_eq!(
+            compatible.rows[0]["address"],
+            serde_json::json!("192.0.2.1")
+        );
+        assert_eq!(compatible.rows[0]["flags"], serde_json::json!("1010"));
+
+        source
+            .client
+            .batch_execute(
+                "CREATE TABLE compressed_varbit_rows (id bigint, flags bit varying); \
+                 INSERT INTO compressed_varbit_rows VALUES \
+                     (1, repeat('1', 2097152)::bit varying);",
+            )
+            .await
+            .expect("compressed varbit fixture should be created");
+        let compressed_error = source
+            .query(
+                &ContainerPath::from_slice(&["postgres", "public"]),
+                "compressed_varbit_rows",
+                None,
+                QueryOptions {
+                    limit: Some(1),
+                    budget,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect_err("TOAST-compressed varbit must fail admission before JSON expansion");
+        assert!(matches!(
+            compressed_error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "wire_cell_bytes",
+                ..
+            }
+        ));
 
         source
             .client

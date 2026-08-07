@@ -1364,36 +1364,26 @@ mod tests {
             }
         ));
 
-        // Deletion can leave Redis hash tables extremely sparse. A logical
-        // offset replay must still stop after a fixed number of atomic SCAN
-        // calls instead of monopolizing the Redis event loop.
-        let mut sparse_set_deletes = redis::pipe();
-        for index in 0..3_999 {
-            sparse_set_deletes
-                .cmd("SREM")
-                .arg("large-set")
-                .arg(format!("member-{index:04}-{}", "x".repeat(300)))
-                .ignore();
-        }
-        sparse_set_deletes
-            .query_async::<()>(&mut connection)
-            .await?;
-        let sparse_set_error = RedisSource::scan_set_page(
+        // The zero-call boundary deterministically proves that logical offset
+        // replay stops at its atomic SCAN cap. Do not infer Redis's internal
+        // hash-table layout from deletions: Redis may compact a sparse value and
+        // legitimately finish a scan in one call.
+        let set_scan_cap_error = RedisSource::scan_set_page(
             &mut connection,
             "large-set",
             0,
             100,
             QueryBudget::default().max_cell_bytes,
             "cell_bytes",
-            1,
+            0,
         )
         .await
-        .expect_err("sparse SSCAN replay must stop at its atomic work cap");
+        .expect_err("SSCAN replay must stop at its zero-call atomic work cap");
         assert!(matches!(
-            sparse_set_error,
+            set_scan_cap_error,
             DataError::ResultLimitExceeded {
                 limit_kind: "scan_iterations",
-                limit: 1,
+                limit: 0,
                 ..
             }
         ));
@@ -1430,33 +1420,22 @@ mod tests {
             high_hash_cursor_page.stats.next_cursor.as_deref(),
             Some("502")
         );
-        let mut sparse_hash_deletes = redis::pipe();
-        for index in 0..3_999 {
-            sparse_hash_deletes
-                .cmd("HDEL")
-                .arg("sparse-hash")
-                .arg(format!("field-{index:04}"))
-                .ignore();
-        }
-        sparse_hash_deletes
-            .query_async::<()>(&mut connection)
-            .await?;
-        let sparse_hash_error = RedisSource::scan_hash_page(
+        let hash_scan_cap_error = RedisSource::scan_hash_page(
             &mut connection,
             "sparse-hash",
             0,
             100,
             QueryBudget::default().max_cell_bytes,
             "cell_bytes",
-            1,
+            0,
         )
         .await
-        .expect_err("sparse HSCAN replay must stop at its atomic work cap");
+        .expect_err("HSCAN replay must stop at its zero-call atomic work cap");
         assert!(matches!(
-            sparse_hash_error,
+            hash_scan_cap_error,
             DataError::ResultLimitExceeded {
                 limit_kind: "scan_iterations",
-                limit: 1,
+                limit: 0,
                 ..
             }
         ));

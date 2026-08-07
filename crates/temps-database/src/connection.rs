@@ -289,9 +289,9 @@ pub async fn connect_for_migrate(database_url: &str) -> ServiceResult<(Arc<DbCon
 /// and sends a query-cancel to the captured backend `pid`, exactly like pressing
 /// Ctrl+C in `psql`: the running DDL aborts and, because Sea-ORM runs each
 /// migration in a transaction, that transaction rolls back — leaving the DB at
-/// the last successfully-applied migration. Also sweeps any backend tagged
-/// `application_name = 'temps_migrate'` (e.g. a straggler from a prior interrupt)
-/// so a re-run never races a lingering backend. Best-effort.
+/// the last successfully-applied migration. Cancellation is scoped to the exact
+/// captured PID; another legitimate `temps migrate` process is never swept by
+/// application name.
 pub async fn cancel_migration_backend(database_url: &str, pid: i32) -> ServiceResult<()> {
     let db = Database::connect(ConnectOptions::new(database_url))
         .await
@@ -299,25 +299,75 @@ pub async fn cancel_migration_backend(database_url: &str, pid: i32) -> ServiceRe
             ServiceError::Database(format!("Failed to connect to cancel migration: {}", e))
         })?;
 
-    // Precise: cancel the migrating backend we captured.
-    let _ = db
-        .execute(Statement::from_sql_and_values(
+    let cancellation = db
+        .query_one(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT pg_cancel_backend($1)",
+            "SELECT pg_cancel_backend($1) AS cancelled",
             [pid.into()],
         ))
-        .await;
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to request cancellation for migration backend {pid}: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ServiceError::Database(format!(
+                "PostgreSQL returned no cancellation result for migration backend {pid}"
+            ))
+        })?
+        .try_get::<bool>("", "cancelled")
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to decode cancellation result for migration backend {pid}: {error}"
+            ))
+        })?;
+    if !cancellation {
+        return Err(ServiceError::Database(format!(
+            "PostgreSQL did not confirm cancellation of migration backend {pid}"
+        )));
+    }
 
-    // Fallback: cancel any other session still tagged as a migrator (never this
-    // cancel connection itself).
-    let _ = db
-        .execute(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
-             WHERE application_name = 'temps_migrate' AND pid <> pg_backend_pid()"
-                .to_owned(),
-        ))
-        .await;
+    // `pg_cancel_backend` confirms signal delivery, not that statement cleanup
+    // and transaction rollback have completed. Do not tell the operator it is
+    // safe to rerun until the target is no longer executing an active query.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stopped = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT NOT EXISTS (\
+                     SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND state = 'active'\
+                 ) AS stopped",
+                [pid.into()],
+            ))
+            .await
+            .map_err(|error| {
+                ServiceError::Database(format!(
+                    "Failed to verify cancellation of migration backend {pid}: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ServiceError::Database(format!(
+                    "PostgreSQL returned no verification result for migration backend {pid}"
+                ))
+            })?
+            .try_get::<bool>("", "stopped")
+            .map_err(|error| {
+                ServiceError::Database(format!(
+                    "Failed to decode cancellation verification for migration backend {pid}: {error}"
+                ))
+            })?;
+        if stopped {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ServiceError::Database(format!(
+                "Migration backend {pid} remained active for 5 seconds after cancellation"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     Ok(())
 }
@@ -789,6 +839,7 @@ pub async fn run_post_migration_backfill(db: &DatabaseConnection) -> ServiceResu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
     #[test]
     fn test_parse_database_url_basic() {
@@ -853,5 +904,106 @@ mod tests {
         let (host, port) = parse_database_url("postgres://user:p%40ss@localhost:5432/db").unwrap();
         assert_eq!(host, "localhost");
         assert_eq!(port, 5432);
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_confirmed_and_scoped_to_the_captured_backend() -> anyhow::Result<()> {
+        let container = match GenericImage::new("postgres", "18-alpine")
+            .with_exposed_port(testcontainers::core::ContainerPort::Tcp(5432))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error)
+                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping Docker-dependent migration cancellation test: {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let host = container.get_host().await?.to_string();
+        let port = container.get_host_port_ipv4(5432).await?;
+        let database_url = format!("postgresql://postgres@{host}:{port}/postgres");
+
+        let (target_db, target_pid) = connect_for_migrate(&database_url).await?;
+        let mut other_options = ConnectOptions::new(&database_url);
+        other_options.max_connections(1).min_connections(1);
+        let other_db = Database::connect(other_options).await?;
+        other_db
+            .execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SET application_name = 'temps_migrate'".to_owned(),
+            ))
+            .await?;
+        let other_pid = other_db
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT pg_backend_pid() AS pid".to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("second migrator returned no backend PID"))?
+            .try_get::<i32>("", "pid")?;
+
+        let target_task = {
+            let db = target_db.clone();
+            tokio::spawn(async move {
+                db.query_one(Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT pg_sleep(30)".to_owned(),
+                ))
+                .await
+            })
+        };
+        let other_task = tokio::spawn(async move {
+            other_db
+                .query_one(Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT pg_sleep(1)".to_owned(),
+                ))
+                .await
+        });
+
+        let observer = Database::connect(&database_url).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let active = observer
+                .query_one(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT COUNT(*)::bigint AS active FROM pg_stat_activity \
+                     WHERE pid IN ($1, $2) AND state = 'active'",
+                    [target_pid.into(), other_pid.into()],
+                ))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("activity query returned no row"))?
+                .try_get::<i64>("", "active")?;
+            if active == 2 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("migration backends did not become active before cancellation test");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        cancel_migration_backend(&database_url, target_pid).await?;
+        let target_result = tokio::time::timeout(Duration::from_secs(5), target_task).await??;
+        assert!(
+            target_result.is_err(),
+            "captured migration backend query must be cancelled"
+        );
+        let other_result = tokio::time::timeout(Duration::from_secs(5), other_task).await??;
+        assert!(
+            other_result.is_ok(),
+            "a separate temps_migrate backend must not be cancelled"
+        );
+
+        Ok(())
     }
 }
