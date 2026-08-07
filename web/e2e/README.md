@@ -25,21 +25,85 @@ console is clean, and that the core flows a first-run user hits actually work.
 
 ```
 e2e/
-  fixtures.ts              shared fixtures: console-error capture, HTTP failure
-                           capture, login helper, URL matchers
-  auth.setup.ts            logs in once, saves storage state for reuse
-  anonymous/               specs that must NOT have a session
-    console-boot.spec.ts   the #504 regression guard: app mounts, no JS errors
-    auth.spec.ts           login success/failure, route gating
-  authenticated/           specs that reuse the saved session
-    navigation.spec.ts     every sidebar destination renders real content
-    project-create.spec.ts creates a project from a public git URL
+  fixtures.ts                 shared fixtures: console-error capture, HTTP
+                              failure capture, login helper, URL matchers,
+                              uniqueSlug() for parallel-safe resource names
+  auth.setup.ts               logs in once, saves storage state for reuse
+  anonymous/                  specs that must NOT have a session
+    console-boot.spec.ts      the #504 regression guard: app mounts, no JS errors
+    auth.spec.ts              login success/failure, route gating
+    command-palette.spec.ts   command palette search/navigation
+  authenticated/               specs that reuse the saved session
+    navigation.spec.ts        every sidebar destination renders real content
+    project-create.spec.ts    creates a project from a public git URL
+    api-key-create.spec.ts    RBAC role-assignment wizard; the minted secret authenticates
+    user-creation.spec.ts     user creation + team-assignment retry (route-mocked)
+    drop-handoff.spec.ts      empty-state ZIP/folder upload handoff (route-mocked)
+    ai-chat-layout.spec.ts    AI chat page layout
+    preview-share-link.spec.ts sandbox preview share-link minting + redemption
 ```
 
 The anonymous/authenticated split is enforced by `playwright.config.ts` rather
 than by convention, because getting it wrong is silent: an "unauthenticated"
 assertion that quietly inherits a logged-in storage state still passes while
 testing nothing.
+
+## Parallel safety and idempotency
+
+`fullyParallel: true` — specs share one backend, so every spec must be safe to
+run concurrently with itself (retries) and with every other spec:
+
+- **Prefer route-mocking** (`page.route(...)`) for anything that doesn't need
+  to prove a real server-side effect. Most specs here (`user-creation`,
+  `drop-handoff`, `command-palette`) never touch the real backend at all, so
+  they have no shared-state exposure by construction.
+- **Specs that do create real backend state must generate worker/retry-unique
+  names** via `uniqueSlug()` in `fixtures.ts` (not a CI run id alone, which is
+  identical across every worker in one run) **and delete what they created in
+  a `try/finally`**, so a failed assertion still leaves the instance clean —
+  see `project-create.spec.ts` and `preview-share-link.spec.ts` for the
+  pattern. A spec that leaks state doesn't just fail once; it corrupts every
+  later run that lists or counts the same resource type.
+- Genuinely singleton flows (the one seeded admin session `auth.setup.ts`
+  creates) live in their own serial Playwright `project` with a `dependencies`
+  edge, which Playwright always runs to completion before any parallel spec
+  starts — this is the one place serialization is correct rather than a
+  workaround.
+
+## Coverage vs. the feature catalog
+
+Tracks `temps/docs/feature-catalog/README.md`'s 6 subsystems. "CLI" refers to
+`apps/temps-e2e` API-parity scenarios, which also validate the paths
+`bunx @temps-sdk/cli` exercises. This table is the source of truth for gaps —
+update it whenever a spec or scenario is added, rather than letting coverage
+silently drift from the catalog.
+
+| Subsystem | UI (`web/e2e`) | CLI (`apps/temps-e2e`) |
+|---|---|---|
+| Deployment & Infrastructure | `project-create`, `navigation`, `drop-handoff` | `scenario`, `examples` |
+| Observability | — | — |
+| Data & Storage | `navigation` (databases page only) | — |
+| AI | `ai-chat-layout` | — |
+| Security & Auth | `auth`, `user-creation`, `api-key-create` | — |
+| Platform & Commerce | `command-palette`, `preview-share-link` | — |
+
+Rows with only a dash are not covered end-to-end yet — tracked gaps, not
+silently-assumed coverage. Observability, data-storage (beyond the page
+rendering), security-auth (API keys/RBAC, audit logs), and platform-commerce
+(webhooks, notifications, plugins) are the priority next additions.
+
+## Mocking third-party services
+
+[`vercel-labs/emulate`](https://github.com/vercel-labs/emulate) is available
+for test-harness-side use in `apps/temps-e2e` (calling a mocked GitHub/AWS/etc.
+API directly from test setup code), but it **cannot** be wired into temps' own
+server-side provider config (git provider `base_url`/`api_url`, webhook and
+Slack notification targets, custom domains). All of those pass through
+`temps_core::url_validation::validate_external_url`, which deliberately
+rejects loopback/private/link-local addresses as an SSRF guard — that's a
+security boundary, not an oversight, and it is not to be weakened for test
+convenience. Practically: real outbound integrations (git clone-by-URL, etc.)
+keep hitting real, public, stable third parties in these specs.
 
 ## Running locally
 
