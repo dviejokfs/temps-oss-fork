@@ -77,8 +77,8 @@ const MANUAL_SOURCE_TYPES: {
  * Splits a repository path into owner and name.
  *
  * Splitting on the LAST slash rather than requiring exactly two segments is
- * what makes nested GitLab groups work: `gala-games/chain/platform/my-repo`
- * is owner `gala-games/chain/platform`, name `my-repo`. That matches how the
+ * what makes nested GitLab groups work: `acme/infra/platform/my-repo`
+ * is owner `acme/infra/platform`, name `my-repo`. That matches how the
  * API stores it (repo_owner / repo_name) and how the provider lists it.
  * Requiring exactly two segments rejected every repo in a subgroup, even
  * though the backend supported them.

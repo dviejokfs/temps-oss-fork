@@ -522,6 +522,19 @@ impl ServeCommand {
             );
         }
 
+        // Converge on out-of-process gate edits here too. A single-binary
+        // `temps serve` swaps this handle in-process on save, so the listener
+        // is redundant for the common case — but in an HA deployment with
+        // several consoles against one database, replica B would otherwise keep
+        // enforcing its boot-time allowlist after an operator tightened the
+        // gate on replica A. `AdminGateService` is `Clone` and the handle is an
+        // `Arc<ArcSwap<_>>`, so this clone writes to the same live handle.
+        {
+            let listener_service = Arc::new(admin_gate_service.clone());
+            let database_url = self.database_url.clone();
+            rt.block_on(async { listener_service.start_settings_listener(database_url) });
+        }
+
         // Shared retention-resolver slot: constructed ONCE here (before either
         // the console or the proxy bootstraps begin) so both see the same
         // object. The console's ProxyPlugin looks this up via the service

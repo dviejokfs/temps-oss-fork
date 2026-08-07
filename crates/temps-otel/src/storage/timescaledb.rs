@@ -1576,6 +1576,105 @@ impl OtelStorage for TimescaleDbStorage {
         Ok(spans)
     }
 
+    async fn query_span_stats(&self, query: SpanStatsQuery) -> StorageResult<Vec<SpanStats>> {
+        let (where_sql, mut values, param_idx) = build_span_stats_filters(&query);
+        let limit = query.effective_limit();
+        let offset = query.effective_offset();
+
+        // sort_by/sort_order come from fixed enums, never user strings, so
+        // interpolating them into SQL is injection-safe. The tie-breaker keeps
+        // pagination deterministic when two operations score identically.
+        let order_dir = query.sort_order.as_sql();
+        let order_expr = span_stats_order_expr(query.sort_by);
+
+        // `min_count` is bound rather than interpolated even though it is a
+        // u64, so a future change to its type can't become an injection.
+        let min_count_param = param_idx;
+        let limit_param = param_idx + 1;
+        let offset_param = param_idx + 2;
+        values.push((query.min_count as i64).into());
+        values.push((limit as i64).into());
+        values.push((offset as i64).into());
+
+        // The percentiles use `percentile_cont`, which is exact rather than
+        // approximate: the window is bounded and the result is grouped, so the
+        // set being sorted per group stays small enough that exactness is
+        // cheaper than explaining an approximation's error bars to an operator
+        // staring at a latency number.
+        let sql = format!(
+            r#"
+            SELECT
+                s.project_id,
+                s.service_name,
+                s.name AS span_name,
+                (array_agg(s.kind ORDER BY s.start_time DESC))[1] AS kind,
+                COUNT(*)::bigint AS span_count,
+                COUNT(*) FILTER (WHERE s.status_code = 'ERROR')::bigint AS error_count,
+                SUM(s.duration_ms)::double precision AS total_duration_ms,
+                MIN(s.duration_ms)::double precision AS min_duration_ms,
+                MAX(s.duration_ms)::double precision AS max_duration_ms,
+                AVG(s.duration_ms)::double precision AS avg_duration_ms,
+                COALESCE(STDDEV_SAMP(s.duration_ms), 0)::double precision AS stddev_duration_ms,
+                percentile_cont(0.50) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p50_duration_ms,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p95_duration_ms,
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p99_duration_ms,
+                MAX(s.start_time) AS last_seen
+            FROM otel_spans s
+            WHERE {where_sql}
+            GROUP BY s.project_id, s.service_name, s.name
+            HAVING COUNT(*) >= ${min_count_param}
+            ORDER BY {order_expr} {order_dir} NULLS LAST, s.project_id, s.service_name, s.name
+            LIMIT ${limit_param} OFFSET ${offset_param}
+            "#
+        );
+
+        let results = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        Ok(results.iter().filter_map(parse_span_stats_row).collect())
+    }
+
+    async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64> {
+        let (where_sql, mut values, param_idx) = build_span_stats_filters(&query);
+        values.push((query.min_count as i64).into());
+
+        // Counting groups needs the grouping to actually happen, so the inner
+        // query mirrors the list query's GROUP BY/HAVING exactly. It selects a
+        // constant rather than the aggregates: the row count is identical and
+        // the percentile sorts are skipped entirely.
+        let sql = format!(
+            r#"
+            SELECT COUNT(*)::bigint AS cnt FROM (
+                SELECT 1
+                FROM otel_spans s
+                WHERE {where_sql}
+                GROUP BY s.project_id, s.service_name, s.name
+                HAVING COUNT(*) >= ${param_idx}
+            ) grouped
+            "#
+        );
+
+        let result = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        Ok(result
+            .and_then(|row| row.try_get::<i64>("", "cnt").ok())
+            .unwrap_or(0)
+            .max(0) as u64)
+    }
+
     async fn query_genai_trace_summaries(
         &self,
         query: TraceQuery,
@@ -3399,6 +3498,167 @@ fn parse_span_kind(kind_str: &str) -> crate::types::SpanKind {
         "UNSPECIFIED" => crate::types::SpanKind::Unspecified,
         _ => crate::types::SpanKind::Internal,
     }
+}
+
+// ── Span-stats helpers ──────────────────────────────────────────────────────
+
+/// Build the shared WHERE clause and bound parameters for the span-stats
+/// list/count queries. Returns `(where_sql, values, next_param_idx)`.
+///
+/// The list and count queries MUST use this same builder: a filter applied to
+/// one but not the other produces a total that disagrees with the rows, and
+/// pagination silently loses or repeats operations.
+fn build_span_stats_filters(query: &SpanStatsQuery) -> (String, Vec<sea_orm::Value>, u32) {
+    // `= ANY($1)` keeps the (project_id, start_time) index usable for the
+    // multi-project case instead of degenerating into a sequential scan.
+    let project_ids: Vec<i32> = query.project_ids.clone();
+    let mut where_clauses = vec![
+        "s.project_id = ANY($1)".to_string(),
+        "s.start_time >= $2".to_string(),
+        "s.start_time <= $3".to_string(),
+    ];
+    let mut values: Vec<sea_orm::Value> = vec![
+        project_ids.into(),
+        query.start_time.into(),
+        query.end_time.into(),
+    ];
+    let mut param_idx = 4u32;
+
+    if let Some(ref svc) = query.service_name {
+        where_clauses.push(format!("s.service_name = ${param_idx}"));
+        values.push(svc.clone().into());
+        param_idx += 1;
+    }
+    if let Some(ref name) = query.span_name {
+        where_clauses.push(format!("s.name = ${param_idx}"));
+        values.push(name.clone().into());
+        param_idx += 1;
+    }
+    if let Some(ref pattern) = query.name_pattern {
+        where_clauses.push(format!("s.name ILIKE ${param_idx}"));
+        values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+        param_idx += 1;
+    }
+    if let Some(kind) = query.kind {
+        where_clauses.push(format!("s.kind = ${param_idx}"));
+        values.push(kind.to_string().into());
+        param_idx += 1;
+    }
+    if let Some(status) = query.status {
+        where_clauses.push(format!("s.status_code = ${param_idx}"));
+        values.push(status.to_string().into());
+        param_idx += 1;
+    }
+    if let Some(min_dur) = query.min_duration_ms {
+        where_clauses.push(format!("s.duration_ms >= ${param_idx}"));
+        values.push(min_dur.into());
+        param_idx += 1;
+    }
+    if let Some(deployment_id) = query.deployment_id {
+        where_clauses.push(format!("s.deployment_id = ${param_idx}"));
+        values.push(deployment_id.into());
+        param_idx += 1;
+    }
+    if let Some(environment_id) = query.environment_id {
+        // A subquery rather than a JOIN: joining `deployments` before the
+        // GROUP BY would multiply span rows and corrupt every aggregate.
+        where_clauses.push(format!(
+            "s.deployment_id IN (SELECT id FROM deployments WHERE environment_id = ${param_idx})"
+        ));
+        values.push(environment_id.into());
+        param_idx += 1;
+    }
+    if let Some(ref attrs) = query.attributes {
+        for (key, value) in attrs {
+            where_clauses.push(format!(
+                "s.attributes->>${}::text = ${}",
+                param_idx,
+                param_idx + 1
+            ));
+            values.push(key.clone().into());
+            values.push(value.clone().into());
+            param_idx += 2;
+        }
+    }
+
+    (where_clauses.join(" AND "), values, param_idx)
+}
+
+/// The SQL expression a span-stats sort field orders by.
+///
+/// Written as aggregate expressions rather than SELECT aliases so PostgreSQL
+/// resolves them against the grouped set regardless of the projection. The
+/// ratio fields guard their denominators: an operation whose spans all record
+/// 0ms would otherwise divide by zero and abort the whole query.
+fn span_stats_order_expr(field: crate::types::SpanStatsSortField) -> &'static str {
+    use crate::types::SpanStatsSortField as F;
+    match field {
+        F::TotalDurationMs => "SUM(s.duration_ms)",
+        F::P50DurationMs => "percentile_cont(0.50) WITHIN GROUP (ORDER BY s.duration_ms)",
+        F::P95DurationMs => "percentile_cont(0.95) WITHIN GROUP (ORDER BY s.duration_ms)",
+        F::P99DurationMs => "percentile_cont(0.99) WITHIN GROUP (ORDER BY s.duration_ms)",
+        F::MaxDurationMs => "MAX(s.duration_ms)",
+        F::AvgDurationMs => "AVG(s.duration_ms)",
+        F::StddevDurationMs => "COALESCE(STDDEV_SAMP(s.duration_ms), 0)",
+        F::Count => "COUNT(*)",
+        F::ErrorCount => "COUNT(*) FILTER (WHERE s.status_code = 'ERROR')",
+        F::ErrorRate => {
+            "COUNT(*) FILTER (WHERE s.status_code = 'ERROR')::double precision \
+                         / NULLIF(COUNT(*), 0)"
+        }
+        F::CoefficientOfVariation => {
+            "COALESCE(STDDEV_SAMP(s.duration_ms), 0) / NULLIF(AVG(s.duration_ms), 0)"
+        }
+        F::TailRatio => {
+            "percentile_cont(0.99) WITHIN GROUP (ORDER BY s.duration_ms) \
+             / NULLIF(percentile_cont(0.50) WITHIN GROUP (ORDER BY s.duration_ms), 0)"
+        }
+    }
+}
+
+/// Convert one span-stats result row into a [`SpanStats`].
+///
+/// Returns `None` for a row missing a required column, matching the read paths
+/// elsewhere in this backend: one malformed row is skipped rather than failing
+/// the whole report.
+fn parse_span_stats_row(row: &sea_orm::QueryResult) -> Option<SpanStats> {
+    let project_id: i32 = row.try_get("", "project_id").ok()?;
+    let service_name: String = row.try_get("", "service_name").ok()?;
+    let span_name: String = row.try_get("", "span_name").ok()?;
+    let kind_str: String = row.try_get("", "kind").ok()?;
+    let count: i64 = row.try_get("", "span_count").ok()?;
+    let error_count: i64 = row.try_get("", "error_count").ok()?;
+    let total_duration_ms: f64 = row.try_get("", "total_duration_ms").unwrap_or(0.0);
+    let min_duration_ms: f64 = row.try_get("", "min_duration_ms").unwrap_or(0.0);
+    let max_duration_ms: f64 = row.try_get("", "max_duration_ms").unwrap_or(0.0);
+    let avg_duration_ms: f64 = row.try_get("", "avg_duration_ms").unwrap_or(0.0);
+    let stddev_duration_ms: f64 = row.try_get("", "stddev_duration_ms").unwrap_or(0.0);
+    let p50_duration_ms: f64 = row.try_get("", "p50_duration_ms").unwrap_or(0.0);
+    let p95_duration_ms: f64 = row.try_get("", "p95_duration_ms").unwrap_or(0.0);
+    let p99_duration_ms: f64 = row.try_get("", "p99_duration_ms").unwrap_or(0.0);
+    let last_seen: DateTime<Utc> = row.try_get("", "last_seen").ok()?;
+
+    Some(crate::types::build_span_stats(
+        crate::types::SpanStatsGroup {
+            project_id,
+            service_name,
+            span_name,
+            kind: parse_span_kind(&kind_str),
+            count,
+            error_count,
+        },
+        crate::types::SpanDurationStats {
+            total_ms: total_duration_ms,
+            min_ms: min_duration_ms,
+            max_ms: max_duration_ms,
+            avg_ms: avg_duration_ms,
+            stddev_ms: stddev_duration_ms,
+            p50_ms: p50_duration_ms,
+            p95_ms: p95_duration_ms,
+            p99_ms: p99_duration_ms,
+        },
+        last_seen,
+    ))
 }
 
 /// One trace's worth of aggregates folded from a span batch, ready to upsert

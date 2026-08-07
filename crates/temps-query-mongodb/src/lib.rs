@@ -42,6 +42,104 @@ use tracing::{debug, error};
 /// MongoDB data source implementation
 pub struct MongoDBSource {
     client: Client,
+    /// The database named in the connection string, when it names one.
+    ///
+    /// The SQL backends pin every request to the database they connected to
+    /// (`temps-query-postgres` rejects a mismatch outright, as does
+    /// `database_from_path` in the MariaDB backend). MongoDB had no equivalent:
+    /// path segment 0 was passed to `client.database(...)` unchecked, so a
+    /// caller could walk out of their own database into any other on the
+    /// server. This is the anchor for the same guard — see
+    /// [`MongoDBSource::assert_database_allowed`].
+    default_database: Option<String>,
+}
+
+/// Databases that are never browsable, whatever the connection string says.
+///
+/// With a Temps-provisioned MongoDB the connection user is typically root, so
+/// these are readable by default and they are not application data:
+/// `admin.system.users` holds the SCRAM credential records for every Mongo
+/// user, and `local.oplog.rs` is the change stream for *every* database on the
+/// server — reading it returns the row contents of databases the caller never
+/// named, which defeats the whole point of gating row access per service.
+const SYSTEM_DATABASES: [&str; 3] = ["admin", "local", "config"];
+
+/// Query operators a data-browser filter may use.
+///
+/// SECURITY: this is an allowlist on purpose, and it is the MongoDB equivalent
+/// of the WHERE-clause validators the SQL backends carry. Filters arrive as
+/// caller-supplied JSON — from `?filter=` and, once a service opts into AI data
+/// access, from a model that may be reading attacker-written rows — and were
+/// previously inserted into the BSON document verbatim, with no `$` check at
+/// all. That made `{"$where": "function(){...}"}` server-side JavaScript
+/// execution inside mongod, `{"$expr": {"$function": {...}}}` the same on 4.4+,
+/// and `$where` additionally ignores the rest of the filter and reads every
+/// document.
+///
+/// A denylist cannot work here: MongoDB adds operators, and any one that
+/// evaluates an expression is another hole. Anything not on this list is
+/// refused with the name echoed back, so a caller using a legitimate operator
+/// we forgot gets an actionable error instead of silence.
+/// `$regex` is on this list deliberately, unlike the SQL backends, which reject
+/// `~`/`SIMILAR TO`/`REGEXP` outright. Recording the reasoning because the
+/// inconsistency is otherwise indistinguishable from an oversight: a crafted
+/// pattern is catastrophic backtracking in mongod's PCRE, the same primitive
+/// the SQL side refuses. The difference is that SQL has `LIKE` and MongoDB has
+/// no other substring-search primitive at all, so removing `$regex` would take
+/// "find documents whose name starts with…" away entirely rather than
+/// redirecting it. The exposure is bounded by `max_time` on every call site
+/// that can carry a filter (`query` and both `count_documents`), which is the
+/// same mitigation the SQL side relies on for the clauses it does allow.
+const ALLOWED_FILTER_OPERATORS: [&str; 15] = [
+    "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$and", "$or", "$nor", "$not",
+    "$exists", "$type", "$regex",
+];
+
+/// Maximum nesting depth of a filter document.
+///
+/// Deep nesting is both a parser-stack risk and a way to hide an operator from
+/// a shallow check. Honest filters are one or two levels.
+const MAX_FILTER_DEPTH: usize = 8;
+
+/// Server-side ceiling for the standalone `count`, which carries no
+/// `QueryOptions` and therefore no caller deadline. Matches the SQL backends.
+const COUNT_TIMEOUT_MS: u64 = 10_000;
+
+/// Validate a caller-supplied MongoDB filter before it reaches the driver.
+///
+/// Walks the whole document — every nested object and array — rather than only
+/// the top level, because `{"$and": [{"$where": "..."}]}` puts the payload one
+/// level down. Field names (anything not starting with `$`) are passed through:
+/// they address data, they are not evaluated.
+fn validate_filter_value(value: &serde_json::Value, depth: usize) -> Result<()> {
+    if depth > MAX_FILTER_DEPTH {
+        return Err(DataError::InvalidQuery(format!(
+            "Filter is nested more than {MAX_FILTER_DEPTH} levels deep"
+        )));
+    }
+
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, nested) in map {
+                if key.starts_with('$') && !ALLOWED_FILTER_OPERATORS.contains(&key.as_str()) {
+                    return Err(DataError::InvalidQuery(format!(
+                        "The MongoDB operator '{key}' is not allowed in the data browser. \
+                         Allowed operators: {}",
+                        ALLOWED_FILTER_OPERATORS.join(", ")
+                    )));
+                }
+                validate_filter_value(nested, depth + 1)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                validate_filter_value(item, depth + 1)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 impl MongoDBSource {
@@ -51,6 +149,21 @@ impl MongoDBSource {
     ///
     /// * `url` - MongoDB connection URL (e.g., "mongodb://localhost:27017")
     pub async fn new(url: &str) -> Result<Self> {
+        Self::new_scoped(url, None).await
+    }
+
+    /// Create a source pinned to one database.
+    ///
+    /// SECURITY: prefer this over [`MongoDBSource::new`] for anything a user can
+    /// aim at a path. The pin used to be read from the URI's `/dbname` segment
+    /// alone, and the data browser builds its URI as
+    /// `mongodb://user:pass@host:port` with no segment — so `default_database`
+    /// was always `None`, `assert_database_allowed` fell through for every
+    /// non-system name, and a guard that looked right did nothing. Taking the
+    /// scope as an explicit argument makes it visible at the call site whether
+    /// a source is pinned, instead of depending on how a string was formatted
+    /// three modules away.
+    pub async fn new_scoped(url: &str, database: Option<&str>) -> Result<Self> {
         debug!("Creating MongoDB source for URL: {}", url);
 
         let mut client_options = ClientOptions::parse(url).await.map_err(|e| {
@@ -67,6 +180,12 @@ impl MongoDBSource {
         // not per-cluster, so direct connection is the correct semantic.
         client_options.direct_connection = Some(true);
 
+        // Explicit scope wins; fall back to the URI's `/dbname` segment.
+        let default_database = database
+            .map(str::to_string)
+            .or_else(|| client_options.default_database.clone())
+            .filter(|d| !d.is_empty());
+
         let client = Client::with_options(client_options).map_err(|e| {
             error!("Failed to create MongoDB client: {}", e);
             DataError::ConnectionFailed(format!("Failed to create MongoDB client: {}", e))
@@ -80,7 +199,59 @@ impl MongoDBSource {
 
         debug!("MongoDB client created successfully");
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            default_database,
+        })
+    }
+
+    /// Reject a database the caller is not entitled to browse.
+    ///
+    /// Two layers, because they close different holes:
+    ///
+    /// 1. System databases are always denied. They are readable by the root
+    ///    user a Temps-provisioned MongoDB connects as, they contain
+    ///    credentials and a cross-database change stream, and no data browser
+    ///    needs them.
+    /// 2. When the connection string names a database, nothing else is
+    ///    reachable — matching what the Postgres and MariaDB backends already
+    ///    enforce. Left permissive when it does not, because a URI without a
+    ///    database is a legitimate configuration and refusing everything would
+    ///    break it; layer 1 still applies.
+    fn assert_database_allowed(&self, db_name: &str) -> Result<()> {
+        if SYSTEM_DATABASES
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(db_name))
+        {
+            return Err(DataError::OperationNotSupported(format!(
+                "The '{db_name}' database is a MongoDB system database and is not browsable"
+            )));
+        }
+
+        if let Some(configured) = &self.default_database {
+            if configured != db_name {
+                return Err(DataError::OperationNotSupported(format!(
+                    "Cannot access database '{db_name}' while connected to '{configured}'"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reject MongoDB's internal collections.
+    ///
+    /// `system.*` is namespaced for the server's own bookkeeping — indexes,
+    /// users, JS — and is not application data. Denied separately from the
+    /// database check because `system.*` collections exist inside ordinary
+    /// databases too, not only inside `admin`.
+    fn assert_collection_allowed(collection: &str) -> Result<()> {
+        if collection.starts_with("system.") {
+            return Err(DataError::OperationNotSupported(format!(
+                "The '{collection}' collection is MongoDB-internal and is not browsable"
+            )));
+        }
+        Ok(())
     }
 
     /// List collections in a specific database
@@ -149,8 +320,26 @@ impl MongoDBSource {
 
         let collection = db.collection::<Document>(collection_name);
 
-        // Get document count
+        // Already an O(1) metadata read rather than a full scan — unlike the
+        // SQL backends, Mongo hands us a maintained count.
         let doc_count = collection.estimated_document_count().await.ok();
+
+        // On-disk size via collStats. Also a metadata read; `storageSize` is
+        // the compressed on-disk figure, which is what an operator asking
+        // "how much space does this use" wants (`size` is the uncompressed
+        // logical total). Best-effort: collStats needs privileges the browsing
+        // user may not have, and a missing size renders as "—" rather than 0.
+        let size_bytes = db
+            .run_command(doc! { "collStats": collection_name })
+            .await
+            .ok()
+            .and_then(|stats| {
+                stats
+                    .get("storageSize")
+                    .or_else(|| stats.get("size"))
+                    .and_then(|v| v.as_i64().or_else(|| v.as_i32().map(i64::from)))
+            })
+            .and_then(|s| u64::try_from(s).ok());
 
         // Sample a document to infer schema
         let schema = if let Ok(Some(sample_doc)) = collection.find_one(doc! {}).await {
@@ -170,7 +359,7 @@ impl MongoDBSource {
             name: collection_name.to_string(),
             entity_type: "collection".to_string(),
             row_count: doc_count.map(|c| c as usize),
-            size_bytes: None,
+            size_bytes,
             schema,
             metadata: Some(serde_json::to_value(metadata_map).unwrap()),
         })
@@ -235,6 +424,11 @@ impl DataSource for MongoDBSource {
 
                 let databases: Vec<ContainerInfo> = db_names
                     .into_iter()
+                    // Don't advertise what `assert_database_allowed` will
+                    // refuse: listing `admin`/`local` and then 400-ing on click
+                    // is worse UX than not offering them, and it tells an agent
+                    // they exist.
+                    .filter(|name| self.assert_database_allowed(name).is_ok())
                     .map(|name| {
                         let mut metadata = HashMap::new();
                         metadata.insert("type".to_string(), serde_json::json!("database"));
@@ -275,6 +469,12 @@ impl DataSource for MongoDBSource {
         }
 
         let db_name = &path.segments[0];
+        // The one entry point that was missing this. Without it,
+        // `/containers/admin/info` confirmed the database exists and returned
+        // its collection count — contradicting the guard applied everywhere
+        // else, and giving an existence oracle for databases the caller cannot
+        // otherwise reach.
+        self.assert_database_allowed(db_name)?;
 
         debug!("Getting info for database: {}", db_name);
 
@@ -332,6 +532,7 @@ impl DataSource for MongoDBSource {
         }
 
         let db_name = &container_path.segments[0];
+        self.assert_database_allowed(db_name)?;
 
         self.list_collections_in_db(db_name).await
     }
@@ -355,6 +556,8 @@ impl DataSource for MongoDBSource {
         }
 
         let db_name = &container_path.segments[0];
+        self.assert_database_allowed(db_name)?;
+        Self::assert_collection_allowed(entity_name)?;
 
         self.get_collection_info(db_name, entity_name).await
     }
@@ -396,11 +599,18 @@ impl temps_query::Queryable for MongoDBSource {
         }
 
         let db_name = &container_path.segments[0];
+        self.assert_database_allowed(db_name)?;
+        Self::assert_collection_allowed(entity_name)?;
         let db = self.client.database(db_name);
         let collection = db.collection::<Document>(entity_name);
 
         // Convert filter JSON to MongoDB Document
         let filter_doc = if let Some(filter_value) = filters {
+            // SECURITY: validate before anything reaches the driver. See
+            // `validate_filter_value` — without this, `$where` is arbitrary
+            // JavaScript execution inside mongod.
+            validate_filter_value(&filter_value, 0)?;
+
             // If the filter is already a MongoDB query, use it directly
             // Otherwise, treat it as key-value equality filters
             match filter_value {
@@ -444,12 +654,22 @@ impl temps_query::Queryable for MongoDBSource {
 
         let start_time = std::time::Instant::now();
 
+        // SECURITY / AVAILABILITY: bound the operation server-side.
+        //
+        // Dropping the future when the caller's deadline fires abandons the
+        // cursor but does not stop the server from doing the work — `maxTimeMS`
+        // is what makes mongod give up. Relevant here because `skip` is
+        // caller-supplied and its cost is O(skip): the server walks and discards
+        // every skipped document regardless of `limit`.
+        let max_time = std::time::Duration::from_millis(options.timeout_ms.unwrap_or(30_000));
+
         // Execute query
         let mut cursor = collection
             .find(filter_doc.clone())
             .sort(sort_doc)
             .limit(limit)
             .skip(skip)
+            .max_time(max_time)
             .await
             .map_err(|e| {
                 error!("MongoDB query failed: {}", e);
@@ -479,11 +699,20 @@ impl temps_query::Queryable for MongoDBSource {
             rows.push(row_map);
         }
 
-        // Get total count (expensive, but needed for pagination)
-        let total_count = collection.count_documents(filter_doc).await.map_err(|e| {
-            error!("Failed to count MongoDB documents: {}", e);
-            DataError::QueryFailed(format!("Failed to count documents: {}", e))
-        })?;
+        // Get total count (expensive, but needed for pagination).
+        //
+        // SECURITY: `max_time` here as well as on the `find` above. Dropping the
+        // future when the control-plane deadline fires abandons the operation
+        // client-side but does not stop mongod, and a count with a
+        // caller-supplied filter is a full collection scan.
+        let total_count = collection
+            .count_documents(filter_doc)
+            .max_time(max_time)
+            .await
+            .map_err(|e| {
+                error!("Failed to count MongoDB documents: {}", e);
+                DataError::QueryFailed(format!("Failed to count documents: {}", e))
+            })?;
 
         let execution_time = start_time.elapsed();
 
@@ -557,11 +786,17 @@ impl temps_query::Queryable for MongoDBSource {
         }
 
         let db_name = &container_path.segments[0];
+        self.assert_database_allowed(db_name)?;
+        Self::assert_collection_allowed(entity_name)?;
         let db = self.client.database(db_name);
         let collection = db.collection::<Document>(entity_name);
 
         // Convert filter JSON to MongoDB Document
         let filter_doc = if let Some(filter_value) = filters {
+            // Same validation as the query path — this call site takes the same
+            // caller-supplied JSON and reaches the same evaluator.
+            validate_filter_value(&filter_value, 0)?;
+
             match filter_value {
                 serde_json::Value::Object(map) => {
                     let mut doc = Document::new();
@@ -578,10 +813,17 @@ impl temps_query::Queryable for MongoDBSource {
             Document::new()
         };
 
-        let count = collection.count_documents(filter_doc).await.map_err(|e| {
-            error!("Failed to count MongoDB documents: {}", e);
-            DataError::QueryFailed(format!("Failed to count documents: {}", e))
-        })?;
+        // `count` takes no QueryOptions, so it has no caller deadline to
+        // honour — but it is reached from `get_entity_info`, which the AI agent
+        // can call, and it is a full collection scan.
+        let count = collection
+            .count_documents(filter_doc)
+            .max_time(std::time::Duration::from_millis(COUNT_TIMEOUT_MS))
+            .await
+            .map_err(|e| {
+                error!("Failed to count MongoDB documents: {}", e);
+                DataError::QueryFailed(format!("Failed to count documents: {}", e))
+            })?;
 
         Ok(count)
     }
@@ -620,5 +862,104 @@ mod tests {
     fn test_capabilities() {
         let capabilities = [Capability::Document];
         assert!(capabilities.contains(&Capability::Document));
+    }
+
+    #[test]
+    fn filter_rejects_javascript_evaluating_operators() {
+        // These were the hole: every top-level key went into the BSON document
+        // verbatim, so `$where` was arbitrary JavaScript inside mongod, and it
+        // also ignores the rest of the filter and reads every document.
+        for payload in [
+            serde_json::json!({"$where": "function(){while(true){}}"}),
+            serde_json::json!({"$expr": {"$function": {"body": "x", "args": [], "lang": "js"}}}),
+            serde_json::json!({"$accumulator": {"init": "x"}}),
+            serde_json::json!({"$merge": "other"}),
+            serde_json::json!({"$out": "other"}),
+        ] {
+            assert!(
+                validate_filter_value(&payload, 0).is_err(),
+                "should have been rejected: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_rejects_disallowed_operators_nested_in_allowed_ones() {
+        // A top-level-only check would pass this: the payload sits one level
+        // down, inside an operator that is itself legitimate.
+        let nested = serde_json::json!({"$and": [{"status": "active"}, {"$where": "1"}]});
+        assert!(validate_filter_value(&nested, 0).is_err());
+
+        let deeper = serde_json::json!({"$or": [{"$and": [{"$where": "1"}]}]});
+        assert!(validate_filter_value(&deeper, 0).is_err());
+    }
+
+    #[test]
+    fn filter_accepts_ordinary_queries() {
+        // The allowlist must not break the filters this exists to run. Field
+        // names address data rather than being evaluated, so they pass through.
+        for payload in [
+            serde_json::json!({"status": "active"}),
+            serde_json::json!({"age": {"$gt": 21, "$lte": 65}}),
+            serde_json::json!({"$and": [{"a": 1}, {"b": {"$in": [1, 2, 3]}}]}),
+            serde_json::json!({"name": {"$regex": "^a"}}),
+            serde_json::json!({"deleted_at": {"$exists": false}}),
+        ] {
+            assert!(
+                validate_filter_value(&payload, 0).is_ok(),
+                "should have been accepted: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_rejects_excessive_nesting() {
+        // Deep nesting is both a stack risk and a way to bury an operator below
+        // whatever depth a check bothers to walk.
+        let mut deep = serde_json::json!({"a": 1});
+        for _ in 0..(MAX_FILTER_DEPTH + 2) {
+            deep = serde_json::json!({"$and": [deep]});
+        }
+        assert!(validate_filter_value(&deep, 0).is_err());
+    }
+
+    #[test]
+    fn database_pin_survives_a_uri_with_no_path_segment() {
+        // The regression this exists for: the data browser builds its URI as
+        // `mongodb://user:pass@host:port` with NO `/dbname` segment, so reading
+        // the pin from the URI alone left `default_database` as None on every
+        // real connection — the guard looked right and never engaged. Assert on
+        // the resolution rule directly, since constructing a source needs a
+        // live server.
+        let from_uri_only: Option<String> = None;
+        let explicit = Some("app_prod");
+
+        let resolved = explicit
+            .map(str::to_string)
+            .or_else(|| from_uri_only.clone())
+            .filter(|d| !d.is_empty());
+        assert_eq!(
+            resolved.as_deref(),
+            Some("app_prod"),
+            "an explicit scope must pin even when the URI carries no database"
+        );
+
+        // An empty configured database must not be mistaken for a real pin.
+        let empty: Option<&str> = Some("");
+        let resolved_empty = empty
+            .map(str::to_string)
+            .or_else(|| from_uri_only.clone())
+            .filter(|d| !d.is_empty());
+        assert_eq!(resolved_empty, None);
+    }
+
+    #[test]
+    fn system_collections_are_not_browsable() {
+        // `system.*` exists inside ordinary databases too, so this is checked
+        // separately from the database guard.
+        assert!(MongoDBSource::assert_collection_allowed("system.users").is_err());
+        assert!(MongoDBSource::assert_collection_allowed("system.indexes").is_err());
+        assert!(MongoDBSource::assert_collection_allowed("users").is_ok());
+        assert!(MongoDBSource::assert_collection_allowed("system_events").is_ok());
     }
 }

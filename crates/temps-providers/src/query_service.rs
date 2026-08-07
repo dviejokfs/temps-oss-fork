@@ -23,6 +23,32 @@ use crate::ExternalServiceManager;
 /// Cache of active connections by (service_id, database_name)
 type ConnectionCache = HashMap<(i32, String), Arc<dyn DataSource>>;
 
+/// Wall-clock ceiling applied to a data-browser query when the caller does not
+/// supply one.
+///
+/// Matches `QueryOptions::default()`. Long enough that an honest query over a
+/// large table on a busy box still completes; short enough that a request which
+/// is never going to finish stops holding a connection. This is a browser, not
+/// a reporting tool — anything slower than this wants a real client.
+pub const DEFAULT_QUERY_TIMEOUT_MS: u64 = 30_000;
+
+/// Hard ceiling on the caller-supplied timeout.
+///
+/// The deadline is the only thing bounding how long one request can hold a
+/// control-plane task and a connection to the operator's database, so it must
+/// not itself be caller-controlled without limit.
+pub const MAX_QUERY_TIMEOUT_MS: u64 = 60_000;
+
+/// Resolve the effective query deadline, clamped to [`MAX_QUERY_TIMEOUT_MS`].
+///
+/// Split out and public so the handler layer and the tests agree on the value
+/// without duplicating the clamp.
+pub fn effective_timeout_ms(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(DEFAULT_QUERY_TIMEOUT_MS)
+        .clamp(1, MAX_QUERY_TIMEOUT_MS)
+}
+
 /// Service for managing query connections to external services
 pub struct QueryService {
     external_service_manager: Arc<ExternalServiceManager>,
@@ -357,11 +383,22 @@ impl QueryService {
                     )
                 };
 
-                // Create MongoDB source
-                let mongodb_source = MongoDBSource::new(&connection_string).await.map_err(|e| {
-                    error!("Failed to connect to MongoDB service {}: {}", service_id, e);
-                    e
-                })?;
+                // Create MongoDB source, pinned to the service's configured
+                // database.
+                //
+                // SECURITY: the pin must be passed explicitly. The URI built
+                // above deliberately carries no `/dbname` segment, so relying on
+                // the driver to infer the scope left `MongoDBSource` unpinned
+                // and its database guard inert — every non-system database on
+                // the server stayed reachable through path segment 0. This
+                // matches what the Postgres and MariaDB backends enforce.
+                let mongodb_source =
+                    MongoDBSource::new_scoped(&connection_string, Some(config.database.as_str()))
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to connect to MongoDB service {}: {}", service_id, e);
+                            e
+                        })?;
 
                 Arc::new(mongodb_source)
             }
@@ -813,12 +850,30 @@ impl QueryService {
         let database = container_path.segments[0].clone();
         let path_clone = container_path.clone();
         let entity_name = entity_name.to_string();
-        self.with_connection_retry(service_id, &database, move |conn| {
+
+        // SECURITY / AVAILABILITY: bound this like `query_data`.
+        //
+        // The deadline originally covered the row path only, which left the
+        // more expensive one open: `get_entity_info` falls through to a full
+        // `COUNT(*)` on several backends (every view, and any table whose stats
+        // were never gathered), and it is in the AI read allowlist. "Check the
+        // row count of every table" would otherwise pin a connection per call
+        // with nothing to stop it.
+        let work = self.with_connection_retry(service_id, &database, move |conn| {
             let path_clone = path_clone.clone();
             let entity_name = entity_name.clone();
             async move { conn.get_entity_info(&path_clone, &entity_name).await }
-        })
+        });
+
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(DEFAULT_QUERY_TIMEOUT_MS),
+            work,
+        )
         .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(DataError::QueryTimeout(DEFAULT_QUERY_TIMEOUT_MS)),
+        }
     }
 
     /// Query data from an entity
@@ -839,7 +894,25 @@ impl QueryService {
         let database = container_path.segments[0].clone();
         let path_clone = container_path.clone();
         let entity_name = entity_name.to_string();
-        self.with_connection_retry(service_id, &database, move |conn| {
+
+        // SECURITY / AVAILABILITY: bound every data-browser query in wall-clock
+        // time, at the one place all four backends funnel through.
+        //
+        // Backends set their own server-side ceiling where the engine has one
+        // (`statement_timeout`, `maxTimeMS`, `max_execution_time`), which is
+        // what actually stops work on the operator's database. This outer
+        // deadline is the backstop for the engines that have no such knob and
+        // for the case where the server ignores it: without it a single request
+        // pins a control-plane task and a connection indefinitely, and the query
+        // keeps running after the HTTP client has disconnected. On the 3 vCPU /
+        // 4 GB reference box a handful of those exhausts the pool.
+        let deadline_ms = effective_timeout_ms(options.timeout_ms);
+        let options = QueryOptions {
+            timeout_ms: Some(deadline_ms),
+            ..options
+        };
+
+        let query = self.with_connection_retry(service_id, &database, move |conn| {
             let path_clone = path_clone.clone();
             let entity_name = entity_name.clone();
             let filters = filters.clone();
@@ -876,8 +949,12 @@ impl QueryService {
                     "Service does not support querying".to_string(),
                 ))
             }
-        })
-        .await
+        });
+
+        match tokio::time::timeout(std::time::Duration::from_millis(deadline_ms), query).await {
+            Ok(result) => result,
+            Err(_) => Err(DataError::QueryTimeout(deadline_ms)),
+        }
     }
 
     /// Get filter schema for a service (if it supports QuerySchemaProvider)

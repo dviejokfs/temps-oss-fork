@@ -1,6 +1,7 @@
 //! Core utilities and types shared across all Temps crates
 
 pub mod admin_gate;
+pub mod ai_tool_call;
 pub mod audit;
 pub mod client_ip;
 pub mod config;

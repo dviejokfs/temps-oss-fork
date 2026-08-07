@@ -135,6 +135,52 @@ the short version:
 - PRs touching the hot path or high-volume data flows must state
   expected load, memory bound, and behaviour at saturation.
 
+## Features must be discoverable, and unconfigured features must onboard
+
+A feature the user can't find is a feature that doesn't exist. Never
+ship a capability whose only entry point is a keyboard shortcut, a
+buried menu item, or knowledge the user is assumed to already have.
+Every new feature needs a visible surface in the UI where the user is
+already looking when they'd want it.
+
+**Optional dependencies do not justify hiding a feature.** When a
+feature needs configuration the operator may not have done yet — an AI
+provider, an S3 bucket, an SMTP server, a DNS token — the wrong move is
+to conditionally render nothing. A self-hosted user has no support
+channel: if the button isn't there, they will never learn the feature
+exists, and they'll conclude temps can't do it.
+
+Instead, always render the surface and switch it into an onboarding
+state:
+
+- **Show what it would do.** Name the capability and give a concrete
+  example of the outcome, not an abstract description.
+- **Say exactly what's missing.** "No AI provider is configured" — not
+  "unavailable" or a disabled control with no explanation.
+- **Link straight to the fix.** A direct link to the settings page that
+  configures it, deep-linked to the right section. Not "see the docs."
+- **Never silently no-op.** If the user triggers it anyway, explain the
+  gap; don't fail quietly or spin forever.
+
+Concretely, the shape to reach for:
+
+```tsx
+// BAD — the feature vanishes; the user never learns it exists
+{aiConfigured && <AiQueryBar />}
+
+// GOOD — always visible, onboards when unconfigured
+<AiQueryBar
+  configured={aiConfigured}
+  onboardingHref="/settings/ai"
+  example="show me the users created last week"
+/>
+```
+
+This applies to the API too: prefer a capability/status endpoint that
+reports `configured: false` with a reason and a setup URL over a 404
+that leaves the client unable to distinguish "not built" from
+"not set up".
+
 ## Don't sweep unrelated dirty files into your commits
 
 If you arrive at a working tree that's already dirty (because a

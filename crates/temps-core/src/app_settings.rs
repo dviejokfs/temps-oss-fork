@@ -1109,6 +1109,43 @@ impl AppSettings {
         serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
     }
 
+    /// Serialize into an EXISTING `settings.data` document, preserving
+    /// top-level keys this struct does not own.
+    ///
+    /// The singleton `settings` row is a shared JSON document. `AppSettings`
+    /// owns most of it, but other subsystems store their own sub-documents on
+    /// the same row under their own key — today `admin_gate` (written by
+    /// `AdminGateService`), and anything added later. Those keys are invisible
+    /// to serde here: `from_json` drops them and `to_json` never re-emits them,
+    /// so writing `to_json()` straight over `data` DELETES them.
+    ///
+    /// That is not theoretical — the console records `console_version` through
+    /// `update_setting_field` on every startup, which wiped the operator's
+    /// admin-gate allowlist (IPs + Host headers) before the gate had even been
+    /// loaded, silently reverting the management surface to "open to any host"
+    /// on each restart. Every settings write must go through this method so a
+    /// subsystem's sub-document survives an unrelated save.
+    ///
+    /// Keys this struct owns always win, so a field can still be updated back
+    /// to its default value.
+    pub fn to_json_merged(&self, existing: &serde_json::Value) -> serde_json::Value {
+        let incoming = self.to_json();
+        let (Some(existing_map), serde_json::Value::Object(incoming_map)) =
+            (existing.as_object(), incoming)
+        else {
+            // Existing blob isn't an object (fresh row, or corrupt), or we
+            // somehow didn't serialize to one: nothing to preserve, so the
+            // serialized settings are the whole document.
+            return self.to_json();
+        };
+
+        // `incoming_map` is owned, so move the values in rather than cloning
+        // every key and every serialized sub-document.
+        let mut merged = existing_map.clone();
+        merged.extend(incoming_map);
+        serde_json::Value::Object(merged)
+    }
+
     /// Resolve the URL that service containers use to reach the Temps API from
     /// inside the Docker network. Resolution order:
     ///   1. `internal_url` settings field (admin-editable, runtime)
@@ -1434,5 +1471,78 @@ mod tests {
         let parsed = AppSettings::from_json(settings.to_json());
         assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 12);
         assert_eq!(parsed.observability_compression.otel_spans_after_hours, 48);
+    }
+
+    /// Regression: a settings save must not delete the `admin_gate`
+    /// sub-document. The console writes `console_version` through
+    /// `update_setting_field` on every startup; with a plain `to_json()`
+    /// overwrite that wiped the operator's admin allowlist and reopened the
+    /// management surface to every host on each restart.
+    #[test]
+    fn merge_preserves_foreign_admin_gate_subdocument() {
+        let existing = serde_json::json!({
+            "preview_domain": "temps.kfs.es",
+            "admin_gate": {
+                "allowed_ips": ["10.0.0.0/8"],
+                "allowed_hosts": ["app.temps.kfs.es"],
+                "trust_forwarded_for": false
+            }
+        });
+
+        let mut settings = AppSettings::from_json(existing.clone());
+        settings.console_version = Some("v0.1.0".to_string());
+
+        let merged = settings.to_json_merged(&existing);
+
+        assert_eq!(
+            merged.get("admin_gate"),
+            existing.get("admin_gate"),
+            "an unrelated settings write must not drop the admin_gate sub-document"
+        );
+        assert_eq!(
+            merged.get("console_version").and_then(|v| v.as_str()),
+            Some("v0.1.0"),
+        );
+        assert_eq!(
+            merged.get("preview_domain").and_then(|v| v.as_str()),
+            Some("temps.kfs.es"),
+        );
+    }
+
+    /// Keys `AppSettings` owns must still be updatable — including back to
+    /// their default value — so the merge cannot simply prefer the stored blob.
+    #[test]
+    fn merge_lets_owned_fields_win_over_stored_values() {
+        let existing = serde_json::json!({
+            "preview_domain": "old.example.com",
+            "insecure_tls": true,
+            "admin_gate": { "allowed_hosts": ["app.example.com"] }
+        });
+
+        let mut settings = AppSettings::from_json(existing.clone());
+        settings.preview_domain = "new.example.com".to_string();
+        settings.insecure_tls = false;
+
+        let merged = settings.to_json_merged(&existing);
+
+        assert_eq!(
+            merged.get("preview_domain").and_then(|v| v.as_str()),
+            Some("new.example.com"),
+        );
+        assert_eq!(
+            merged.get("insecure_tls").and_then(|v| v.as_bool()),
+            Some(false),
+            "a field must be settable back to its default value"
+        );
+        assert!(merged.get("admin_gate").is_some());
+    }
+
+    /// A fresh/corrupt row has nothing to preserve — the serialized settings
+    /// become the whole document.
+    #[test]
+    fn merge_falls_back_to_plain_serialization_for_non_object_blob() {
+        let settings = AppSettings::default();
+        let merged = settings.to_json_merged(&serde_json::Value::Null);
+        assert_eq!(merged, settings.to_json());
     }
 }
