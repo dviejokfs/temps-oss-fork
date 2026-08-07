@@ -423,6 +423,27 @@ impl ServiceMemberInfo {
     }
 }
 
+/// Match monitor-reported primary identity to exactly one persisted member.
+///
+/// The monitor is authoritative for transient role state, but it is not an
+/// authority for credential destinations. Duplicate, missing, stopped, or
+/// non-data matches fail closed by returning `None`.
+fn trusted_primary_member<'a>(
+    members: &'a [ServiceMemberInfo],
+    monitor_nodename: &str,
+) -> Option<&'a ServiceMemberInfo> {
+    let mut matches = members.iter().filter(|member| {
+        member.is_data_member()
+            && member.status == "running"
+            && member.container_name == monitor_nodename
+    });
+    let member = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(member)
+}
+
 /// Parse a raw role string (TEXT column / spec) into the typed enum.
 /// Returns `None` for unknown values; callers should use the
 /// classification helpers below for `is_monitor()` / `is_data_member()`
@@ -2574,6 +2595,58 @@ impl ExternalServiceManager {
             .collect())
     }
 
+    /// Resolve a persisted cluster member to the control plane endpoint that
+    /// was authorized during provisioning.
+    ///
+    /// Monitor rows are deliberately not accepted here. The monitor is queried
+    /// over trust-authenticated, self-signed TLS and can report arbitrary
+    /// `nodehost`/`nodeport` values if that channel is forged. Those values are
+    /// health data, not authorization to send the cluster password somewhere.
+    async fn stored_member_endpoint(
+        &self,
+        service_id: i32,
+        member: &ServiceMemberInfo,
+    ) -> Result<(String, u16), ExternalServiceError> {
+        let raw_port =
+            member
+                .port
+                .ok_or_else(|| ExternalServiceError::ParameterValidationFailed {
+                    service_id,
+                    reason: format!(
+                        "Persisted cluster member '{}' has no authorized TCP port",
+                        member.container_name
+                    ),
+                })?;
+        let port = u16::try_from(raw_port).map_err(|_| {
+            ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "Persisted port {} for cluster member '{}' is outside the valid TCP range",
+                    raw_port, member.container_name
+                ),
+            }
+        })?;
+
+        let host = if let Some(node_id) = member.node_id {
+            let node = nodes::Entity::find_by_id(node_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot resolve cluster member '{}' for service {}: node {} was not found",
+                        member.container_name, service_id, node_id
+                    ),
+                })?;
+            node.private_address
+        } else {
+            // Local members publish their container port on the control-plane
+            // host; Docker-internal names and addresses are not host-routable.
+            "localhost".to_string()
+        };
+
+        Ok((host, port))
+    }
+
     /// Find the live primary among a cluster's members by asking the
     /// monitor for the current FSM state.
     ///
@@ -2771,11 +2844,11 @@ impl ExternalServiceManager {
         };
         let monitor_port = monitor.port.unwrap_or(5432);
 
-        // pg_auto_failover requires SSL for the autoctl_node user (the
-        // hba rule is `hostssl ... trust`). We use PostgresSource which
-        // tries TLS-with-self-signed-accept first, then falls back to
-        // plain. Empty password is correct: autoctl_node is trust-auth'd
-        // from 0.0.0.0/0 once SSL is established.
+        // SECURITY: this probe carries no password, and `sslmode=require`
+        // prevents tokio-postgres from silently accepting a cleartext socket.
+        // pg_auto_failover trust-authenticates `autoctl_node` only after SSL is
+        // established, so accepting the monitor's self-signed certificate does
+        // not expose a reusable credential.
         let conn_str = format!(
             "host={monitor_host} port={monitor_port} user=autoctl_node \
              dbname=pg_auto_failover sslmode=require connect_timeout=3"
@@ -2879,8 +2952,8 @@ impl ExternalServiceManager {
     /// 1. `pgautofailover.node` from the monitor (TLS, autoctl_node) —
     ///    authoritative for `reportedstate` / `candidatepriority` /
     ///    `replicationquorum`.
-    /// 2. `pg_stat_replication` from the current primary (TLS,
-    ///    autoctl_node) — gives `sync_state` and `replay_lag` per
+    /// 2. `pg_stat_replication` from the current primary (credential-safe TLS
+    ///    ladder, application user) — gives `sync_state` and `replay_lag` per
     ///    streaming replica, joined to step 1 by `application_name = nodename`.
     ///
     /// Best-effort on (2): if the primary is briefly unreachable mid-failover,
@@ -2945,6 +3018,9 @@ impl ExternalServiceManager {
         };
         let monitor_port = monitor.port.unwrap_or(5432);
 
+        // SECURITY: this monitor probe carries no password. Keep
+        // `sslmode=require`: the self-signed connector may skip certificate
+        // authentication, but it must never downgrade this socket to cleartext.
         let monitor_conn_str = format!(
             "host={monitor_host} port={monitor_port} user=autoctl_node \
              dbname=pg_auto_failover sslmode=require connect_timeout=3"
@@ -3028,7 +3104,7 @@ impl ExternalServiceManager {
         // sync_state / replay_lag_ms in the next step from the primary.
         let mut by_name: std::collections::HashMap<String, ClusterMemberHealth> =
             std::collections::HashMap::new();
-        let mut primary_endpoint: Option<(String, i32)> = None;
+        let mut primary_member_name: Option<String> = None;
         for row in &nodes_rows {
             let nodename: String = row.get(0);
             let nodehost: String = row.get(1);
@@ -3049,7 +3125,7 @@ impl ExternalServiceManager {
                 && health == 1
                 && seconds_since_report < 30
             {
-                primary_endpoint = Some((nodehost.clone(), nodeport));
+                primary_member_name = Some(nodename.clone());
             }
 
             by_name.insert(
@@ -3082,7 +3158,20 @@ impl ExternalServiceManager {
         // `pgautofailover_standby_<nodeid>`, which doesn't match our
         // friendly `node-1`/`node-2` names. `client_addr` matches
         // `pgautofailover.node.nodehost`, which we already have.
-        if let Some((primary_host, primary_port)) = primary_endpoint {
+        // SECURITY: the monitor decides which persisted member is primary, but
+        // never where credentials are sent. Resolve the selected nodename back
+        // to the member row and its provisioned node address/port. A forged
+        // monitor can therefore lie about state, but cannot redirect the
+        // application password to its own `nodehost`/`nodeport`.
+        let trusted_primary_endpoint = match primary_member_name
+            .as_deref()
+            .and_then(|name| trusted_primary_member(&members, name))
+        {
+            Some(member) => self.stored_member_endpoint(service.id, member).await.ok(),
+            None => None,
+        };
+
+        if let Some((primary_host, primary_port)) = trusted_primary_endpoint {
             let app_creds = self
                 .get_service_parameters(service.id)
                 .await
@@ -3107,13 +3196,15 @@ impl ExternalServiceManager {
                 });
 
             if let Some((user, password, database)) = app_creds {
-                let primary_conn_str = format!(
-                    "host={primary_host} port={primary_port} user={user} password={password} \
-                     dbname={database} sslmode=require connect_timeout=3"
-                );
                 if let Ok(Ok(primary_client)) = tokio::time::timeout(
                     PROBE_TIMEOUT,
-                    temps_query_postgres::connect_with_self_signed_tls(&primary_conn_str),
+                    temps_query_postgres::connect_with_private_tls_ladder(
+                        &primary_host,
+                        primary_port,
+                        &user,
+                        &password,
+                        &database,
+                    ),
                 )
                 .await
                 {
@@ -4149,29 +4240,9 @@ echo "[restore] Pre-seed complete"
         });
 
         if let Some(primary) = primary {
-            let port = primary.port.unwrap_or(5432) as u16;
-
-            // For local members (no node_id), the hostname is a Docker-internal IP
-            // (e.g. 192.168.1.x) which is unreachable from the host. Since the
-            // container port is mapped to the same host port, use localhost instead.
-            // For remote members, use the node's private address.
-            let host = if let Some(node_id) = primary.node_id {
-                // Remote node — resolve via node's private address
-                let node = nodes::Entity::find_by_id(node_id)
-                    .one(self.db.as_ref())
-                    .await?;
-                node.map(|n| n.private_address).unwrap_or_else(|| {
-                    primary
-                        .hostname
-                        .clone()
-                        .unwrap_or_else(|| primary.container_name.clone())
-                })
-            } else {
-                // Local node — use localhost since Docker maps host_port:container_port
-                "localhost".to_string()
-            };
-
-            Ok(Some((host, port)))
+            self.stored_member_endpoint(service_id, primary)
+                .await
+                .map(Some)
         } else {
             Err(ExternalServiceError::InternalError {
                 reason: format!(
@@ -4252,44 +4323,28 @@ echo "[restore] Pre-seed complete"
             }
         };
 
-        // Dial the primary using the same connection helper as Browse
-        // Data so TLS/plain fallback + chained-error reporting are
-        // shared.
-        let conn_str = format!(
-            "host={} port={} user={} password={} dbname={}",
-            host,
+        // SECURITY: use typed config setters so none of these values can inject
+        // libpq connection-string parameters. The shared ladder resolves the
+        // host once, pins the approved addresses, requires TLS on both TLS
+        // rungs, and permits an unverified certificate or cleartext only for
+        // those exact private addresses.
+        let client = temps_query_postgres::connect_with_private_tls_ladder(
+            &host,
             port,
             admin_user,
             admin_password,
-            // Connect to the cluster's bootstrap DB ("postgres" by
-            // default) to issue CREATE DATABASE — you can't create
-            // a DB while connected to it.
+            // Connect to the bootstrap DB to issue CREATE DATABASE; PostgreSQL
+            // cannot create the database currently in use.
             "postgres",
-        );
-
-        let client = match temps_query_postgres::connect_with_self_signed_tls(&conn_str).await {
-            Ok(c) => c,
-            Err(tls_err) => {
-                use tokio_postgres::NoTls;
-                tokio_postgres::connect(&conn_str, NoTls)
-                    .await
-                    .map(|(client, conn)| {
-                        tokio::spawn(async move {
-                            if let Err(e) = conn.await {
-                                warn!("Cluster admin connection error: {}", e);
-                            }
-                        });
-                        client
-                    })
-                    .map_err(|plain_err| ExternalServiceError::InternalError {
-                        reason: format!(
-                            "Failed to connect to cluster {} primary at {}:{} \
-                             (TLS error: {}, plain error: {})",
-                            service_id, host, port, tls_err, plain_err
-                        ),
-                    })?
-            }
-        };
+        )
+        .await
+        .map_err(|error| ExternalServiceError::InternalError {
+            reason: format!(
+                "Failed to connect to cluster {} primary at {}:{} while provisioning database \
+                 '{}': {}",
+                service_id, host, port, db_name, error
+            ),
+        })?;
 
         let exists: bool = client
             .query_one(
@@ -10236,6 +10291,51 @@ mod tests {
                 health: *h,
             })
             .collect()
+    }
+
+    fn service_member_info(id: i32, name: &str, role: &str, status: &str) -> ServiceMemberInfo {
+        ServiceMemberInfo {
+            id,
+            role: role.to_string(),
+            node_id: None,
+            container_name: name.to_string(),
+            hostname: Some(format!("{name}.cluster.temps.local")),
+            port: Some(5432),
+            status: status.to_string(),
+            ordinal: id,
+            compute_ip: Some(format!("172.20.0.{id}")),
+            provisioning_step: None,
+            provisioning_error: None,
+            live_state: None,
+        }
+    }
+
+    #[test]
+    fn monitor_primary_identity_cannot_authorize_an_unstored_endpoint() {
+        let members = vec![
+            service_member_info(1, "cluster-node-1", "node", "running"),
+            service_member_info(2, "cluster-node-2", "node", "running"),
+            service_member_info(3, "cluster-monitor", "monitor", "running"),
+        ];
+
+        let selected = trusted_primary_member(&members, "cluster-node-1")
+            .expect("a unique persisted running data member should be selected");
+        assert_eq!(selected.id, 1);
+
+        // A forged monitor row can supply any nodehost/nodeport, but only its
+        // nodename crosses this boundary. An identity not persisted for this
+        // service cannot become a credential destination.
+        assert!(trusted_primary_member(&members, "attacker.example").is_none());
+        assert!(trusted_primary_member(&members, "cluster-monitor").is_none());
+
+        let stopped = vec![service_member_info(4, "cluster-node-4", "node", "stopped")];
+        assert!(trusted_primary_member(&stopped, "cluster-node-4").is_none());
+
+        let duplicates = vec![
+            service_member_info(5, "cluster-node-5", "node", "running"),
+            service_member_info(6, "cluster-node-5", "node", "running"),
+        ];
+        assert!(trusted_primary_member(&duplicates, "cluster-node-5").is_none());
     }
 
     /// The total-outage case, and the reason `health` is read at all: when
