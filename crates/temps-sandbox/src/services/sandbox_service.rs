@@ -343,9 +343,11 @@ pub(crate) fn url_has_embedded_credentials(url: &str) -> bool {
         return false;
     };
     let rest = &url[scheme_end + 3..];
-    // Stop at the path: an `@` after the first `/` belongs to the path, not
-    // to userinfo (e.g. `https://host/org/repo@v1.git`).
-    let authority = rest.split('/').next().unwrap_or(rest);
+    // Stop at the end of the authority. Userinfo always precedes the first
+    // `/`, `?` or `#`, so anything past them is path/query/fragment — an `@`
+    // there is not a credential (`https://host/org/repo@v1.git`, or a query
+    // like `?ref=a:b@c`, which a `/`-only split misread as userinfo).
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     match authority.find('@') {
         Some(at) => authority[..at].contains(':'),
         None => false,
@@ -3233,6 +3235,18 @@ mod storage_cleanup_tests {
             "https://github.com/org/repo@v1.git"
         ));
         assert!(!url_has_embedded_credentials("git@github.com:org/repo.git"));
+        // A `:` and `@` in the query or fragment are not userinfo either —
+        // userinfo always precedes the first `/`, `?` or `#`. Splitting on
+        // `/` alone read this as `user:password` and rejected a valid URL.
+        assert!(!url_has_embedded_credentials(
+            "https://github.com/org/repo.git?ref=a:b@c"
+        ));
+        assert!(!url_has_embedded_credentials("https://host?ref=a:b@c"));
+        assert!(!url_has_embedded_credentials("https://host#frag=a:b@c"));
+        // ...but real userinfo before a query is still caught.
+        assert!(url_has_embedded_credentials(
+            "https://user:pw@github.com/org/repo.git?ref=main"
+        ));
     }
 
     #[tokio::test]

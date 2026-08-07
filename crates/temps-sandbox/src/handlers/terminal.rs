@@ -104,7 +104,13 @@ struct UserSlot(i32);
 impl UserSlot {
     /// Returns `None` when this user is already at their cap.
     fn acquire(user_id: i32) -> Option<Self> {
-        let mut guard = TERMINALS_PER_USER.lock().ok()?;
+        // A poisoned `HashMap<i32, usize>` is not logically corrupt — the
+        // critical section is one entry update — so recover rather than turn
+        // every future attach into a permanent instance-wide 429 that blames
+        // the user's own session count.
+        let mut guard = TERMINALS_PER_USER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let counts = guard.get_or_insert_with(HashMap::new);
         let entry = counts.entry(user_id).or_insert(0);
         if *entry >= MAX_TERMINALS_PER_USER {
@@ -117,14 +123,17 @@ impl UserSlot {
 
 impl Drop for UserSlot {
     fn drop(&mut self) {
-        if let Ok(mut guard) = TERMINALS_PER_USER.lock() {
-            if let Some(counts) = guard.as_mut() {
-                if let Some(entry) = counts.get_mut(&self.0) {
-                    *entry = entry.saturating_sub(1);
-                    // Don't let the map grow one entry per user id forever.
-                    if *entry == 0 {
-                        counts.remove(&self.0);
-                    }
+        // Recover from poisoning here too: bailing out would leak the slot
+        // permanently, which is the one outcome worse than a poisoned map.
+        let mut guard = TERMINALS_PER_USER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(counts) = guard.as_mut() {
+            if let Some(entry) = counts.get_mut(&self.0) {
+                *entry = entry.saturating_sub(1);
+                // Don't let the map grow one entry per user id forever.
+                if *entry == 0 {
+                    counts.remove(&self.0);
                 }
             }
         }
@@ -150,6 +159,14 @@ const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
 /// stays open, and a global slot is never returned. A live terminal answers
 /// pings; a dead one does not.
 const MISSED_PONGS_BEFORE_CLOSE: u32 = 3;
+
+/// How long a single write to the agent may block before the session gives up.
+///
+/// Writes happen in a `select!` handler body, which tokio does not cancel, so
+/// an agent that has stopped draining its socket blocks every other branch
+/// with it. Bounding the write is what keeps the session ceiling and the ping
+/// timeout meaningful.
+const AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Hard ceiling on a single attachment.
 ///
@@ -255,8 +272,21 @@ fn default_shell_cmd() -> String {
 ///
 /// Once no supported image ships the old agent this wrapper can go; until
 /// then, removing it silently reintroduces a shell you cannot type into.
+///
+/// # Why the command is nested rather than spliced
+///
+/// The obvious form — `stty sane; exec {cmd}` — splices at *statement* level,
+/// so any shell operator inside `cmd` binds to the wrapper instead of to the
+/// user's program. `--cmd "cd /app && npm start"` became
+/// `exec cd /app && npm start`: `exec cd` fails (`cd` is a builtin, not a
+/// program), and `npm start` never ran. Nesting in an inner `sh -c` hands the
+/// original string to a shell verbatim, so it parses exactly as the caller
+/// wrote it.
 fn wrap_with_sane_termios(cmd: &str) -> String {
-    format!("stty sane 2>/dev/null; exec {cmd}")
+    // Single-quote the whole command and escape any embedded single quote by
+    // the standard `'\''` dance: close, emit an escaped quote, reopen.
+    let quoted = cmd.replace('\'', r"'\''");
+    format!("stty sane 2>/dev/null; exec /bin/sh -c '{quoted}'")
 }
 
 /// Attach an interactive terminal to a sandbox.
@@ -543,15 +573,37 @@ impl TerminalSession {
                     unanswered_pings = 0;
                     match msg {
                         Some(Ok(Message::Binary(data))) => {
-                            match pty::write_frame(&mut agent_in, pty::OP_INPUT, &data).await {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    // Most likely an oversized paste. Say so
-                                    // instead of letting the terminal vanish
-                                    // with no explanation.
+                            // Bounded: this write is in a handler body, which
+                            // `select!` does not cancel, so an agent that has
+                            // stopped draining its socket would otherwise wedge
+                            // the whole loop — the deadline and heartbeat
+                            // branches stop being polled, defeating both
+                            // MAX_SESSION_DURATION and the ping timeout while
+                            // still holding a global permit and a docker exec.
+                            // A tab whose program never reads stdin (say
+                            // `?cmd=sleep 3600`) fills the PTY buffer and does
+                            // exactly that.
+                            match tokio::time::timeout(
+                                AGENT_WRITE_TIMEOUT,
+                                pty::write_frame(&mut agent_in, pty::OP_INPUT, &data),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
                                     send_error(
                                         &mut ws_tx,
                                         format!("could not forward input: {}", e),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                Err(_) => {
+                                    send_error(
+                                        &mut ws_tx,
+                                        "the program in this tab stopped reading input; \
+                                         detaching. Reattach to try again."
+                                            .to_string(),
                                     )
                                     .await;
                                     break;
@@ -565,7 +617,24 @@ impl TerminalSession {
                         }
                         Some(Ok(Message::Close(_))) | None => break,
                         Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                        Some(Err(_)) => break,
+                        Some(Err(e)) => {
+                            // Where an oversized paste actually lands: the
+                            // WebSocket cap (MAX_WS_MESSAGE_BYTES) is enforced
+                            // by the *reader*, so the message never reaches the
+                            // frame writer's size check. Without this the
+                            // terminal simply vanished, which is the behaviour
+                            // the message cap was supposed to replace.
+                            send_error(
+                                &mut ws_tx,
+                                format!(
+                                    "connection closed: {} (input is limited to {} KiB per message)",
+                                    e,
+                                    MAX_WS_MESSAGE_BYTES / 1024
+                                ),
+                            )
+                            .await;
+                            break;
+                        }
                     }
                 }
             }
@@ -756,14 +825,45 @@ mod tests {
         // inside a shell that does not work.
         let wrapped = wrap_with_sane_termios(&default_shell_cmd());
         assert!(wrapped.starts_with("stty sane"), "{wrapped}");
-        assert!(wrapped.contains("exec /bin/bash -l"), "{wrapped}");
+        assert!(wrapped.contains("'/bin/bash -l'"), "{wrapped}");
+    }
+
+    #[test]
+    fn wrapping_preserves_shell_operators_in_a_custom_command() {
+        // The regression this nesting exists to prevent. Splicing at
+        // statement level bound the caller's operators to the *wrapper*:
+        // `exec cd /app && npm start` ran `exec cd` (which fails — `cd` is a
+        // builtin, not a program) and never reached `npm start`.
+        let wrapped = wrap_with_sane_termios("cd /app && npm start");
+        assert!(
+            wrapped.contains("'cd /app && npm start'"),
+            "the command must reach an inner shell intact: {wrapped}"
+        );
+        assert!(
+            !wrapped.contains("exec cd /app"),
+            "must not splice the command at statement level: {wrapped}"
+        );
+    }
+
+    #[test]
+    fn wrapping_escapes_embedded_single_quotes() {
+        // Otherwise a quote in the command closes our quoting early and the
+        // rest is reinterpreted by the outer shell.
+        let wrapped = wrap_with_sane_termios("echo 'hi there'");
+        assert!(wrapped.contains(r"'\''hi there'\''"), "{wrapped}");
+        // The wrapper's own quoting must still be balanced.
+        assert_eq!(
+            wrapped.matches('\'').count() % 2,
+            0,
+            "unbalanced quoting: {wrapped}"
+        );
     }
 
     #[test]
     fn wrapping_preserves_a_custom_command_verbatim() {
         // `--cmd claude` must still start claude, arguments intact.
         let wrapped = wrap_with_sane_termios("claude --resume");
-        assert!(wrapped.ends_with("exec claude --resume"), "{wrapped}");
+        assert!(wrapped.ends_with("'claude --resume'"), "{wrapped}");
         // `exec` matters: the wrapper shell must be replaced, not left as a
         // parent, or signals and exit codes get an extra hop.
         assert!(wrapped.contains("; exec "), "{wrapped}");
