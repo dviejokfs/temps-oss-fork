@@ -121,6 +121,23 @@ pub struct AppSettings {
     #[serde(default)]
     pub require_mfa_for_admins: bool,
 
+    /// One-click "Update now" from the console. Enabled by default; an admin
+    /// can turn it off here to keep upgrades on the CLI/config-management path.
+    ///
+    /// This is the *soft* switch — it is stored in the database, so whoever can
+    /// write settings can also turn it back on. Operators who need an upgrade
+    /// path that no console session can re-open should start the server with
+    /// `--disable-self-update`, which wins over this field unconditionally.
+    /// `None` means the client did not express an opinion, NOT "reset to
+    /// default". Every other field on this struct is safe to re-default on a
+    /// partial write, but this one gates whether the server may replace its own
+    /// binary — silently flipping it back on because an older client PUT a
+    /// settings document without it would undo a deliberate security decision.
+    /// The update handler preserves the stored value when this is absent; read
+    /// it through `self_update()`.
+    #[serde(default)]
+    pub self_update: Option<SelfUpdateSettings>,
+
     /// Binary version tag (e.g. "v0.1.0") of the *console* process
     /// (`temps serve`, role=all or role=console) that last started. Written
     /// on console startup; read by the standalone `temps proxy` to detect
@@ -905,7 +922,50 @@ impl Default for AppSettings {
             observability_retention: ObservabilityRetentionSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
+            self_update: None,
             console_version: None,
+        }
+    }
+}
+
+impl AppSettings {
+    /// Effective self-update settings, treating "never configured" as the
+    /// default. Use this everywhere instead of touching the `Option` directly,
+    /// so absence and an explicit default behave identically at read time.
+    pub fn self_update(&self) -> SelfUpdateSettings {
+        self.self_update.clone().unwrap_or_default()
+    }
+}
+
+/// Controls the console's one-click "Update now" action.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct SelfUpdateSettings {
+    /// Allow admins to apply a release and restart the server from the console.
+    /// `true` by default: the action is permission-gated, audited, and only
+    /// ever installs an official release whose published SHA-256 matches.
+    ///
+    /// Turning this off hides nothing — the console still shows the update
+    /// banner and the manual command, it just refuses to run it for you.
+    #[schema(example = true)]
+    pub enabled: bool,
+
+    /// Release channel this install tracks: `stable`, `beta` or `nightly`.
+    ///
+    /// `None` (the default) means "infer from the running version tag", which
+    /// is what the CLI has always done — a `-nightly.` build tracks nightly, a
+    /// `-beta.N` build tracks beta, a plain tag tracks stable. Setting it
+    /// explicitly pins the channel, so an operator can move a nightly box back
+    /// onto stable without reinstalling.
+    #[schema(example = "stable")]
+    pub channel: Option<String>,
+}
+
+impl Default for SelfUpdateSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            channel: None,
         }
     }
 }

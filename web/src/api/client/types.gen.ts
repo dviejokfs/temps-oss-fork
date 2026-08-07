@@ -1106,6 +1106,16 @@ export type AppSettings = {
     screenshots?: ScreenshotSettings;
     security_headers?: SecurityHeadersSettings;
     /**
+     * One-click "Update now" from the console. Enabled by default; an admin
+     * can turn it off here to keep upgrades on the CLI/config-management path.
+     *
+     * This is the *soft* switch — it is stored in the database, so whoever can
+     * write settings can also turn it back on. Operators who need an upgrade
+     * path that no console session can re-open should start the server with
+     * `--disable-self-update`, which wins over this field unconditionally.
+     */
+    self_update?: SelfUpdateSettings;
+    /**
      * Set to `true` by `temps setup` (all modes) once initial configuration
      * has been applied. The web onboarding wizard reads this from the server
      * and skips itself when true, preventing the "Configure Base Domain" wall
@@ -1189,6 +1199,13 @@ export type AppSettingsResponse = {
     require_mfa_for_admins: boolean;
     screenshots: ScreenshotSettings;
     security_headers: SecurityHeadersSettings;
+    /**
+     * Whether admins may apply a release from the console. This is the
+     * database-backed toggle only — a server started with
+     * `--disable-self-update` refuses regardless of what this says, which
+     * `GET /settings/update` reports as the authoritative answer.
+     */
+    self_update: SelfUpdateSettings;
     /**
      * Whether `temps setup` has been run at least once. The web onboarding
      * wizard checks this field on load and skips itself when true.
@@ -13244,6 +13261,34 @@ export type ReinstallWebhookResponse = {
     message: string;
 };
 
+/**
+ * Outcome of an operator-triggered release check.
+ */
+export type ReleaseCheckResult = {
+    /**
+     * Channel that was queried.
+     */
+    channel: string;
+    /**
+     * Version tag of the running binary.
+     */
+    current_version: string;
+    /**
+     * Newest release published on that channel, if any could be resolved.
+     */
+    latest_version?: string | null;
+    /**
+     * Release-notes page for `latest_version`.
+     */
+    release_url?: string | null;
+    /**
+     * True when `latest_version` is strictly newer than what is running.
+     * False on a channel whose newest release is older — which is normal and
+     * expected right after switching a nightly box onto stable.
+     */
+    update_available: boolean;
+};
+
 export type ReleaseListResponse = {
     releases: Array<string>;
 };
@@ -14542,6 +14587,88 @@ export type SecurityHeadersSettings = {
     x_frame_options?: string;
     x_xss_protection?: string;
 };
+
+/**
+ * A single update attempt. Persisted to `<data_dir>/self-update.json` so the
+ * result survives the restart it causes.
+ */
+export type SelfUpdateAttempt = {
+    /**
+     * Operator-facing failure reason. Always set when `status` is `Failed`.
+     */
+    error?: string | null;
+    /**
+     * When the outcome was decided. `None` while still `Pending`.
+     */
+    finished_at?: string | null;
+    /**
+     * Version the attempt started from.
+     */
+    from_version: string;
+    /**
+     * Where the replaced binary was kept, so a bad release can be reverted by
+     * hand (`mv <path> <binary>`). Set once the swap completes.
+     */
+    previous_binary_path?: string | null;
+    started_at: string;
+    status: SelfUpdateStatus;
+    /**
+     * Version the attempt targeted. `None` if it failed before resolving one.
+     */
+    to_version?: string | null;
+    /**
+     * User who clicked the button. `None` for attempts started by the CLI.
+     */
+    triggered_by_user_id?: number | null;
+};
+
+/**
+ * Why a one-click update is unavailable. Exactly one is reported — the most
+ * fundamental blocker wins, so the operator fixes the real problem first
+ * rather than clearing one only to hit the next.
+ */
+export type SelfUpdateBlocker = 'disabled_by_flag' | 'disabled_by_setting' | 'not_supported' | 'binary_not_writable' | 'unsupported_platform' | 'in_progress';
+
+/**
+ * Where an in-flight update has got to. Polled by the console so a long
+ * download shows progress instead of an indefinite spinner.
+ */
+export type SelfUpdatePhase = 'idle' | 'resolving' | 'downloading' | 'verifying' | 'installing' | 'restarting' | 'pending_restart' | 'failed';
+
+/**
+ * What happens to the running process once the new binary is in place.
+ */
+export type SelfUpdateRestartMode = 'automatic' | 'manual';
+
+/**
+ * Controls the console's one-click "Update now" action.
+ */
+export type SelfUpdateSettings = {
+    /**
+     * Release channel this install tracks: `stable`, `beta` or `nightly`.
+     *
+     * `None` (the default) means "infer from the running version tag", which
+     * is what the CLI has always done — a `-nightly.` build tracks nightly, a
+     * `-beta.N` build tracks beta, a plain tag tracks stable. Setting it
+     * explicitly pins the channel, so an operator can move a nightly box back
+     * onto stable without reinstalling.
+     */
+    channel?: string | null;
+    /**
+     * Allow admins to apply a release and restart the server from the console.
+     * `true` by default: the action is permission-gated, audited, and only
+     * ever installs an official release whose published SHA-256 matches.
+     *
+     * Turning this off hides nothing — the console still shows the update
+     * banner and the manual command, it just refuses to run it for you.
+     */
+    enabled?: boolean;
+};
+
+/**
+ * Outcome of an update attempt, as persisted in the journal.
+ */
+export type SelfUpdateStatus = 'pending' | 'succeeded' | 'installed_pending_restart' | 'failed';
 
 export type SendEmailRequestBody = {
     /**
@@ -16182,6 +16309,37 @@ export type StartRestoreRequest = RestoreRequestMode & {
     s3_source_id?: number | null;
 };
 
+/**
+ * Optional pin for the version to install.
+ */
+export type StartUpdateRequest = {
+    /**
+     * Release tag to install (e.g. `v0.2.0`). Omit to take the newest release
+     * on the channel this install already tracks.
+     */
+    version?: string | null;
+};
+
+/**
+ * Acknowledgement that an update was accepted and is running.
+ */
+export type StartUpdateResponse = {
+    /**
+     * Version the server is running as it accepts this request.
+     */
+    current_version: string;
+    /**
+     * How long to allow for the server to come back before treating the
+     * restart as failed. `0` when nothing restarts.
+     */
+    estimated_restart_secs: number;
+    message: string;
+    /**
+     * `automatic` (temps restarts itself) or `manual` (installed only).
+     */
+    restart_mode: SelfUpdateRestartMode;
+};
+
 export type StatResponse = {
     exists: boolean;
     is_dir: boolean;
@@ -16407,6 +16565,11 @@ export type StripeConfig = {
      */
     product_allowlist?: Array<string>;
 };
+
+/**
+ * What (if anything) will restart the process after it exits.
+ */
+export type SupervisorKind = 'systemd' | 'launchd' | 'container' | 'none';
 
 export type SyncedRepositoryListQuery = {
     direction?: string | null;
@@ -17339,6 +17502,77 @@ export type UpdateBlobResponse = {
      * Whether the operation succeeded
      */
     success: boolean;
+};
+
+/**
+ * Whether this install can apply a release update on request, and how the last
+ * attempt went.
+ *
+ * Deliberately answerable even when the answer is "no": an operator who cannot
+ * use the button still needs to know *why* and what to run instead, so this
+ * never 404s or returns an empty body when the feature is unavailable.
+ */
+export type UpdateCapabilityResponse = {
+    /**
+     * Whether the *caller* holds `platform:update`. Distinct from `can_apply`,
+     * which describes the server: the console shows the action only when both
+     * are true, so a reader is never offered a button that would 403.
+     */
+    allowed: boolean;
+    /**
+     * Binary that would be replaced.
+     */
+    binary_path: string;
+    blocker?: null | SelfUpdateBlocker;
+    /**
+     * True only when a request would actually download, install and restart.
+     */
+    can_apply: boolean;
+    /**
+     * Non-blocking warning to show with the confirmation (split topology).
+     */
+    caveat?: string | null;
+    /**
+     * Channel actually tracked, after applying the configured override or
+     * falling back to inference from the running version tag.
+     */
+    channel: string;
+    /**
+     * True when `channel` was set explicitly in settings rather than inferred.
+     */
+    channel_is_pinned: boolean;
+    /**
+     * Version tag of the running binary. Always present — the version page
+     * needs it whether or not an update exists.
+     */
+    current_version: string;
+    last_attempt?: null | SelfUpdateAttempt;
+    /**
+     * The equivalent command to run by hand. Always present.
+     */
+    manual_command: string;
+    /**
+     * Phase of an in-flight attempt: `idle` when none is running.
+     */
+    phase: SelfUpdatePhase;
+    /**
+     * Failure detail while `phase` is `failed`.
+     */
+    phase_error?: string | null;
+    /**
+     * Operator-facing explanation of `blocker`.
+     */
+    reason?: string | null;
+    /**
+     * `automatic` when applying an update also restarts temps; `manual` when
+     * it only installs the binary and the operator restarts on their own
+     * schedule. Lets the console set expectations before the click.
+     */
+    restart_mode: SelfUpdateRestartMode;
+    /**
+     * What would restart the process: `systemd`, `launchd`, `container`, `none`.
+     */
+    supervisor: SupervisorKind;
 };
 
 export type UpdateCloudflareProviderRequest = {
@@ -47531,6 +47765,70 @@ export type DownloadGlobalSkillArchiveResponses = {
 
 export type DownloadGlobalSkillArchiveResponse = DownloadGlobalSkillArchiveResponses[keyof DownloadGlobalSkillArchiveResponses];
 
+export type GetUpdateCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/update';
+};
+
+export type GetUpdateCapabilityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetUpdateCapabilityResponses = {
+    /**
+     * Self-update capability for this install
+     */
+    200: UpdateCapabilityResponse;
+};
+
+export type GetUpdateCapabilityResponse = GetUpdateCapabilityResponses[keyof GetUpdateCapabilityResponses];
+
+export type StartUpdateData = {
+    body: StartUpdateRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/update';
+};
+
+export type StartUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Update unavailable or already running
+     */
+    409: ProblemDetails;
+    /**
+     * This process cannot apply updates
+     */
+    501: ProblemDetails;
+};
+
+export type StartUpdateError = StartUpdateErrors[keyof StartUpdateErrors];
+
+export type StartUpdateResponses = {
+    /**
+     * Update accepted; the server will restart
+     */
+    202: StartUpdateResponse;
+};
+
+export type StartUpdateResponse2 = StartUpdateResponses[keyof StartUpdateResponses];
+
 export type GetUpdateStatusData = {
     body?: never;
     path?: never;
@@ -47557,6 +47855,43 @@ export type GetUpdateStatusResponses = {
 };
 
 export type GetUpdateStatusResponse = GetUpdateStatusResponses[keyof GetUpdateStatusResponses];
+
+export type CheckForUpdateData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/update/check';
+};
+
+export type CheckForUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * This process cannot check for updates
+     */
+    501: ProblemDetails;
+    /**
+     * The release API could not be reached
+     */
+    502: ProblemDetails;
+};
+
+export type CheckForUpdateError = CheckForUpdateErrors[keyof CheckForUpdateErrors];
+
+export type CheckForUpdateResponses = {
+    /**
+     * Result of the release check
+     */
+    200: ReleaseCheckResult;
+};
+
+export type CheckForUpdateResponse = CheckForUpdateResponses[keyof CheckForUpdateResponses];
 
 export type ListTeamsData = {
     body?: never;

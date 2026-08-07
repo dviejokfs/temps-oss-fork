@@ -24,6 +24,7 @@ import { registerNotificationsCommands } from '../src/commands/notifications/ind
 import { registerDnsCommands } from '../src/commands/dns/index.js'
 import { registerServicesCommands } from '../src/commands/services/index.js'
 import { registerSettingsCommands } from '../src/commands/settings/index.js'
+import { registerPlatformCommands } from '../src/commands/platform/index.js'
 import { registerUsersCommands } from '../src/commands/users/index.js'
 import { registerApiKeysCommands } from '../src/commands/apikeys/index.js'
 import { registerMonitorsCommands } from '../src/commands/monitors/index.js'
@@ -344,6 +345,7 @@ async function main() {
   registerDnsCommands(program)
   registerServicesCommands(program)
   registerSettingsCommands(program)
+  registerPlatformCommands(program)
   registerUsersCommands(program)
   registerApiKeysCommands(program)
   registerMonitorsCommands(program)

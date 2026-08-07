@@ -229,6 +229,10 @@ export async function updatePlatformSettings(
     monitoring: updated.monitoring,
     observability_compression: updated.observability_compression,
     observability_retention: updated.observability_retention,
+    // Must be sent on every save: the server deserializes `AppSettings` with
+    // `#[serde(default)]`, so omitting this field would silently re-enable
+    // console updates whenever any other settings page is saved.
+    self_update: updated.self_update,
   }
   const result = await updateSettings({ body })
   if (result.error) {

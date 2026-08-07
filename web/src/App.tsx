@@ -267,6 +267,11 @@ const DockerRegistryPage = lazy(() =>
     default: m.DockerRegistryPage,
   }))
 )
+const VersionPage = lazy(() =>
+  import('./pages/settings/VersionPage').then((m) => ({
+    default: m.VersionPage,
+  }))
+)
 const SecurityPage = lazy(() =>
   import('./pages/settings/SecurityPage').then((m) => ({
     default: m.SecurityPage,
@@ -591,6 +596,7 @@ const FullAppRoutes = () => {
                         element={<DockerRegistryPage />}
                       />
                       {/* Security */}
+                      <Route path="version" element={<VersionPage />} />
                       <Route path="security" element={<SecurityPage />} />
                       <Route
                         path="rate-limiting"
