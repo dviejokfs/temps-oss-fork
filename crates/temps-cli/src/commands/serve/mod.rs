@@ -15,6 +15,15 @@ use tracing::{debug, info, warn};
 pub use console::start_console_api;
 pub use proxy::start_proxy_server;
 
+const POST_MIGRATION_INDEX_INITIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+const POST_MIGRATION_INDEX_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn next_post_migration_index_retry(current: std::time::Duration) -> std::time::Duration {
+    current
+        .saturating_mul(2)
+        .min(POST_MIGRATION_INDEX_MAX_RETRY)
+}
+
 /// Which halves of the control plane this `temps serve` process runs.
 ///
 /// The default (`All`) is the single-binary control plane that has always
@@ -307,7 +316,7 @@ impl ServeCommand {
         {
             let index_db = db.clone();
             rt.spawn(async move {
-                let mut retry_delay = std::time::Duration::from_secs(5);
+                let mut retry_delay = POST_MIGRATION_INDEX_INITIAL_RETRY;
                 loop {
                     match temps_database::run_post_migration_indexes(index_db.as_ref()).await {
                         Ok(()) => break,
@@ -318,9 +327,7 @@ impl ServeCommand {
                                 e
                             );
                             tokio::time::sleep(retry_delay).await;
-                            retry_delay = retry_delay
-                                .saturating_mul(2)
-                                .min(std::time::Duration::from_secs(300));
+                            retry_delay = next_post_migration_index_retry(retry_delay);
                         }
                     }
                 }
@@ -690,5 +697,19 @@ impl ServeCommand {
             Some(admin_gate_handle),
             retention_resolver_slot as Arc<dyn temps_core::RetentionResolver>,
         )
+    }
+}
+
+#[cfg(test)]
+mod post_migration_tests {
+    use super::*;
+
+    #[test]
+    fn index_retry_backoff_grows_and_caps() {
+        let mut delay = POST_MIGRATION_INDEX_INITIAL_RETRY;
+        for expected in [10, 20, 40, 80, 160, 300, 300] {
+            delay = next_post_migration_index_retry(delay);
+            assert_eq!(delay, std::time::Duration::from_secs(expected));
+        }
     }
 }

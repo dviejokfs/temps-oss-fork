@@ -1329,6 +1329,21 @@ mod tests {
         GenericImage, ImageExt,
     };
 
+    fn container_runtime_unavailable(error: &str) -> bool {
+        let message = error.to_ascii_lowercase();
+        [
+            "hyper legacy client: client error (connect)",
+            "failed to connect to docker",
+            "error connecting to docker",
+            "docker daemon is unavailable",
+            "docker client is unavailable",
+            "could not find docker environment",
+            "docker socket",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
+    }
+
     #[test]
     fn generated_query_guards_encoded_row_before_wire_transfer() {
         let columns = vec![
@@ -1394,10 +1409,11 @@ mod tests {
             .await
         {
             Ok(container) => container,
-            Err(error) => {
+            Err(error) if container_runtime_unavailable(&error.to_string()) => {
                 eprintln!("Skipping Docker-dependent MariaDB budget test: {error}");
                 return Ok(());
             }
+            Err(error) => return Err(error.into()),
         };
         let host = container.get_host().await?.to_string();
         let port = container.get_host_port_ipv4(3306).await?;

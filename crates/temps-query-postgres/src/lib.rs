@@ -2365,6 +2365,21 @@ mod tests {
         GenericImage, ImageExt,
     };
 
+    fn container_runtime_unavailable(error: &str) -> bool {
+        let message = error.to_ascii_lowercase();
+        [
+            "hyper legacy client: client error (connect)",
+            "failed to connect to docker",
+            "error connecting to docker",
+            "docker daemon is unavailable",
+            "docker client is unavailable",
+            "could not find docker environment",
+            "docker socket",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
+    }
+
     #[test]
     fn ip_is_private_allows_local_and_mesh_addresses() {
         // These are where a Temps-managed database actually lives: a container
@@ -2974,10 +2989,11 @@ mod tests {
             .await
         {
             Ok(container) => container,
-            Err(error) => {
+            Err(error) if container_runtime_unavailable(&error.to_string()) => {
                 eprintln!("Docker unavailable; skipping PostgreSQL row-budget test: {error}");
                 return;
             }
+            Err(error) => panic!("failed to start PostgreSQL row-budget container: {error}"),
         };
         let host = container
             .get_host()
@@ -2988,13 +3004,11 @@ mod tests {
             .get_host_port_ipv4(5432)
             .await
             .expect("started PostgreSQL container must expose port 5432");
-        let source = match PostgresSource::connect(&host, port, "postgres", "", "postgres").await {
-            Ok(source) => source,
-            Err(error) => {
-                eprintln!("PostgreSQL container unavailable after startup; skipping: {error}");
-                return;
-            }
-        };
+        let source = std::sync::Arc::new(
+            PostgresSource::connect(&host, port, "postgres", "", "postgres")
+                .await
+                .expect("started PostgreSQL container must accept source connections"),
+        );
         source
             .client
             .batch_execute(
@@ -3051,6 +3065,59 @@ mod tests {
             .await
             .expect("bounded PostgreSQL arrays should remain browsable");
         assert_eq!(result.rows[0]["tags"], serde_json::json!(["alpha", "beta"]));
+
+        source
+            .client
+            .batch_execute(
+                "CREATE VIEW slow_rows AS \
+                 SELECT 1::bigint AS id FROM (SELECT pg_sleep(0.2)) AS delay;",
+            )
+            .await
+            .expect("slow view fixture should be created");
+        let query_source = source.clone();
+        let count_source = source.clone();
+        let held_timeout_lock = source.query_timeout_lock.lock().await;
+        let query_task = tokio::spawn(async move {
+            query_source
+                .query(
+                    &ContainerPath::from_slice(&["postgres", "public"]),
+                    "slow_rows",
+                    None,
+                    QueryOptions {
+                        limit: Some(1),
+                        timeout_ms: Some(10),
+                        ..QueryOptions::default()
+                    },
+                )
+                .await
+        });
+        // Queue the short-timeout row query first, then the count. The shared
+        // mutex must keep count's 10s timeout from overwriting the row query's
+        // 10ms timeout on their single PostgreSQL session.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let count_task = tokio::spawn(async move {
+            count_source
+                .count(
+                    &ContainerPath::from_slice(&["postgres", "public"]),
+                    "slow_rows",
+                    None,
+                )
+                .await
+        });
+        drop(held_timeout_lock);
+
+        let query_error = query_task
+            .await
+            .expect("row query task should join")
+            .expect_err("10ms row query must time out before the count changes the session");
+        assert!(matches!(query_error, DataError::BackendQueryFailed { .. }));
+        assert_eq!(
+            count_task
+                .await
+                .expect("count task should join")
+                .expect("count should inherit its own timeout"),
+            1
+        );
     }
 
     #[tokio::test]

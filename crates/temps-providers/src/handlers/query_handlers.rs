@@ -414,6 +414,10 @@ fn entity_names_are_user_data(service_type: &str) -> bool {
     )
 }
 
+fn entity_info_contains_user_data(service_type: &str) -> bool {
+    entity_names_are_user_data(service_type) || service_type.trim().eq_ignore_ascii_case("mongodb")
+}
+
 /// Fixed audit categories derived only from an allowlisted engine type.
 /// Unknown future engines fail closed to non-identifying categories.
 fn ai_read_audit_categories(service_type: &str) -> (AiBackendCategory, AiEntityCategory) {
@@ -440,6 +444,7 @@ async fn apply_entity_name_gate(
     app_state: &AppState,
     service_id: i32,
     is_ai_call: bool,
+    includes_entity_info: bool,
 ) -> Result<(), Problem> {
     if !is_ai_call {
         return Ok(());
@@ -455,8 +460,18 @@ async fn apply_entity_name_gate(
                 .with_detail(e.to_string())
         })?;
 
-    if entity_names_are_user_data(&service.service_type) {
-        enforce_ai_data_access(app_state, service_id, is_ai_call, "keys and object names").await?;
+    let exposes_user_data = if includes_entity_info {
+        entity_info_contains_user_data(&service.service_type)
+    } else {
+        entity_names_are_user_data(&service.service_type)
+    };
+    if exposes_user_data {
+        let data_kind = if includes_entity_info {
+            "sampled schema, keys, and object names"
+        } else {
+            "keys and object names"
+        };
+        enforce_ai_data_access(app_state, service_id, is_ai_call, data_kind).await?;
     }
 
     Ok(())
@@ -1240,7 +1255,7 @@ pub async fn list_entities(
     // This operation is allowlisted for the agent as "schema shape only", which
     // is true of tables and collections but NOT of keys and object names — on
     // Redis and S3 the entity name *is* user data. See `apply_entity_name_gate`.
-    apply_entity_name_gate(&app_state, service_id, is_ai_call).await?;
+    apply_entity_name_gate(&app_state, service_id, is_ai_call, false).await?;
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments);
@@ -1312,7 +1327,7 @@ pub async fn get_entity_info(
     // an actual sampled document, so in a schemaless store those keys can be
     // user-written, and on Redis/S3 a 200-vs-404 is an existence oracle for a
     // guessed key or object name (`session:<token>`), plus TTL and etag.
-    apply_entity_name_gate(&app_state, service_id, ai_call.is_some()).await?;
+    apply_entity_name_gate(&app_state, service_id, ai_call.is_some(), true).await?;
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments.clone());
@@ -1891,6 +1906,14 @@ mod tests {
         assert!(!entity_names_are_user_data("mongodb"));
         // Casing and stray whitespace must not open the gate.
         assert!(!entity_names_are_user_data("  PostgreSQL "));
+    }
+
+    #[test]
+    fn mongodb_entity_info_is_data_bearing_even_when_collection_names_are_not() {
+        assert!(!entity_names_are_user_data("mongodb"));
+        assert!(entity_info_contains_user_data("mongodb"));
+        assert!(entity_info_contains_user_data(" MongoDB "));
+        assert!(!entity_info_contains_user_data("postgres"));
     }
 
     #[test]

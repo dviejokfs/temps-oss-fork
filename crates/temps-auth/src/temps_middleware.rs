@@ -231,11 +231,15 @@ impl AuthMiddleware {
 
         // Run the next middleware/handler
         let response = next.run(req).await;
-        if let Some(event) =
-            permission_denial_event(&response, principal, method, route, ip_address, user_agent)
-        {
-            self.permission_denial_recorder.record(event);
-        }
+        record_permission_denial_response(
+            self.permission_denial_recorder.as_ref(),
+            &response,
+            principal,
+            method,
+            route,
+            ip_address,
+            user_agent,
+        );
         Ok(response)
     }
 
@@ -262,6 +266,22 @@ impl AuthMiddleware {
             }
         }
         None
+    }
+}
+
+fn record_permission_denial_response(
+    recorder: &PermissionDenialRecorder,
+    response: &Response,
+    principal: SafePrincipal,
+    method: String,
+    route: String,
+    ip_address: Option<String>,
+    user_agent: String,
+) {
+    if let Some(event) =
+        permission_denial_event(response, principal, method, route, ip_address, user_agent)
+    {
+        recorder.record(event);
     }
 }
 
@@ -331,18 +351,38 @@ fn permission_denial_event(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::Extension;
     use axum::http::StatusCode;
     use axum::middleware::from_fn;
     use axum::routing::get;
     use axum::Router;
     use chrono::Utc;
     use temps_core::problemdetails::PermissionDenialKind;
+    use temps_core::{AuditLogger, AuditOperation};
     use temps_entities::deployment_tokens::DeploymentTokenPermission;
     use temps_entities::users;
     use tower::ServiceExt;
 
     use super::*;
     use crate::permissions::{Permission, Role};
+
+    #[derive(Default)]
+    struct WorkflowRecordingLogger {
+        records: Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuditLogger for WorkflowRecordingLogger {
+        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+            self.records
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workflow logger lock poisoned"))?
+                .push(serde_json::from_str(&operation.serialize()?)?);
+            Ok(())
+        }
+    }
 
     fn test_user() -> users::Model {
         let now = Utc::now();
@@ -403,6 +443,60 @@ mod tests {
         assert_eq!(event.denial_kind, "insufficient_permission");
         assert_eq!(event.required_permission.as_deref(), Some("projects:write"));
         assert_eq!(event.route, "/projects/{project_id}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guard_response_flows_through_middleware_recorder_to_audit_logger() {
+        async fn guarded_handler(
+            Extension(auth): Extension<crate::context::AuthContext>,
+        ) -> Result<StatusCode, temps_core::problemdetails::Problem> {
+            crate::permission_guard!(auth, ProjectsWrite);
+            Ok(StatusCode::OK)
+        }
+
+        let auth = crate::context::AuthContext::new_api_key(
+            test_user(),
+            Some(Role::User),
+            Some(vec![Permission::ProjectsRead]),
+            "workflow-key".to_string(),
+            99,
+        );
+        let principal = safe_principal(&auth);
+        let response = Router::new()
+            .route("/projects/{project_id}", get(guarded_handler))
+            .layer(Extension(auth))
+            .oneshot(
+                Request::builder()
+                    .uri("/projects/7")
+                    .body(axum::body::Body::empty())
+                    .expect("workflow request should build"),
+            )
+            .await
+            .expect("guarded router should respond");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let logger = Arc::new(WorkflowRecordingLogger::default());
+        let recorder = PermissionDenialRecorder::new(logger.clone());
+        record_permission_denial_response(
+            recorder.as_ref(),
+            &response,
+            principal,
+            "GET".to_string(),
+            "/projects/{project_id}".to_string(),
+            Some("203.0.113.5".to_string()),
+            "workflow-agent".to_string(),
+        );
+
+        // Let the worker arm its aggregation window, then advance to its flush.
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+
+        let records = logger.records.lock().expect("workflow logger lock");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["denial_kind"], "insufficient_permission");
+        assert_eq!(records[0]["required_permission"], "projects:write");
+        assert_eq!(records[0]["route"], "/projects/{project_id}");
     }
 
     #[test]

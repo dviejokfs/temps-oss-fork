@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use temps_query::{
     BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
     DataError, DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef,
-    FieldType, QueryOptions, QueryResult, QueryStats, Queryable, Result,
+    FieldType, QueryBudget, QueryOptions, QueryResult, QueryStats, Queryable, Result,
 };
 use tracing::{debug, error};
 
@@ -67,14 +67,27 @@ fn redis_aggregate_limit(options: &QueryOptions) -> Result<usize> {
 
 fn redis_next_value_cursor(offset: usize, limit: usize, truncated: bool) -> Option<String> {
     let next = offset.saturating_add(limit);
-    (truncated && next.saturating_add(limit) <= MAX_REDIS_VALUE_OFFSET).then(|| next.to_string())
+    (truncated && next <= MAX_REDIS_VALUE_OFFSET).then(|| next.to_string())
+}
+
+fn redis_wire_cap(budget: QueryBudget) -> (usize, &'static str) {
+    if budget.max_bytes < budget.max_cell_bytes {
+        (budget.max_bytes, "response_bytes")
+    } else {
+        (budget.max_cell_bytes, "cell_bytes")
+    }
 }
 
 impl RedisSource {
-    fn wire_budget_error(key: &str, limit: usize, observed: usize) -> DataError {
+    fn wire_budget_error(
+        key: &str,
+        limit_kind: &'static str,
+        limit: usize,
+        observed: usize,
+    ) -> DataError {
         DataError::ResultLimitExceeded {
             entity: key.to_string(),
-            limit_kind: "cell_bytes",
+            limit_kind,
             limit,
             observed,
         }
@@ -86,6 +99,7 @@ impl RedisSource {
         offset: usize,
         limit: usize,
         max_cell_bytes: usize,
+        limit_kind: &'static str,
     ) -> Result<(Vec<String>, bool)> {
         const SCRIPT: &str = r#"
 local cursor = '0'
@@ -94,7 +108,7 @@ local values = {}
 local estimated = 2
 local has_more = 0
 local encoding = redis.call('OBJECT', 'ENCODING', KEYS[1])
-if encoding == 'listpack' or encoding == 'ziplist' then
+if encoding == 'listpack' or encoding == 'ziplist' or encoding == 'intset' then
   local allocated = redis.call('MEMORY', 'USAGE', KEYS[1]) or 0
   if allocated > tonumber(ARGV[3]) then return {0, allocated, 0, {}} end
 end
@@ -136,7 +150,12 @@ return {1, estimated, has_more, values}
                     }
                 })?;
         if admitted == 0 {
-            return Err(Self::wire_budget_error(key, max_cell_bytes, observed));
+            return Err(Self::wire_budget_error(
+                key,
+                limit_kind,
+                max_cell_bytes,
+                observed,
+            ));
         }
         Ok((values, has_more != 0))
     }
@@ -147,6 +166,7 @@ return {1, estimated, has_more, values}
         offset: usize,
         limit: usize,
         max_cell_bytes: usize,
+        limit_kind: &'static str,
     ) -> Result<(Vec<(String, String)>, bool)> {
         const SCRIPT: &str = r#"
 local cursor = '0'
@@ -200,7 +220,12 @@ return {1, estimated, has_more, values}
                     }
                 })?;
         if admitted == 0 {
-            return Err(Self::wire_budget_error(key, max_cell_bytes, observed));
+            return Err(Self::wire_budget_error(
+                key,
+                limit_kind,
+                max_cell_bytes,
+                observed,
+            ));
         }
         let values = flat_values
             .chunks_exact(2)
@@ -215,6 +240,7 @@ return {1, estimated, has_more, values}
         offset: usize,
         limit: usize,
         max_cell_bytes: usize,
+        limit_kind: &'static str,
     ) -> Result<(Vec<String>, bool)> {
         const SCRIPT: &str = r#"
 local values = {}
@@ -246,7 +272,12 @@ return {1, estimated, has_more, values}
                     }
                 })?;
         if admitted == 0 {
-            return Err(Self::wire_budget_error(key, max_cell_bytes, observed));
+            return Err(Self::wire_budget_error(
+                key,
+                limit_kind,
+                max_cell_bytes,
+                observed,
+            ));
         }
         Ok((values, has_more != 0))
     }
@@ -257,6 +288,7 @@ return {1, estimated, has_more, values}
         offset: usize,
         limit: usize,
         max_cell_bytes: usize,
+        limit_kind: &'static str,
     ) -> Result<(Vec<(String, f64)>, bool)> {
         const SCRIPT: &str = r#"
 local values = {}
@@ -289,7 +321,12 @@ return {1, estimated, has_more, values}
                     }
                 })?;
         if admitted == 0 {
-            return Err(Self::wire_budget_error(key, max_cell_bytes, observed));
+            return Err(Self::wire_budget_error(
+                key,
+                limit_kind,
+                max_cell_bytes,
+                observed,
+            ));
         }
         let mut values = Vec::with_capacity(flat_values.len() / 2);
         for pair in flat_values.chunks_exact(2) {
@@ -504,6 +541,7 @@ return {1, estimated, has_more, values}
             error!("Failed to get key TTL: {}", e);
             DataError::QueryFailed(format!("Failed to get key TTL: {}", e))
         })?;
+        let (wire_cap, wire_limit_kind) = redis_wire_cap(options.budget);
 
         // A string is one response cell, so reject it by logical length before
         // transfer. Collection allocation is deliberately not compared with a
@@ -520,13 +558,13 @@ return {1, estimated, has_more, values}
                         entity: key.to_string(),
                     }
                 })?;
-            if observed > options.budget.max_cell_bytes {
-                return Err(DataError::ResultLimitExceeded {
-                    entity: key.to_string(),
-                    limit_kind: "cell_bytes",
-                    limit: options.budget.max_cell_bytes,
+            if observed > wire_cap {
+                return Err(Self::wire_budget_error(
+                    key,
+                    wire_limit_kind,
+                    wire_cap,
                     observed,
-                });
+                ));
             }
         }
 
@@ -547,44 +585,71 @@ return {1, estimated, has_more, values}
             )));
         }
         let aggregate_limit = redis_aggregate_limit(options)?;
-        let wire_cap = options.budget.max_cell_bytes.min(options.budget.max_bytes);
         let mut truncated = false;
 
         // Get value based on type
         let value = match key_type.as_str() {
             "string" => {
-                let max_string_bytes = options.budget.max_cell_bytes.saturating_sub(2).max(1);
-                let end = i64::try_from(max_string_bytes.saturating_sub(1)).unwrap_or(i64::MAX);
-                let v: Vec<u8> = redis::cmd("GETRANGE")
-                    .arg(key)
-                    .arg(0)
-                    .arg(end)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|e: RedisError| {
-                        error!("Failed to get string value: {}", e);
-                        DataError::BackendQueryFailed {
-                            backend: "Redis",
-                            entity: key.to_string(),
-                        }
-                    })?;
+                let v: Vec<u8> = if wire_cap == 0 {
+                    Vec::new()
+                } else {
+                    // STRLEN above admits only values whose raw bytes fit the
+                    // wire cap. Fetch that entire admitted range: subtracting
+                    // JSON quote overhead here silently truncated strings at
+                    // the boundary while reporting `truncated = false`.
+                    let end = i64::try_from(wire_cap.saturating_sub(1)).unwrap_or(i64::MAX);
+                    redis::cmd("GETRANGE")
+                        .arg(key)
+                        .arg(0)
+                        .arg(end)
+                        .query_async(&mut conn)
+                        .await
+                        .map_err(|e: RedisError| {
+                            error!("Failed to get string value: {}", e);
+                            DataError::BackendQueryFailed {
+                                backend: "Redis",
+                                entity: key.to_string(),
+                            }
+                        })?
+                };
                 serde_json::Value::String(String::from_utf8_lossy(&v).into_owned())
             }
             "list" => {
-                let (v, has_more) =
-                    Self::list_page(&mut conn, key, offset, aggregate_limit, wire_cap).await?;
+                let (v, has_more) = Self::list_page(
+                    &mut conn,
+                    key,
+                    offset,
+                    aggregate_limit,
+                    wire_cap,
+                    wire_limit_kind,
+                )
+                .await?;
                 truncated = has_more;
                 serde_json::json!(v)
             }
             "set" => {
-                let (v, has_more) =
-                    Self::scan_set_page(&mut conn, key, offset, aggregate_limit, wire_cap).await?;
+                let (v, has_more) = Self::scan_set_page(
+                    &mut conn,
+                    key,
+                    offset,
+                    aggregate_limit,
+                    wire_cap,
+                    wire_limit_kind,
+                )
+                .await?;
                 truncated = has_more;
                 serde_json::json!(v)
             }
             "zset" => {
-                let (v, has_more) =
-                    Self::zset_page(&mut conn, key, offset, aggregate_limit, wire_cap).await?;
+                let (v, has_more) = Self::zset_page(
+                    &mut conn,
+                    key,
+                    offset,
+                    aggregate_limit,
+                    wire_cap,
+                    wire_limit_kind,
+                )
+                .await?;
                 truncated = has_more;
                 serde_json::json!(v
                     .into_iter()
@@ -594,8 +659,15 @@ return {1, estimated, has_more, values}
                     .collect::<Vec<_>>())
             }
             "hash" => {
-                let (values, has_more) =
-                    Self::scan_hash_page(&mut conn, key, offset, aggregate_limit, wire_cap).await?;
+                let (values, has_more) = Self::scan_hash_page(
+                    &mut conn,
+                    key,
+                    offset,
+                    aggregate_limit,
+                    wire_cap,
+                    wire_limit_kind,
+                )
+                .await?;
                 truncated = has_more;
                 serde_json::json!(values.into_iter().collect::<HashMap<_, _>>())
             }
@@ -1058,6 +1130,21 @@ mod tests {
     use temps_query::QueryBudget;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage};
 
+    fn container_runtime_unavailable(error: &str) -> bool {
+        let message = error.to_ascii_lowercase();
+        [
+            "hyper legacy client: client error (connect)",
+            "failed to connect to docker",
+            "error connecting to docker",
+            "docker daemon is unavailable",
+            "docker client is unavailable",
+            "could not find docker environment",
+            "docker socket",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
+    }
+
     #[test]
     fn test_source_type() {
         assert_eq!("redis", "redis");
@@ -1100,7 +1187,11 @@ mod tests {
 
         assert_eq!(redis_next_value_cursor(0, 2, true).as_deref(), Some("2"));
         assert_eq!(
-            redis_next_value_cursor(MAX_REDIS_VALUE_OFFSET - 100, 100, true),
+            redis_next_value_cursor(MAX_REDIS_VALUE_OFFSET - 2, 2, true).as_deref(),
+            Some("1000")
+        );
+        assert_eq!(
+            redis_next_value_cursor(MAX_REDIS_VALUE_OFFSET, 2, true),
             None
         );
     }
@@ -1114,10 +1205,11 @@ mod tests {
             .await
         {
             Ok(container) => container,
-            Err(error) => {
+            Err(error) if container_runtime_unavailable(&error.to_string()) => {
                 eprintln!("Skipping Docker-dependent Redis paging test: {error}");
                 return Ok(());
             }
+            Err(error) => return Err(error.into()),
         };
         let host = container.get_host().await?;
         let port = container.get_host_port_ipv4(6379).await?;
@@ -1217,7 +1309,7 @@ mod tests {
         assert!(matches!(
             page_budget_error,
             DataError::ResultLimitExceeded {
-                limit_kind: "cell_bytes",
+                limit_kind: "response_bytes",
                 limit: 64,
                 ..
             }
@@ -1233,6 +1325,96 @@ mod tests {
             .query(&path, "compact-hash", None, QueryOptions::default())
             .await?;
         assert_eq!(compact_hash.rows[0]["value"]["field"], "safe");
+
+        let mut intset_pipeline = redis::pipe();
+        for value in 0..500 {
+            intset_pipeline
+                .cmd("SADD")
+                .arg("compact-intset")
+                .arg(value)
+                .ignore();
+        }
+        intset_pipeline.query_async::<()>(&mut connection).await?;
+        let intset_encoding: String = redis::cmd("OBJECT")
+            .arg("ENCODING")
+            .arg("compact-intset")
+            .query_async(&mut connection)
+            .await?;
+        assert_eq!(intset_encoding, "intset");
+        let intset_error = source
+            .query(
+                &path,
+                "compact-intset",
+                None,
+                QueryOptions {
+                    budget: QueryBudget {
+                        max_cell_bytes: 256,
+                        ..QueryBudget::default()
+                    },
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect_err("compact intsets must be preflighted before SSCAN materialization");
+        assert!(matches!(
+            intset_error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "cell_bytes",
+                limit: 256,
+                ..
+            }
+        ));
+
+        redis::cmd("SET")
+            .arg("boundary-string")
+            .arg("b".repeat(64))
+            .query_async::<()>(&mut connection)
+            .await?;
+        let (boundary_row, boundary_truncated, _) = source
+            .get_key_value(
+                0,
+                "boundary-string",
+                &QueryOptions {
+                    budget: QueryBudget {
+                        max_cell_bytes: 64,
+                        ..QueryBudget::default()
+                    },
+                    ..QueryOptions::default()
+                },
+            )
+            .await?;
+        assert_eq!(boundary_row["value"].as_str().map(str::len), Some(64));
+        assert!(!boundary_truncated);
+
+        redis::cmd("SET")
+            .arg("page-bounded-string")
+            .arg("s".repeat(1_000))
+            .query_async::<()>(&mut connection)
+            .await?;
+        let string_error = source
+            .query(
+                &path,
+                "page-bounded-string",
+                None,
+                QueryOptions {
+                    budget: QueryBudget {
+                        max_bytes: 64,
+                        max_cell_bytes: 8 * 1024,
+                        ..QueryBudget::default()
+                    },
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect_err("Redis strings must honor the smaller page budget before transfer");
+        assert!(matches!(
+            string_error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "response_bytes",
+                limit: 64,
+                ..
+            }
+        ));
 
         let oversized = "y".repeat(100_000);
         redis::cmd("RPUSH")

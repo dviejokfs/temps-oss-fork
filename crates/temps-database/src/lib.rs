@@ -19,6 +19,8 @@ pub mod test_utils;
 mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, Database};
+    use sea_orm_migration::MigratorTrait;
+    use temps_migrations::Migrator;
     use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
     #[tokio::test]
@@ -144,6 +146,73 @@ mod tests {
         // parentheses, so assert its semantic pieces instead of one formatting.
         assert!(index_definition.contains("operation_type"));
         assert!(index_definition.contains("PERMISSION_DENIED"));
+
+        connection
+            .execute_unprepared(
+                "DROP INDEX CONCURRENTLY idx_audit_logs_permission_denied_retention",
+            )
+            .await?;
+        connection
+            .execute_unprepared(
+                "CREATE FUNCTION fail_permission_index(integer) RETURNS integer \
+                 IMMUTABLE LANGUAGE plpgsql AS $$ \
+                 BEGIN RAISE EXCEPTION 'intentional index build failure'; END $$; \
+                 CREATE TABLE invalid_permission_index_fixture(id integer); \
+                 INSERT INTO invalid_permission_index_fixture VALUES (1);",
+            )
+            .await?;
+        let failed_build = connection
+            .execute_unprepared(
+                "CREATE INDEX CONCURRENTLY idx_audit_logs_permission_denied_retention \
+                 ON invalid_permission_index_fixture (fail_permission_index(id))",
+            )
+            .await;
+        assert!(failed_build.is_err());
+        let invalid = connection
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT index.indisvalid AS is_valid FROM pg_index AS index \
+                 WHERE index.indexrelid = \
+                     to_regclass('idx_audit_logs_permission_denied_retention')"
+                    .to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("failed concurrent build left no index identity"))?;
+        assert!(!invalid.try_get::<bool>("", "is_valid")?);
+
+        run_post_migration_indexes(connection.as_ref()).await?;
+        let repaired = connection
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT index.indisvalid AS is_valid FROM pg_index AS index \
+                 WHERE index.indexrelid = \
+                     to_regclass('idx_audit_logs_permission_denied_retention')"
+                    .to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("invalid retention index was not rebuilt"))?;
+        assert!(repaired.try_get::<bool>("", "is_valid")?);
+
+        // The compatibility migration is deliberately reversible as a no-op:
+        // the concurrently managed index must survive both down and re-up.
+        Migrator::down(connection.as_ref(), Some(1)).await?;
+        let pending_after_down = get_pending_migration_names(connection.as_ref()).await?;
+        assert_eq!(
+            pending_after_down.last().map(String::as_str),
+            Some("m20260806_000001_index_permission_denied_retention")
+        );
+        Migrator::up(connection.as_ref(), Some(1)).await?;
+        let index_after_round_trip = connection
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT index.indisvalid AS is_valid FROM pg_index AS index \
+                 WHERE index.indexrelid = \
+                     to_regclass('idx_audit_logs_permission_denied_retention')"
+                    .to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("migration round-trip removed managed index"))?;
+        assert!(index_after_round_trip.try_get::<bool>("", "is_valid")?);
 
         // If we get here, migrations ran successfully and connection is established
         println!("✅ Database connection with migrations established successfully");
