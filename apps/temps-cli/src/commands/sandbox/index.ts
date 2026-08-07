@@ -16,10 +16,60 @@ import {
   warning,
   keyValue,
 } from '../../ui/output.js'
+import {
+  resolveWorkspaceSource,
+  resolveProjectIdBySlug,
+} from './workspace-source.js'
+import { shellAction } from './shell.js'
 
 // ── Types mirroring /v1/sandbox/* responses ─────────────────────────────────
 
+/**
+ * The `sandbox` object the server actually returns — the
+ * `@vercel/sandbox`-compatible shape, not the flat one this file used to
+ * assume.
+ *
+ * These types were written against an older contract and never corrected,
+ * because the singular-vs-plural URL bug meant no request ever came back
+ * 200 for anyone to notice. Two traps worth naming:
+ *
+ * - `cwd`, not `work_dir`.
+ * - `createdAt` / `timeout` are **epoch milliseconds** and a **duration in
+ *   milliseconds**. There is no `expires_at` on the wire; it is derived.
+ */
+interface SandboxInner {
+  id: string
+  name: string
+  status: string
+  image: string | null
+  cwd: string
+  /** Epoch milliseconds. */
+  createdAt: number
+  /** Idle timeout in milliseconds. */
+  timeout: number
+  backend?: string | null
+  disk_size_mb?: number | null
+  preview_url_template?: string
+  preview_password_hint?: string | null
+  agent_run_id?: number | null
+  /** 'ephemeral' | 'workspace' — absent on servers older than ADR-036. */
+  lifecycle?: string
+  project_id?: number | null
+  source_repo_url?: string | null
+}
+
+/** Single-sandbox responses are wrapped: `{ sandbox, routes }`. */
 interface SandboxResponse {
+  sandbox: SandboxInner
+  routes?: Array<{ url: string; subdomain: string; port: number }>
+}
+
+/**
+ * Flattened view for display, mirroring
+ * `web/src/components/sandboxes/helpers.ts` so the CLI and the console
+ * derive `expires_at` identically instead of drifting apart again.
+ */
+interface SandboxView {
   id: string
   name: string
   status: string
@@ -28,6 +78,26 @@ interface SandboxResponse {
   created_at: string
   expires_at: string
   preview_password_hint?: string | null
+  lifecycle?: string
+  project_id?: number | null
+  source_repo_url?: string | null
+}
+
+export function toSandboxView(inner: SandboxInner): SandboxView {
+  return {
+    id: inner.id,
+    name: inner.name,
+    status: inner.status,
+    image: inner.image ?? null,
+    work_dir: inner.cwd,
+    created_at: new Date(inner.createdAt).toISOString(),
+    // The server sends a duration, not a deadline.
+    expires_at: new Date(inner.createdAt + inner.timeout).toISOString(),
+    preview_password_hint: inner.preview_password_hint ?? undefined,
+    lifecycle: inner.lifecycle,
+    project_id: inner.project_id ?? null,
+    source_repo_url: inner.source_repo_url ?? null,
+  }
 }
 
 interface SetPreviewPasswordResponse {
@@ -35,10 +105,8 @@ interface SetPreviewPasswordResponse {
 }
 
 interface ListSandboxesResponse {
-  items: SandboxResponse[]
-  total: number
-  page: number
-  page_size: number
+  sandboxes: SandboxInner[]
+  pagination: { count: number; next: number | null; prev: number | null }
 }
 
 interface ExecResponse {
@@ -86,8 +154,17 @@ async function auth(): Promise<SandboxApi> {
   return { baseUrl, apiKey }
 }
 
-function sandboxUrl(api: SandboxApi, path: string): string {
-  return `${api.baseUrl}/v1/sandbox${path}`
+/**
+ * Build the absolute URL for a sandbox API path.
+ *
+ * The route is `/v1/sandboxes` — plural. The singular form predates a
+ * rename and matches nothing on any current server, so every command in
+ * this group was returning 404 against a real instance. The Rust CLI's
+ * `sandbox_url` already carried both the fix and the warning; this one
+ * did not. Covered by a test below so it can't drift back.
+ */
+export function sandboxUrl(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/+$/, '')}/v1/sandboxes${path}`
 }
 
 async function apiRequest<T>(
@@ -101,7 +178,7 @@ async function apiRequest<T>(
     headers.set('Content-Type', 'application/json')
   }
 
-  const response = await fetch(sandboxUrl(api, path), { ...init, headers })
+  const response = await fetch(sandboxUrl(api.baseUrl, path), { ...init, headers })
 
   if (!response.ok) {
     throw await readApiError(response)
@@ -219,6 +296,23 @@ export function registerSandboxCommands(program: Command): void {
     .option('--git-password <token>', 'HTTP Basic password/token (paired with --git-username; injected via GIT_ASKPASS)')
     .option('--tarball-url <url>', 'Tarball URL to download and extract')
     .option(
+      '--workspace',
+      'Create a persistent workspace: suspends when idle, wakes automatically on the next command, and is never destroyed for you',
+    )
+    .option(
+      '--project <slug>',
+      "Seed from a temps project's connected repo (and attribute the sandbox to it). Defaults to the linked project in .temps/config.json",
+    )
+    .option(
+      '--repo <owner/name>',
+      'Seed from a repo on one of your git connections that has no temps project',
+    )
+    .option('--branch <ref>', 'Branch, tag, or SHA to check out (alias of --git-rev)')
+    .option(
+      '--new-branch <name>',
+      'Create and switch to a new branch after cloning, based on whatever was checked out',
+    )
+    .option(
       '--preview-password',
       'Generate a random preview-URL password and print it once on stdout',
     )
@@ -235,6 +329,9 @@ export function registerSandboxCommands(program: Command): void {
     .description('List your sandboxes')
     .option('--page <n>', 'Page (1-indexed)')
     .option('--page-size <n>', 'Items per page (default 20, max 100)')
+    .option('--workspace', 'Show only persistent workspaces')
+    .option('--lifecycle <class>', 'Filter by lifecycle class: ephemeral | workspace')
+    .option('--project <slug>', 'Show only sandboxes created from this project')
     .option('--json', 'Output as JSON')
     .action(listAction)
 
@@ -280,6 +377,23 @@ export function registerSandboxCommands(program: Command): void {
     .option('--git-password <token>', 'HTTP Basic password/token (injected via GIT_ASKPASS)')
     .option('--tarball-url <url>', 'Tarball URL to download and extract')
     .action(cloneAction)
+
+  sandbox
+    .command('shell <id>')
+    .alias('attach')
+    .description(
+      'Open an interactive terminal in a sandbox. Detach with Ctrl-P Ctrl-Q to leave the program running; `exit` ends it. Reattach with the same --tab',
+    )
+    .option(
+      '--tab <name>',
+      'Tab to attach to; reusing a name reattaches to the program already running in it',
+      'main',
+    )
+    .option(
+      '--cmd <command>',
+      'Program to start when the tab is created, e.g. "claude" (default: login shell)',
+    )
+    .action(shellAction)
 
   sandbox
     .command('extend <id>')
@@ -370,6 +484,11 @@ interface CreateOptions {
   tarballUrl?: string
   previewPassword?: boolean
   previewPasswordLength?: string
+  workspace?: boolean
+  project?: string
+  repo?: string
+  branch?: string
+  newBranch?: string
   json?: boolean
 }
 
@@ -454,9 +573,30 @@ async function createAction(options: CreateOptions): Promise<void> {
   if (Object.keys(env).length > 0) body.env = env
   if (options.cpuLimit !== undefined) body.cpu_limit = Number(options.cpuLimit)
   if (options.memoryMb !== undefined) body.memory_limit_mb = Number(options.memoryMb)
+  if (options.workspace) body.lifecycle = 'workspace'
 
-  const source = buildSource(options)
-  if (source) body.source = source
+  // A workspace always needs code, so resolve one even when no source flag
+  // was passed — that's the whole point of `sandbox create --workspace` in
+  // a linked checkout. A plain sandbox stays empty unless asked, so it
+  // never turns into an interactive command.
+  const wantsSource =
+    options.workspace ||
+    options.repo !== undefined ||
+    options.project !== undefined ||
+    options.gitUrl !== undefined ||
+    options.tarballUrl !== undefined
+
+  let origin: string | undefined
+  if (wantsSource) {
+    const resolved = await resolveWorkspaceSource(options)
+    if (resolved.projectId !== undefined) body.project_id = resolved.projectId
+    if (resolved.source) body.source = resolved.source
+    origin = resolved.origin
+  } else {
+    // Preserves the "--git-* without --git-url" guard for stray flags.
+    const source = buildSource(options)
+    if (source) body.source = source
+  }
 
   // Preview-password generation happens client-side so the plaintext
   // exists only on this machine: the server stores just an argon2 hash
@@ -474,27 +614,90 @@ async function createAction(options: CreateOptions): Promise<void> {
     body.preview_password = generatedPassword
   }
 
-  const sbx = await withSpinner('Creating sandbox...', () =>
-    apiRequest<SandboxResponse>(api, '', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
+  const envelope = await withSpinner(
+    options.workspace ? 'Creating workspace...' : 'Creating sandbox...',
+    () =>
+      apiRequest<SandboxResponse>(api, '', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
   )
+  const sbx = toSandboxView(envelope.sandbox)
+
+  // Branch creation is a post-clone step: the server seeds the work dir at
+  // whatever ref was requested, then we branch off it. Non-fatal — the
+  // workspace exists and is usable either way, so report and carry on
+  // rather than leaving the user with a sandbox they think failed.
+  let newBranchError: string | undefined
+  if (options.newBranch) {
+    try {
+      const res = await apiRequest<ExecResponse>(
+        api,
+        `/${encodeURIComponent(sbx.id)}/exec`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            cmd: ['git', 'checkout', '-b', options.newBranch],
+            cwd: sbx.work_dir,
+          }),
+        },
+      )
+      if (res.exit_code !== 0) {
+        newBranchError = res.stderr.trim() || `git exited ${res.exit_code}`
+      }
+    } catch (e) {
+      newBranchError = e instanceof Error ? e.message : String(e)
+    }
+  }
 
   if (options.json) {
     // In JSON mode the generated plaintext is part of the payload so
     // scripts can capture it in one call. Caller is responsible for
     // handling it safely.
-    json(generatedPassword ? { ...sbx, preview_password: generatedPassword } : sbx)
+    json(
+      generatedPassword
+        ? { ...envelope, preview_password: generatedPassword }
+        : envelope,
+    )
     return
   }
 
-  success(`Sandbox ${colors.primary(sbx.id)} created`)
+  const createdWorkspace = sbx.lifecycle === 'workspace'
+  success(
+    `${createdWorkspace ? 'Workspace' : 'Sandbox'} ${colors.primary(sbx.id)} created`,
+  )
   keyValue('Name', sbx.name)
   keyValue('Status', statusColor(sbx.status))
   keyValue('Image', sbx.image ?? '(default)')
   keyValue('Work dir', sbx.work_dir)
-  keyValue('Expires', sbx.expires_at)
+  keyValue(createdWorkspace ? 'Suspends at' : 'Expires', sbx.expires_at)
+  // `origin` says where the code came from *and how we worked that out*
+  // (flag, linked project, this directory's remote) — the inference is
+  // only trustworthy if it's visible.
+  if (origin) {
+    keyValue('Source', origin)
+  } else if (sbx.source_repo_url) {
+    keyValue('Repo', sbx.source_repo_url)
+  }
+  if (options.newBranch && !newBranchError) {
+    keyValue('Branch', `${options.newBranch} (created)`)
+  }
+  if (newBranchError) {
+    newline()
+    warning(
+      `Workspace created, but creating branch '${options.newBranch}' failed: ${newBranchError}`,
+    )
+    info(
+      `Retry inside it: temps sandbox exec ${sbx.id} -- git checkout -b ${options.newBranch}`,
+    )
+  }
+  if (createdWorkspace) {
+    newline()
+    info(
+      `Run a command in it with: temps sandbox exec ${sbx.id} -- <command>\n` +
+        '  It suspends when idle and wakes on the next command — your files stay put.',
+    )
+  }
   if (generatedPassword) {
     newline()
     warning('Preview password (shown once — copy it now):')
@@ -577,6 +780,9 @@ async function passwordAction(
 interface ListOptions {
   page?: string
   pageSize?: string
+  workspace?: boolean
+  lifecycle?: string
+  project?: string
   json?: boolean
 }
 
@@ -586,6 +792,17 @@ async function listAction(options: ListOptions): Promise<void> {
   const qs: string[] = []
   if (options.page) qs.push(`page=${encodeURIComponent(options.page)}`)
   if (options.pageSize) qs.push(`page_size=${encodeURIComponent(options.pageSize)}`)
+  // `--workspace` is shorthand for `--lifecycle workspace`. If both are
+  // given, the explicit one wins rather than silently conflicting.
+  const lifecycle = options.lifecycle ?? (options.workspace ? 'workspace' : undefined)
+  if (lifecycle) qs.push(`lifecycle=${encodeURIComponent(lifecycle)}`)
+  // Slug in, numeric id out — the filter is on `sandboxes.project_id`, but
+  // every other `--project` in this CLI takes a slug and users shouldn't
+  // have to know which is which.
+  if (options.project) {
+    const projectId = await resolveProjectIdBySlug(options.project)
+    qs.push(`project_id=${projectId}`)
+  }
   const path = qs.length ? `?${qs.join('&')}` : ''
 
   const data = await withSpinner('Fetching sandboxes...', () =>
@@ -597,41 +814,56 @@ async function listAction(options: ListOptions): Promise<void> {
     return
   }
 
-  newline()
-  header(`${icons.info} Sandboxes (${data.total})`)
+  const items = (data.sandboxes ?? []).map(toSandboxView)
 
-  if (data.items.length === 0) {
+  newline()
+  header(`${icons.info} Sandboxes (${data.pagination?.count ?? items.length})`)
+
+  if (items.length === 0) {
     info('No sandboxes found. Create one with `temps sandbox create`.')
     newline()
     return
   }
 
-  const columns: TableColumn<SandboxResponse>[] = [
+  const columns: TableColumn<SandboxView>[] = [
     { header: 'ID', key: 'id', color: (v) => colors.primary(v) },
     { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
     { header: 'Status', key: 'status', color: (v) => statusColor(v) },
+    {
+      header: 'Kind',
+      // Older servers don't send `lifecycle`; everything there is ephemeral.
+      accessor: (s) => (s.lifecycle === 'workspace' ? 'workspace' : 'ephemeral'),
+      color: (v) => (v === 'workspace' ? colors.primary(v) : colors.muted(v)),
+    },
     {
       header: 'Image',
       accessor: (s) => s.image ?? '(default)',
       color: (v) => colors.muted(v.length > 30 ? v.slice(0, 30) + '...' : v),
     },
+    // For a workspace this is when it suspends, not when it dies — the
+    // header would be misleading without that distinction, and the
+    // `sandbox show` output spells it out.
     { header: 'Expires', key: 'expires_at', color: (v) => colors.muted(v) },
   ]
 
-  printTable(data.items, columns, { style: 'minimal' })
+  printTable(items, columns, { style: 'minimal' })
   newline()
 }
 
 async function showAction(id: string, options: { json?: boolean }): Promise<void> {
   const api = await auth()
-  const sbx = await withSpinner('Fetching sandbox...', () =>
+  const envelope = await withSpinner('Fetching sandbox...', () =>
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}`),
   )
 
   if (options.json) {
-    json(sbx)
+    // JSON mode passes the server's envelope through untouched — scripts
+    // should see the real API shape, not our display projection.
+    json(envelope)
     return
   }
+
+  const sbx = toSandboxView(envelope.sandbox)
 
   newline()
   header(`${icons.info} ${sbx.id}`)
@@ -640,9 +872,27 @@ async function showAction(id: string, options: { json?: boolean }): Promise<void
   keyValue('Image', sbx.image ?? '(default)')
   keyValue('Work dir', sbx.work_dir)
   keyValue('Created', sbx.created_at)
-  keyValue('Expires', sbx.expires_at)
+  const isWorkspace = sbx.lifecycle === 'workspace'
+  keyValue('Kind', isWorkspace ? 'workspace (persistent)' : 'ephemeral')
+  // Same column, two meanings. Spelling it out here is the difference
+  // between "my sandbox is about to be deleted" panic and understanding
+  // that a workspace just goes to sleep.
+  keyValue(isWorkspace ? 'Suspends at' : 'Expires', sbx.expires_at)
+  if (sbx.project_id !== undefined && sbx.project_id !== null) {
+    keyValue('Project', String(sbx.project_id))
+  }
+  if (sbx.source_repo_url) {
+    keyValue('Repo', sbx.source_repo_url)
+  }
   if (sbx.preview_password_hint) {
     keyValue('Preview password', `ends in …${sbx.preview_password_hint}`)
+  }
+  if (isWorkspace) {
+    newline()
+    info(
+      'Persistent workspace: it suspends after the idle timeout and wakes automatically ' +
+        'on the next exec or file operation. Your files persist until you run `sandbox rm`.',
+    )
   }
   newline()
 }
@@ -669,26 +919,29 @@ async function rmAction(id: string, options: { force?: boolean }): Promise<void>
 
 async function pauseAction(id: string): Promise<void> {
   const api = await auth()
-  const sbx = await withSpinner('Pausing sandbox...', () =>
+  const envelope = await withSpinner('Pausing sandbox...', () =>
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/pause`, { method: 'POST' }),
   )
+  const sbx = toSandboxView(envelope.sandbox)
   success(`Sandbox ${colors.primary(id)} paused — status: ${statusColor(sbx.status)}`)
   info(`Resume with: temps sandbox resume ${id}`)
 }
 
 async function resumeAction(id: string): Promise<void> {
   const api = await auth()
-  const sbx = await withSpinner('Resuming sandbox...', () =>
+  const envelope = await withSpinner('Resuming sandbox...', () =>
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/resume`, { method: 'POST' }),
   )
+  const sbx = toSandboxView(envelope.sandbox)
   success(`Sandbox ${colors.primary(id)} resumed — expires: ${sbx.expires_at}`)
 }
 
 async function restartAction(id: string): Promise<void> {
   const api = await auth()
-  const sbx = await withSpinner('Restarting sandbox...', () =>
+  const envelope = await withSpinner('Restarting sandbox...', () =>
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/restart`, { method: 'POST' }),
   )
+  const sbx = toSandboxView(envelope.sandbox)
   success(`Sandbox ${colors.primary(id)} restarted — status: ${statusColor(sbx.status)}`)
 }
 
@@ -714,8 +967,9 @@ async function cloneAction(id: string, options: CloneOptions): Promise<void> {
       body: JSON.stringify(source),
     }),
   )
-  success(`Source seeded into ${colors.primary(sbx.id)}`)
-  keyValue('Work dir', sbx.work_dir)
+  const view = toSandboxView(sbx.sandbox)
+  success(`Source seeded into ${colors.primary(view.id)}`)
+  keyValue('Work dir', view.work_dir)
 }
 
 async function extendAction(id: string, options: { secs: string }): Promise<void> {
@@ -731,7 +985,7 @@ async function extendAction(id: string, options: { secs: string }): Promise<void
       body: JSON.stringify({ extra_secs: extra }),
     }),
   )
-  success(`Extended by ${extra}s — new expiry: ${sbx.expires_at}`)
+  success(`Extended by ${extra}s — new expiry: ${toSandboxView(sbx.sandbox).expires_at}`)
 }
 
 interface ExecOptions {
@@ -797,7 +1051,7 @@ async function logsAction(id: string, jobId: string): Promise<void> {
   const api = await auth()
 
   const response = await fetch(
-    sandboxUrl(api, `/${encodeURIComponent(id)}/jobs/${encodeURIComponent(jobId)}/logs`),
+    sandboxUrl(api.baseUrl, `/${encodeURIComponent(id)}/jobs/${encodeURIComponent(jobId)}/logs`),
     {
       headers: {
         Authorization: `Bearer ${api.apiKey}`,

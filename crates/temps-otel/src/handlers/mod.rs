@@ -40,6 +40,7 @@ pub const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
 ///   GET /otel/metric-names
 ///   GET /otel/traces
 ///   GET /otel/traces/{trace_id}
+///   GET /otel/span-stats
 ///   GET /otel/logs
 ///   GET /otel/insights
 ///   GET /otel/health
@@ -89,6 +90,9 @@ pub fn configure_routes() -> Router<OtelAppState> {
             "/otel/trace-summaries",
             get(query_handler::query_trace_summaries),
         )
+        // Registered before `/otel/traces/{project_id}/{trace_id}` for
+        // readability only — matchit prefers static segments regardless.
+        .route("/otel/span-stats", get(query_handler::query_span_stats))
         .route(
             "/otel/traces/{project_id}/{trace_id}",
             get(query_handler::get_trace),

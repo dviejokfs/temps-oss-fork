@@ -5,6 +5,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { OtelMetricAlertRuleResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -101,10 +102,13 @@ export default function MetricAlerts({ project }: MetricAlertsProps) {
             projectSlug={project.slug}
             projectName={project.name}
           />
-          <Button size="sm" onClick={goToNew} className="gap-1.5">
-            <Plus className="size-4" />
-            New alert
-          </Button>
+          <CreateActionButton
+            size="sm"
+            onClick={goToNew}
+            label="New alert"
+            icon={<Plus className="size-4" />}
+            className="gap-1.5"
+          />
         </div>
       </div>
 

@@ -6,6 +6,10 @@ Guidance for Claude Code when working with the Temps codebase.
 ## Critical Rules
 
 ### NEVER
+- Put a real user's, customer's, or third party's identity into anything that leaves this machine. This repository is **public**. Company names, product names, internal hostnames, account names, contract/method names, real trace/span/request IDs, and any other detail that identifies whose system produced a payload must never appear in code, comments, test fixtures, commit messages, branch names, file names, PR titles, PR descriptions, PR comments, or issue text. This applies with full force to bug reports: a customer sends you a captured payload to get it fixed, not to have it published, and "it is just a fixture" is exactly how it gets published
+  - **Reproducing a reported bug**: keep the *shape* that makes the payload valuable (timings, ordering, precision, nesting, sizes, edge cases) and replace everything that names anyone. Rename services, operations, and hosts to generic equivalents, and regenerate every identifier. A fixture that reproduces the bug and identifies nobody is strictly better -- it is also readable by someone who has never heard of the reporter
+  - **Describing the bug**: say "a reported cross-project trace", never who reported it. The fix is reviewed on its merits; the reporter's identity adds nothing to a reviewer and cannot be taken back once pushed
+  - **Before pushing**: grep the diff for the reporter's names and identifiers. Once it reaches GitHub it is effectively permanent -- force-pushing does not remove a pull request's recorded commits or its Files-changed diff, pull requests cannot be deleted, and forks may retain the objects. Removal at that point requires GitHub Support
 - Commit `.env` files, credentials, or secrets -- this includes local dev-instance artifacts (encryption keys, auth secrets, generated tokens, `temps_data`-style data directories) created while running a local server for manual testing/verification. Before staging changes, run `git status` and scrutinize every path outside the files you intentionally edited -- a broad `git add` after spinning up a local test instance is the most common way this happens. If a secret is committed, treat it as compromised: remove it from tracking going forward at minimum, and flag to the user whether history needs rewriting (don't force-push without asking)
 - Access database directly from HTTP handlers -- ALWAYS use services
 - Return untyped JSON (`serde_json::Value`) -- ALWAYS use typed structs
@@ -17,6 +21,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Leave the project in non-compilable state
 - Use `#[tokio::main]` when integrating with pingora
 - Use plain text logging -- ALWAYS use structured JSONL logging
+- Overwrite `apps/temps-cli/openapi.json` with the raw server response (`curl ... > openapi.json`) -- the committed file is ~92,000 lines of sorted, indented JSON and the server serves it minified on one line, so a direct write reports **-92,000 deletions** and buries the real change. ALWAYS use `cd apps/temps-cli && bun run spec:update` (see [Regenerating the OpenAPI clients](#regenerating-the-openapi-clients))
 - Create markdown documentation files unless explicitly requested
 - Mark Docker tests with `#[ignore]` -- they MUST skip gracefully at runtime instead
 - Create error types with generic messages -- ALWAYS include IDs, names, and operation context
@@ -726,6 +731,36 @@ async fn create_backup(
 - All write operations (POST, PATCH, DELETE) must include audit logging
 - Convert entities to response DTOs via `From` trait
 - Register all handlers in `ApiDoc` with `#[openapi(...)]`
+
+### Regenerating the OpenAPI clients
+
+Two generated clients consume the spec, and they are refreshed differently:
+
+| Client | Source of truth | Refresh with |
+|---|---|---|
+| `web/src/api/client/` | the **live server** | `cd web && bun run openapi-ts` |
+| `apps/temps-cli/src/api/` | the **committed** `apps/temps-cli/openapi.json` | `cd apps/temps-cli && bun run spec:update && bun run generate:api` |
+
+After any change to handlers, request/response shapes, schemas or routes:
+restart `temps serve`, then refresh both. Commit the regenerated files --
+they are tracked so reviewers see the API delta.
+
+`apps/temps-cli/openapi.json` must stay in its canonical shape: **keys sorted
+recursively, two-space indent, trailing newline**. `bun run spec:update` is the
+only supported way to write it. Sorting is what keeps a diff proportional to
+the API change instead of to serde's iteration order, which is not stable
+between builds.
+
+Verify before committing -- adding a few endpoints is a few hundred changed
+lines, never tens of thousands:
+
+```bash
+git diff --numstat -- apps/temps-cli/openapi.json
+```
+
+Merge conflicts in either client are conflicts in build output. Never
+hand-merge them: take one side to clear the conflict, then regenerate from a
+server built off the merged source and typecheck both packages.
 
 ### Permission System
 

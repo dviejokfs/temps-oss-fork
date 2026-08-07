@@ -86,6 +86,12 @@ pub enum Permission {
     DnsProvidersRead,
     DnsProvidersWrite,
     DnsAutomationWrite,
+    /// Apply a release update to the server binary and restart the process.
+    /// Deliberately separate from `SettingsWrite`: replacing the running binary
+    /// and dropping every in-flight request is a different class of action from
+    /// editing a config value, so a custom role scoped to settings must not
+    /// acquire it implicitly.
+    PlatformUpdate,
 
     // Files permissions
     FilesRead,
@@ -331,6 +337,7 @@ impl fmt::Display for Permission {
             Permission::DnsProvidersRead => "dns_providers:read",
             Permission::DnsProvidersWrite => "dns_providers:write",
             Permission::DnsAutomationWrite => "dns_automation:write",
+            Permission::PlatformUpdate => "platform:update",
             Permission::ErrorTrackingRead => "error_tracking:read",
             Permission::ErrorTrackingWrite => "error_tracking:write",
             Permission::ErrorTrackingCreate => "error_tracking:create",
@@ -448,6 +455,7 @@ impl Permission {
             "dns_providers:read" => Some(Permission::DnsProvidersRead),
             "dns_providers:write" => Some(Permission::DnsProvidersWrite),
             "dns_automation:write" => Some(Permission::DnsAutomationWrite),
+            "platform:update" => Some(Permission::PlatformUpdate),
             "files:read" => Some(Permission::FilesRead),
             "files:write" => Some(Permission::FilesWrite),
             "files:delete" => Some(Permission::FilesDelete),
@@ -597,6 +605,7 @@ impl Permission {
             Permission::DnsProvidersRead,
             Permission::DnsProvidersWrite,
             Permission::DnsAutomationWrite,
+            Permission::PlatformUpdate,
             Permission::FilesRead,
             Permission::FilesWrite,
             Permission::FilesDelete,
@@ -814,6 +823,7 @@ impl Role {
                 Permission::PipelinesRead,
                 Permission::PipelinesWrite,
                 Permission::PlatformInfoRead,
+                Permission::PlatformUpdate,
                 Permission::ProjectsCreate,
                 Permission::ProjectsDelete,
                 Permission::ProjectsRead,
@@ -959,6 +969,7 @@ impl Role {
                 Permission::PipelinesRead,
                 Permission::PipelinesWrite,
                 Permission::PlatformInfoRead,
+                Permission::PlatformUpdate,
                 Permission::ProjectsRead,
                 Permission::SessionMetricsRead,
                 Permission::SettingsRead,

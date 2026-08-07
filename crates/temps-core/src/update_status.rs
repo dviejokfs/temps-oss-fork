@@ -55,6 +55,20 @@ impl UpdateStatusSlot {
         *guard = Some(update);
     }
 
+    /// Drop any recorded notice.
+    ///
+    /// Used when a check finds nothing newer — otherwise switching from a
+    /// nightly install onto the stable channel would leave the old nightly
+    /// notice on screen forever, since stable is *older* and can never
+    /// overwrite it.
+    pub fn clear(&self) {
+        let mut guard = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = None;
+    }
+
     /// The most recent notice, if any check has found a newer release.
     pub fn get(&self) -> Option<AvailableUpdate> {
         let guard = match self.inner.read() {
@@ -90,6 +104,14 @@ mod tests {
         let update = notice("v0.2.0");
         slot.set(update.clone());
         assert_eq!(slot.get(), Some(update));
+    }
+
+    #[test]
+    fn test_slot_clear_removes_a_stale_notice() {
+        let slot = UpdateStatusSlot::new();
+        slot.set(notice("v0.2.0"));
+        slot.clear();
+        assert_eq!(slot.get(), None);
     }
 
     #[test]

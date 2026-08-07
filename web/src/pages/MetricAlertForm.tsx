@@ -93,6 +93,7 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link, useNavigate, useParams } from 'react-router'
+import { useGoBack } from '@/hooks/useGoBack'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -215,6 +216,7 @@ interface AlertFormBodyProps {
  */
 function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps) {
   const navigate = useNavigate()
+  const goBack = useGoBack(`/projects/${project.slug}/metrics/alerts`)
   const queryClient = useQueryClient()
 
   const namesQuery = useQuery({
@@ -417,7 +419,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
           return key === 'listAlerts' || key === 'getAlert'
         },
       })
-      navigate(-1)
+      goBack()
     },
   })
 
@@ -492,7 +494,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
   return (
     <div className="w-full space-y-6">
       <div className="flex items-center gap-4">
-        <Button variant="ghost" size="icon" onClick={() => navigate(-1)}>
+        <Button variant="ghost" size="icon" onClick={() => goBack()}>
           <ArrowLeft className="size-4" />
         </Button>
         <div className="flex flex-1 flex-col gap-1">
@@ -1323,7 +1325,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                   ? 'Save changes'
                   : 'Create alert'}
             </Button>
-            <Button type="button" variant="outline" onClick={() => navigate(-1)}>
+            <Button type="button" variant="outline" onClick={() => goBack()}>
               Cancel
             </Button>
           </div>

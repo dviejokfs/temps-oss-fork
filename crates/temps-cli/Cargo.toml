@@ -104,6 +104,9 @@ utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 async-trait = { workspace = true }
 sea-orm = { workspace = true }
+# Used for Postgres LISTEN/NOTIFY (`settings_change`) so the standalone
+# `temps proxy` picks up admin-gate edits made in another process.
+sqlx = { workspace = true }
 sysinfo = { workspace = true }
 include_dir = "0.7"
 ipnet = "2.10"

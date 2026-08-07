@@ -27,7 +27,8 @@ use temps_otel::storage::clickhouse::{ClickHouseOtelConfig, ClickHouseOtelStorag
 use temps_otel::storage::timescaledb::TimescaleDbStorage;
 use temps_otel::storage::OtelStorage;
 use temps_otel::types::{
-    ResourceInfo, SpanKind, SpanRecord, SpanStatusCode, TraceQuery, TraceSortField,
+    ResourceInfo, SortOrder, SpanKind, SpanRecord, SpanStatsQuery, SpanStatsSortField,
+    SpanStatusCode, TraceQuery, TraceSortField,
 };
 
 const PROJECT: i32 = 42;
@@ -522,5 +523,503 @@ async fn query_spans_never_returns_more_rows_than_the_limit_despite_duplicates()
             "asked for {limit} rows, got {} — duplicates leaked past the page size",
             spans.len()
         );
+    }
+}
+
+// ── query_span_stats ─────────────────────────────────────────────────
+//
+// The span-stats SQL is assembled the same hand-rolled way `query_spans` is —
+// a placeholder string built in parallel with a bind vector — and it renders
+// that WHERE clause twice, once for the list query and once for the count.
+// A misalignment between the two would not fail to compile and would not
+// error: it would return a page whose `total` quietly disagrees with it.
+// These tests are here to catch that, plus the ClickHouse-specific hazards
+// the TimescaleDB tests cannot exercise (`quantileTDigest` accuracy in the
+// tail, and `nullIf` guarding the ratio sorts against division by zero).
+
+fn stats_span(
+    project_id: i32,
+    service: &str,
+    name: &str,
+    status: SpanStatusCode,
+    minutes_ago: i64,
+    duration_ms: f64,
+    seq: u64,
+) -> SpanRecord {
+    span(
+        project_id,
+        &format!("{seq:032x}"),
+        &format!("{seq:016x}"),
+        None,
+        name,
+        service,
+        status,
+        minutes_ago,
+        duration_ms,
+        None,
+        &[],
+    )
+}
+
+fn stats_query(project_ids: Vec<i32>, minutes: i64) -> SpanStatsQuery {
+    SpanStatsQuery {
+        project_ids,
+        start_time: Utc::now() - Duration::minutes(minutes),
+        end_time: Utc::now() + Duration::minutes(1),
+        service_name: None,
+        span_name: None,
+        name_pattern: None,
+        kind: None,
+        status: None,
+        environment_id: None,
+        deployment_id: None,
+        attributes: None,
+        min_duration_ms: None,
+        min_count: 1,
+        sort_by: SpanStatsSortField::default(),
+        sort_order: SortOrder::default(),
+        limit: None,
+        offset: None,
+    }
+}
+
+/// Fixture shaped like the problem this report exists to solve:
+/// `steady` is uniformly ~100ms, `erratic` is bimodal (fast band plus a 2s
+/// tail), `cache.get` is trivially fast but very frequent, and OTHER_PROJECT
+/// holds a decoy that must never leak in.
+async fn seeded_stats() -> Option<Harness> {
+    let (storage, probe, container) = setup().await?;
+
+    let mut spans = Vec::new();
+    let mut seq = 1_000u64;
+    for i in 0..20 {
+        seq += 1;
+        spans.push(stats_span(
+            PROJECT,
+            "api",
+            "steady",
+            SpanStatusCode::Ok,
+            10,
+            100.0 + i as f64,
+            seq,
+        ));
+    }
+    for i in 0..18 {
+        seq += 1;
+        spans.push(stats_span(
+            PROJECT,
+            "api",
+            "erratic",
+            SpanStatusCode::Ok,
+            10,
+            40.0 + i as f64,
+            seq,
+        ));
+    }
+    for _ in 0..2 {
+        seq += 1;
+        spans.push(stats_span(
+            PROJECT,
+            "api",
+            "erratic",
+            SpanStatusCode::Error,
+            10,
+            2000.0,
+            seq,
+        ));
+    }
+    for _ in 0..60 {
+        seq += 1;
+        spans.push(stats_span(
+            PROJECT,
+            "worker",
+            "cache.get",
+            SpanStatusCode::Ok,
+            10,
+            1.0,
+            seq,
+        ));
+    }
+    // Decoy: another project, and one span far outside any window under test.
+    for _ in 0..30 {
+        seq += 1;
+        spans.push(stats_span(
+            OTHER_PROJECT,
+            "api",
+            "leaky",
+            SpanStatusCode::Ok,
+            10,
+            999.0,
+            seq,
+        ));
+    }
+    seq += 1;
+    spans.push(stats_span(
+        PROJECT,
+        "api",
+        "ancient",
+        SpanStatusCode::Ok,
+        60 * 24 * 3,
+        50.0,
+        seq,
+    ));
+
+    storage.store_spans(spans).await.expect("store_spans");
+    Some((storage, probe, container))
+}
+
+#[tokio::test]
+async fn span_stats_aggregates_and_scopes_to_the_requested_projects_and_window() {
+    let Some((storage, _probe, _c)) = seeded_stats().await else {
+        return;
+    };
+
+    let rows = storage
+        .query_span_stats(stats_query(vec![PROJECT], 60))
+        .await
+        .expect("query_span_stats");
+
+    let names: Vec<&str> = rows.iter().map(|r| r.span_name.as_str()).collect();
+    assert!(names.contains(&"steady"));
+    assert!(names.contains(&"erratic"));
+    assert!(names.contains(&"cache.get"));
+    assert!(
+        !names.contains(&"leaky"),
+        "another project's spans must never appear: {names:?}"
+    );
+    assert!(
+        !names.contains(&"ancient"),
+        "spans outside the window must not be aggregated: {names:?}"
+    );
+
+    let erratic = rows.iter().find(|r| r.span_name == "erratic").unwrap();
+    assert_eq!(erratic.count, 20);
+    assert_eq!(erratic.error_count, 2);
+    assert!((erratic.error_rate - 0.1).abs() < 1e-9);
+    assert!((erratic.max_duration_ms - 2000.0).abs() < 1.0);
+    // quantileTDigest is approximate, but the tail must still land in the
+    // slow band — that is the entire signal this report sells.
+    assert!(
+        erratic.p50_duration_ms < 100.0,
+        "p50 was {}",
+        erratic.p50_duration_ms
+    );
+    assert!(
+        erratic.p99_duration_ms > 1000.0,
+        "p99 was {}",
+        erratic.p99_duration_ms
+    );
+
+    let steady = rows.iter().find(|r| r.span_name == "steady").unwrap();
+    assert!(erratic.tail_ratio > steady.tail_ratio);
+    assert!(erratic.coefficient_of_variation > steady.coefficient_of_variation);
+}
+
+#[tokio::test]
+async fn span_stats_count_agrees_with_the_page_under_every_filter() {
+    let Some((storage, _probe, _c)) = seeded_stats().await else {
+        return;
+    };
+
+    // The list and count queries render the same WHERE clause independently.
+    // Exercise every optional filter at once: a bind that slipped out of
+    // alignment in one but not the other shows up here as a mismatch.
+    let filtered = SpanStatsQuery {
+        service_name: Some("api".into()),
+        name_pattern: Some("err".into()),
+        kind: Some(SpanKind::Server),
+        status: Some(SpanStatusCode::Ok),
+        min_duration_ms: Some(10.0),
+        min_count: 2,
+        ..stats_query(vec![PROJECT, OTHER_PROJECT], 60)
+    };
+
+    let rows = storage
+        .query_span_stats(filtered.clone())
+        .await
+        .expect("query_span_stats");
+    let total = storage
+        .count_span_stats(filtered)
+        .await
+        .expect("count_span_stats");
+
+    assert_eq!(total as usize, rows.len(), "count must match the page");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].span_name, "erratic");
+    // status=Ok excluded the two 2s error spans, so only the fast band remains.
+    assert_eq!(rows[0].count, 18);
+    assert!(rows[0].max_duration_ms < 100.0);
+}
+
+#[tokio::test]
+async fn span_stats_min_count_and_pagination_are_stable() {
+    let Some((storage, _probe, _c)) = seeded_stats().await else {
+        return;
+    };
+
+    let base = stats_query(vec![PROJECT], 60);
+
+    // A min_count above every group's sample count must return nothing rather
+    // than falling back to unfiltered rows.
+    let none = storage
+        .query_span_stats(SpanStatsQuery {
+            min_count: 1_000,
+            ..base.clone()
+        })
+        .await
+        .expect("query_span_stats");
+    assert!(none.is_empty());
+
+    // Paging must not repeat or drop a row: page 1 + page 2 == the whole list.
+    let all = storage
+        .query_span_stats(base.clone())
+        .await
+        .expect("query_span_stats");
+    assert!(all.len() >= 3);
+
+    let first = storage
+        .query_span_stats(SpanStatsQuery {
+            limit: Some(2),
+            ..base.clone()
+        })
+        .await
+        .expect("query_span_stats");
+    let second = storage
+        .query_span_stats(SpanStatsQuery {
+            limit: Some(2),
+            offset: Some(2),
+            ..base
+        })
+        .await
+        .expect("query_span_stats");
+
+    let paged: Vec<&str> = first
+        .iter()
+        .chain(second.iter())
+        .map(|r| r.span_name.as_str())
+        .collect();
+    let expected: Vec<&str> = all.iter().take(4).map(|r| r.span_name.as_str()).collect();
+    assert_eq!(paged, expected);
+}
+
+#[tokio::test]
+async fn span_stats_sorts_by_every_field_without_dividing_by_zero() {
+    let Some((storage, _probe, _c)) = seeded_stats().await else {
+        return;
+    };
+
+    let base = stats_query(vec![PROJECT], 60);
+
+    // total_time: 60 x 1ms = 60ms vs 20 x ~100ms = 2000ms+.
+    let by_total = storage
+        .query_span_stats(SpanStatsQuery {
+            sort_by: SpanStatsSortField::TotalDurationMs,
+            ..base.clone()
+        })
+        .await
+        .expect("query_span_stats");
+    assert_ne!(by_total[0].span_name, "cache.get");
+
+    // count: the trivially cheap but frequent call must win.
+    let by_count = storage
+        .query_span_stats(SpanStatsQuery {
+            sort_by: SpanStatsSortField::Count,
+            ..base.clone()
+        })
+        .await
+        .expect("query_span_stats");
+    assert_eq!(by_count[0].span_name, "cache.get");
+
+    // The variability rankings must surface the bimodal operation, not the
+    // uniformly slower one.
+    for field in [
+        SpanStatsSortField::CoefficientOfVariation,
+        SpanStatsSortField::TailRatio,
+    ] {
+        let rows = storage
+            .query_span_stats(SpanStatsQuery {
+                sort_by: field,
+                ..base.clone()
+            })
+            .await
+            .expect("query_span_stats");
+        assert_eq!(rows[0].span_name, "erratic", "sort_by {field:?}");
+    }
+
+    // Every remaining field must at least execute: the ratio sorts divide in
+    // SQL, and `cache.get` spans are uniform, so an unguarded denominator
+    // would either error or sort `inf` to the top.
+    for field in [
+        SpanStatsSortField::P50DurationMs,
+        SpanStatsSortField::P95DurationMs,
+        SpanStatsSortField::P99DurationMs,
+        SpanStatsSortField::MaxDurationMs,
+        SpanStatsSortField::AvgDurationMs,
+        SpanStatsSortField::StddevDurationMs,
+        SpanStatsSortField::ErrorCount,
+        SpanStatsSortField::ErrorRate,
+    ] {
+        for order in [SortOrder::Asc, SortOrder::Desc] {
+            let rows = storage
+                .query_span_stats(SpanStatsQuery {
+                    sort_by: field,
+                    sort_order: order,
+                    ..base.clone()
+                })
+                .await
+                .unwrap_or_else(|e| panic!("sort_by {field:?} {order:?} failed: {e}"));
+            assert!(
+                !rows.is_empty(),
+                "sort_by {field:?} {order:?} returned none"
+            );
+            for row in &rows {
+                assert!(
+                    row.tail_ratio.is_finite() && row.coefficient_of_variation.is_finite(),
+                    "non-finite ratio in {row:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The two backends implement span-stats in independently-written SQL —
+/// PostgreSQL's `percentile_cont`/`STDDEV_SAMP` versus ClickHouse's
+/// `quantileTDigest`/`stddevSamp`, with separate filter builders and separate
+/// ORDER BY expression tables. Nothing in the type system ties them together,
+/// so the only way to know they answer the same question is to ask both.
+///
+/// Requires Docker for BOTH a ClickHouse container and a TimescaleDB one;
+/// skips when either is unavailable.
+#[tokio::test]
+async fn span_stats_agrees_between_clickhouse_and_timescaledb() {
+    let Some((ch_storage, _probe, _c)) = setup().await else {
+        return;
+    };
+    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Skipping cross-backend span-stats test: no TestDatabase ({e})");
+            return;
+        }
+    };
+    let ts_storage = TimescaleDbStorage::new(test_db.db.clone(), None);
+
+    // Deterministic fixture with a wide spread of durations, so the
+    // percentile implementations have something to disagree about if they are
+    // going to. 200 samples keeps t-digest well inside its accuracy envelope.
+    let mut spans = Vec::new();
+    let mut seq = 5_000u64;
+    for i in 0..200 {
+        seq += 1;
+        // Fast band for 90% of calls, a decade-slower tail for the rest.
+        let duration = if i % 10 == 0 {
+            3000.0 + i as f64
+        } else {
+            50.0 + (i % 7) as f64
+        };
+        spans.push(stats_span(
+            PROJECT,
+            "api",
+            "mixed",
+            if i % 25 == 0 {
+                SpanStatusCode::Error
+            } else {
+                SpanStatusCode::Ok
+            },
+            10,
+            duration,
+            seq,
+        ));
+    }
+    for i in 0..80 {
+        seq += 1;
+        spans.push(stats_span(
+            PROJECT,
+            "worker",
+            "steady",
+            SpanStatusCode::Ok,
+            10,
+            120.0 + i as f64,
+            seq,
+        ));
+    }
+
+    ch_storage
+        .store_spans(spans.clone())
+        .await
+        .expect("clickhouse store_spans");
+    ts_storage
+        .store_spans(spans)
+        .await
+        .expect("timescaledb store_spans");
+
+    for sort_by in [
+        SpanStatsSortField::TotalDurationMs,
+        SpanStatsSortField::P95DurationMs,
+        SpanStatsSortField::Count,
+        SpanStatsSortField::TailRatio,
+        SpanStatsSortField::CoefficientOfVariation,
+    ] {
+        let query = SpanStatsQuery {
+            sort_by,
+            ..stats_query(vec![PROJECT], 60)
+        };
+        let ch = ch_storage
+            .query_span_stats(query.clone())
+            .await
+            .expect("clickhouse query_span_stats");
+        let ts = ts_storage
+            .query_span_stats(query.clone())
+            .await
+            .expect("timescaledb query_span_stats");
+
+        // Same ranking, in the same order.
+        let ch_order: Vec<&str> = ch.iter().map(|r| r.span_name.as_str()).collect();
+        let ts_order: Vec<&str> = ts.iter().map(|r| r.span_name.as_str()).collect();
+        assert_eq!(
+            ch_order, ts_order,
+            "ranking differs for sort_by {sort_by:?}"
+        );
+
+        // Same counts, exactly. These are not approximations in either engine.
+        for (c, t) in ch.iter().zip(ts.iter()) {
+            assert_eq!(c.count, t.count, "count differs for {}", c.span_name);
+            assert_eq!(
+                c.error_count, t.error_count,
+                "error_count differs for {}",
+                c.span_name
+            );
+            let close = |a: f64, b: f64, tolerance: f64, label: &str| {
+                let denominator = a.abs().max(b.abs()).max(1.0);
+                assert!(
+                    (a - b).abs() / denominator <= tolerance,
+                    "{label} differs for {}: clickhouse {a} vs timescaledb {b}",
+                    c.span_name
+                );
+            };
+            // Exact aggregates must match to floating-point noise.
+            close(c.total_duration_ms, t.total_duration_ms, 1e-6, "total");
+            close(c.min_duration_ms, t.min_duration_ms, 1e-6, "min");
+            close(c.max_duration_ms, t.max_duration_ms, 1e-6, "max");
+            close(c.avg_duration_ms, t.avg_duration_ms, 1e-6, "avg");
+            close(c.stddev_duration_ms, t.stddev_duration_ms, 1e-6, "stddev");
+            // Percentiles are t-digest on one side and exact on the other, so
+            // allow a real (but small) divergence — the point is that they
+            // describe the same distribution, not that they are bit-identical.
+            close(c.p50_duration_ms, t.p50_duration_ms, 0.05, "p50");
+            close(c.p95_duration_ms, t.p95_duration_ms, 0.05, "p95");
+            close(c.p99_duration_ms, t.p99_duration_ms, 0.05, "p99");
+        }
+
+        // And the totals used for pagination must agree.
+        let ch_total = ch_storage
+            .count_span_stats(query.clone())
+            .await
+            .expect("clickhouse count_span_stats");
+        let ts_total = ts_storage
+            .count_span_stats(query)
+            .await
+            .expect("timescaledb count_span_stats");
+        assert_eq!(ch_total, ts_total, "total differs for sort_by {sort_by:?}");
     }
 }

@@ -125,6 +125,23 @@ pub struct AppSettings {
     #[serde(default)]
     pub require_mfa_for_admins: bool,
 
+    /// One-click "Update now" from the console. Enabled by default; an admin
+    /// can turn it off here to keep upgrades on the CLI/config-management path.
+    ///
+    /// This is the *soft* switch — it is stored in the database, so whoever can
+    /// write settings can also turn it back on. Operators who need an upgrade
+    /// path that no console session can re-open should start the server with
+    /// `--disable-self-update`, which wins over this field unconditionally.
+    /// `None` means the client did not express an opinion, NOT "reset to
+    /// default". Every other field on this struct is safe to re-default on a
+    /// partial write, but this one gates whether the server may replace its own
+    /// binary — silently flipping it back on because an older client PUT a
+    /// settings document without it would undo a deliberate security decision.
+    /// The update handler preserves the stored value when this is absent; read
+    /// it through `self_update()`.
+    #[serde(default)]
+    pub self_update: Option<SelfUpdateSettings>,
+
     /// Binary version tag (e.g. "v0.1.0") of the *console* process
     /// (`temps serve`, role=all or role=console) that last started. Written
     /// on console startup; read by the standalone `temps proxy` to detect
@@ -926,7 +943,50 @@ impl Default for AppSettings {
             observability_retention: ObservabilityRetentionSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
+            self_update: None,
             console_version: None,
+        }
+    }
+}
+
+impl AppSettings {
+    /// Effective self-update settings, treating "never configured" as the
+    /// default. Use this everywhere instead of touching the `Option` directly,
+    /// so absence and an explicit default behave identically at read time.
+    pub fn self_update(&self) -> SelfUpdateSettings {
+        self.self_update.clone().unwrap_or_default()
+    }
+}
+
+/// Controls the console's one-click "Update now" action.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct SelfUpdateSettings {
+    /// Allow admins to apply a release and restart the server from the console.
+    /// `true` by default: the action is permission-gated, audited, and only
+    /// ever installs an official release whose published SHA-256 matches.
+    ///
+    /// Turning this off hides nothing — the console still shows the update
+    /// banner and the manual command, it just refuses to run it for you.
+    #[schema(example = true)]
+    pub enabled: bool,
+
+    /// Release channel this install tracks: `stable`, `beta` or `nightly`.
+    ///
+    /// `None` (the default) means "infer from the running version tag", which
+    /// is what the CLI has always done — a `-nightly.` build tracks nightly, a
+    /// `-beta.N` build tracks beta, a plain tag tracks stable. Setting it
+    /// explicitly pins the channel, so an operator can move a nightly box back
+    /// onto stable without reinstalling.
+    #[schema(example = "stable")]
+    pub channel: Option<String>,
+}
+
+impl Default for SelfUpdateSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            channel: None,
         }
     }
 }
@@ -1084,6 +1144,43 @@ impl AppSettings {
     /// Convert settings to JSON value
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    /// Serialize into an EXISTING `settings.data` document, preserving
+    /// top-level keys this struct does not own.
+    ///
+    /// The singleton `settings` row is a shared JSON document. `AppSettings`
+    /// owns most of it, but other subsystems store their own sub-documents on
+    /// the same row under their own key — today `admin_gate` (written by
+    /// `AdminGateService`), and anything added later. Those keys are invisible
+    /// to serde here: `from_json` drops them and `to_json` never re-emits them,
+    /// so writing `to_json()` straight over `data` DELETES them.
+    ///
+    /// That is not theoretical — the console records `console_version` through
+    /// `update_setting_field` on every startup, which wiped the operator's
+    /// admin-gate allowlist (IPs + Host headers) before the gate had even been
+    /// loaded, silently reverting the management surface to "open to any host"
+    /// on each restart. Every settings write must go through this method so a
+    /// subsystem's sub-document survives an unrelated save.
+    ///
+    /// Keys this struct owns always win, so a field can still be updated back
+    /// to its default value.
+    pub fn to_json_merged(&self, existing: &serde_json::Value) -> serde_json::Value {
+        let incoming = self.to_json();
+        let (Some(existing_map), serde_json::Value::Object(incoming_map)) =
+            (existing.as_object(), incoming)
+        else {
+            // Existing blob isn't an object (fresh row, or corrupt), or we
+            // somehow didn't serialize to one: nothing to preserve, so the
+            // serialized settings are the whole document.
+            return self.to_json();
+        };
+
+        // `incoming_map` is owned, so move the values in rather than cloning
+        // every key and every serialized sub-document.
+        let mut merged = existing_map.clone();
+        merged.extend(incoming_map);
+        serde_json::Value::Object(merged)
     }
 
     /// Resolve the URL that service containers use to reach the Temps API from
@@ -1411,5 +1508,78 @@ mod tests {
         let parsed = AppSettings::from_json(settings.to_json());
         assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 12);
         assert_eq!(parsed.observability_compression.otel_spans_after_hours, 48);
+    }
+
+    /// Regression: a settings save must not delete the `admin_gate`
+    /// sub-document. The console writes `console_version` through
+    /// `update_setting_field` on every startup; with a plain `to_json()`
+    /// overwrite that wiped the operator's admin allowlist and reopened the
+    /// management surface to every host on each restart.
+    #[test]
+    fn merge_preserves_foreign_admin_gate_subdocument() {
+        let existing = serde_json::json!({
+            "preview_domain": "temps.kfs.es",
+            "admin_gate": {
+                "allowed_ips": ["10.0.0.0/8"],
+                "allowed_hosts": ["app.temps.kfs.es"],
+                "trust_forwarded_for": false
+            }
+        });
+
+        let mut settings = AppSettings::from_json(existing.clone());
+        settings.console_version = Some("v0.1.0".to_string());
+
+        let merged = settings.to_json_merged(&existing);
+
+        assert_eq!(
+            merged.get("admin_gate"),
+            existing.get("admin_gate"),
+            "an unrelated settings write must not drop the admin_gate sub-document"
+        );
+        assert_eq!(
+            merged.get("console_version").and_then(|v| v.as_str()),
+            Some("v0.1.0"),
+        );
+        assert_eq!(
+            merged.get("preview_domain").and_then(|v| v.as_str()),
+            Some("temps.kfs.es"),
+        );
+    }
+
+    /// Keys `AppSettings` owns must still be updatable — including back to
+    /// their default value — so the merge cannot simply prefer the stored blob.
+    #[test]
+    fn merge_lets_owned_fields_win_over_stored_values() {
+        let existing = serde_json::json!({
+            "preview_domain": "old.example.com",
+            "insecure_tls": true,
+            "admin_gate": { "allowed_hosts": ["app.example.com"] }
+        });
+
+        let mut settings = AppSettings::from_json(existing.clone());
+        settings.preview_domain = "new.example.com".to_string();
+        settings.insecure_tls = false;
+
+        let merged = settings.to_json_merged(&existing);
+
+        assert_eq!(
+            merged.get("preview_domain").and_then(|v| v.as_str()),
+            Some("new.example.com"),
+        );
+        assert_eq!(
+            merged.get("insecure_tls").and_then(|v| v.as_bool()),
+            Some(false),
+            "a field must be settable back to its default value"
+        );
+        assert!(merged.get("admin_gate").is_some());
+    }
+
+    /// A fresh/corrupt row has nothing to preserve — the serialized settings
+    /// become the whole document.
+    #[test]
+    fn merge_falls_back_to_plain_serialization_for_non_object_blob() {
+        let settings = AppSettings::default();
+        let merged = settings.to_json_merged(&serde_json::Value::Null);
+        assert_eq!(merged, settings.to_json());
     }
 }
