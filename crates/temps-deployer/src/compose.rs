@@ -55,6 +55,41 @@ pub enum ComposeError {
     Io(#[from] std::io::Error),
 }
 
+/// Where the contents of a referenced `env_file` come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvFileSource {
+    /// The repository ships the file; it is copied verbatim.
+    Repository(PathBuf),
+    /// The repository does not ship it, so it is synthesized from the
+    /// project's Temps environment variables.
+    ProjectEnvironment,
+}
+
+/// One `env_file:` reference resolved against the repository checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvFilePlan {
+    /// Path exactly as written in the compose file, relative to the project.
+    pub path: String,
+    pub source: EnvFileSource,
+}
+
+/// Render environment variables as `KEY=value` lines for an env file.
+///
+/// Keys are emitted in sorted order so redeploying with an unchanged set
+/// produces an identical file (`HashMap` iteration order is not stable).
+fn render_env_file(vars: &HashMap<String, String>) -> String {
+    let mut entries: Vec<(&String, &String)> = vars.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut rendered = String::new();
+    for (key, value) in entries {
+        rendered.push_str(key);
+        rendered.push('=');
+        rendered.push_str(value);
+        rendered.push('\n');
+    }
+    rendered
+}
+
 /// Request to deploy a Docker Compose stack.
 #[derive(Debug, Clone)]
 pub struct ComposeDeployRequest {
@@ -428,6 +463,47 @@ impl ComposeExecutor {
                         reason: e.to_string(),
                     })?;
             }
+        }
+
+        // Satisfy every `env_file:` the compose file declares. The stack
+        // directory is not a repo checkout — only the files Temps writes here
+        // exist — so a referenced env file must either be copied out of the
+        // repository or synthesized, otherwise `docker compose` aborts with
+        // "env file ... not found" before a single container starts. Operators
+        // deploying somebody else's repository cannot fix that by editing it.
+        let already_written_env = request
+            .env_content
+            .as_deref()
+            .is_some_and(|content| !content.trim().is_empty());
+        for plan in Self::plan_env_files(&request.compose_content, request.repo_dir.as_deref()) {
+            if already_written_env && plan.path == ".env" {
+                continue;
+            }
+            let destination =
+                Self::confined_write_path(project_dir, Path::new(&plan.path), "env_file")?;
+            let contents = match &plan.source {
+                EnvFileSource::Repository(repo_path) => tokio::fs::read_to_string(repo_path)
+                    .await
+                    .map_err(|e| ComposeError::FileWriteFailed {
+                        path: repo_path.display().to_string(),
+                        reason: format!("failed to read referenced env file from repository: {e}"),
+                    })?,
+                EnvFileSource::ProjectEnvironment => render_env_file(&request.environment_vars),
+            };
+            if let Some(parent) = destination.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    ComposeError::FileWriteFailed {
+                        path: parent.display().to_string(),
+                        reason: e.to_string(),
+                    }
+                })?;
+            }
+            tokio::fs::write(&destination, contents)
+                .await
+                .map_err(|e| ComposeError::FileWriteFailed {
+                    path: destination.display().to_string(),
+                    reason: e.to_string(),
+                })?;
         }
 
         // Write Temps system env vars to .env.temps
@@ -2430,6 +2506,90 @@ impl ComposeExecutor {
     /// Enumerate service names from parsed compose YAML (with merge keys
     /// expanded). Falls back to the line-based parser if the content is not
     /// valid YAML or has no `services:` mapping.
+    /// Collect every path referenced by an `env_file:` key across all services.
+    ///
+    /// Handles all three shapes the Compose spec allows:
+    /// `env_file: .env`, `env_file: [a.env, b.env]`, and the long form
+    /// `env_file: [{path: .env, required: false}]`. Paths are returned exactly
+    /// as written, de-duplicated, in first-seen order.
+    ///
+    /// Paths that cannot be confined to the project (absolute, `..`) are
+    /// dropped here rather than propagated: the compose file may come from a
+    /// repository the operator does not control, so an `env_file` entry must
+    /// never be able to name a location outside the stack directory.
+    pub fn collect_env_file_refs(compose_content: &str) -> Vec<String> {
+        let mut root: YamlValue = match serde_yaml::from_str(compose_content) {
+            Ok(value) => value,
+            Err(_) => return Vec::new(),
+        };
+        let _ = root.apply_merge();
+        let Some(services) = root.get("services").and_then(YamlValue::as_mapping) else {
+            return Vec::new();
+        };
+
+        let mut refs: Vec<String> = Vec::new();
+        let push = |candidate: Option<&str>, refs: &mut Vec<String>| {
+            let Some(path) = candidate else { return };
+            if Self::validate_relative_path(path, "env_file").is_err() {
+                return;
+            }
+            if !refs.iter().any(|existing| existing == path) {
+                refs.push(path.to_string());
+            }
+        };
+
+        for service in services.values() {
+            match service.get("env_file") {
+                Some(YamlValue::String(single)) => push(Some(single.as_str()), &mut refs),
+                Some(YamlValue::Sequence(entries)) => {
+                    for entry in entries {
+                        match entry {
+                            YamlValue::String(path) => push(Some(path.as_str()), &mut refs),
+                            // Long form: {path: .env, required: false}. `required`
+                            // is Compose's own concern — Temps satisfies the
+                            // reference either way, so the file exists whichever
+                            // the author chose.
+                            YamlValue::Mapping(_) => {
+                                push(entry.get("path").and_then(YamlValue::as_str), &mut refs)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        refs
+    }
+
+    /// Resolve each referenced env file against the repository checkout,
+    /// deciding whether it is copied from the repo or synthesized.
+    ///
+    /// Pure and side-effect free so the deployment job can log the same plan it
+    /// is about to execute — an operator must be able to see that Temps created
+    /// a file the repository never contained.
+    pub fn plan_env_files(compose_content: &str, repo_dir: Option<&Path>) -> Vec<EnvFilePlan> {
+        Self::collect_env_file_refs(compose_content)
+            .into_iter()
+            .map(|path| {
+                let from_repo = repo_dir.and_then(|dir| {
+                    // Confine the read for the same reason as the write: the
+                    // path comes from the compose file, not from Temps.
+                    let candidate = dir.join(&path);
+                    let canonical_dir = std::fs::canonicalize(dir).ok()?;
+                    let canonical = std::fs::canonicalize(&candidate).ok()?;
+                    (canonical.starts_with(&canonical_dir) && canonical.is_file())
+                        .then_some(canonical)
+                });
+                let source = match from_repo {
+                    Some(repo_path) => EnvFileSource::Repository(repo_path),
+                    None => EnvFileSource::ProjectEnvironment,
+                };
+                EnvFilePlan { path, source }
+            })
+            .collect()
+    }
+
     fn parse_service_names_yaml(&self, compose_content: &str) -> Vec<String> {
         let mut root: YamlValue = match serde_yaml::from_str(compose_content) {
             Ok(value) => value,
@@ -4014,5 +4174,109 @@ services:
         let compose = "services:\n  web:\n    image: nginx\n  worker:\n    image: alpine\n";
         let override_yaml = executor.generate_security_override(compose);
         assert_eq!(override_yaml.matches("privileged: false").count(), 2);
+    }
+
+    /// Compose allows three shapes for `env_file`; a stack must not fail to
+    /// deploy because its author picked one of them.
+    #[test]
+    fn collects_env_file_refs_in_all_three_compose_shapes() {
+        let compose = r#"
+services:
+  api:
+    image: api:latest
+    env_file: .env
+  worker:
+    image: worker:latest
+    env_file:
+      - .env
+      - config/worker.env
+  web:
+    image: web:latest
+    env_file:
+      - path: config/web.env
+        required: false
+"#;
+        let refs = ComposeExecutor::collect_env_file_refs(compose);
+        // `.env` is referenced by two services but materialized once.
+        assert_eq!(refs, vec![".env", "config/worker.env", "config/web.env"]);
+    }
+
+    /// The compose file may come from a repository the operator does not
+    /// control, so an `env_file` entry must never name a write target outside
+    /// the stack directory.
+    #[test]
+    fn drops_env_file_refs_that_escape_the_project() {
+        let compose = r#"
+services:
+  evil:
+    image: evil:latest
+    env_file:
+      - ../../../root/.ssh/authorized_keys
+      - /etc/passwd
+      - ok.env
+"#;
+        assert_eq!(
+            ComposeExecutor::collect_env_file_refs(compose),
+            vec!["ok.env"]
+        );
+    }
+
+    #[test]
+    fn collects_nothing_from_compose_without_env_files() {
+        let compose = "services:\n  api:\n    image: api:latest\n";
+        assert!(ComposeExecutor::collect_env_file_refs(compose).is_empty());
+        // Unparsable YAML must not panic or invent references.
+        assert!(ComposeExecutor::collect_env_file_refs("{{{ not yaml").is_empty());
+    }
+
+    /// A file the repository ships is authored config and wins; one it does not
+    /// ship is synthesized from the project's environment variables.
+    #[test]
+    fn plans_repo_copy_when_present_and_synthesis_when_absent() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("config")).unwrap();
+        std::fs::write(repo.path().join("config/worker.env"), "FROM_REPO=1\n").unwrap();
+
+        let compose = r#"
+services:
+  api:
+    image: api:latest
+    env_file:
+      - .env
+      - config/worker.env
+"#;
+        let plans = ComposeExecutor::plan_env_files(compose, Some(repo.path()));
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].path, ".env");
+        assert_eq!(plans[0].source, EnvFileSource::ProjectEnvironment);
+        assert_eq!(plans[1].path, "config/worker.env");
+        assert!(matches!(plans[1].source, EnvFileSource::Repository(_)));
+    }
+
+    /// A symlink in the repo must not let a referenced env file read outside it.
+    #[cfg(unix)]
+    #[test]
+    fn plan_rejects_repo_env_file_symlinked_outside_the_checkout() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.env"), "STOLEN=1\n").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.env"),
+            repo.path().join("app.env"),
+        )
+        .unwrap();
+
+        let compose = "services:\n  api:\n    image: api:latest\n    env_file: app.env\n";
+        let plans = ComposeExecutor::plan_env_files(compose, Some(repo.path()));
+        assert_eq!(plans[0].source, EnvFileSource::ProjectEnvironment);
+    }
+
+    #[test]
+    fn renders_env_file_deterministically() {
+        let mut vars = HashMap::new();
+        vars.insert("B_KEY".to_string(), "2".to_string());
+        vars.insert("A_KEY".to_string(), "1".to_string());
+        assert_eq!(render_env_file(&vars), "A_KEY=1\nB_KEY=2\n");
+        assert_eq!(render_env_file(&HashMap::new()), "");
     }
 }
