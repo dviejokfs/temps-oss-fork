@@ -1105,16 +1105,7 @@ export type AppSettings = {
     require_mfa_for_admins?: boolean;
     screenshots?: ScreenshotSettings;
     security_headers?: SecurityHeadersSettings;
-    /**
-     * One-click "Update now" from the console. Enabled by default; an admin
-     * can turn it off here to keep upgrades on the CLI/config-management path.
-     *
-     * This is the *soft* switch — it is stored in the database, so whoever can
-     * write settings can also turn it back on. Operators who need an upgrade
-     * path that no console session can re-open should start the server with
-     * `--disable-self-update`, which wins over this field unconditionally.
-     */
-    self_update?: SelfUpdateSettings;
+    self_update?: null | SelfUpdateSettings;
     /**
      * Set to `true` by `temps setup` (all modes) once initial configuration
      * has been applied. The web onboarding wizard reads this from the server

@@ -2423,6 +2423,18 @@
               }
             ]
           },
+          "self_update": {
+            "default": null,
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SelfUpdateSettings",
+                "description": "One-click \"Update now\" from the console. Enabled by default; an admin\ncan turn it off here to keep upgrades on the CLI/config-management path.\n\nThis is the *soft* switch — it is stored in the database, so whoever can\nwrite settings can also turn it back on. Operators who need an upgrade\npath that no console session can re-open should start the server with\n`--disable-self-update`, which wins over this field unconditionally.\n`None` means the client did not express an opinion, NOT \"reset to\ndefault\". Every other field on this struct is safe to re-default on a\npartial write, but this one gates whether the server may replace its own\nbinary — silently flipping it back on because an older client PUT a\nsettings document without it would undo a deliberate security decision.\nThe update handler preserves the stored value when this is absent; read\nit through `self_update()`."
+              }
+            ]
+          },
           "setup_complete": {
             "default": false,
             "description": "Set to `true` by `temps setup` (all modes) once initial configuration\nhas been applied. The web onboarding wizard reads this from the server\nand skips itself when true, preventing the \"Configure Base Domain\" wall\nfrom appearing on installs that were already configured via the CLI.",
@@ -2539,6 +2551,10 @@
           "security_headers": {
             "$ref": "#/components/schemas/SecurityHeadersSettings"
           },
+          "self_update": {
+            "$ref": "#/components/schemas/SelfUpdateSettings",
+            "description": "Whether admins may apply a release from the console. This is the\ndatabase-backed toggle only — a server started with\n`--disable-self-update` refuses regardless of what this says, which\n`GET /settings/update` reports as the authoritative answer."
+          },
           "setup_complete": {
             "description": "Whether `temps setup` has been run at least once. The web onboarding\nwizard checks this field on load and skips itself when true.",
             "type": "boolean"
@@ -2568,7 +2584,8 @@
           "require_mfa_for_admins",
           "cluster_dns",
           "build_limits",
-          "ai_chat_limits"
+          "ai_chat_limits",
+          "self_update"
         ],
         "type": "object"
       },
@@ -2840,7 +2857,23 @@
           "message": {
             "type": "string"
           },
+          "mfa_enrollment_required": {
+            "type": "boolean"
+          },
           "mfa_required": {
+            "type": "boolean"
+          },
+          "mfa_setup": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MfaSetupResponse"
+              }
+            ]
+          },
+          "password_change_required": {
             "type": "boolean"
           },
           "success": {
@@ -2857,7 +2890,9 @@
         "required": [
           "success",
           "message",
-          "mfa_required"
+          "mfa_required",
+          "mfa_enrollment_required",
+          "password_change_required"
         ],
         "type": "object"
       },
@@ -8264,6 +8299,9 @@
               "null"
             ]
           },
+          "must_change_password": {
+            "type": "boolean"
+          },
           "password": {
             "type": [
               "string",
@@ -9799,6 +9837,28 @@
             "format": "int32",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "sourceBundleContentType": {
+            "description": "Uploaded source archive content type.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sourceBundleId": {
+            "description": "Uploaded source archive ID. Source archives are extracted before the\nregular preset build pipeline and do not require Git metadata.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sourceBundlePath": {
+            "description": "Uploaded source archive path in the Temps data directory.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -27496,6 +27556,13 @@
             "$ref": "#/components/schemas/PropertyColumn",
             "description": "Property column to group by"
           },
+          "include_crawlers": {
+            "description": "Include crawler/bot traffic (default: false). Off by default so the\nbreakdown percentages share a denominator with the headline counts,\nwhich always exclude crawlers.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "limit": {
             "description": "Maximum number of results to return (default: 20, max: 100)",
             "format": "int32",
@@ -27630,6 +27697,13 @@
           "group_by": {
             "$ref": "#/components/schemas/PropertyColumn",
             "description": "Property column to group by"
+          },
+          "include_crawlers": {
+            "description": "Include crawler/bot traffic (default: false). See\n[`PropertyBreakdownQuery::include_crawlers`].",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "start_date": {
             "description": "Start date for the query range",
@@ -28576,7 +28650,7 @@
             "type": "integer"
           },
           "truncated": {
-            "description": "Whether rows were dropped from this response to stay inside the byte budget.\n\n`returned_count` is always the number of rows actually present, so a truncated page is still internally consistent — but a caller comparing it against the requested limit would otherwise conclude the table simply ended. Reported explicitly so a partial page is never mistaken for a complete one, by a human, a script, or a model reading a tool result.",
+            "description": "Whether rows were dropped from this response to stay inside the byte\nbudget.\n\n`returned_count` is always the number of rows actually present, so a\ntruncated page is still internally consistent — but a caller comparing\nit against the requested limit would otherwise conclude the table simply\nended. Reported explicitly so a partial page is never mistaken for a\ncomplete one, by a human, a script, or a model reading a tool result.",
             "example": false,
             "type": "boolean"
           }
@@ -29365,6 +29439,43 @@
         ],
         "type": "object"
       },
+      "ReleaseCheckResult": {
+        "description": "Outcome of an operator-triggered release check.",
+        "properties": {
+          "channel": {
+            "description": "Channel that was queried.",
+            "type": "string"
+          },
+          "current_version": {
+            "description": "Version tag of the running binary.",
+            "type": "string"
+          },
+          "latest_version": {
+            "description": "Newest release published on that channel, if any could be resolved.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "release_url": {
+            "description": "Release-notes page for `latest_version`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "update_available": {
+            "description": "True when `latest_version` is strictly newer than what is running.\nFalse on a channel whose newest release is older — which is normal and\nexpected right after switching a nightly box onto stable.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "channel",
+          "current_version",
+          "update_available"
+        ],
+        "type": "object"
+      },
       "ReleaseListResponse": {
         "properties": {
           "releases": {
@@ -29795,6 +29906,51 @@
           "request_headers",
           "response_headers",
           "headers_truncated"
+        ],
+        "type": "object"
+      },
+      "RequiredPasswordChangeRequest": {
+        "properties": {
+          "new_password": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "new_password"
+        ],
+        "type": "object"
+      },
+      "RequiredPasswordChangeResponse": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "mfa_enrollment_required": {
+            "type": "boolean"
+          },
+          "mfa_setup": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MfaSetupResponse"
+              }
+            ]
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "user_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "success",
+          "message",
+          "user_id",
+          "mfa_enrollment_required"
         ],
         "type": "object"
       },
@@ -30883,6 +31039,9 @@
           "mfa_enabled": {
             "type": "boolean"
           },
+          "must_change_password": {
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
@@ -30903,6 +31062,7 @@
           "image",
           "mfa_enabled",
           "email_verified",
+          "must_change_password",
           "created_at",
           "updated_at"
         ],
@@ -32199,6 +32359,131 @@
           }
         },
         "type": "object"
+      },
+      "SelfUpdateAttempt": {
+        "description": "A single update attempt. Persisted to `<data_dir>/self-update.json` so the\nresult survives the restart it causes.",
+        "properties": {
+          "error": {
+            "description": "Operator-facing failure reason. Always set when `status` is `Failed`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "description": "When the outcome was decided. `None` while still `Pending`.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_version": {
+            "description": "Version the attempt started from.",
+            "type": "string"
+          },
+          "previous_binary_path": {
+            "description": "Where the replaced binary was kept, so a bad release can be reverted by\nhand (`mv <path> <binary>`). Set once the swap completes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "example": "2026-08-06T09:12:31Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SelfUpdateStatus"
+          },
+          "to_version": {
+            "description": "Version the attempt targeted. `None` if it failed before resolving one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "triggered_by_user_id": {
+            "description": "User who clicked the button. `None` for attempts started by the CLI.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "from_version",
+          "status",
+          "started_at"
+        ],
+        "type": "object"
+      },
+      "SelfUpdateBlocker": {
+        "description": "Why a one-click update is unavailable. Exactly one is reported — the most\nfundamental blocker wins, so the operator fixes the real problem first\nrather than clearing one only to hit the next.",
+        "enum": [
+          "disabled_by_flag",
+          "disabled_by_setting",
+          "not_supported",
+          "binary_not_writable",
+          "unsupported_platform",
+          "in_progress"
+        ],
+        "type": "string"
+      },
+      "SelfUpdatePhase": {
+        "description": "Where an in-flight update has got to. Polled by the console so a long\ndownload shows progress instead of an indefinite spinner.",
+        "enum": [
+          "idle",
+          "resolving",
+          "downloading",
+          "verifying",
+          "installing",
+          "restarting",
+          "pending_restart",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "SelfUpdateRestartMode": {
+        "description": "What happens to the running process once the new binary is in place.",
+        "enum": [
+          "automatic",
+          "manual"
+        ],
+        "type": "string"
+      },
+      "SelfUpdateSettings": {
+        "description": "Controls the console's one-click \"Update now\" action.",
+        "properties": {
+          "channel": {
+            "default": null,
+            "description": "Release channel this install tracks: `stable`, `beta` or `nightly`.\n\n`None` (the default) means \"infer from the running version tag\", which\nis what the CLI has always done — a `-nightly.` build tracks nightly, a\n`-beta.N` build tracks beta, a plain tag tracks stable. Setting it\nexplicitly pins the channel, so an operator can move a nightly box back\nonto stable without reinstalling.",
+            "example": "stable",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "default": true,
+            "description": "Allow admins to apply a release and restart the server from the console.\n`true` by default: the action is permission-gated, audited, and only\never installs an official release whose published SHA-256 matches.\n\nTurning this off hides nothing — the console still shows the update\nbanner and the manual command, it just refuses to run it for you.",
+            "example": true,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "SelfUpdateStatus": {
+        "description": "Outcome of an update attempt, as persisted in the journal.",
+        "enum": [
+          "pending",
+          "succeeded",
+          "installed_pending_restart",
+          "failed"
+        ],
+        "type": "string"
       },
       "SendEmailRequestBody": {
         "properties": {
@@ -35992,6 +36277,48 @@
           }
         ]
       },
+      "StartUpdateRequest": {
+        "description": "Optional pin for the version to install.",
+        "properties": {
+          "version": {
+            "description": "Release tag to install (e.g. `v0.2.0`). Omit to take the newest release\non the channel this install already tracks.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "StartUpdateResponse": {
+        "description": "Acknowledgement that an update was accepted and is running.",
+        "properties": {
+          "current_version": {
+            "description": "Version the server is running as it accepts this request.",
+            "type": "string"
+          },
+          "estimated_restart_secs": {
+            "description": "How long to allow for the server to come back before treating the\nrestart as failed. `0` when nothing restarts.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "restart_mode": {
+            "$ref": "#/components/schemas/SelfUpdateRestartMode",
+            "description": "`automatic` (temps restarts itself) or `manual` (installed only)."
+          }
+        },
+        "required": [
+          "current_version",
+          "estimated_restart_secs",
+          "restart_mode",
+          "message"
+        ],
+        "type": "object"
+      },
       "StatResponse": {
         "properties": {
           "exists": {
@@ -36628,6 +36955,16 @@
           }
         },
         "type": "object"
+      },
+      "SupervisorKind": {
+        "description": "What (if anything) will restart the process after it exits.",
+        "enum": [
+          "systemd",
+          "launchd",
+          "container",
+          "none"
+        ],
+        "type": "string"
       },
       "SyncedRepositoryListQuery": {
         "properties": {
@@ -38533,6 +38870,107 @@
           "success",
           "message",
           "status"
+        ],
+        "type": "object"
+      },
+      "UpdateCapabilityResponse": {
+        "description": "Whether this install can apply a release update on request, and how the last\nattempt went.\n\nDeliberately answerable even when the answer is \"no\": an operator who cannot\nuse the button still needs to know *why* and what to run instead, so this\nnever 404s or returns an empty body when the feature is unavailable.",
+        "properties": {
+          "allowed": {
+            "description": "Whether the *caller* holds `platform:update`. Distinct from `can_apply`,\nwhich describes the server: the console shows the action only when both\nare true, so a reader is never offered a button that would 403.",
+            "type": "boolean"
+          },
+          "binary_path": {
+            "description": "Binary that would be replaced.",
+            "type": "string"
+          },
+          "blocker": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SelfUpdateBlocker",
+                "description": "Machine-readable reason `can_apply` is false (`disabled_by_flag`,\n`disabled_by_setting`, `container`, `no_supervisor`, `binary_not_writable`,\n`unsupported_platform`, `in_progress`)."
+              }
+            ]
+          },
+          "can_apply": {
+            "description": "True only when a request would actually download, install and restart.",
+            "type": "boolean"
+          },
+          "caveat": {
+            "description": "Non-blocking warning to show with the confirmation (split topology).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "channel": {
+            "description": "Channel actually tracked, after applying the configured override or\nfalling back to inference from the running version tag.",
+            "type": "string"
+          },
+          "channel_is_pinned": {
+            "description": "True when `channel` was set explicitly in settings rather than inferred.",
+            "type": "boolean"
+          },
+          "current_version": {
+            "description": "Version tag of the running binary. Always present — the version page\nneeds it whether or not an update exists.",
+            "type": "string"
+          },
+          "last_attempt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SelfUpdateAttempt",
+                "description": "Most recent attempt, including one resolved during this boot — this is\nhow the console reports the outcome of an update that restarted it."
+              }
+            ]
+          },
+          "manual_command": {
+            "description": "The equivalent command to run by hand. Always present.",
+            "type": "string"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/SelfUpdatePhase",
+            "description": "Phase of an in-flight attempt: `idle` when none is running."
+          },
+          "phase_error": {
+            "description": "Failure detail while `phase` is `failed`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Operator-facing explanation of `blocker`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "restart_mode": {
+            "$ref": "#/components/schemas/SelfUpdateRestartMode",
+            "description": "`automatic` when applying an update also restarts temps; `manual` when\nit only installs the binary and the operator restarts on their own\nschedule. Lets the console set expectations before the click."
+          },
+          "supervisor": {
+            "$ref": "#/components/schemas/SupervisorKind",
+            "description": "What would restart the process: `systemd`, `launchd`, `container`, `none`."
+          }
+        },
+        "required": [
+          "can_apply",
+          "allowed",
+          "manual_command",
+          "current_version",
+          "channel",
+          "channel_is_pinned",
+          "supervisor",
+          "restart_mode",
+          "binary_path",
+          "phase"
         ],
         "type": "object"
       },
@@ -48465,6 +48903,45 @@
               }
             },
             "description": "Enabled OIDC providers for login page"
+          }
+        },
+        "tags": [
+          "Authentication"
+        ]
+      }
+    },
+    "/auth/password-change-required": {
+      "post": {
+        "operationId": "change_required_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequiredPasswordChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequiredPasswordChangeResponse"
+                }
+              }
+            },
+            "description": "Required password change completed"
+          },
+          "400": {
+            "description": "Password does not meet requirements"
+          },
+          "401": {
+            "description": "Password-change session is missing or expired"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         },
         "tags": [
@@ -77632,6 +78109,15 @@
             }
           },
           {
+            "description": "Include crawler/bot traffic (default: false)",
+            "in": "query",
+            "name": "include_crawlers",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "description": "Filter by country (for region/city drill-downs)",
             "in": "query",
             "name": "filter_country",
@@ -77804,6 +78290,15 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Include crawler/bot traffic (default: false)",
+            "in": "query",
+            "name": "include_crawlers",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -82468,6 +82963,16 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceArchiveUpload"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "201": {
             "content": {
@@ -87968,6 +88473,99 @@
         ]
       }
     },
+    "/settings/update": {
+      "get": {
+        "operationId": "get_update_capability",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateCapabilityResponse"
+                }
+              }
+            },
+            "description": "Self-update capability for this install"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Report whether a release update can be applied from the console.",
+        "tags": [
+          "Settings"
+        ]
+      },
+      "post": {
+        "description": "Returns as soon as the attempt is accepted: the download and swap run in the\nbackground and the process then exits so its supervisor restarts it on the\nnew binary. Poll `GET /settings/update` for progress — after the restart,\n`last_attempt` carries the outcome.",
+        "operationId": "start_update",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartUpdateResponse"
+                }
+              }
+            },
+            "description": "Update accepted; the server will restart"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Update unavailable or already running"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This process cannot apply updates"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Install a release and restart the server.",
+        "tags": [
+          "Settings"
+        ]
+      }
+    },
     "/settings/update-status": {
       "get": {
         "operationId": "get_update_status",
@@ -87995,6 +88593,58 @@
           }
         ],
         "summary": "Report whether a newer temps release is available for this install.",
+        "tags": [
+          "Settings"
+        ]
+      }
+    },
+    "/settings/update/check": {
+      "post": {
+        "operationId": "check_for_update",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseCheckResult"
+                }
+              }
+            },
+            "description": "Result of the release check"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This process cannot check for updates"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The release API could not be reached"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Ask the release API for the newest version on this install's channel, now,\ninstead of waiting for the background notifier's next pass.",
         "tags": [
           "Settings"
         ]
@@ -88818,6 +89468,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "409": {
+            "description": "MFA is already enabled; verify and disable it before re-enrollment"
           },
           "500": {
             "description": "Internal server error"
