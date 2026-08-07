@@ -1182,6 +1182,18 @@ function PublicPortsInline({
 }
 
 // Repo change dialog — wraps the existing repo selector flow without re-implementing it.
+/**
+ * Extract `owner/name` from a public repository URL. Shared by the initial
+ * seed and the input handler so a project that is already connected to a
+ * public repo shows the same parse the user would get by typing it.
+ */
+function parsePublicRepoUrl(url: string): { owner: string; name: string } | null {
+  const m = url
+    .trim()
+    .match(/(?:github\.com|gitlab\.com)[/:]([^/\s]+)\/([^/\s.]+)/)
+  return m ? { owner: m[1], name: m[2].replace(/\.git$/, '') } : null
+}
+
 export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   const navigate = useNavigate()
   const updateGit = useMutation({ ...updateGitSettingsMutation() })
@@ -1199,14 +1211,26 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   )
   const [modeTouched, setModeTouched] = useState(false)
   useEffect(() => {
+    // A public-repo project also has no connection id, so that alone cannot
+    // mean "send them to the picker" — it would drop someone editing a public
+    // URL project onto the provider tab every time. Only redirect projects
+    // with no git source at all (converted from docker/static), which is what
+    // a missing git_url identifies. `is_public_repo` is not exposed on
+    // ProjectResponse, so the URL is the available signal.
     if (
       !modeTouched &&
       !project.git_provider_connection_id &&
+      !project.git_url &&
       connections.length > 0
     ) {
       setMode('connection')
     }
-  }, [modeTouched, connections.length, project.git_provider_connection_id])
+  }, [
+    modeTouched,
+    connections.length,
+    project.git_provider_connection_id,
+    project.git_url,
+  ])
 
   const [selectedConnectionId, setSelectedConnectionId] = useState<
     number | null
@@ -1224,11 +1248,18 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   const [selectedRepo, setSelectedRepo] = useState<RepositoryResponse | null>(
     null
   )
-  const [publicUrl, setPublicUrl] = useState('')
+  // Seed from the project so "change repository" starts from the repository
+  // it is currently connected to, instead of an empty field the user has to
+  // retype from memory.
+  const initialPublicUrl =
+    !project.git_provider_connection_id && project.git_url
+      ? project.git_url
+      : ''
+  const [publicUrl, setPublicUrl] = useState(initialPublicUrl)
   const [parsedPublic, setParsedPublic] = useState<{
     owner: string
     name: string
-  } | null>(null)
+  } | null>(() => parsePublicRepoUrl(initialPublicUrl))
   const [directory, setDirectory] = useState(project.directory || './')
   // Holds the selector's composite `slug::path` key, not a bare slug — a
   // monorepo can expose the same preset at several paths, and a bare slug
@@ -1236,6 +1267,9 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   // `splitPresetSelection` before sending to the API.
   const [preset, setPreset] = useState<string>(
     presetSelectionKey(project.preset, project.directory)
+  )
+  const [detectedComposeFile, setDetectedComposeFile] = useState<string | null>(
+    null
   )
 
   /**
@@ -1255,11 +1289,55 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     }),
     enabled: mode === 'connection' && !!(selectedRepo as { id?: number })?.id,
   })
+  // ...and for a public URL, which has no repository id to key off. Without
+  // this the public path fell back to the full static catalogue, so the user
+  // had to know their own stack instead of being told.
+  const publicPresetQuery = useQuery({
+    ...detectPublicPresetsOptions({
+      path: {
+        provider: 'github',
+        owner: parsedPublic?.owner || '',
+        repo: parsedPublic?.name || '',
+      },
+    }),
+    enabled: mode === 'public' && !!parsedPublic,
+  })
+  // The public endpoint answers in snake_case; FrameworkSelector reads
+  // camelCase. Same mapping the read-only Git settings page performs.
+  const publicPresetData = useMemo(() => {
+    if (!publicPresetQuery.data?.presets?.length) return null
+    return {
+      presets: publicPresetQuery.data.presets.map((p: any) => ({
+        preset: p.preset,
+        presetLabel: p.preset_label,
+        exposedPort: p.exposed_port,
+        iconUrl: p.icon_url,
+        projectType: p.project_type,
+        path: p.path,
+        composeFiles: p.compose_files,
+      })),
+    }
+  }, [publicPresetQuery.data])
+  const detectedPresetData =
+    mode === 'public' ? publicPresetData : (presetQuery.data ?? null)
+  const detectedPresetLoading =
+    mode === 'public'
+      ? publicPresetQuery.isLoading || publicPresetQuery.isFetching
+      : presetQuery.isLoading
+  const detectedPresetError =
+    mode === 'public' ? publicPresetQuery.error : presetQuery.error
   useEffect(() => {
     const detectedList =
       (
-        presetQuery.data as
-          { presets?: { preset: string; path?: string }[] } | undefined
+        detectedPresetData as
+          | {
+              presets?: {
+                preset: string
+                path?: string
+                composeFiles?: string[]
+              }[]
+            }
+          | undefined
       )?.presets ?? []
     if (!detectedList.length) return
     // Prefer the detected entry that sits at the directory already configured,
@@ -1272,7 +1350,15 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     // Carry the detected path into the key. Storing just the slug here was
     // why auto-detected presets highlighted every card with that slug.
     selectPreset(presetSelectionKey(detected.preset, detected.path))
-  }, [presetQuery.data])
+    // Detection also reports which compose file it found. Carrying it over
+    // means a repo whose file is named `compose.yml` deploys without the user
+    // discovering that the default is `docker-compose.yml`.
+    if (detected.preset === 'docker-compose') {
+      setDetectedComposeFile(detected.composeFiles?.[0] ?? null)
+    } else {
+      setDetectedComposeFile(null)
+    }
+  }, [detectedPresetData])
 
   const back = () => navigate(`/projects/${project.slug}/git`)
 
@@ -1297,6 +1383,18 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
         (selectedRepo as { default_branch?: string })?.default_branch ||
         project.main_branch ||
         'main',
+    }
+    // `composePath` is camelCase on the wire: DockerComposeConfig is
+    // #[serde(rename_all = "camelCase")], and an unknown key is dropped
+    // silently rather than rejected.
+    if (
+      splitPresetSelection(preset).preset === 'docker-compose' &&
+      detectedComposeFile
+    ) {
+      body.preset_config = {
+        preset: 'docker-compose',
+        composePath: detectedComposeFile,
+      }
     }
     if (mode === 'public') {
       body.git_url = `https://github.com/${repoToConnect.owner}/${repoToConnect.name}`
@@ -1418,12 +1516,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
               onChange={(e) => {
                 const url = e.target.value
                 setPublicUrl(url)
-                const m = url
-                  .trim()
-                  .match(/(?:github\.com|gitlab\.com)[/:]([^/\s]+)\/([^/\s.]+)/)
-                setParsedPublic(
-                  m ? { owner: m[1], name: m[2].replace(/\.git$/, '') } : null
-                )
+                setParsedPublic(parsePublicRepoUrl(url))
               }}
             />
             {parsedPublic && (
@@ -1445,9 +1538,9 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
             <div className="space-y-2">
               <Label>Framework / preset</Label>
               <FrameworkSelector
-                presetData={presetQuery.data as any}
-                isLoading={presetQuery.isLoading}
-                error={presetQuery.error}
+                presetData={detectedPresetData as any}
+                isLoading={detectedPresetLoading}
+                error={detectedPresetError}
                 selectedPreset={preset}
                 onSelectPreset={selectPreset}
               />
