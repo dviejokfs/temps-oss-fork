@@ -119,7 +119,9 @@ end
 repeat
   if scan_calls >= tonumber(ARGV[4]) then return {2, scan_calls + 1, 1, {}} end
   scan_calls = scan_calls + 1
-  local page = redis.call('SSCAN', KEYS[1], cursor, 'COUNT', 1)
+  -- Fixed small work hint keeps valid logical offsets reachable within the
+  -- call cap without materializing an entire hashtable encoding in one step.
+  local page = redis.call('SSCAN', KEYS[1], cursor, 'COUNT', 32)
   cursor = page[1]
   for _, value in ipairs(page[2]) do
     if skipped < tonumber(ARGV[1]) then
@@ -199,7 +201,9 @@ end
 repeat
   if scan_calls >= tonumber(ARGV[4]) then return {2, scan_calls + 1, 1, {}} end
   scan_calls = scan_calls + 1
-  local page = redis.call('HSCAN', KEYS[1], cursor, 'COUNT', 1)
+  -- Fixed small work hint keeps valid logical offsets reachable within the
+  -- call cap without materializing an entire hashtable encoding in one step.
+  local page = redis.call('HSCAN', KEYS[1], cursor, 'COUNT', 32)
   cursor = page[1]
   for index = 1, #page[2], 2 do
     if skipped < tonumber(ARGV[1]) then
@@ -1305,6 +1309,21 @@ mod tests {
         assert!(first.stats.truncated);
         assert!(second.stats.truncated);
 
+        let high_cursor_page = source
+            .query(
+                &path,
+                "large-set",
+                None,
+                QueryOptions {
+                    limit: Some(2),
+                    cursor: Some("500".to_string()),
+                    ..QueryOptions::default()
+                },
+            )
+            .await?;
+        assert_eq!(members(&high_cursor_page).len(), 2);
+        assert_eq!(high_cursor_page.stats.next_cursor.as_deref(), Some("502"));
+
         let offset_error = source
             .query(
                 &path,
@@ -1389,6 +1408,28 @@ mod tests {
                 .ignore();
         }
         sparse_hash.query_async::<()>(&mut connection).await?;
+        let high_hash_cursor_page = source
+            .query(
+                &path,
+                "sparse-hash",
+                None,
+                QueryOptions {
+                    limit: Some(2),
+                    cursor: Some("500".to_string()),
+                    ..QueryOptions::default()
+                },
+            )
+            .await?;
+        assert_eq!(
+            high_hash_cursor_page.rows[0]["value"]
+                .as_object()
+                .map(|value| value.len()),
+            Some(2)
+        );
+        assert_eq!(
+            high_hash_cursor_page.stats.next_cursor.as_deref(),
+            Some("502")
+        );
         let mut sparse_hash_deletes = redis::pipe();
         for index in 0..3_999 {
             sparse_hash_deletes
