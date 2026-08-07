@@ -40,7 +40,7 @@ struct PgQueryColumn {
     udt_kind: Option<String>,
 }
 
-fn pg_column_admission(column: &PgQueryColumn, row_budget: usize) -> Result<String> {
+fn pg_column_admission(column: &PgQueryColumn, row_budget: usize) -> Option<String> {
     let value = format!("__temps_source.\"{}\"", escape_ident(&column.name));
     let compression_aware_size = || {
         format!(
@@ -106,14 +106,9 @@ fn pg_column_admission(column: &PgQueryColumn, row_budget: usize) -> Result<Stri
         // bytes). Their JSON representation is therefore safely bounded
         // without invoking an arbitrary user-defined output function.
         "USER-DEFINED" if column.udt_kind.as_deref() == Some("e") => "386".to_string(),
-        unsupported => {
-            return Err(DataError::OperationNotSupported(format!(
-                "PostgreSQL column '{}' uses unsupported type '{}'",
-                column.name, unsupported
-            )))
-        }
+        _ => return None,
     };
-    Ok(expression)
+    Some(expression)
 }
 
 /// Admit rows from non-materializing per-column upper bounds. `TO_JSONB` is
@@ -123,10 +118,37 @@ fn with_wire_row_budget(
     columns: &[PgQueryColumn],
     budget: QueryBudget,
 ) -> Result<String> {
-    let estimates = columns
+    let admissions = columns
         .iter()
         .map(|column| pg_column_admission(column, budget.max_bytes))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
+    // Preserve queryability when an extension defines an output type whose
+    // expansion cannot be bounded safely. Only that field becomes JSON null;
+    // supported fields in the same row remain available. The raw unsupported
+    // value is never referenced by the projection, so PostgreSQL does not run
+    // its arbitrary output function or detoast it for JSON conversion.
+    let safe_source_sql = if columns.is_empty() {
+        sql.to_string()
+    } else {
+        let projection = columns
+            .iter()
+            .zip(&admissions)
+            .map(|(column, admission)| {
+                let name = escape_ident(&column.name);
+                if admission.is_some() {
+                    format!("__temps_raw.\"{name}\" AS \"{name}\"")
+                } else {
+                    format!("NULL::text AS \"{name}\"")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("SELECT {projection} FROM ({sql}) AS __temps_raw")
+    };
+    let estimates = admissions
+        .into_iter()
+        .map(|admission| admission.unwrap_or_else(|| "4".to_string()))
+        .collect::<Vec<_>>();
     let max_cell = if estimates.is_empty() {
         "0".to_string()
     } else {
@@ -145,7 +167,7 @@ fn with_wire_row_budget(
         "SELECT CASE WHEN __temps_max_cell <= {} AND __temps_row_size <= {} \
              THEN TO_JSONB(__temps_source) ELSE NULL END AS __temps_row, \
              __temps_row_size AS __temps_size, __temps_max_cell \
-         FROM ({sql}) AS __temps_source \
+         FROM ({safe_source_sql}) AS __temps_source \
          CROSS JOIN LATERAL (SELECT {row_size}::bigint AS __temps_row_size, \
              {max_cell}::bigint AS __temps_max_cell) AS __temps_admission",
         budget.max_cell_bytes, budget.max_bytes
@@ -2304,21 +2326,27 @@ mod wire_budget_tests {
     }
 
     #[test]
-    fn unknown_types_are_rejected_before_query_execution() {
-        let error = with_wire_row_budget(
+    fn unknown_types_null_only_the_unsupported_field() {
+        let sql = with_wire_row_budget(
             "SELECT * FROM public.widgets",
-            &[PgQueryColumn {
-                name: "shape".to_string(),
-                data_type: "USER-DEFINED".to_string(),
-                udt_kind: Some("b".to_string()),
-            }],
+            &[
+                PgQueryColumn {
+                    name: "id".to_string(),
+                    data_type: "bigint".to_string(),
+                    udt_kind: Some("b".to_string()),
+                },
+                PgQueryColumn {
+                    name: "shape".to_string(),
+                    data_type: "USER-DEFINED".to_string(),
+                    udt_kind: Some("b".to_string()),
+                },
+            ],
             QueryBudget::default(),
         )
-        .expect_err("unknown output functions have no safe size upper bound");
-        assert!(matches!(
-            error,
-            temps_query::DataError::OperationNotSupported(_)
-        ));
+        .expect("an unsupported field must not make the whole relation unqueryable");
+        assert!(sql.contains("__temps_raw.\"id\" AS \"id\""));
+        assert!(sql.contains("NULL::text AS \"shape\""));
+        assert!(!sql.contains("__temps_raw.\"shape\""));
     }
 
     #[test]
@@ -3217,6 +3245,31 @@ mod tests {
                 ..
             }
         ));
+
+        source
+            .client
+            .batch_execute(
+                "CREATE TYPE opaque_payload AS (secret text); \
+                 CREATE TABLE extension_rows (id bigint, payload opaque_payload); \
+                 INSERT INTO extension_rows VALUES (1, ROW('hidden')::opaque_payload);",
+            )
+            .await
+            .expect("unsupported extension fixture should be created");
+        let extension_row = source
+            .query(
+                &ContainerPath::from_slice(&["postgres", "public"]),
+                "extension_rows",
+                None,
+                QueryOptions {
+                    limit: Some(1),
+                    budget,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect("unsupported extension field must not hide supported row fields");
+        assert_eq!(extension_row.rows[0]["id"], serde_json::json!(1));
+        assert_eq!(extension_row.rows[0]["payload"], serde_json::Value::Null);
 
         source
             .client

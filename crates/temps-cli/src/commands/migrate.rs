@@ -87,7 +87,8 @@ async fn interrupted_maintenance_error(
     println!("{}", format!("Interrupted — cancelling {phase}…").yellow());
     match temps_database::cancel_migration_backend(database_url, backend_pid).await {
         Ok(()) => anyhow::anyhow!(
-            "{phase} was interrupted and PostgreSQL confirmed backend {backend_pid} stopped. \
+            "{phase} was interrupted and PostgreSQL confirmed the statement on backend \
+             {backend_pid} is no longer active. \
              Re-run `temps migrate` to repair any invalid concurrent index and continue."
         ),
         Err(error) => anyhow::anyhow!(
