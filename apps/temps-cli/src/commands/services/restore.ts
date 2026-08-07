@@ -150,14 +150,16 @@ async function listBackupsAction(options: ListBackupsOptions): Promise<void> {
       accessor: (r) =>
         typeof r.size_bytes === 'number' && r.size_bytes != null
           ? formatBytes(r.size_bytes)
-          : colors.muted('—'),
+          : '—',
+      color: (value, r) => typeof r.size_bytes === 'number' && r.size_bytes != null ? value : colors.muted(value),
     },
     {
       header: 'Location',
       accessor: (r) =>
         (r.location ?? '').startsWith('s3://')
-          ? colors.success('WAL-G')
-          : colors.muted('legacy'),
+          ? 'WAL-G'
+          : 'legacy',
+      color: (value, r) => (r.location ?? '').startsWith('s3://') ? colors.success(value) : colors.muted(value),
     },
     {
       header: 'Created',
@@ -358,17 +360,18 @@ async function listRunsAction(options: RestoreRunsOptions): Promise<void> {
     { header: 'Phase', accessor: (r) => r.phase },
     {
       header: 'Status',
-      accessor: (r) =>
-        statusBadge(
-          r.status === 'completed' ? 'active' : r.status === 'failed' ? 'inactive' : 'pending',
-        ),
+      accessor: (r) => r.status,
+      color: (_value, r) => statusBadge(
+        r.status === 'completed' ? 'active' : r.status === 'failed' ? 'inactive' : 'pending',
+      ),
     },
     {
       header: 'Target',
       accessor: (r) =>
         r.target_service_id != null
           ? `#${r.target_service_id} (${r.target_service_name ?? ''})`
-          : colors.muted('—'),
+          : '—',
+      color: (value, r) => r.target_service_id != null ? value : colors.muted(value),
     },
     {
       header: 'Started',

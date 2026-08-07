@@ -87,24 +87,28 @@ async function listAction(options: { json?: boolean }): Promise<void> {
   const columns: TableColumn<ContextRow>[] = [
     {
       header: '',
-      accessor: (c) => (isActiveRow(c) ? colors.success('●') : colors.muted('○')),
+      accessor: (c) => (isActiveRow(c) ? '●' : '○'),
+      color: (value, c) => isActiveRow(c) ? colors.success(value) : colors.muted(value),
     },
     { header: 'Name', key: 'name', color: (v) => colors.bold(String(v)) },
     { header: 'URL', key: 'url', color: (v) => colors.primary(String(v)) },
     {
       header: 'Email',
-      accessor: (c) => c.email || colors.muted('-'),
+      accessor: (c) => c.email || '-',
+      color: (value, c) => c.email ? value : colors.muted(value),
     },
     {
       header: 'Key',
-      accessor: (c) => (c.keyPrefix ? colors.muted(`${c.keyPrefix}…`) : colors.muted('-')),
+      accessor: (c) => (c.keyPrefix ? `${c.keyPrefix}…` : '-'),
+      color: (value) => colors.muted(value),
     },
     {
       header: 'Expires',
       accessor: (c) =>
         c.expiresAt
           ? new Date(c.expiresAt).toISOString().split('T')[0] ?? '-'
-          : colors.muted('-'),
+          : '-',
+      color: (value, c) => c.expiresAt ? value : colors.muted(value),
     },
   ]
 

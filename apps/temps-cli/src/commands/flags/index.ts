@@ -279,7 +279,7 @@ async function listFlagsCmd(options: {
       ? { header: options.environment!, accessor: (f) => effectiveValue(f, environmentId) }
       : { header: 'Default', accessor: (f) => formatValue(f.default_value) },
     { header: 'Client', accessor: (f) => (f.client_visible ? 'yes' : 'no') },
-    { header: 'Status', accessor: (f) => (f.archived_at ? colors.dim('archived') : 'active') },
+    { header: 'Status', accessor: (f) => (f.archived_at ? 'archived' : 'active'), color: (value, f) => f.archived_at ? colors.dim(value) : value },
   ]
 
   printTable(flags, columns, { style: 'minimal' })
@@ -337,7 +337,7 @@ async function getFlagCmd(
       flag.environments,
       [
         { header: 'Environment ID', accessor: (e) => String(e.environment_id) },
-        { header: 'Enabled', accessor: (e) => (e.enabled ? 'yes' : colors.warning('no (kill switch)')) },
+        { header: 'Enabled', accessor: (e) => (e.enabled ? 'yes' : 'no (kill switch)'), color: (value, e) => e.enabled ? value : colors.warning(value) },
         { header: 'Value', accessor: (e) => formatValue(e.value) },
       ],
       { style: 'minimal' },

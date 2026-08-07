@@ -3,14 +3,15 @@
 //! Implements DataSource, Introspect, and Queryable traits for PostgreSQL.
 
 use async_trait::async_trait;
+use futures_util::{pin_mut, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use temps_query::{
-    Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataError,
-    DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType,
-    Introspect, QueryOptions, QueryResult, QueryStats, Queryable, Result,
+    BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
+    DataError, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType,
+    Introspect, QueryBudget, QueryOptions, QueryResult, QueryStats, Queryable, Result,
 };
-use tokio_postgres::{Client, NoTls, Row};
+use tokio_postgres::{types::ToSql, Client, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, error, warn};
 
@@ -30,6 +31,147 @@ const DEFAULT_COUNT_TIMEOUT_MS: u64 = 10_000;
 /// Prevents identifier injection when used inside `"..."` quoting.
 fn escape_ident(name: &str) -> String {
     name.replace('"', "\"\"")
+}
+
+#[derive(Clone, Debug)]
+struct PgQueryColumn {
+    name: String,
+    data_type: String,
+    udt_kind: Option<String>,
+}
+
+fn pg_column_admission(column: &PgQueryColumn, row_budget: usize) -> Option<String> {
+    let value = format!("__temps_source.\"{}\"", escape_ident(&column.name));
+    let compression_aware_size = || {
+        format!(
+            "CASE WHEN {value} IS NULL THEN 4 WHEN PG_COLUMN_COMPRESSION({value}) IS NOT NULL \
+             THEN {} ELSE PG_COLUMN_SIZE({value})::bigint * 8 + 64 END",
+            row_budget.saturating_add(1)
+        )
+    };
+    let expression = match column.data_type.as_str() {
+        "character varying" | "character" | "text" | "xml" => {
+            format!("COALESCE(OCTET_LENGTH({value})::bigint * 6 + 2, 4)")
+        }
+        "bytea" => format!("COALESCE(OCTET_LENGTH({value})::bigint * 2 + 8, 4)"),
+        "json" => format!("COALESCE(OCTET_LENGTH({value}::text)::bigint * 6 + 8, 4)"),
+        "jsonb" | "ARRAY" => compression_aware_size(),
+        "boolean"
+        | "smallint"
+        | "integer"
+        | "bigint"
+        | "real"
+        | "double precision"
+        | "numeric"
+        | "decimal"
+        | "date"
+        | "time without time zone"
+        | "time with time zone"
+        | "interval"
+        | "timestamp without time zone"
+        | "timestamp with time zone"
+        | "uuid"
+        | "money"
+        | "inet"
+        | "cidr"
+        | "macaddr"
+        | "macaddr8"
+        | "bit"
+        | "bit varying"
+        | "oid"
+        | "regclass"
+        | "regtype"
+        | "tsvector"
+        | "tsquery"
+        | "int4range"
+        | "int8range"
+        | "numrange"
+        | "tsrange"
+        | "tstzrange"
+        | "daterange"
+        | "int4multirange"
+        | "int8multirange"
+        | "nummultirange"
+        | "tsmultirange"
+        | "tstzmultirange"
+        | "datemultirange" => {
+            // Several apparently scalar PostgreSQL types are varlena and may
+            // be TOAST-compressed (notably bit varying, ranges, tsvector, and
+            // extension-backed domains). A compressed on-disk size is not a
+            // safe upper bound for JSON expansion, so fail closed before
+            // TO_JSONB just as we do for JSONB and arrays.
+            compression_aware_size()
+        }
+        // PostgreSQL enum labels are limited to NAMEDATALEN (normally 63
+        // bytes). Their JSON representation is therefore safely bounded
+        // without invoking an arbitrary user-defined output function.
+        "USER-DEFINED" if column.udt_kind.as_deref() == Some("e") => "386".to_string(),
+        _ => return None,
+    };
+    Some(expression)
+}
+
+/// Admit rows from non-materializing per-column upper bounds. `TO_JSONB` is
+/// located only in the admitted CASE arm, so rejected values are never encoded.
+fn with_wire_row_budget(
+    sql: &str,
+    columns: &[PgQueryColumn],
+    budget: QueryBudget,
+) -> Result<String> {
+    let admissions = columns
+        .iter()
+        .map(|column| pg_column_admission(column, budget.max_bytes))
+        .collect::<Vec<_>>();
+    // Preserve queryability when an extension defines an output type whose
+    // expansion cannot be bounded safely. Only that field becomes JSON null;
+    // supported fields in the same row remain available. The raw unsupported
+    // value is never referenced by the projection, so PostgreSQL does not run
+    // its arbitrary output function or detoast it for JSON conversion.
+    let safe_source_sql = if columns.is_empty() {
+        sql.to_string()
+    } else {
+        let projection = columns
+            .iter()
+            .zip(&admissions)
+            .map(|(column, admission)| {
+                let name = escape_ident(&column.name);
+                if admission.is_some() {
+                    format!("__temps_raw.\"{name}\" AS \"{name}\"")
+                } else {
+                    format!("NULL::text AS \"{name}\"")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("SELECT {projection} FROM ({sql}) AS __temps_raw")
+    };
+    let estimates = admissions
+        .into_iter()
+        .map(|admission| admission.unwrap_or_else(|| "4".to_string()))
+        .collect::<Vec<_>>();
+    let max_cell = if estimates.is_empty() {
+        "0".to_string()
+    } else {
+        format!("GREATEST({})", estimates.join(", "))
+    };
+    let key_overhead = columns.iter().fold(2usize, |total, column| {
+        total.saturating_add(column.name.len().saturating_mul(6).saturating_add(4))
+    });
+    let row_size = if estimates.is_empty() {
+        key_overhead.to_string()
+    } else {
+        format!("{key_overhead} + {}", estimates.join(" + "))
+    };
+
+    Ok(format!(
+        "SELECT CASE WHEN __temps_max_cell <= {} AND __temps_row_size <= {} \
+             THEN TO_JSONB(__temps_source) ELSE NULL END AS __temps_row, \
+             __temps_row_size AS __temps_size, __temps_max_cell \
+         FROM ({safe_source_sql}) AS __temps_source \
+         CROSS JOIN LATERAL (SELECT {row_size}::bigint AS __temps_row_size, \
+             {max_cell}::bigint AS __temps_max_cell) AS __temps_admission",
+        budget.max_cell_bytes, budget.max_bytes
+    ))
 }
 
 /// A certificate verifier that accepts all server certificates (including self-signed).
@@ -89,6 +231,9 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAllVerifier {
 pub struct PostgresSource {
     client: Arc<Client>,
     database_name: String,
+    /// `statement_timeout` is session-scoped. Serialize the SET + query pair so
+    /// concurrent row/count calls cannot inherit one another's timeout.
+    query_timeout_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// True when `input` begins with `keyword` on a token boundary.
@@ -286,6 +431,7 @@ impl PostgresSource {
         Ok(Self {
             client: Arc::new(client),
             database_name: database.to_string(),
+            query_timeout_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -722,10 +868,30 @@ impl PostgresSource {
     /// lookup fails (e.g. insufficient privileges), which callers already
     /// render as "—" rather than as zero.
     async fn row_count_and_size(
-        client: &tokio_postgres::Client,
+        &self,
         schema_name: &str,
         entity_name: &str,
     ) -> (Option<usize>, Option<u64>) {
+        self.row_count_and_size_with_timeout(schema_name, entity_name, DEFAULT_COUNT_TIMEOUT_MS)
+            .await
+    }
+
+    async fn row_count_and_size_with_timeout(
+        &self,
+        schema_name: &str,
+        entity_name: &str,
+        timeout_ms: u64,
+    ) -> (Option<usize>, Option<u64>) {
+        let client = &self.client;
+        let _timeout_guard = self.query_timeout_lock.lock().await;
+        if let Err(error) = client
+            .batch_execute(&format!("SET statement_timeout = {timeout_ms}"))
+            .await
+        {
+            warn!(%error, "failed to bound PostgreSQL entity-info statistics query");
+            return (None, None);
+        }
+
         let qualified = format!(
             "\"{}\".\"{}\"",
             escape_ident(schema_name),
@@ -1213,100 +1379,39 @@ impl PostgresSource {
         }
     }
 
-    /// Convert PostgreSQL row to DataRow
-    fn row_to_datarow(row: &Row) -> Result<DataRow> {
-        let mut data_row = HashMap::new();
-
-        for (idx, column) in row.columns().iter().enumerate() {
-            let name = column.name().to_string();
-            let value = Self::extract_value(row, idx)?;
-            data_row.insert(name, value);
-        }
-
-        Ok(data_row)
-    }
-
-    /// Extract value from PostgreSQL row
-    fn extract_value(row: &Row, idx: usize) -> Result<serde_json::Value> {
-        let column = &row.columns()[idx];
-        let type_name = column.type_().name();
-
-        let value = match type_name {
-            "bool" => row
-                .try_get::<_, Option<bool>>(idx)
-                .ok()
-                .flatten()
-                .map(serde_json::Value::Bool)
-                .unwrap_or(serde_json::Value::Null),
-
-            "int2" | "int4" => row
-                .try_get::<_, Option<i32>>(idx)
-                .ok()
-                .flatten()
-                .map(|v| serde_json::Value::Number(v.into()))
-                .unwrap_or(serde_json::Value::Null),
-
-            "int8" => row
-                .try_get::<_, Option<i64>>(idx)
-                .ok()
-                .flatten()
-                .map(|v| serde_json::Value::Number(v.into()))
-                .unwrap_or(serde_json::Value::Null),
-
-            "float4" => row
-                .try_get::<_, Option<f32>>(idx)
-                .ok()
-                .flatten()
-                .and_then(|v| serde_json::Number::from_f64(v as f64))
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-
-            "float8" => row
-                .try_get::<_, Option<f64>>(idx)
-                .ok()
-                .flatten()
-                .and_then(serde_json::Number::from_f64)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-
-            "varchar" | "text" | "char" | "bpchar" => row
-                .try_get::<_, Option<String>>(idx)
-                .ok()
-                .flatten()
-                .map(serde_json::Value::String)
-                .unwrap_or(serde_json::Value::Null),
-
-            "timestamp" | "timestamptz" => row
-                .try_get::<_, Option<chrono::NaiveDateTime>>(idx)
-                .ok()
-                .flatten()
-                .map(|v| serde_json::Value::String(v.to_string()))
-                .unwrap_or(serde_json::Value::Null),
-
-            "json" | "jsonb" => row
-                .try_get::<_, Option<serde_json::Value>>(idx)
-                .ok()
-                .flatten()
-                .unwrap_or(serde_json::Value::Null),
-
-            "uuid" => row
-                .try_get::<_, Option<uuid::Uuid>>(idx)
-                .ok()
-                .flatten()
-                .map(|v| serde_json::Value::String(v.to_string()))
-                .unwrap_or(serde_json::Value::Null),
-
-            _ => {
-                // Try to get as string for unknown types
-                row.try_get::<_, Option<String>>(idx)
-                    .ok()
-                    .flatten()
-                    .map(serde_json::Value::String)
-                    .unwrap_or(serde_json::Value::Null)
-            }
-        };
-
-        Ok(value)
+    async fn query_columns(
+        &self,
+        schema_name: &str,
+        entity_name: &str,
+    ) -> Result<Vec<PgQueryColumn>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT columns.column_name, columns.data_type, types.typtype::text \
+                 FROM information_schema.columns AS columns \
+                 LEFT JOIN pg_catalog.pg_namespace AS namespaces \
+                   ON namespaces.nspname = columns.udt_schema \
+                 LEFT JOIN pg_catalog.pg_type AS types \
+                   ON types.typnamespace = namespaces.oid AND types.typname = columns.udt_name \
+                 WHERE columns.table_schema = $1 AND columns.table_name = $2 \
+                 ORDER BY columns.ordinal_position",
+                &[&schema_name, &entity_name],
+            )
+            .await
+            .map_err(|_error| {
+                DataError::SchemaError(format!(
+                    "Failed to inspect PostgreSQL query columns for '{}.{}'",
+                    schema_name, entity_name
+                ))
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PgQueryColumn {
+                name: row.get(0),
+                data_type: row.get(1),
+                udt_kind: row.get(2),
+            })
+            .collect())
     }
 }
 
@@ -1709,8 +1814,7 @@ impl DataSource for PostgresSource {
 
         // Row count + on-disk size. Both come from planner statistics for
         // anything large — see `row_count_and_size`.
-        let (row_count, size_bytes) =
-            Self::row_count_and_size(client, schema_name, entity_name).await;
+        let (row_count, size_bytes) = self.row_count_and_size(schema_name, entity_name).await;
 
         Ok(EntityInfo {
             namespace: schema_name.clone(),
@@ -1899,6 +2003,7 @@ impl Queryable for PostgresSource {
         }
 
         let schema_name = &container_path.segments[1];
+        let columns = self.query_columns(schema_name, entity_name).await?;
 
         let start = std::time::Instant::now();
 
@@ -1952,13 +2057,18 @@ impl Queryable for PostgresSource {
         let limit = options.limit.unwrap_or(100);
         let offset = options.offset.unwrap_or(0);
         sql.push_str(&format!(" LIMIT {} OFFSET {}", limit, offset));
+        let sql = with_wire_row_budget(&sql, &columns, options.budget)?;
 
-        debug!("Executing query: {}", sql);
+        debug!(
+            entity = entity_name,
+            limit, offset, "executing PostgreSQL data query"
+        );
 
         // Safety: SQL injection is prevented by validate_sql() for WHERE clauses
         // and escape_ident() for identifiers. The database user should be read-only
         // as defense-in-depth.
         let client = &self.client;
+        let _timeout_guard = self.query_timeout_lock.lock().await;
 
         // SECURITY / AVAILABILITY: bound the query server-side before running it.
         //
@@ -1985,43 +2095,90 @@ impl Queryable for PostgresSource {
             warn!("Failed to set statement_timeout for data browser query: {e}");
         }
 
-        let rows = client.query(&sql, &[]).await.map_err(|e| {
-            error!("PostgreSQL query failed: {}", e);
-            error!("Failed SQL: {}", sql);
-
-            // Extract detailed error message from PostgreSQL error
-            let error_msg = if let Some(db_error) = e.as_db_error() {
-                // Build detailed error message from PostgreSQL error fields
-                let mut msg = db_error.message().to_string();
-
-                if let Some(detail) = db_error.detail() {
-                    msg.push_str(&format!("\nDetail: {}", detail));
+        let stream = client
+            .query_raw(&sql, std::iter::empty::<&dyn ToSql>())
+            .await
+            .map_err(|_error| {
+                error!(entity = entity_name, limit, "PostgreSQL query failed");
+                DataError::BackendQueryFailed {
+                    backend: "PostgreSQL",
+                    entity: entity_name.to_string(),
                 }
-
-                if let Some(hint) = db_error.hint() {
-                    msg.push_str(&format!("\nHint: {}", hint));
+            })?;
+        pin_mut!(stream);
+        let mut bounded = BoundedRows::new(options.budget);
+        while let Some(row) = stream.try_next().await.map_err(|_error| {
+            error!(entity = entity_name, limit, "PostgreSQL row stream failed");
+            DataError::BackendQueryFailed {
+                backend: "PostgreSQL",
+                entity: entity_name.to_string(),
+            }
+        })? {
+            let observed = row.try_get::<_, i64>("__temps_size").map_err(|_error| {
+                error!(
+                    entity = entity_name,
+                    limit, "PostgreSQL bounded row size decode failed"
+                );
+                DataError::BackendQueryFailed {
+                    backend: "PostgreSQL",
+                    entity: entity_name.to_string(),
                 }
-
-                if let Some(position) = db_error.position() {
-                    msg.push_str(&format!("\nPosition: {:?}", position));
+            })?;
+            let observed_cell = row
+                .try_get::<_, i64>("__temps_max_cell")
+                .map_err(|_error| DataError::BackendQueryFailed {
+                    backend: "PostgreSQL",
+                    entity: entity_name.to_string(),
+                })?;
+            let payload = row
+                .try_get::<_, Option<serde_json::Value>>("__temps_row")
+                .map_err(|_error| {
+                    error!(
+                        entity = entity_name,
+                        limit, "PostgreSQL bounded row decode failed"
+                    );
+                    DataError::BackendQueryFailed {
+                        backend: "PostgreSQL",
+                        entity: entity_name.to_string(),
+                    }
+                })?
+                .ok_or_else(|| {
+                    let observed_cell = usize::try_from(observed_cell).unwrap_or(usize::MAX);
+                    let (limit_kind, limit, observed) =
+                        if observed_cell > options.budget.max_cell_bytes {
+                            (
+                                "wire_cell_bytes",
+                                options.budget.max_cell_bytes,
+                                observed_cell,
+                            )
+                        } else {
+                            (
+                                "wire_row_bytes",
+                                options.budget.max_bytes,
+                                usize::try_from(observed).unwrap_or(usize::MAX),
+                            )
+                        };
+                    DataError::ResultLimitExceeded {
+                        entity: entity_name.to_string(),
+                        limit_kind,
+                        limit,
+                        observed,
+                    }
+                })?;
+            let data_row = match payload {
+                serde_json::Value::Object(values) => values.into_iter().collect(),
+                _ => {
+                    return Err(DataError::SerializationError(format!(
+                        "PostgreSQL bounded row for entity '{}' was not an object",
+                        entity_name
+                    )))
                 }
-
-                if let Some(column) = db_error.column() {
-                    msg.push_str(&format!("\nColumn: {}", column));
-                }
-
-                msg
-            } else {
-                // Non-database error (connection error, etc.)
-                format!("{}", e)
             };
-
-            DataError::QueryFailed(format!("{}\n\nQuery: {}", error_msg, sql))
-        })?;
-
-        // Convert rows to DataRow
-        let data_rows: Result<Vec<DataRow>> = rows.iter().map(Self::row_to_datarow).collect();
-        let data_rows = data_rows?;
+            if !bounded.push(entity_name, data_row)? {
+                break;
+            }
+        }
+        let (data_rows, truncated) = bounded.into_parts();
 
         // Get schema from first row or from table schema
         let schema = self.get_schema(container_path, entity_name).await?;
@@ -2040,6 +2197,7 @@ impl Queryable for PostgresSource {
                 execution_ms,
                 has_more: row_count >= limit,
                 next_cursor: None,
+                truncated,
             },
         })
     }
@@ -2075,6 +2233,7 @@ impl Queryable for PostgresSource {
         }
 
         let client = &self.client;
+        let _timeout_guard = self.query_timeout_lock.lock().await;
 
         // SECURITY: bound this the same way `query` is bounded.
         //
@@ -2127,6 +2286,113 @@ impl Queryable for PostgresSource {
 
         let count: i64 = row.get(0);
         Ok(count > 0)
+    }
+}
+
+#[cfg(test)]
+mod wire_budget_tests {
+    use super::{with_wire_row_budget, PgQueryColumn};
+    use temps_query::QueryBudget;
+
+    #[test]
+    fn generated_query_guards_encoded_row_before_wire_transfer() {
+        let columns = vec![
+            PgQueryColumn {
+                name: "bio".to_string(),
+                data_type: "text".to_string(),
+                udt_kind: Some("b".to_string()),
+            },
+            PgQueryColumn {
+                name: "payload".to_string(),
+                data_type: "jsonb".to_string(),
+                udt_kind: Some("b".to_string()),
+            },
+        ];
+        let budget = QueryBudget {
+            max_bytes: 262_144,
+            max_cell_bytes: 65_536,
+            ..QueryBudget::default()
+        };
+        let sql = with_wire_row_budget("SELECT * FROM public.users", &columns, budget)
+            .expect("supported schema should build a bounded query");
+        assert!(sql.contains("OCTET_LENGTH(__temps_source.\"bio\")::bigint * 6"));
+        assert!(sql.contains("PG_COLUMN_COMPRESSION(__temps_source.\"payload\")"));
+        assert!(sql.contains("__temps_max_cell <= 65536"));
+        assert!(sql.contains("__temps_row_size <= 262144"));
+        assert!(sql.contains("THEN TO_JSONB(__temps_source) ELSE NULL"));
+        assert!(!sql.contains("TO_JSONB(__temps_source)::text"));
+        assert_eq!(sql.matches("TO_JSONB(__temps_source)").count(), 1);
+        assert!(sql.contains("SELECT * FROM public.users"));
+    }
+
+    #[test]
+    fn unknown_types_null_only_the_unsupported_field() {
+        let sql = with_wire_row_budget(
+            "SELECT * FROM public.widgets",
+            &[
+                PgQueryColumn {
+                    name: "id".to_string(),
+                    data_type: "bigint".to_string(),
+                    udt_kind: Some("b".to_string()),
+                },
+                PgQueryColumn {
+                    name: "shape".to_string(),
+                    data_type: "USER-DEFINED".to_string(),
+                    udt_kind: Some("b".to_string()),
+                },
+            ],
+            QueryBudget::default(),
+        )
+        .expect("an unsupported field must not make the whole relation unqueryable");
+        assert!(sql.contains("__temps_raw.\"id\" AS \"id\""));
+        assert!(sql.contains("NULL::text AS \"shape\""));
+        assert!(!sql.contains("__temps_raw.\"shape\""));
+    }
+
+    #[test]
+    fn common_builtin_and_enum_types_remain_browsable() {
+        for (data_type, udt_kind) in [
+            ("inet", Some("b")),
+            ("interval", Some("b")),
+            ("time with time zone", Some("b")),
+            ("bit varying", Some("b")),
+            ("USER-DEFINED", Some("e")),
+        ] {
+            let sql = with_wire_row_budget(
+                "SELECT * FROM public.compatibility_types",
+                &[PgQueryColumn {
+                    name: "value".to_string(),
+                    data_type: data_type.to_string(),
+                    udt_kind: udt_kind.map(str::to_string),
+                }],
+                QueryBudget::default(),
+            )
+            .expect("common bounded PostgreSQL types should remain browsable");
+            assert!(sql.contains("TO_JSONB(__temps_source)"));
+        }
+    }
+
+    #[test]
+    fn arrays_use_compression_aware_admission_before_json_generation() {
+        for name in [
+            "token_tok_live_secret",
+            "large_numeric_array",
+            "custom_type_array",
+        ] {
+            let sql = with_wire_row_budget(
+                "SELECT * FROM public.array_payloads",
+                &[PgQueryColumn {
+                    name: name.to_string(),
+                    data_type: "ARRAY".to_string(),
+                    udt_kind: Some("b".to_string()),
+                }],
+                QueryBudget::default(),
+            )
+            .expect("array columns should remain browsable through bounded admission");
+            assert!(sql.contains("PG_COLUMN_COMPRESSION"));
+            assert!(sql.contains("PG_COLUMN_SIZE"));
+            assert_eq!(sql.matches("TO_JSONB(__temps_source)").count(), 1);
+        }
     }
 }
 
@@ -2214,6 +2480,21 @@ mod tests {
         runners::AsyncRunner,
         GenericImage, ImageExt,
     };
+
+    fn container_runtime_unavailable(error: &str) -> bool {
+        let message = error.to_ascii_lowercase();
+        [
+            "hyper legacy client: client error (connect)",
+            "failed to connect to docker",
+            "error connecting to docker",
+            "docker daemon is unavailable",
+            "docker client is unavailable",
+            "could not find docker environment",
+            "docker socket",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
+    }
 
     #[test]
     fn ip_is_private_allows_local_and_mesh_addresses() {
@@ -2808,6 +3089,275 @@ mod tests {
             )
         };
         drop(source);
+    }
+
+    #[tokio::test]
+    async fn oversized_first_row_is_rejected_by_real_postgres_query() {
+        let container = match GenericImage::new("postgres", "18-alpine")
+            .with_exposed_port(ContainerPort::Tcp(5432))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) if container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker unavailable; skipping PostgreSQL row-budget test: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to start PostgreSQL row-budget container: {error}"),
+        };
+        let host = container
+            .get_host()
+            .await
+            .expect("started PostgreSQL container must expose its host")
+            .to_string();
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("started PostgreSQL container must expose port 5432");
+        let source = std::sync::Arc::new(
+            PostgresSource::connect(&host, port, "postgres", "", "postgres")
+                .await
+                .expect("started PostgreSQL container must accept source connections"),
+        );
+        source
+            .client
+            .batch_execute(
+                "CREATE TABLE oversized_rows (id bigint, payload text); \
+                 INSERT INTO oversized_rows VALUES (1, repeat('x', 2097152));",
+            )
+            .await
+            .expect("oversized row fixture should be created");
+        let budget = QueryBudget {
+            max_bytes: 128 * 1024,
+            max_cell_bytes: 64 * 1024,
+            ..QueryBudget::default()
+        };
+        let error = source
+            .query(
+                &ContainerPath::from_slice(&["postgres", "public"]),
+                "oversized_rows",
+                None,
+                QueryOptions {
+                    limit: Some(1),
+                    budget,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect_err("the first oversized row must be rejected");
+        assert!(matches!(
+            error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "wire_cell_bytes",
+                ..
+            }
+        ));
+
+        source
+            .client
+            .batch_execute(
+                "CREATE TABLE array_rows (id bigint, tags text[]); \
+                 INSERT INTO array_rows VALUES (1, ARRAY['alpha', 'beta']);",
+            )
+            .await
+            .expect("array fixture should be created");
+        let result = source
+            .query(
+                &ContainerPath::from_slice(&["postgres", "public"]),
+                "array_rows",
+                None,
+                QueryOptions {
+                    limit: Some(1),
+                    budget,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect("bounded PostgreSQL arrays should remain browsable");
+        assert_eq!(result.rows[0]["tags"], serde_json::json!(["alpha", "beta"]));
+
+        source
+            .client
+            .batch_execute(
+                "CREATE TYPE browse_state AS ENUM ('ready', 'paused'); \
+                 CREATE TABLE compatibility_types (\
+                     state browse_state, address inet, duration interval, \
+                     clock time with time zone, flags bit varying\
+                 ); \
+                 INSERT INTO compatibility_types VALUES (\
+                     'ready', '192.0.2.1', interval '1 hour', '12:34:56+00', B'1010'\
+                 );",
+            )
+            .await
+            .expect("common PostgreSQL type fixture should be created");
+        let compatible = source
+            .query(
+                &ContainerPath::from_slice(&["postgres", "public"]),
+                "compatibility_types",
+                None,
+                QueryOptions {
+                    limit: Some(1),
+                    budget,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect("common PostgreSQL built-ins and enums should remain browsable");
+        assert_eq!(compatible.rows[0]["state"], serde_json::json!("ready"));
+        assert_eq!(
+            compatible.rows[0]["address"],
+            serde_json::json!("192.0.2.1")
+        );
+        assert_eq!(compatible.rows[0]["flags"], serde_json::json!("1010"));
+
+        source
+            .client
+            .batch_execute(
+                "CREATE TABLE compressed_varbit_rows (id bigint, flags bit varying); \
+                 INSERT INTO compressed_varbit_rows VALUES \
+                     (1, repeat('1', 2097152)::bit varying);",
+            )
+            .await
+            .expect("compressed varbit fixture should be created");
+        let compressed_error = source
+            .query(
+                &ContainerPath::from_slice(&["postgres", "public"]),
+                "compressed_varbit_rows",
+                None,
+                QueryOptions {
+                    limit: Some(1),
+                    budget,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect_err("TOAST-compressed varbit must fail admission before JSON expansion");
+        assert!(matches!(
+            compressed_error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "wire_cell_bytes",
+                ..
+            }
+        ));
+
+        source
+            .client
+            .batch_execute(
+                "CREATE TYPE opaque_payload AS (secret text); \
+                 CREATE TABLE extension_rows (id bigint, payload opaque_payload); \
+                 INSERT INTO extension_rows VALUES (1, ROW('hidden')::opaque_payload);",
+            )
+            .await
+            .expect("unsupported extension fixture should be created");
+        let extension_row = source
+            .query(
+                &ContainerPath::from_slice(&["postgres", "public"]),
+                "extension_rows",
+                None,
+                QueryOptions {
+                    limit: Some(1),
+                    budget,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect("unsupported extension field must not hide supported row fields");
+        assert_eq!(extension_row.rows[0]["id"], serde_json::json!(1));
+        assert_eq!(extension_row.rows[0]["payload"], serde_json::Value::Null);
+
+        source
+            .client
+            .batch_execute(
+                "CREATE VIEW slow_rows AS \
+                 SELECT 1::bigint AS id FROM (SELECT pg_sleep(0.2)) AS delay;",
+            )
+            .await
+            .expect("slow view fixture should be created");
+        let query_source = source.clone();
+        let count_source = source.clone();
+        let held_timeout_lock = source.query_timeout_lock.lock().await;
+        let query_task = tokio::spawn(async move {
+            query_source
+                .query(
+                    &ContainerPath::from_slice(&["postgres", "public"]),
+                    "slow_rows",
+                    None,
+                    QueryOptions {
+                        limit: Some(1),
+                        timeout_ms: Some(10),
+                        ..QueryOptions::default()
+                    },
+                )
+                .await
+        });
+        // Queue the short-timeout row query first, then the count. The shared
+        // mutex must keep count's 10s timeout from overwriting the row query's
+        // 10ms timeout on their single PostgreSQL session.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let count_task = tokio::spawn(async move {
+            count_source
+                .count(
+                    &ContainerPath::from_slice(&["postgres", "public"]),
+                    "slow_rows",
+                    None,
+                )
+                .await
+        });
+        drop(held_timeout_lock);
+
+        let query_error = query_task
+            .await
+            .expect("row query task should join")
+            .expect_err("10ms row query must time out before the count changes the session");
+        assert!(matches!(query_error, DataError::BackendQueryFailed { .. }));
+        assert_eq!(
+            count_task
+                .await
+                .expect("count task should join")
+                .expect("count should inherit its own timeout"),
+            1
+        );
+
+        let held_timeout_lock = source.query_timeout_lock.lock().await;
+        let metadata_source = source.clone();
+        let count_source = source.clone();
+        let metadata_task = tokio::spawn(async move {
+            metadata_source
+                .row_count_and_size_with_timeout("public", "slow_rows", 10)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let count_task = tokio::spawn(async move {
+            count_source
+                .count(
+                    &ContainerPath::from_slice(&["postgres", "public"]),
+                    "slow_rows",
+                    None,
+                )
+                .await
+        });
+        drop(held_timeout_lock);
+
+        let (metadata_count, _) = metadata_task
+            .await
+            .expect("entity-info metadata task should join");
+        assert_eq!(
+            metadata_count, None,
+            "entity-info fallback COUNT(*) must be cancelled by its own timeout"
+        );
+        assert_eq!(
+            count_task
+                .await
+                .expect("post-metadata count task should join")
+                .expect("count should receive its own timeout after entity-info"),
+            1
+        );
     }
 
     #[tokio::test]

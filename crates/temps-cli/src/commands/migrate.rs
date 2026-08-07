@@ -34,7 +34,9 @@
 
 use clap::Args;
 use colored::Colorize;
+use std::future::Future;
 use std::io::{IsTerminal, Write};
+use std::sync::Arc;
 use tracing::info;
 
 #[derive(Args)]
@@ -58,6 +60,88 @@ pub struct MigrateCommand {
     /// Log format: compact, full
     #[arg(long, env = "TEMPS_LOG_FORMAT", default_value = "compact")]
     pub log_format: String,
+}
+
+enum MaintenanceRace<T> {
+    Completed(T),
+    Interrupted,
+}
+
+async fn race_maintenance<M, I, T>(maintenance: M, interrupt: I) -> MaintenanceRace<T>
+where
+    M: Future<Output = T>,
+    I: Future,
+{
+    tokio::select! {
+        result = maintenance => MaintenanceRace::Completed(result),
+        _ = interrupt => MaintenanceRace::Interrupted,
+    }
+}
+
+async fn interrupted_maintenance_error(
+    database_url: &str,
+    backend_pid: i32,
+    phase: &str,
+) -> anyhow::Error {
+    println!();
+    println!("{}", format!("Interrupted — cancelling {phase}…").yellow());
+    match temps_database::cancel_migration_backend(database_url, backend_pid).await {
+        Ok(()) => anyhow::anyhow!(
+            "{phase} was interrupted and PostgreSQL confirmed the statement on backend \
+             {backend_pid} is no longer active. \
+             Re-run `temps migrate` to repair any invalid concurrent index and continue."
+        ),
+        Err(error) => anyhow::anyhow!(
+            "{phase} was interrupted, but PostgreSQL did not confirm that backend {backend_pid} \
+             stopped: {error}. Do not rerun migrations until that PID is no longer active; check \
+             `SELECT pid, state, query FROM pg_stat_activity WHERE pid = {backend_pid}`."
+        ),
+    }
+}
+
+async fn run_post_migration_maintenance(
+    db: &Arc<temps_database::DbConnection>,
+    database_url: &str,
+    backend_pid: i32,
+) -> anyhow::Result<()> {
+    match race_maintenance(
+        temps_database::run_post_migration_indexes(db),
+        tokio::signal::ctrl_c(),
+    )
+    .await
+    {
+        MaintenanceRace::Completed(result) => result?,
+        MaintenanceRace::Interrupted => {
+            return Err(interrupted_maintenance_error(
+                database_url,
+                backend_pid,
+                "post-migration index creation",
+            )
+            .await)
+        }
+    }
+
+    match race_maintenance(
+        temps_database::run_post_migration_backfill(db),
+        tokio::signal::ctrl_c(),
+    )
+    .await
+    {
+        MaintenanceRace::Completed(Ok(())) => {}
+        MaintenanceRace::Completed(Err(error)) => {
+            info!("Post-migration backfill skipped/failed (refresh policy will catch up): {error}");
+        }
+        MaintenanceRace::Interrupted => {
+            return Err(interrupted_maintenance_error(
+                database_url,
+                backend_pid,
+                "post-migration backfill",
+            )
+            .await)
+        }
+    }
+
+    Ok(())
 }
 
 impl MigrateCommand {
@@ -90,6 +174,12 @@ impl MigrateCommand {
                     "{}",
                     "✓ Database already up to date — no migrations to apply.".green()
                 );
+                if !self.dry_run {
+                    // Non-transactional maintenance must remain retryable even
+                    // after every schema migration is already recorded.
+                    run_post_migration_maintenance(&db, &self.database_url, backend_pid).await?;
+                    println!("{}", "✓ Post-migration maintenance complete.".green());
+                }
                 return Ok(());
             }
 
@@ -133,25 +223,11 @@ impl MigrateCommand {
                     res.map_err(|e| anyhow::anyhow!("{}", e))?
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    println!();
-                    println!(
-                        "{}",
-                        "Interrupted — cancelling the running migration…".yellow()
-                    );
-                    if let Err(e) =
-                        temps_database::cancel_migration_backend(&self.database_url, backend_pid)
-                            .await
-                    {
-                        eprintln!("  could not cancel the database backend: {e}");
-                        eprintln!(
-                            "  check manually: SELECT pg_cancel_backend({backend_pid});"
-                        );
-                    }
-                    anyhow::bail!(
-                        "Migration interrupted. The in-flight migration was cancelled and \
-                         rolled back; the database is at the last successfully-applied \
-                         migration. Re-run `temps migrate` to continue."
-                    );
+                    return Err(interrupted_maintenance_error(
+                        &self.database_url,
+                        backend_pid,
+                        "migration execution",
+                    ).await);
                 }
             };
 
@@ -173,11 +249,11 @@ impl MigrateCommand {
                 );
             }
 
-            // Continuous-aggregate backfill is idempotent and safe to run here
-            // (the operator is already waiting on this command).
-            if let Err(e) = temps_database::run_post_migration_backfill(&db).await {
-                info!("Post-migration backfill skipped/failed (refresh policy will catch up): {e}");
-            }
+            // Keep Ctrl+C active through non-transactional maintenance too.
+            // Tokio's process-wide signal handler remains installed after the
+            // migration select above, so awaiting these phases directly would
+            // swallow a later SIGINT and leave the operator unable to cancel.
+            run_post_migration_maintenance(&db, &self.database_url, backend_pid).await?;
 
             let total: std::time::Duration = report.results.iter().map(|r| r.elapsed).sum();
             println!(
@@ -299,5 +375,22 @@ fn format_elapsed(d: std::time::Duration) -> String {
     } else {
         let secs = d.as_secs();
         format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{race_maintenance, MaintenanceRace};
+
+    #[tokio::test]
+    async fn maintenance_race_observes_interrupts_after_migrations_finish() {
+        let result = race_maintenance(std::future::pending::<()>(), std::future::ready(())).await;
+        assert!(matches!(result, MaintenanceRace::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn maintenance_race_returns_completed_work() {
+        let result = race_maintenance(std::future::ready(42), std::future::pending::<()>()).await;
+        assert!(matches!(result, MaintenanceRace::Completed(42)));
     }
 }

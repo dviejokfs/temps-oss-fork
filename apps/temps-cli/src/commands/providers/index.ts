@@ -961,7 +961,7 @@ async function syncConnectionAction(options: IdOptions): Promise<void> {
     return data
   })
 
-  success(`Repository sync started for connection ${id}`)
+  success(`Repository sync started for connection ${result?.connection_id ?? id}`)
   if (result?.started_at) {
     info(`Started at: ${result.started_at}`)
   }
