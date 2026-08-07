@@ -60,6 +60,64 @@ The shortest way to spot a missing step: TypeScript compile errors
 in `web/src/` that say "Module ... has no exported member ...". That
 means the SDK is stale.
 
+## Never overwrite `apps/temps-cli/openapi.json` with the raw server response
+
+The CLI's SDK is generated from a **committed** copy of the spec at
+`apps/temps-cli/openapi.json`. That file is ~92,000 lines of formatted
+JSON; the server serves the same document minified on one line, with
+keys in whatever order serde produced.
+
+So `curl .../openapi.json > apps/temps-cli/openapi.json` turns a
+92,000-line file into a 1-line file, and the pull request reports
+**-92,000 deletions** — burying the actual change and making the diff
+unreviewable. Pretty-printing alone is not enough either: key order is
+not stable between builds, so an unsorted dump reorders huge blocks for
+no reason.
+
+Use the script, which fetches, sorts keys recursively, indents by two
+and keeps the trailing newline:
+
+```bash
+cd apps/temps-cli
+TEMPS_API_KEY=tk_... bun run spec:update --url http://localhost:8080/api/api-docs/openapi.json
+bun run generate:api        # regenerate the client from the file
+bun run scripts/generate-docs.ts --output docs/CLI.md
+bun run scripts/generate-docs.ts --format mdx --output docs/CLI.mdx
+```
+
+Sanity check before committing — a few new endpoints should be a few
+hundred changed lines, never tens of thousands:
+
+```bash
+git diff --numstat -- apps/temps-cli/openapi.json
+```
+
+`web/src/api/client/` has no committed spec; it is generated straight
+from the live server by `bun run openapi-ts` (see above), so it does not
+have this failure mode.
+
+## Resolving merge conflicts in generated clients
+
+Conflicts in `web/src/api/client/**`, `apps/temps-cli/src/api/**` or
+`apps/temps-cli/openapi.json` are conflicts in **build output**. Do not
+hand-merge them, and do not hand-pick hunks — the result is a client
+that matches neither side's spec.
+
+Take either side to clear the conflict, then regenerate from a server
+built off the merged source:
+
+```bash
+git checkout --ours -- web/src/api/client apps/temps-cli/src/api apps/temps-cli/openapi.json
+git add web/src/api/client apps/temps-cli/src/api apps/temps-cli/openapi.json
+# build + start the merged server, then:
+cd apps/temps-cli && bun run spec:update --url <server>/api/api-docs/openapi.json && bun run generate:api
+cd ../../web && bun run openapi-ts
+```
+
+Then `bun run typecheck` (or `npx tsc --noEmit`) in both `web/` and
+`apps/temps-cli/`. A clean typecheck is what proves the regenerated
+client still satisfies every caller on both sides of the merge.
+
 ## Scope Docker usage on shared hosts
 
 This host may already be running a live Temps instance or other

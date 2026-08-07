@@ -21,6 +21,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Leave the project in non-compilable state
 - Use `#[tokio::main]` when integrating with pingora
 - Use plain text logging -- ALWAYS use structured JSONL logging
+- Overwrite `apps/temps-cli/openapi.json` with the raw server response (`curl ... > openapi.json`) -- the committed file is ~92,000 lines of sorted, indented JSON and the server serves it minified on one line, so a direct write reports **-92,000 deletions** and buries the real change. ALWAYS use `cd apps/temps-cli && bun run spec:update` (see [Regenerating the OpenAPI clients](#regenerating-the-openapi-clients))
 - Create markdown documentation files unless explicitly requested
 - Mark Docker tests with `#[ignore]` -- they MUST skip gracefully at runtime instead
 - Create error types with generic messages -- ALWAYS include IDs, names, and operation context
@@ -730,6 +731,36 @@ async fn create_backup(
 - All write operations (POST, PATCH, DELETE) must include audit logging
 - Convert entities to response DTOs via `From` trait
 - Register all handlers in `ApiDoc` with `#[openapi(...)]`
+
+### Regenerating the OpenAPI clients
+
+Two generated clients consume the spec, and they are refreshed differently:
+
+| Client | Source of truth | Refresh with |
+|---|---|---|
+| `web/src/api/client/` | the **live server** | `cd web && bun run openapi-ts` |
+| `apps/temps-cli/src/api/` | the **committed** `apps/temps-cli/openapi.json` | `cd apps/temps-cli && bun run spec:update && bun run generate:api` |
+
+After any change to handlers, request/response shapes, schemas or routes:
+restart `temps serve`, then refresh both. Commit the regenerated files --
+they are tracked so reviewers see the API delta.
+
+`apps/temps-cli/openapi.json` must stay in its canonical shape: **keys sorted
+recursively, two-space indent, trailing newline**. `bun run spec:update` is the
+only supported way to write it. Sorting is what keeps a diff proportional to
+the API change instead of to serde's iteration order, which is not stable
+between builds.
+
+Verify before committing -- adding a few endpoints is a few hundred changed
+lines, never tens of thousands:
+
+```bash
+git diff --numstat -- apps/temps-cli/openapi.json
+```
+
+Merge conflicts in either client are conflicts in build output. Never
+hand-merge them: take one side to clear the conflict, then regenerate from a
+server built off the merged source and typecheck both packages.
 
 ### Permission System
 
