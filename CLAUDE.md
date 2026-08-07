@@ -751,8 +751,22 @@ only supported way to write it. Sorting is what keeps a diff proportional to
 the API change instead of to serde's iteration order, which is not stable
 between builds.
 
-Verify before committing -- adding a few endpoints is a few hundred changed
-lines, never tens of thousands:
+This is enforced, not just documented. `bun run spec:check` verifies the
+committed file -- it reads only what is on disk, so it needs no server and no
+`bun install`, and it runs both as a pre-commit hook and as the
+**OpenAPI Spec Format** job on every pull request:
+
+```bash
+cd apps/temps-cli
+bun run spec:check          # verify; exits 1 with the reason
+bun run spec:check --fix    # reformat what is already committed (does not fetch)
+```
+
+`--fix` only reformats. When the API itself changed you still need
+`bun run spec:update` against a running server, then `bun run generate:api`.
+
+Sanity-check the size before committing -- adding a few endpoints is a few
+hundred changed lines, never tens of thousands:
 
 ```bash
 git diff --numstat -- apps/temps-cli/openapi.json

@@ -2,16 +2,9 @@
 /**
  * Refresh `openapi.json` from a running temps server, in a canonical shape.
  *
- * Why this exists: the server emits the spec minified and with whatever key
- * order serde produced. Writing that straight to disk replaces a ~92,000-line
- * pretty-printed file with a single line, so the pull request reports ~-92,000
- * deletions and the real change is invisible to reviewers. Key order is not
- * stable across builds either, so even a pretty-printed dump reorders large
- * blocks for no reason.
- *
- * Canonical form is therefore: keys sorted, two-space indent, trailing
- * newline. Sorting is what makes the diff proportional to the API change
- * rather than to serde's iteration order.
+ * Why this exists, and what "canonical" means, is documented once in
+ * `openapi-canonical.ts` — this script is the fetching half, `check-openapi.ts`
+ * is the verifying half, and both share that definition so they cannot drift.
  *
  * Usage:
  *   bun run scripts/update-openapi.ts                     # localhost:8080
@@ -22,26 +15,9 @@
  *   bun run generate:api
  */
 
-const DEFAULT_URL = 'http://localhost:8080/api/api-docs/openapi.json'
-const OUTPUT = new URL('../openapi.json', import.meta.url).pathname
+import { SPEC_PATH, pathCount, serialize } from './openapi-canonical'
 
-/** Recursively sort object keys so the on-disk order never depends on the server. */
-function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    // Array order is meaningful in OpenAPI (parameter lists, enum values) —
-    // sort the contents, never the sequence.
-    return value.map(canonicalize)
-  }
-  if (value && typeof value === 'object') {
-    const source = value as Record<string, unknown>
-    return Object.fromEntries(
-      Object.keys(source)
-        .sort()
-        .map((key) => [key, canonicalize(source[key])])
-    )
-  }
-  return value
-}
+const DEFAULT_URL = 'http://localhost:8080/api/api-docs/openapi.json'
 
 function parseArgs(argv: string[]): { url: string } {
   const index = argv.indexOf('--url')
@@ -76,13 +52,14 @@ if (!response.ok) {
 }
 
 const spec = await response.json()
-if (!spec?.paths || Object.keys(spec.paths).length === 0) {
+const paths = pathCount(spec)
+if (paths === 0) {
   // A spec with no paths means the server answered but the doc was not
   // assembled — writing it would silently delete the entire committed client.
   console.error('Refusing to write: the fetched spec has no paths.')
   process.exit(1)
 }
 
-await Bun.write(OUTPUT, `${JSON.stringify(canonicalize(spec), null, 2)}\n`)
-console.log(`Wrote ${OUTPUT} (${Object.keys(spec.paths).length} paths)`)
+await Bun.write(SPEC_PATH, serialize(spec))
+console.log(`Wrote ${SPEC_PATH} (${paths} paths)`)
 console.log('Now run: bun run generate:api')
