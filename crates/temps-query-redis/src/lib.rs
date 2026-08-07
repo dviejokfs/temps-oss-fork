@@ -47,6 +47,8 @@ pub struct RedisSource {
 /// data-browser request cannot monopolize the linked Redis server.
 const MAX_REDIS_VALUE_OFFSET: usize = 1_000;
 const MAX_REDIS_AGGREGATE_PAGE_ITEMS: usize = 100;
+/// Atomic Lua must never replay an unbounded number of sparse SCAN buckets.
+const MAX_REDIS_SCAN_CALLS: usize = 128;
 
 fn redis_aggregate_limit(options: &QueryOptions) -> Result<usize> {
     // A JSON array/object consumes at least two structural elements per Redis
@@ -100,6 +102,7 @@ impl RedisSource {
         limit: usize,
         max_cell_bytes: usize,
         limit_kind: &'static str,
+        max_scan_calls: usize,
     ) -> Result<(Vec<String>, bool)> {
         const SCRIPT: &str = r#"
 local cursor = '0'
@@ -107,12 +110,15 @@ local skipped = 0
 local values = {}
 local estimated = 2
 local has_more = 0
+local scan_calls = 0
 local encoding = redis.call('OBJECT', 'ENCODING', KEYS[1])
 if encoding == 'listpack' or encoding == 'ziplist' or encoding == 'intset' then
   local allocated = redis.call('MEMORY', 'USAGE', KEYS[1]) or 0
   if allocated > tonumber(ARGV[3]) then return {0, allocated, 0, {}} end
 end
 repeat
+  if scan_calls >= tonumber(ARGV[4]) then return {2, scan_calls + 1, 1, {}} end
+  scan_calls = scan_calls + 1
   local page = redis.call('SSCAN', KEYS[1], cursor, 'COUNT', 1)
   cursor = page[1]
   for _, value in ipairs(page[2]) do
@@ -140,6 +146,7 @@ return {1, estimated, has_more, values}
                 .arg(offset)
                 .arg(limit)
                 .arg(max_cell_bytes)
+                .arg(max_scan_calls)
                 .invoke_async(conn)
                 .await
                 .map_err(|error: RedisError| {
@@ -157,6 +164,14 @@ return {1, estimated, has_more, values}
                 observed,
             ));
         }
+        if admitted == 2 {
+            return Err(Self::wire_budget_error(
+                key,
+                "scan_iterations",
+                max_scan_calls,
+                observed,
+            ));
+        }
         Ok((values, has_more != 0))
     }
 
@@ -167,6 +182,7 @@ return {1, estimated, has_more, values}
         limit: usize,
         max_cell_bytes: usize,
         limit_kind: &'static str,
+        max_scan_calls: usize,
     ) -> Result<(Vec<(String, String)>, bool)> {
         const SCRIPT: &str = r#"
 local cursor = '0'
@@ -174,12 +190,15 @@ local skipped = 0
 local values = {}
 local estimated = 2
 local has_more = 0
+local scan_calls = 0
 local encoding = redis.call('OBJECT', 'ENCODING', KEYS[1])
 if encoding == 'listpack' or encoding == 'ziplist' then
   local allocated = redis.call('MEMORY', 'USAGE', KEYS[1]) or 0
   if allocated > tonumber(ARGV[3]) then return {0, allocated, 0, {}} end
 end
 repeat
+  if scan_calls >= tonumber(ARGV[4]) then return {2, scan_calls + 1, 1, {}} end
+  scan_calls = scan_calls + 1
   local page = redis.call('HSCAN', KEYS[1], cursor, 'COUNT', 1)
   cursor = page[1]
   for index = 1, #page[2], 2 do
@@ -210,6 +229,7 @@ return {1, estimated, has_more, values}
                 .arg(offset)
                 .arg(limit)
                 .arg(max_cell_bytes)
+                .arg(max_scan_calls)
                 .invoke_async(conn)
                 .await
                 .map_err(|error: RedisError| {
@@ -224,6 +244,14 @@ return {1, estimated, has_more, values}
                 key,
                 limit_kind,
                 max_cell_bytes,
+                observed,
+            ));
+        }
+        if admitted == 2 {
+            return Err(Self::wire_budget_error(
+                key,
+                "scan_iterations",
+                max_scan_calls,
                 observed,
             ));
         }
@@ -635,6 +663,7 @@ return {1, estimated, has_more, values}
                     aggregate_limit,
                     wire_cap,
                     wire_limit_kind,
+                    MAX_REDIS_SCAN_CALLS,
                 )
                 .await?;
                 truncated = has_more;
@@ -666,6 +695,7 @@ return {1, estimated, has_more, values}
                     aggregate_limit,
                     wire_cap,
                     wire_limit_kind,
+                    MAX_REDIS_SCAN_CALLS,
                 )
                 .await?;
                 truncated = has_more;
@@ -1311,6 +1341,81 @@ mod tests {
             DataError::ResultLimitExceeded {
                 limit_kind: "response_bytes",
                 limit: 64,
+                ..
+            }
+        ));
+
+        // Deletion can leave Redis hash tables extremely sparse. A logical
+        // offset replay must still stop after a fixed number of atomic SCAN
+        // calls instead of monopolizing the Redis event loop.
+        let mut sparse_set_deletes = redis::pipe();
+        for index in 0..3_999 {
+            sparse_set_deletes
+                .cmd("SREM")
+                .arg("large-set")
+                .arg(format!("member-{index:04}-{}", "x".repeat(300)))
+                .ignore();
+        }
+        sparse_set_deletes
+            .query_async::<()>(&mut connection)
+            .await?;
+        let sparse_set_error = RedisSource::scan_set_page(
+            &mut connection,
+            "large-set",
+            0,
+            100,
+            QueryBudget::default().max_cell_bytes,
+            "cell_bytes",
+            1,
+        )
+        .await
+        .expect_err("sparse SSCAN replay must stop at its atomic work cap");
+        assert!(matches!(
+            sparse_set_error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "scan_iterations",
+                limit: 1,
+                ..
+            }
+        ));
+
+        let mut sparse_hash = redis::pipe();
+        for index in 0..4_000 {
+            sparse_hash
+                .cmd("HSET")
+                .arg("sparse-hash")
+                .arg(format!("field-{index:04}"))
+                .arg("value")
+                .ignore();
+        }
+        sparse_hash.query_async::<()>(&mut connection).await?;
+        let mut sparse_hash_deletes = redis::pipe();
+        for index in 0..3_999 {
+            sparse_hash_deletes
+                .cmd("HDEL")
+                .arg("sparse-hash")
+                .arg(format!("field-{index:04}"))
+                .ignore();
+        }
+        sparse_hash_deletes
+            .query_async::<()>(&mut connection)
+            .await?;
+        let sparse_hash_error = RedisSource::scan_hash_page(
+            &mut connection,
+            "sparse-hash",
+            0,
+            100,
+            QueryBudget::default().max_cell_bytes,
+            "cell_bytes",
+            1,
+        )
+        .await
+        .expect_err("sparse HSCAN replay must stop at its atomic work cap");
+        assert!(matches!(
+            sparse_hash_error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "scan_iterations",
+                limit: 1,
                 ..
             }
         ));

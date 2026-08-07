@@ -811,10 +811,30 @@ impl PostgresSource {
     /// lookup fails (e.g. insufficient privileges), which callers already
     /// render as "—" rather than as zero.
     async fn row_count_and_size(
-        client: &tokio_postgres::Client,
+        &self,
         schema_name: &str,
         entity_name: &str,
     ) -> (Option<usize>, Option<u64>) {
+        self.row_count_and_size_with_timeout(schema_name, entity_name, DEFAULT_COUNT_TIMEOUT_MS)
+            .await
+    }
+
+    async fn row_count_and_size_with_timeout(
+        &self,
+        schema_name: &str,
+        entity_name: &str,
+        timeout_ms: u64,
+    ) -> (Option<usize>, Option<u64>) {
+        let client = &self.client;
+        let _timeout_guard = self.query_timeout_lock.lock().await;
+        if let Err(error) = client
+            .batch_execute(&format!("SET statement_timeout = {timeout_ms}"))
+            .await
+        {
+            warn!(%error, "failed to bound PostgreSQL entity-info statistics query");
+            return (None, None);
+        }
+
         let qualified = format!(
             "\"{}\".\"{}\"",
             escape_ident(schema_name),
@@ -1730,8 +1750,7 @@ impl DataSource for PostgresSource {
 
         // Row count + on-disk size. Both come from planner statistics for
         // anything large — see `row_count_and_size`.
-        let (row_count, size_bytes) =
-            Self::row_count_and_size(client, schema_name, entity_name).await;
+        let (row_count, size_bytes) = self.row_count_and_size(schema_name, entity_name).await;
 
         Ok(EntityInfo {
             namespace: schema_name.clone(),
@@ -3116,6 +3135,41 @@ mod tests {
                 .await
                 .expect("count task should join")
                 .expect("count should inherit its own timeout"),
+            1
+        );
+
+        let held_timeout_lock = source.query_timeout_lock.lock().await;
+        let metadata_source = source.clone();
+        let count_source = source.clone();
+        let metadata_task = tokio::spawn(async move {
+            metadata_source
+                .row_count_and_size_with_timeout("public", "slow_rows", 10)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let count_task = tokio::spawn(async move {
+            count_source
+                .count(
+                    &ContainerPath::from_slice(&["postgres", "public"]),
+                    "slow_rows",
+                    None,
+                )
+                .await
+        });
+        drop(held_timeout_lock);
+
+        let (metadata_count, _) = metadata_task
+            .await
+            .expect("entity-info metadata task should join");
+        assert_eq!(
+            metadata_count, None,
+            "entity-info fallback COUNT(*) must be cancelled by its own timeout"
+        );
+        assert_eq!(
+            count_task
+                .await
+                .expect("post-metadata count task should join")
+                .expect("count should receive its own timeout after entity-info"),
             1
         );
     }
