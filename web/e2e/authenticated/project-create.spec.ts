@@ -1,4 +1,10 @@
-import { expect, expectAppMounted, test, urlForProject } from '../fixtures'
+import {
+  expect,
+  expectAppMounted,
+  test,
+  uniqueSlug,
+  urlForProject,
+} from '../fixtures'
 
 /**
  * Creates a project from a PUBLIC git repository, entirely through the UI.
@@ -18,24 +24,12 @@ import { expect, expectAppMounted, test, urlForProject } from '../fixtures'
 const PUBLIC_REPO_URL =
   process.env.E2E_REPO_URL ?? 'https://github.com/gotempsh/temps.git'
 
-/**
- * Unique per run AND per retry.
- *
- * The retry index matters: if an attempt creates the project and then fails
- * later in the flow, a retry reusing the same name hits a duplicate-name error
- * and fails permanently -- turning a transient problem into a hard red.
- */
-function projectName(retry: number): string {
-  const run = process.env.GITHUB_RUN_ID ?? String(process.hrtime.bigint())
-  return `e2e-ui-${run.slice(-8)}-${retry}`.toLowerCase().slice(0, 32)
-}
-
 test.describe('project creation', () => {
   test('creates a project from a public git URL', async ({
     page,
     consoleErrors,
   }, testInfo) => {
-    const name = projectName(testInfo.retry)
+    const name = uniqueSlug('e2e-ui', testInfo)
 
     await page.goto('/projects/new')
     await expectAppMounted(page)
@@ -86,21 +80,34 @@ test.describe('project creation', () => {
       .getByRole('button', { name: 'Create Project', exact: true })
       .click()
 
-    // Landing on the project page is the success signal.
-    await page.waitForURL(urlForProject(name), { timeout: 60_000 })
-    await expectAppMounted(page)
-    await expect(
-      page.getByRole('heading', { name, exact: true }).first()
-    ).toBeVisible()
+    try {
+      // Landing on the project page is the success signal.
+      await page.waitForURL(urlForProject(name), { timeout: 60_000 })
+      await expectAppMounted(page)
+      await expect(
+        page.getByRole('heading', { name, exact: true }).first()
+      ).toBeVisible()
 
-    // And it must survive a reload -- i.e. it was actually persisted, not just
-    // rendered optimistically from local state.
-    await page.goto('/projects')
-    await expect(page.getByText(name, { exact: true }).first()).toBeVisible({
-      timeout: 30_000,
-    })
+      // And it must survive a reload -- i.e. it was actually persisted, not
+      // just rendered optimistically from local state.
+      await page.goto('/projects')
+      await expect(page.getByText(name, { exact: true }).first()).toBeVisible({
+        timeout: 30_000,
+      })
 
-    expect(consoleErrors).toEqual([])
+      expect(consoleErrors).toEqual([])
+    } finally {
+      // Every run creates a real project; without cleanup they accumulate
+      // forever and eventually collide with slug uniqueness or pollute the
+      // /projects list other specs assert against. Resolve by slug (the UI
+      // never exposes the numeric id) and delete unconditionally, even on
+      // assertion failure above.
+      const found = await page.request.get(`/api/projects/by-slug/${name}`)
+      if (found.ok()) {
+        const project = (await found.json()) as { id: number }
+        await page.request.delete(`/api/projects/${project.id}`)
+      }
+    }
   })
 
   test('surfaces a clear error for an unreachable repository', async ({

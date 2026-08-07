@@ -363,7 +363,18 @@ export async function assertNotConsoleFallback(opts: {
   )
 }
 
-/** A stable, unique-ish run id derived from a timestamp passed in by the caller. */
+/**
+ * A run id derived from a timestamp passed in by the caller, plus a random
+ * suffix.
+ *
+ * The timestamp alone collides when two scenario runs start within the same
+ * millisecond — realistic whenever more than one `scenario`/`examples`
+ * process is launched concurrently (parallel CI shards, a dev running two
+ * terminals). The random suffix makes each call unique regardless of timing;
+ * the timestamp prefix is kept so ids still sort roughly chronologically for
+ * debugging.
+ */
 export function makeRunId(nowMs: number): string {
-  return `e2e-${nowMs.toString(36)}`
+  const rand = Math.random().toString(36).slice(2, 8)
+  return `e2e-${nowMs.toString(36)}-${rand}`
 }

@@ -1,4 +1,9 @@
-import { test as base, expect, type Page } from '@playwright/test'
+import {
+  test as base,
+  expect,
+  type Page,
+  type TestInfo,
+} from '@playwright/test'
 
 /**
  * Shared fixtures. The important one is `consoleErrors`: every test collects
@@ -165,3 +170,21 @@ export const URL_PROJECTS = /\/projects(?:[?#]|$)/
 export const URL_LOGIN = /\/login(?:[?#]|$)/
 export const urlForProject = (name: string) =>
   new RegExp(`/projects/${name}(?:[/?#]|$)`)
+
+/**
+ * Generates a resource name that is unique across parallel workers, retries,
+ * and CI shards -- not just across runs.
+ *
+ * The CI run id alone (the pattern this replaces) is identical for every
+ * worker in one job, so two workers creating similarly-prefixed resources in
+ * the same run collide the moment `fullyParallel` is on. Mixing in
+ * `parallelIndex` (unique per concurrently-running worker) and a short random
+ * suffix (unique per call, so retries of the same test in the same worker
+ * still get a fresh name) closes both gaps.
+ */
+export function uniqueSlug(prefix: string, testInfo: TestInfo): string {
+  const worker = testInfo.parallelIndex
+  const retry = testInfo.retry
+  const rand = Math.random().toString(36).slice(2, 8)
+  return `${prefix}-${worker}-${retry}-${rand}`.toLowerCase().slice(0, 32)
+}
