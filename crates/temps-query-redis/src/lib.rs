@@ -45,15 +45,29 @@ pub struct RedisSource {
 
 /// Bounds the work performed by the atomic SSCAN/HSCAN admission scripts so a
 /// data-browser request cannot monopolize the linked Redis server.
-const MAX_REDIS_VALUE_OFFSET: usize = 10_000;
+const MAX_REDIS_VALUE_OFFSET: usize = 1_000;
+const MAX_REDIS_AGGREGATE_PAGE_ITEMS: usize = 100;
 
-fn redis_aggregate_limit(options: &QueryOptions) -> usize {
+fn redis_aggregate_limit(options: &QueryOptions) -> Result<usize> {
     // A JSON array/object consumes at least two structural elements per Redis
     // item (container entry + scalar), and zset rows consume more. Dividing by
     // four is deliberately conservative and keeps the shared structural
     // limiter from accepting a backend page that was already too large.
     let structural_limit = (options.budget.max_value_elements_per_row / 4).max(1);
-    options.limit.unwrap_or(100).min(structural_limit)
+    let requested = options.limit.unwrap_or(100);
+    if requested == 0 {
+        return Err(DataError::InvalidQuery(
+            "Redis aggregate page limit must be at least 1".to_string(),
+        ));
+    }
+    Ok(requested
+        .min(structural_limit)
+        .min(MAX_REDIS_AGGREGATE_PAGE_ITEMS))
+}
+
+fn redis_next_value_cursor(offset: usize, limit: usize, truncated: bool) -> Option<String> {
+    let next = offset.saturating_add(limit);
+    (truncated && next.saturating_add(limit) <= MAX_REDIS_VALUE_OFFSET).then(|| next.to_string())
 }
 
 impl RedisSource {
@@ -79,8 +93,13 @@ local skipped = 0
 local values = {}
 local estimated = 2
 local has_more = 0
+local encoding = redis.call('OBJECT', 'ENCODING', KEYS[1])
+if encoding == 'listpack' or encoding == 'ziplist' then
+  local allocated = redis.call('MEMORY', 'USAGE', KEYS[1]) or 0
+  if allocated > tonumber(ARGV[3]) then return {0, allocated, 0, {}} end
+end
 repeat
-  local page = redis.call('SSCAN', KEYS[1], cursor, 'COUNT', math.min(tonumber(ARGV[2]) + 1, 512))
+  local page = redis.call('SSCAN', KEYS[1], cursor, 'COUNT', 1)
   cursor = page[1]
   for _, value in ipairs(page[2]) do
     if skipped < tonumber(ARGV[1]) then
@@ -135,8 +154,13 @@ local skipped = 0
 local values = {}
 local estimated = 2
 local has_more = 0
+local encoding = redis.call('OBJECT', 'ENCODING', KEYS[1])
+if encoding == 'listpack' or encoding == 'ziplist' then
+  local allocated = redis.call('MEMORY', 'USAGE', KEYS[1]) or 0
+  if allocated > tonumber(ARGV[3]) then return {0, allocated, 0, {}} end
+end
 repeat
-  local page = redis.call('HSCAN', KEYS[1], cursor, 'COUNT', math.min(tonumber(ARGV[2]) + 1, 512))
+  local page = redis.call('HSCAN', KEYS[1], cursor, 'COUNT', 1)
   cursor = page[1]
   for index = 1, #page[2], 2 do
     if skipped < tonumber(ARGV[1]) then
@@ -193,13 +217,16 @@ return {1, estimated, has_more, values}
         max_cell_bytes: usize,
     ) -> Result<(Vec<String>, bool)> {
         const SCRIPT: &str = r#"
-local values = redis.call('LRANGE', KEYS[1], tonumber(ARGV[1]), tonumber(ARGV[1]) + tonumber(ARGV[2]))
-local has_more = (#values > tonumber(ARGV[2])) and 1 or 0
-if has_more == 1 then table.remove(values) end
+local values = {}
 local estimated = 2
-for _, value in ipairs(values) do
+local has_more = 0
+for index = 0, tonumber(ARGV[2]) do
+  local value = redis.call('LINDEX', KEYS[1], tonumber(ARGV[1]) + index)
+  if not value then break end
+  if index >= tonumber(ARGV[2]) then has_more = 1; break end
   estimated = estimated + string.len(value) * 6 + 8
   if estimated > tonumber(ARGV[3]) then return {0, estimated, 0, {}} end
+  table.insert(values, value)
 end
 return {1, estimated, has_more, values}
 "#;
@@ -232,13 +259,17 @@ return {1, estimated, has_more, values}
         max_cell_bytes: usize,
     ) -> Result<(Vec<(String, f64)>, bool)> {
         const SCRIPT: &str = r#"
-local values = redis.call('ZRANGE', KEYS[1], tonumber(ARGV[1]), tonumber(ARGV[1]) + tonumber(ARGV[2]), 'WITHSCORES')
-local has_more = ((#values / 2) > tonumber(ARGV[2])) and 1 or 0
-if has_more == 1 then table.remove(values); table.remove(values) end
+local values = {}
 local estimated = 2
-for index = 1, #values, 2 do
-  estimated = estimated + (string.len(values[index]) + string.len(values[index + 1])) * 6 + 24
+local has_more = 0
+for index = 0, tonumber(ARGV[2]) do
+  local pair = redis.call('ZRANGE', KEYS[1], tonumber(ARGV[1]) + index, tonumber(ARGV[1]) + index, 'WITHSCORES')
+  if #pair == 0 then break end
+  if index >= tonumber(ARGV[2]) then has_more = 1; break end
+  estimated = estimated + (string.len(pair[1]) + string.len(pair[2])) * 6 + 24
   if estimated > tonumber(ARGV[3]) then return {0, estimated, 0, {}} end
+  table.insert(values, pair[1])
+  table.insert(values, pair[2])
 end
 return {1, estimated, has_more, values}
 "#;
@@ -515,7 +546,8 @@ return {1, estimated, has_more, values}
                 "Redis value offset {offset} exceeds maximum {MAX_REDIS_VALUE_OFFSET}"
             )));
         }
-        let aggregate_limit = redis_aggregate_limit(options);
+        let aggregate_limit = redis_aggregate_limit(options)?;
+        let wire_cap = options.budget.max_cell_bytes.min(options.budget.max_bytes);
         let mut truncated = false;
 
         // Get value based on type
@@ -539,38 +571,20 @@ return {1, estimated, has_more, values}
                 serde_json::Value::String(String::from_utf8_lossy(&v).into_owned())
             }
             "list" => {
-                let (v, has_more) = Self::list_page(
-                    &mut conn,
-                    key,
-                    offset,
-                    aggregate_limit,
-                    options.budget.max_cell_bytes,
-                )
-                .await?;
+                let (v, has_more) =
+                    Self::list_page(&mut conn, key, offset, aggregate_limit, wire_cap).await?;
                 truncated = has_more;
                 serde_json::json!(v)
             }
             "set" => {
-                let (v, has_more) = Self::scan_set_page(
-                    &mut conn,
-                    key,
-                    offset,
-                    aggregate_limit,
-                    options.budget.max_cell_bytes,
-                )
-                .await?;
+                let (v, has_more) =
+                    Self::scan_set_page(&mut conn, key, offset, aggregate_limit, wire_cap).await?;
                 truncated = has_more;
                 serde_json::json!(v)
             }
             "zset" => {
-                let (v, has_more) = Self::zset_page(
-                    &mut conn,
-                    key,
-                    offset,
-                    aggregate_limit,
-                    options.budget.max_cell_bytes,
-                )
-                .await?;
+                let (v, has_more) =
+                    Self::zset_page(&mut conn, key, offset, aggregate_limit, wire_cap).await?;
                 truncated = has_more;
                 serde_json::json!(v
                     .into_iter()
@@ -580,14 +594,8 @@ return {1, estimated, has_more, values}
                     .collect::<Vec<_>>())
             }
             "hash" => {
-                let (values, has_more) = Self::scan_hash_page(
-                    &mut conn,
-                    key,
-                    offset,
-                    aggregate_limit,
-                    options.budget.max_cell_bytes,
-                )
-                .await?;
+                let (values, has_more) =
+                    Self::scan_hash_page(&mut conn, key, offset, aggregate_limit, wire_cap).await?;
                 truncated = has_more;
                 serde_json::json!(values.into_iter().collect::<HashMap<_, _>>())
             }
@@ -607,7 +615,7 @@ return {1, estimated, has_more, values}
         row.insert("ttl".to_string(), serde_json::Value::Number(ttl.into()));
         row.insert("value".to_string(), value);
 
-        let next_cursor = truncated.then(|| offset.saturating_add(aggregate_limit).to_string());
+        let next_cursor = redis_next_value_cursor(offset, aggregate_limit, truncated);
         Ok((row, truncated, next_cursor))
     }
 
@@ -915,6 +923,7 @@ impl Queryable for RedisSource {
         // Get the key value
         let (row, value_truncated, next_cursor) =
             self.get_key_value(db_num, entity_name, &options).await?;
+        let has_more = next_cursor.is_some();
         let execution_ms = start.elapsed().as_millis() as u64;
 
         // Define schema for the result
@@ -958,7 +967,7 @@ impl Queryable for RedisSource {
                 row_count: rows.len(),
                 total_rows: Some(1),
                 execution_ms,
-                has_more: value_truncated,
+                has_more,
                 next_cursor,
                 truncated: value_truncated || budget_truncated,
             },
@@ -1078,7 +1087,22 @@ mod tests {
             },
             ..QueryOptions::default()
         };
-        assert_eq!(redis_aggregate_limit(&options), 10);
+        assert_eq!(redis_aggregate_limit(&options).expect("valid limit"), 10);
+
+        let zero = QueryOptions {
+            limit: Some(0),
+            ..QueryOptions::default()
+        };
+        assert!(matches!(
+            redis_aggregate_limit(&zero),
+            Err(DataError::InvalidQuery(_))
+        ));
+
+        assert_eq!(redis_next_value_cursor(0, 2, true).as_deref(), Some("2"));
+        assert_eq!(
+            redis_next_value_cursor(MAX_REDIS_VALUE_OFFSET - 100, 100, true),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1172,6 +1196,43 @@ mod tests {
             .await
             .expect_err("Redis aggregate script work must be offset-bounded");
         assert!(matches!(offset_error, DataError::InvalidQuery(_)));
+
+        let page_budget_error = source
+            .query(
+                &path,
+                "large-set",
+                None,
+                QueryOptions {
+                    limit: Some(2),
+                    budget: QueryBudget {
+                        max_bytes: 64,
+                        max_cell_bytes: 8 * 1024,
+                        ..QueryBudget::default()
+                    },
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect_err("Redis admission must enforce the smaller page budget pre-wire");
+        assert!(matches!(
+            page_budget_error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "cell_bytes",
+                limit: 64,
+                ..
+            }
+        ));
+
+        redis::cmd("HSET")
+            .arg("compact-hash")
+            .arg("field")
+            .arg("safe")
+            .query_async::<()>(&mut connection)
+            .await?;
+        let compact_hash = source
+            .query(&path, "compact-hash", None, QueryOptions::default())
+            .await?;
+        assert_eq!(compact_hash.rows[0]["value"]["field"], "safe");
 
         let oversized = "y".repeat(100_000);
         redis::cmd("RPUSH")

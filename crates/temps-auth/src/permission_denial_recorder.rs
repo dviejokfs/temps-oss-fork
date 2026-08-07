@@ -384,6 +384,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingLogger {
         records: Mutex<Vec<serde_json::Value>>,
+        user_agents: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -395,6 +396,10 @@ mod tests {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("test logger lock poisoned"))?
                 .push(value);
+            self.user_agents
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test user-agent lock poisoned"))?
+                .push(operation.user_agent().to_string());
             Ok(())
         }
     }
@@ -451,7 +456,10 @@ mod tests {
         assert_eq!(records[0]["auth_source"], "api_key");
         assert_eq!(records[0]["credential_id"], 9);
         assert_eq!(records[0]["ip_address"], serde_json::Value::Null);
-        assert_eq!(records[0]["user_agent"], MIXED_VALUE);
+        assert_eq!(
+            logger.user_agents.lock().expect("test user-agent lock")[0],
+            MIXED_VALUE
+        );
         assert_eq!(records[0]["multiple_origins"], true);
         assert!(records[0].get("key_name").is_none());
         assert!(records[0].get("token_name").is_none());
@@ -470,7 +478,10 @@ mod tests {
         let records = logger.records.lock().expect("test logger lock");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["ip_address"], serde_json::Value::Null);
-        assert_eq!(records[0]["user_agent"], MIXED_VALUE);
+        assert_eq!(
+            logger.user_agents.lock().expect("test user-agent lock")[0],
+            MIXED_VALUE
+        );
         assert_eq!(records[0]["multiple_origins"], true);
     }
 
