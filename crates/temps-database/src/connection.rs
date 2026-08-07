@@ -563,6 +563,10 @@ pub async fn run_post_migration_indexes(db: &DatabaseConnection) -> ServiceResul
             "Failed to acquire database connection for post-migration indexes: {error}"
         ))
     })?;
+    // Session timeouts cannot be reset asynchronously from Drop if this future
+    // is cancelled. Treat this as a disposable maintenance connection so no
+    // cancellation or RESET failure can leak its settings back into the pool.
+    connection.close_on_drop();
 
     sqlx::query("SET lock_timeout = '5s'")
         .execute(&mut *connection)

@@ -90,6 +90,17 @@ impl MigrateCommand {
                     "{}",
                     "✓ Database already up to date — no migrations to apply.".green()
                 );
+                if !self.dry_run {
+                    // Non-transactional maintenance must remain retryable even
+                    // after every schema migration is already recorded.
+                    temps_database::run_post_migration_indexes(&db).await?;
+                    if let Err(e) = temps_database::run_post_migration_backfill(&db).await {
+                        info!(
+                            "Post-migration backfill skipped/failed (refresh policy will catch up): {e}"
+                        );
+                    }
+                    println!("{}", "✓ Post-migration maintenance complete.".green());
+                }
                 return Ok(());
             }
 

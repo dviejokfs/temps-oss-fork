@@ -43,6 +43,10 @@ pub struct RedisSource {
     connection: ConnectionManager,
 }
 
+/// Bounds the work performed by the atomic SSCAN/HSCAN admission scripts so a
+/// data-browser request cannot monopolize the linked Redis server.
+const MAX_REDIS_VALUE_OFFSET: usize = 10_000;
+
 fn redis_aggregate_limit(options: &QueryOptions) -> usize {
     // A JSON array/object consumes at least two structural elements per Redis
     // item (container entry + scalar), and zset rows consume more. Dividing by
@@ -52,59 +56,70 @@ fn redis_aggregate_limit(options: &QueryOptions) -> usize {
     options.limit.unwrap_or(100).min(structural_limit)
 }
 
-fn trim_extra<T>(values: &mut Vec<T>, limit: usize) -> bool {
-    if values.len() > limit {
-        values.truncate(limit);
-        true
-    } else {
-        false
-    }
-}
-
 impl RedisSource {
+    fn wire_budget_error(key: &str, limit: usize, observed: usize) -> DataError {
+        DataError::ResultLimitExceeded {
+            entity: key.to_string(),
+            limit_kind: "cell_bytes",
+            limit,
+            observed,
+        }
+    }
+
     async fn scan_set_page(
         conn: &mut ConnectionManager,
         key: &str,
         offset: usize,
         limit: usize,
+        max_cell_bytes: usize,
     ) -> Result<(Vec<String>, bool)> {
-        let mut cursor = 0_u64;
-        let mut skipped = 0_usize;
-        let mut values = Vec::with_capacity(limit.saturating_add(1));
-        let count_hint = limit.saturating_add(1).clamp(1, 512);
-
-        loop {
-            let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SSCAN")
-                .arg(key)
-                .arg(cursor)
-                .arg("COUNT")
-                .arg(count_hint)
-                .query_async(conn)
+        const SCRIPT: &str = r#"
+local cursor = '0'
+local skipped = 0
+local values = {}
+local estimated = 2
+local has_more = 0
+repeat
+  local page = redis.call('SSCAN', KEYS[1], cursor, 'COUNT', math.min(tonumber(ARGV[2]) + 1, 512))
+  cursor = page[1]
+  for _, value in ipairs(page[2]) do
+    if skipped < tonumber(ARGV[1]) then
+      skipped = skipped + 1
+    elseif #values >= tonumber(ARGV[2]) then
+      has_more = 1
+      break
+    else
+      local next_estimate = estimated + string.len(value) * 6 + 8
+      if next_estimate > tonumber(ARGV[3]) then
+        return {0, next_estimate, 0, {}}
+      end
+      table.insert(values, value)
+      estimated = next_estimate
+    end
+  end
+until has_more == 1 or cursor == '0'
+if cursor ~= '0' then has_more = 1 end
+return {1, estimated, has_more, values}
+"#;
+        let (admitted, observed, has_more, values): (i64, usize, i64, Vec<String>) =
+            redis::Script::new(SCRIPT)
+                .key(key)
+                .arg(offset)
+                .arg(limit)
+                .arg(max_cell_bytes)
+                .invoke_async(conn)
                 .await
                 .map_err(|error: RedisError| {
-                    error!(error = %error, "failed to page Redis set");
+                    error!(error = %error, "failed to safely page Redis set");
                     DataError::BackendQueryFailed {
                         backend: "Redis",
                         entity: key.to_string(),
                     }
                 })?;
-
-            for value in batch {
-                if skipped < offset {
-                    skipped += 1;
-                } else if values.len() <= limit {
-                    values.push(value);
-                }
-            }
-            cursor = next_cursor;
-            if values.len() > limit || cursor == 0 {
-                break;
-            }
+        if admitted == 0 {
+            return Err(Self::wire_budget_error(key, max_cell_bytes, observed));
         }
-
-        let has_more = values.len() > limit || cursor != 0;
-        values.truncate(limit);
-        Ok((values, has_more))
+        Ok((values, has_more != 0))
     }
 
     async fn scan_hash_page(
@@ -112,44 +127,151 @@ impl RedisSource {
         key: &str,
         offset: usize,
         limit: usize,
+        max_cell_bytes: usize,
     ) -> Result<(Vec<(String, String)>, bool)> {
-        let mut cursor = 0_u64;
-        let mut skipped = 0_usize;
-        let mut values = Vec::with_capacity(limit.saturating_add(1));
-        let count_hint = limit.saturating_add(1).clamp(1, 512);
-
-        loop {
-            let (next_cursor, batch): (u64, Vec<(String, String)>) = redis::cmd("HSCAN")
-                .arg(key)
-                .arg(cursor)
-                .arg("COUNT")
-                .arg(count_hint)
-                .query_async(conn)
+        const SCRIPT: &str = r#"
+local cursor = '0'
+local skipped = 0
+local values = {}
+local estimated = 2
+local has_more = 0
+repeat
+  local page = redis.call('HSCAN', KEYS[1], cursor, 'COUNT', math.min(tonumber(ARGV[2]) + 1, 512))
+  cursor = page[1]
+  for index = 1, #page[2], 2 do
+    if skipped < tonumber(ARGV[1]) then
+      skipped = skipped + 1
+    elseif (#values / 2) >= tonumber(ARGV[2]) then
+      has_more = 1
+      break
+    else
+      local field = page[2][index]
+      local value = page[2][index + 1]
+      local next_estimate = estimated + (string.len(field) + string.len(value)) * 6 + 16
+      if next_estimate > tonumber(ARGV[3]) then
+        return {0, next_estimate, 0, {}}
+      end
+      table.insert(values, field)
+      table.insert(values, value)
+      estimated = next_estimate
+    end
+  end
+until has_more == 1 or cursor == '0'
+if cursor ~= '0' then has_more = 1 end
+return {1, estimated, has_more, values}
+"#;
+        let (admitted, observed, has_more, flat_values): (i64, usize, i64, Vec<String>) =
+            redis::Script::new(SCRIPT)
+                .key(key)
+                .arg(offset)
+                .arg(limit)
+                .arg(max_cell_bytes)
+                .invoke_async(conn)
                 .await
                 .map_err(|error: RedisError| {
-                    error!(error = %error, "failed to page Redis hash");
+                    error!(error = %error, "failed to safely page Redis hash");
                     DataError::BackendQueryFailed {
                         backend: "Redis",
                         entity: key.to_string(),
                     }
                 })?;
-
-            for value in batch {
-                if skipped < offset {
-                    skipped += 1;
-                } else if values.len() <= limit {
-                    values.push(value);
-                }
-            }
-            cursor = next_cursor;
-            if values.len() > limit || cursor == 0 {
-                break;
-            }
+        if admitted == 0 {
+            return Err(Self::wire_budget_error(key, max_cell_bytes, observed));
         }
+        let values = flat_values
+            .chunks_exact(2)
+            .map(|pair| (pair[0].clone(), pair[1].clone()))
+            .collect();
+        Ok((values, has_more != 0))
+    }
 
-        let has_more = values.len() > limit || cursor != 0;
-        values.truncate(limit);
-        Ok((values, has_more))
+    async fn list_page(
+        conn: &mut ConnectionManager,
+        key: &str,
+        offset: usize,
+        limit: usize,
+        max_cell_bytes: usize,
+    ) -> Result<(Vec<String>, bool)> {
+        const SCRIPT: &str = r#"
+local values = redis.call('LRANGE', KEYS[1], tonumber(ARGV[1]), tonumber(ARGV[1]) + tonumber(ARGV[2]))
+local has_more = (#values > tonumber(ARGV[2])) and 1 or 0
+if has_more == 1 then table.remove(values) end
+local estimated = 2
+for _, value in ipairs(values) do
+  estimated = estimated + string.len(value) * 6 + 8
+  if estimated > tonumber(ARGV[3]) then return {0, estimated, 0, {}} end
+end
+return {1, estimated, has_more, values}
+"#;
+        let (admitted, observed, has_more, values): (i64, usize, i64, Vec<String>) =
+            redis::Script::new(SCRIPT)
+                .key(key)
+                .arg(offset)
+                .arg(limit)
+                .arg(max_cell_bytes)
+                .invoke_async(conn)
+                .await
+                .map_err(|error: RedisError| {
+                    error!(error = %error, "failed to safely page Redis list");
+                    DataError::BackendQueryFailed {
+                        backend: "Redis",
+                        entity: key.to_string(),
+                    }
+                })?;
+        if admitted == 0 {
+            return Err(Self::wire_budget_error(key, max_cell_bytes, observed));
+        }
+        Ok((values, has_more != 0))
+    }
+
+    async fn zset_page(
+        conn: &mut ConnectionManager,
+        key: &str,
+        offset: usize,
+        limit: usize,
+        max_cell_bytes: usize,
+    ) -> Result<(Vec<(String, f64)>, bool)> {
+        const SCRIPT: &str = r#"
+local values = redis.call('ZRANGE', KEYS[1], tonumber(ARGV[1]), tonumber(ARGV[1]) + tonumber(ARGV[2]), 'WITHSCORES')
+local has_more = ((#values / 2) > tonumber(ARGV[2])) and 1 or 0
+if has_more == 1 then table.remove(values); table.remove(values) end
+local estimated = 2
+for index = 1, #values, 2 do
+  estimated = estimated + (string.len(values[index]) + string.len(values[index + 1])) * 6 + 24
+  if estimated > tonumber(ARGV[3]) then return {0, estimated, 0, {}} end
+end
+return {1, estimated, has_more, values}
+"#;
+        let (admitted, observed, has_more, flat_values): (i64, usize, i64, Vec<String>) =
+            redis::Script::new(SCRIPT)
+                .key(key)
+                .arg(offset)
+                .arg(limit)
+                .arg(max_cell_bytes)
+                .invoke_async(conn)
+                .await
+                .map_err(|error: RedisError| {
+                    error!(error = %error, "failed to safely page Redis sorted set");
+                    DataError::BackendQueryFailed {
+                        backend: "Redis",
+                        entity: key.to_string(),
+                    }
+                })?;
+        if admitted == 0 {
+            return Err(Self::wire_budget_error(key, max_cell_bytes, observed));
+        }
+        let mut values = Vec::with_capacity(flat_values.len() / 2);
+        for pair in flat_values.chunks_exact(2) {
+            let score = pair[1].parse::<f64>().map_err(|error| {
+                error!(error = %error, "failed to decode Redis sorted-set score");
+                DataError::BackendQueryFailed {
+                    backend: "Redis",
+                    entity: key.to_string(),
+                }
+            })?;
+            values.push((pair[0].clone(), score));
+        }
+        Ok((values, has_more != 0))
     }
 
     /// Create a new Redis data source
@@ -388,9 +510,12 @@ impl RedisSource {
             })?,
             None => options.offset.unwrap_or(0),
         };
+        if offset > MAX_REDIS_VALUE_OFFSET {
+            return Err(DataError::InvalidQuery(format!(
+                "Redis value offset {offset} exceeds maximum {MAX_REDIS_VALUE_OFFSET}"
+            )));
+        }
         let aggregate_limit = redis_aggregate_limit(options);
-        let start = isize::try_from(offset).unwrap_or(isize::MAX);
-        let end = start.saturating_add(isize::try_from(aggregate_limit).unwrap_or(isize::MAX));
         let mut truncated = false;
 
         // Get value based on type
@@ -414,37 +539,39 @@ impl RedisSource {
                 serde_json::Value::String(String::from_utf8_lossy(&v).into_owned())
             }
             "list" => {
-                let mut v: Vec<String> =
-                    conn.lrange(key, start, end)
-                        .await
-                        .map_err(|e: RedisError| {
-                            error!("Failed to get list value: {}", e);
-                            DataError::BackendQueryFailed {
-                                backend: "Redis",
-                                entity: key.to_string(),
-                            }
-                        })?;
-                truncated = trim_extra(&mut v, aggregate_limit);
+                let (v, has_more) = Self::list_page(
+                    &mut conn,
+                    key,
+                    offset,
+                    aggregate_limit,
+                    options.budget.max_cell_bytes,
+                )
+                .await?;
+                truncated = has_more;
                 serde_json::json!(v)
             }
             "set" => {
-                let (v, has_more) =
-                    Self::scan_set_page(&mut conn, key, offset, aggregate_limit).await?;
+                let (v, has_more) = Self::scan_set_page(
+                    &mut conn,
+                    key,
+                    offset,
+                    aggregate_limit,
+                    options.budget.max_cell_bytes,
+                )
+                .await?;
                 truncated = has_more;
                 serde_json::json!(v)
             }
             "zset" => {
-                let mut v: Vec<(String, f64)> = conn
-                    .zrange_withscores(key, start, end)
-                    .await
-                    .map_err(|e: RedisError| {
-                        error!("Failed to get sorted set value: {}", e);
-                        DataError::BackendQueryFailed {
-                            backend: "Redis",
-                            entity: key.to_string(),
-                        }
-                    })?;
-                truncated = trim_extra(&mut v, aggregate_limit);
+                let (v, has_more) = Self::zset_page(
+                    &mut conn,
+                    key,
+                    offset,
+                    aggregate_limit,
+                    options.budget.max_cell_bytes,
+                )
+                .await?;
+                truncated = has_more;
                 serde_json::json!(v
                     .into_iter()
                     .map(|(member, score)| {
@@ -453,8 +580,14 @@ impl RedisSource {
                     .collect::<Vec<_>>())
             }
             "hash" => {
-                let (values, has_more) =
-                    Self::scan_hash_page(&mut conn, key, offset, aggregate_limit).await?;
+                let (values, has_more) = Self::scan_hash_page(
+                    &mut conn,
+                    key,
+                    offset,
+                    aggregate_limit,
+                    options.budget.max_cell_bytes,
+                )
+                .await?;
                 truncated = has_more;
                 serde_json::json!(values.into_iter().collect::<HashMap<_, _>>())
             }
@@ -946,10 +1079,6 @@ mod tests {
             ..QueryOptions::default()
         };
         assert_eq!(redis_aggregate_limit(&options), 10);
-
-        let mut values = vec!["value"; 11];
-        assert!(trim_extra(&mut values, redis_aggregate_limit(&options)));
-        assert_eq!(values.len(), 10);
     }
 
     #[tokio::test]
@@ -1029,6 +1158,75 @@ mod tests {
         assert_eq!(first.stats.next_cursor.as_deref(), Some("2"));
         assert!(first.stats.truncated);
         assert!(second.stats.truncated);
+
+        let offset_error = source
+            .query(
+                &path,
+                "large-set",
+                None,
+                QueryOptions {
+                    cursor: Some((MAX_REDIS_VALUE_OFFSET + 1).to_string()),
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect_err("Redis aggregate script work must be offset-bounded");
+        assert!(matches!(offset_error, DataError::InvalidQuery(_)));
+
+        let oversized = "y".repeat(100_000);
+        redis::cmd("RPUSH")
+            .arg("oversized-list")
+            .arg(&oversized)
+            .query_async::<()>(&mut connection)
+            .await?;
+        redis::cmd("SADD")
+            .arg("oversized-set")
+            .arg(&oversized)
+            .query_async::<()>(&mut connection)
+            .await?;
+        redis::cmd("ZADD")
+            .arg("oversized-zset")
+            .arg(1)
+            .arg(&oversized)
+            .query_async::<()>(&mut connection)
+            .await?;
+        redis::cmd("HSET")
+            .arg("oversized-hash")
+            .arg("field")
+            .arg(&oversized)
+            .query_async::<()>(&mut connection)
+            .await?;
+
+        for key in [
+            "oversized-list",
+            "oversized-set",
+            "oversized-zset",
+            "oversized-hash",
+        ] {
+            let error = source
+                .query(
+                    &path,
+                    key,
+                    None,
+                    QueryOptions {
+                        limit: Some(2),
+                        budget: QueryBudget {
+                            max_cell_bytes: 8 * 1024,
+                            ..QueryBudget::default()
+                        },
+                        ..QueryOptions::default()
+                    },
+                )
+                .await
+                .expect_err("oversized Redis aggregate element must be rejected in Lua");
+            assert!(matches!(
+                error,
+                DataError::ResultLimitExceeded {
+                    limit_kind: "cell_bytes",
+                    ..
+                }
+            ));
+        }
 
         Ok(())
     }

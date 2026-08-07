@@ -300,21 +300,34 @@ impl ServeCommand {
 
         let rt = tokio::runtime::Runtime::new()?;
 
-        // Backfill TimescaleDB continuous aggregates on this long-lived runtime,
-        // detached. `establish_connection` no longer runs this (it would block
-        // startup on a slow `CALL`); it's idempotent and the refresh policy
-        // catches up regardless, so it must not gate the proxy bind.
+        // Run non-transactional indexes and the TimescaleDB backfill on this
+        // long-lived runtime, detached. Index creation retries with capped
+        // backoff until the retention query has its supporting index; the
+        // idempotent backfill remains best-effort and never gates proxy bind.
         {
+            let index_db = db.clone();
+            rt.spawn(async move {
+                let mut retry_delay = std::time::Duration::from_secs(5);
+                loop {
+                    match temps_database::run_post_migration_indexes(index_db.as_ref()).await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Post-migration index build failed; retrying in {:?}: {}",
+                                retry_delay,
+                                e
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = retry_delay
+                                .saturating_mul(2)
+                                .min(std::time::Duration::from_secs(300));
+                        }
+                    }
+                }
+            });
+
             let backfill_db = db.clone();
             rt.spawn(async move {
-                if let Err(e) =
-                    temps_database::run_post_migration_indexes(backfill_db.as_ref()).await
-                {
-                    tracing::warn!(
-                        "Post-migration index build failed (will retry on next startup): {}",
-                        e
-                    );
-                }
                 if let Err(e) =
                     temps_database::run_post_migration_backfill(backfill_db.as_ref()).await
                 {
