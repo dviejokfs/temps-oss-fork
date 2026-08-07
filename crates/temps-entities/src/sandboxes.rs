@@ -40,6 +40,26 @@ pub struct Model {
     /// underlying container is gone.
     pub status: String,
 
+    /// Lifecycle class (ADR-036): `"ephemeral"` (default) or
+    /// `"workspace"`. Both are suspended on idle by the expiration
+    /// sweeper; the difference is what happens on the next access —
+    /// an ephemeral sandbox returns `InvalidState`, a workspace is
+    /// transparently woken. Never `NULL`: the migration defaults
+    /// pre-existing rows to `"ephemeral"`.
+    pub lifecycle: String,
+
+    /// Project this sandbox was created from, when the caller asked for
+    /// a workspace on a project's repo. Used to list workspaces per
+    /// project and to derive the clone URL at create time. Deliberately
+    /// not a foreign key — deleting a project must not cascade into
+    /// deleting a user's working tree.
+    pub project_id: Option<i32>,
+
+    /// Repo URL the work dir was seeded from, recorded for display.
+    /// Never contains credentials — the create path rejects URLs with
+    /// embedded userinfo.
+    pub source_repo_url: Option<String>,
+
     /// Optional Docker image override. When null, the platform default
     /// is used (the same image agent-runs use).
     pub image: Option<String>,

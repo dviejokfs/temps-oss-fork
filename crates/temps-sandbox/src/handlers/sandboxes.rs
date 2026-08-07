@@ -32,7 +32,7 @@ use temps_agents::sandbox::ExecStream;
 use tokio_stream::wrappers::BroadcastStream;
 use utoipa::ToSchema;
 
-use temps_auth::{permissions::Permission, RequireAuth};
+use temps_auth::{permissions::Permission, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 
 use crate::error::SandboxError;
@@ -63,7 +63,7 @@ fn require_sandbox_admin(auth: &temps_auth::context::AuthContext) -> Result<(), 
     )
 }
 
-fn sandbox_permission_guard(
+pub(crate) fn sandbox_permission_guard(
     auth: &temps_auth::context::AuthContext,
     primary: Permission,
     fallback: Permission,
@@ -88,7 +88,9 @@ fn sandbox_permission_guard(
 use crate::services::exec::{ExecOptions, ExecResult};
 use crate::services::fs::StatInfo;
 use crate::services::job_tracker::{JobState, JobStatus};
-use crate::services::sandbox_service::{CreateSandboxRequest, SandboxSource, SandboxSummary};
+use crate::services::sandbox_service::{
+    CreateSandboxRequest, SandboxLifecycle, SandboxSource, SandboxSummary,
+};
 
 // ── Error → Problem conversion ──────────────────────────────────────────────
 
@@ -122,6 +124,12 @@ impl From<SandboxError> for Problem {
                 .with_detail(error.to_string()),
             SandboxError::ManagedByAgentRun { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Sandbox Managed By Agent Run")
+                .with_detail(error.to_string()),
+            SandboxError::ProjectNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Project Not Found")
+                .with_detail(error.to_string()),
+            SandboxError::ProjectHasNoRepo { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Project Has No Repository")
                 .with_detail(error.to_string()),
             SandboxError::Timeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
                 .with_title("Sandbox Operation Timed Out")
@@ -185,26 +193,6 @@ pub enum SourceBody {
     Tarball {
         url: String,
     },
-}
-
-/// Reject credentials baked into the URL (`https://user:pass@host/...`).
-/// We want credentials to flow through the `username`/`password` or
-/// `git_connection_id` channels so the token goes through the safe
-/// `GIT_ASKPASS` path and never lands in `.git/config` or logs.
-fn url_contains_credentials(url: &str) -> bool {
-    // Look for `://<something>@` where `<something>` contains `:` — that's
-    // the `user:password` form. A plain `@` without `:` is fine (user-only,
-    // which git treats as "prompt for password").
-    if let Some(scheme_end) = url.find("://") {
-        let rest = &url[scheme_end + 3..];
-        if let Some(at_idx) = rest.find('@') {
-            let userinfo = &rest[..at_idx];
-            if userinfo.contains(':') {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Reject URLs that point at private/loopback/metadata IPs or use
@@ -297,7 +285,7 @@ impl SourceBody {
                         message: "git source: url must not be empty".into(),
                     });
                 }
-                if url_contains_credentials(url) {
+                if crate::services::sandbox_service::url_has_embedded_credentials(url) {
                     return Err(SandboxError::Validation {
                         message: "git source: url must not contain embedded credentials — use username/password or git_connection_id".into(),
                     });
@@ -431,6 +419,25 @@ pub struct CreateSandboxBody {
     /// 400 rather than silently downgrading isolation.
     #[serde(default)]
     pub backend: Option<String>,
+    /// Lifecycle class (ADR-036, temps-native): `"ephemeral"` (default) or
+    /// `"workspace"`.
+    ///
+    /// A workspace is a long-lived development environment: it is still
+    /// suspended after `timeout_secs` of inactivity, but the next exec or
+    /// filesystem call wakes it transparently instead of returning 409, and
+    /// nothing ever destroys it automatically. Use it for "give me a place
+    /// to work on this repo"; leave it unset for throwaway sandboxes.
+    #[serde(default)]
+    pub lifecycle: Option<String>,
+    /// Create the sandbox against a temps project (temps-native). The
+    /// project's connected repo and git credential seed the work dir when
+    /// no explicit `source` is given, and the sandbox is attributed to the
+    /// project so it can be listed alongside it.
+    ///
+    /// Requires access to the project — the same team/scope rules that
+    /// gate every other project-scoped endpoint apply.
+    #[serde(default)]
+    pub project_id: Option<i32>,
 
     // ── `@vercel/sandbox` fields accepted for compatibility and ignored.
     // We accept them so SDK calls don't 422 on `deny_unknown_fields`; we
@@ -459,6 +466,8 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             preview_password: b.preview_password,
             ports: b.ports,
             backend: b.backend,
+            lifecycle: b.lifecycle,
+            project_id: b.project_id,
         }
     }
 }
@@ -524,6 +533,16 @@ pub struct SandboxInner {
     /// `None` for sandboxes created via this API.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_run_id: Option<i32>,
+    /// Lifecycle class (ADR-036): `"ephemeral"` or `"workspace"`. Always
+    /// present — a client that doesn't know about workspaces sees
+    /// `"ephemeral"` and behaves exactly as before.
+    pub lifecycle: String,
+    /// Project this sandbox was created from, when created from one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<i32>,
+    /// Repo the work dir was seeded from. Never carries credentials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_repo_url: Option<String>,
 }
 
 /// `@vercel/sandbox` wraps every single-sandbox response as
@@ -582,6 +601,9 @@ impl SandboxResponse {
                 preview_url_template: template,
                 preview_password_hint: s.preview_password_hint,
                 agent_run_id: s.agent_run_id,
+                lifecycle: s.lifecycle,
+                project_id: s.project_id,
+                source_repo_url: s.source_repo_url,
             },
             routes,
         }
@@ -627,10 +649,16 @@ pub struct PaginationParams {
     pub page_size: Option<u64>,
     /// SDK-compat: `limit` maps to `page_size` when the latter isn't set.
     pub limit: Option<u64>,
-    /// Accepted and ignored — temps has no project scoping on sandboxes.
+    /// Accepted and ignored — the SDK's opaque project slug. temps uses
+    /// the numeric `project_id` filter below instead.
     pub project: Option<String>,
     pub since: Option<i64>,
     pub until: Option<i64>,
+    /// Filter by lifecycle class (temps-native): `"ephemeral"` or
+    /// `"workspace"`. Omit for both.
+    pub lifecycle: Option<String>,
+    /// Filter to sandboxes created from a specific temps project.
+    pub project_id: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -878,6 +906,14 @@ pub async fn create_sandbox(
     Json(body): Json<CreateSandboxBody>,
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+    // Creating a sandbox *from* a project reads that project's repo URL and
+    // git credential, so it needs the same access gate as any other
+    // project-scoped endpoint — an API key scoped to project A must not be
+    // able to clone project B's private repo into a sandbox it owns.
+    if let Some(project_id) = body.project_id {
+        project_scope_guard!(auth, project_id);
+        project_access_guard!(auth, project_id, state.project_access_checker);
+    }
     if let Some(src) = body.source.as_ref() {
         src.validate_async().await?;
     }
@@ -894,8 +930,11 @@ pub async fn create_sandbox(
     get,
     path = "/v1/sandboxes",
     params(("page" = Option<u64>, Query, description = "Page (1-indexed)"),
-           ("page_size" = Option<u64>, Query, description = "Items per page (default 20, max 100)")),
-    responses((status = 200, description = "List sandboxes", body = ListSandboxesResponse)),
+           ("page_size" = Option<u64>, Query, description = "Items per page (default 20, max 100)"),
+           ("lifecycle" = Option<String>, Query, description = "Filter by lifecycle class: \"ephemeral\" or \"workspace\""),
+           ("project_id" = Option<i32>, Query, description = "Filter to sandboxes created from a project")),
+    responses((status = 200, description = "List sandboxes", body = ListSandboxesResponse),
+              (status = 400, description = "Unknown lifecycle value")),
     security(("bearer_auth" = []))
 )]
 pub async fn list_sandboxes(
@@ -906,9 +945,20 @@ pub async fn list_sandboxes(
     sandbox_permission_guard(&auth, Permission::SandboxesRead, Permission::ProjectsRead)?;
     let page = q.page.unwrap_or(1);
     let page_size = q.page_size.or(q.limit).unwrap_or(20);
+    let lifecycle = q
+        .lifecycle
+        .as_deref()
+        .map(SandboxLifecycle::parse)
+        .transpose()?;
     let (items, total) = state
         .sandbox_service
-        .list_for_user(auth.user_id(), Some(page), Some(page_size))
+        .list_for_user(
+            auth.user_id(),
+            Some(page),
+            Some(page_size),
+            lifecycle,
+            q.project_id,
+        )
         .await?;
     let envelopes = build_summary_responses(&state, items).await;
     let sandboxes: Vec<SandboxInner> = envelopes.into_iter().map(|e| e.sandbox).collect();
@@ -2407,6 +2457,10 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
         .route("/v1/sandboxes/rootfs", get(rootfs_report))
         .route("/v1/sandboxes/rootfs/gc", post(rootfs_gc))
         .route("/v1/sandboxes/{id}", get(get_sandbox))
+        .route(
+            "/v1/sandboxes/{id}/terminal",
+            get(crate::handlers::terminal::terminal),
+        )
         .route("/v1/sandboxes/{id}/stop", post(stop_sandbox))
         .route("/v1/sandboxes/{id}/destroy", post(destroy_sandbox))
         .route("/v1/sandboxes/{id}/events", get(list_events))
@@ -2618,6 +2672,9 @@ mod tests {
             backend: None,
             disk_size_mb: None,
             agent_run_id: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
         };
         let r = SandboxResponse::from(summary);
         assert_eq!(r.sandbox.id, "sbx_abc");
@@ -2645,6 +2702,9 @@ mod tests {
             backend: None,
             disk_size_mb: None,
             agent_run_id: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
         };
         let parts = PreviewUrlParts {
             protocol: "https".into(),

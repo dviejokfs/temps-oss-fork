@@ -17,14 +17,14 @@ use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 
 use temps_agents::sandbox::SandboxCreateConfig;
 use temps_agents::services::run_service::TERMINAL_RUN_STATUSES;
 use temps_config::ConfigService;
-use temps_entities::{agent_runs, sandbox_events, sandboxes};
+use temps_entities::{agent_runs, projects, sandbox_events, sandboxes};
 use temps_git::GitProviderManager;
 
 use crate::error::{from_agent_error, SandboxError};
@@ -65,6 +65,67 @@ pub enum SandboxSource {
     Tarball { url: String },
 }
 
+/// Lifecycle class of a sandbox (ADR-036).
+///
+/// Both classes are suspended on idle by the expiration sweeper — the
+/// difference is what the *next* access does. An ephemeral sandbox is
+/// owned by whoever created it and returns `InvalidState` once stopped
+/// (the behaviour `@vercel/sandbox` consumers expect); a workspace is a
+/// place a human comes back to, so it wakes transparently instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxLifecycle {
+    /// Throwaway sandbox. Default for every caller that doesn't ask.
+    #[default]
+    Ephemeral,
+    /// Long-lived workspace: suspends on idle, wakes on access, never
+    /// auto-destroyed.
+    Workspace,
+}
+
+impl SandboxLifecycle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SandboxLifecycle::Ephemeral => "ephemeral",
+            SandboxLifecycle::Workspace => "workspace",
+        }
+    }
+
+    /// Parse the API-facing string. Unknown values are a validation
+    /// error rather than a silent fallback: a caller who typo'd
+    /// `"workspaces"` and got an ephemeral sandbox would lose their work
+    /// to the first idle sweep without ever being told.
+    pub fn parse(value: &str) -> Result<Self, SandboxError> {
+        match value {
+            "ephemeral" => Ok(SandboxLifecycle::Ephemeral),
+            "workspace" => Ok(SandboxLifecycle::Workspace),
+            other => Err(SandboxError::Validation {
+                message: format!(
+                    "unknown lifecycle '{}' (expected \"ephemeral\" or \"workspace\")",
+                    other
+                ),
+            }),
+        }
+    }
+
+    /// Read the class off a persisted row. Unlike [`Self::parse`] this
+    /// cannot fail: a row carrying a value we don't recognise (written
+    /// by a newer binary, then rolled back) is treated as ephemeral,
+    /// which is the conservative reading — it never auto-starts a
+    /// container the caller didn't ask for.
+    pub fn from_row(row: &sandboxes::Model) -> Self {
+        match row.lifecycle.as_str() {
+            "workspace" => SandboxLifecycle::Workspace,
+            _ => SandboxLifecycle::Ephemeral,
+        }
+    }
+}
+
+impl std::fmt::Display for SandboxLifecycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Input to `create_sandbox`. A subset of the `@vercel/sandbox` create
 /// options — we accept what SDK clients send and ignore the rest.
 #[derive(Debug, Clone, Default)]
@@ -101,6 +162,12 @@ pub struct CreateSandboxRequest {
     /// it). Unknown values are a validation error, and requesting a
     /// backend the host doesn't have fails create rather than downgrading.
     pub backend: Option<String>,
+    /// Lifecycle class (ADR-036). `None` → ephemeral, so existing
+    /// callers and SDK clients are unaffected.
+    pub lifecycle: Option<String>,
+    /// Project to derive the repo from when `source` is absent, and to
+    /// attribute the sandbox to. `None` → unattached sandbox.
+    pub project_id: Option<i32>,
 }
 
 /// Output DTO — what the service returns to handlers and what handlers
@@ -131,6 +198,12 @@ pub struct SandboxSummary {
     /// Set when this sandbox executes an agent run (autofixer / workflow
     /// agent). `None` for sandboxes created via the standalone API.
     pub agent_run_id: Option<i32>,
+    /// Lifecycle class: `"ephemeral"` or `"workspace"` (ADR-036).
+    pub lifecycle: String,
+    /// Project this sandbox belongs to, when created from one.
+    pub project_id: Option<i32>,
+    /// Repo the work dir was seeded from, for display.
+    pub source_repo_url: Option<String>,
 }
 
 impl From<&sandboxes::Model> for SandboxSummary {
@@ -152,6 +225,9 @@ impl From<&sandboxes::Model> for SandboxSummary {
                 .and_then(|v| v.get("disk_size_mb"))
                 .and_then(|v| v.as_u64()),
             agent_run_id: m.agent_run_id,
+            lifecycle: m.lifecycle.clone(),
+            project_id: m.project_id,
+            source_repo_url: m.source_repo_url.clone(),
         }
     }
 }
@@ -178,6 +254,104 @@ fn ports_from_metadata(metadata: Option<&serde_json::Value>) -> Vec<u16> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The idle deadline for a sandbox: the instant it becomes eligible for
+/// suspension if nothing touches it in the meantime.
+///
+/// One helper rather than five open-coded `now + Duration::seconds(...)`
+/// sites, because every path that records activity — create, touch,
+/// resume, wake — must agree on it. When they disagreed, `expires_at`
+/// meant "wall-clock deadline" on some paths and "idle deadline" on
+/// others, which is the bug ADR-036 §3 describes.
+fn idle_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+    timeout_secs: i32,
+) -> chrono::DateTime<chrono::Utc> {
+    now + chrono::Duration::seconds(timeout_secs as i64)
+}
+
+/// Security validation for a seed source *after* it has been resolved.
+///
+/// The handler validates the caller-supplied `source` DTO, which covers the
+/// request-shape rules it owns (mutually exclusive auth fields, and so on).
+/// It cannot cover a source this layer derives from a project row, so the
+/// two checks that actually matter for safety are repeated here on whatever
+/// we finally decided to clone:
+///
+/// - **SSRF**, including DNS resolution. `validate_external_url` rejects
+///   hosts that resolve to private, loopback, link-local or cloud-metadata
+///   addresses — the project-side URL guard only checks IP *literals*, so a
+///   name like `metadata.google.internal` would otherwise pass.
+/// - **Embedded credentials.** A `user:password@` in the URL would be
+///   persisted to `sandboxes.source_repo_url` and echoed back out of the
+///   API. Rows predating the project-side guard can still carry one.
+async fn validate_resolved_source(source: &SandboxSource) -> Result<(), SandboxError> {
+    let (url, kind) = match source {
+        SandboxSource::Git { url, .. } => (url.as_str(), "git"),
+        SandboxSource::Tarball { url } => (url.as_str(), "tarball"),
+    };
+
+    if url_has_embedded_credentials(url) {
+        return Err(SandboxError::Validation {
+            message: format!(
+                "{kind} source: url must not contain embedded credentials — \
+                 use a stored git connection instead"
+            ),
+        });
+    }
+
+    // Sync pass first: scheme + IP-literal blocklist. Cheap, and it avoids a
+    // DNS lookup for URLs that are already disqualified.
+    let parsed = temps_core::url_validation::validate_external_url(url).map_err(|_| {
+        SandboxError::Validation {
+            message: format!(
+                "{kind} source: scheme must be http or https, and the host must \
+                 not be a private, loopback, or metadata address"
+            ),
+        }
+    })?;
+
+    // Then resolve: an IP literal is already covered above, but a *name*
+    // pointing at 169.254.169.254 is only caught here.
+    if let Some(url::Host::Domain(domain)) = parsed.host() {
+        temps_core::url_validation::validate_domain_async(domain)
+            .await
+            .map_err(|_| SandboxError::Validation {
+                message: format!(
+                    "{kind} source: host resolves to a private, loopback, or \
+                     metadata address"
+                ),
+            })?;
+    }
+    Ok(())
+}
+
+/// Does the URL carry `user:password@`?
+///
+/// A bare `user@` is fine — git reads that as "prompt for a password" and it
+/// carries no secret. Only the colon form is a credential.
+///
+/// Shared with the handler so both entry points agree. The naive version —
+/// scanning for the first `@` anywhere after the scheme — false-positives on a
+/// URL that has an explicit port and an `@` later in the path
+/// (`https://host:8080/org/repo@v1.git`), because it reads the whole
+/// `host:8080/org/repo` as userinfo. Stopping at the first `/` is what makes
+/// that correct.
+pub(crate) fn url_has_embedded_credentials(url: &str) -> bool {
+    let Some(scheme_end) = url.find("://") else {
+        return false;
+    };
+    let rest = &url[scheme_end + 3..];
+    // Stop at the end of the authority. Userinfo always precedes the first
+    // `/`, `?` or `#`, so anything past them is path/query/fragment — an `@`
+    // there is not a credential (`https://host/org/repo@v1.git`, or a query
+    // like `?ref=a:b@c`, which a `/`-only split misread as userinfo).
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    match authority.find('@') {
+        Some(at) => authority[..at].contains(':'),
+        None => false,
+    }
 }
 
 /// Reject standalone lifecycle ops (`pause`/`resume`/`restart`/`resize`)
@@ -242,6 +416,12 @@ fn work_dir_to_remove(data_root: &Path, public_id_value: &str) -> Option<PathBuf
 /// Bounds on `timeout_secs` at the service layer. The upper bound
 /// protects against "sandbox leaks" where a caller creates sandboxes
 /// with absurd timeouts and relies on the server never cleaning up.
+/// How long a wake-on-access container start may take before the request
+/// gives up. A wake blocks a user's exec/fs call, so it needs a ceiling: a
+/// wedged container runtime must surface as a clear error, not an
+/// indefinitely hung request.
+const WAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 const MIN_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60; // 24 hours
 const DEFAULT_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour
@@ -334,17 +514,35 @@ impl SandboxService {
     }
 
     /// List the caller's non-destroyed sandboxes, newest first.
+    ///
+    /// `lifecycle` and `project_id` are optional filters, both backed by
+    /// partial indexes from the ADR-036 migration — but only for the
+    /// selective side. The lifecycle index is `WHERE lifecycle <> 'ephemeral'`,
+    /// so `?lifecycle=workspace` avoids the ephemeral rows (the overwhelming
+    /// majority) while `?lifecycle=ephemeral` — an equally valid call — gets
+    /// no index and falls back to the `user_id` scan, which is the right
+    /// trade: one user's sandboxes are few, and indexing the common value
+    /// would cost writes on every row for no gain.
     pub async fn list_for_user(
         &self,
         user_id: i32,
         page: Option<u64>,
         page_size: Option<u64>,
+        lifecycle: Option<SandboxLifecycle>,
+        project_id: Option<i32>,
     ) -> Result<(Vec<SandboxSummary>, u64), SandboxError> {
         let page = page.unwrap_or(1).max(1);
         let page_size = page_size.unwrap_or(20).clamp(1, 100);
-        let paginator = sandboxes::Entity::find()
+        let mut query = sandboxes::Entity::find()
             .filter(sandboxes::Column::UserId.eq(user_id))
-            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .filter(sandboxes::Column::Status.ne("destroyed"));
+        if let Some(lifecycle) = lifecycle {
+            query = query.filter(sandboxes::Column::Lifecycle.eq(lifecycle.as_str()));
+        }
+        if let Some(project_id) = project_id {
+            query = query.filter(sandboxes::Column::ProjectId.eq(project_id));
+        }
+        let paginator = query
             .order_by_desc(sandboxes::Column::CreatedAt)
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
@@ -578,6 +776,50 @@ impl SandboxService {
         Ok(())
     }
 
+    /// Derive a git seed source from a project's connected repository.
+    ///
+    /// The point of `project_id` on create: a user who already deploys a
+    /// project should be able to say "give me a workspace on this" without
+    /// re-typing the clone URL or re-picking the credential. The project
+    /// row already knows both, so we read them here.
+    ///
+    /// Checks out the project's `main_branch` and reuses its
+    /// `git_provider_connection_id`, so private repos clone without the
+    /// caller ever handling a token. Full history (no shallow depth) —
+    /// this is a workspace someone will branch and rebase in, not a
+    /// one-shot build.
+    ///
+    /// Authorization is the caller's responsibility: handlers gate this
+    /// with `project_scope_guard!` + `project_access_guard!` before the
+    /// request reaches the service.
+    async fn source_from_project(&self, project_id: i32) -> Result<SandboxSource, SandboxError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(SandboxError::ProjectNotFound { project_id })?;
+
+        let url = project
+            .git_url
+            .as_ref()
+            .map(|u| u.trim())
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| SandboxError::ProjectHasNoRepo {
+                project_id,
+                name: project.name.clone(),
+            })?
+            .to_string();
+
+        Ok(SandboxSource::Git {
+            url,
+            revision: Some(project.main_branch.clone()),
+            depth: None,
+            username: None,
+            password: None,
+            git_connection_id: project.git_provider_connection_id,
+        })
+    }
+
     // ── Lifecycle ────────────────────────────────────────────────────────
 
     /// Create a new standalone sandbox. Inserts the DB row first (to get
@@ -589,6 +831,40 @@ impl SandboxService {
         user_id: i32,
         req: CreateSandboxRequest,
     ) -> Result<sandboxes::Model, SandboxError> {
+        let lifecycle = match req.lifecycle.as_deref() {
+            None => SandboxLifecycle::default(),
+            Some(value) => SandboxLifecycle::parse(value)?,
+        };
+
+        // Resolve the effective seed source before anything is created.
+        // An explicit `source` always wins — `project_id` only supplies a
+        // default, so a caller can create a workspace attributed to a
+        // project while seeding it from a fork or a different branch.
+        let source = match (req.source.clone(), req.project_id) {
+            // Caller-supplied: already validated by the handler, which owns
+            // the request-shape rules too. Re-checking here would duplicate a
+            // DNS lookup on every create for no gain.
+            (Some(explicit), _) => Some(explicit),
+            // Project-derived: the handler never saw this URL, so it is
+            // validated here — the layer that produced it. `projects.git_url`
+            // is checked for IP literals on the project side but never
+            // resolved, so a name pointing at the metadata endpoint would
+            // otherwise pass; and a row predating that guard can still carry
+            // `user:password@`, which would land in `source_repo_url` and be
+            // echoed back out of the API.
+            (None, Some(project_id)) => {
+                let derived = self.source_from_project(project_id).await?;
+                validate_resolved_source(&derived).await?;
+                Some(derived)
+            }
+            (None, None) => None,
+        };
+
+        let source_repo_url = source.as_ref().and_then(|s| match s {
+            SandboxSource::Git { url, .. } => Some(url.clone()),
+            SandboxSource::Tarball { .. } => None,
+        });
+
         let timeout = req
             .timeout_secs
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -664,7 +940,15 @@ impl SandboxService {
             name: Set(name.clone()),
             status: Set("running".to_string()),
             image: Set(req.image.clone()),
-            work_dir: Set("/workspace".to_string()),
+            // The real directory inside the container, not a nominal
+            // "/workspace" — that path does not exist in the sandbox image
+            // and never has. The agent-run path above already used this
+            // constant; this one was hardcoded and wrong, which stayed
+            // invisible because `exec` and the filesystem ops take the work
+            // dir from the provider handle rather than from this row. It
+            // only surfaced once the terminal used the row's value as a
+            // PTY cwd and every shell died with ENOENT.
+            work_dir: Set(temps_agents::sandbox::SANDBOX_WORK_DIR.to_string()),
             timeout_secs: Set(timeout as i32),
             metadata: Set(metadata_value),
             created_at: Set(now),
@@ -672,6 +956,9 @@ impl SandboxService {
             expires_at: Set(expires_at),
             preview_password_hash: Set(preview.as_ref().map(|p| p.hash.clone())),
             preview_password_hint: Set(preview.as_ref().map(|p| p.hint.clone())),
+            lifecycle: Set(lifecycle.as_str().to_string()),
+            project_id: Set(req.project_id),
+            source_repo_url: Set(source_repo_url),
             ..Default::default()
         };
         let mut row = active.insert(self.db.as_ref()).await?;
@@ -760,7 +1047,7 @@ impl SandboxService {
         // extract now. On failure we tear the sandbox down so the user
         // isn't left with a half-initialized container that's billing
         // their timeout budget.
-        if let Some(source) = req.source {
+        if let Some(source) = source {
             if let Err(e) = self
                 .seed_source(row.id, &public_id_value, user_id, &source)
                 .await
@@ -1216,7 +1503,7 @@ TEMPS_ASKPASS_EOF\n\
             .await
             .map_err(|e| from_agent_error(public_id_value, e))?;
         let now = Utc::now();
-        let new_expires = now + chrono::Duration::seconds(row.timeout_secs as i64);
+        let new_expires = idle_deadline(now, row.timeout_secs);
         let sandbox_id = row.id;
         let mut active: sandboxes::ActiveModel = row.into();
         active.status = Set("running".to_string());
@@ -1389,17 +1676,54 @@ TEMPS_ASKPASS_EOF\n\
         Ok(updated)
     }
 
-    /// Update `last_activity_at` — called by exec/fs ops to keep the
-    /// expiry sweeper honest. Swallows DB errors because activity
-    /// bumps are best-effort.
-    pub async fn touch(&self, sandbox_id: i32) {
+    /// Record activity on a sandbox: bump `last_activity_at` **and** push
+    /// `expires_at` out to `now + timeout_secs`.
+    ///
+    /// Moving `expires_at` here is what makes `timeout_secs` an *idle*
+    /// timeout, which is what the column has always been documented as
+    /// (and what the API calls it). Before this, `expires_at` was set once
+    /// at create and never moved by activity, so a sandbox in continuous
+    /// use was still stopped at its original deadline.
+    ///
+    /// The deadline is materialised in the indexed column rather than
+    /// computed by the sweeper (`last_activity_at + timeout_secs`) on
+    /// purpose: the sweep query rides the partial index on
+    /// `(expires_at) WHERE status = 'running'`, and a predicate over an
+    /// expression would not use it.
+    ///
+    /// Called on every exec and filesystem operation, so it must stay a
+    /// single UPDATE with no read-modify-write. `timeout_secs` is taken
+    /// from the caller (who already has the row) to avoid a SELECT here.
+    ///
+    /// **The deadline only ever moves forward.** `extend_timeout` (the SDK's
+    /// `extendTimeout()`) pushes `expires_at` past `now + timeout_secs`
+    /// precisely so a long operation can outlive the idle window — and the
+    /// first thing that operation does is exec, which lands here. Assigning
+    /// the idle deadline unconditionally would silently undo the extension
+    /// the caller just paid for, so the write is `CASE WHEN`-guarded in SQL:
+    /// still one statement, still no read-modify-write, but never a
+    /// regression. `last_activity_at` is always bumped — it records activity,
+    /// not a deadline.
+    ///
+    /// Swallows DB errors: activity bumps are best-effort, and failing a
+    /// user's exec because a bookkeeping write lost a race would be worse
+    /// than a sandbox expiring slightly early.
+    pub async fn touch(&self, sandbox_id: i32, timeout_secs: i32) {
         let now = Utc::now();
-        let active = sandboxes::ActiveModel {
-            id: Set(sandbox_id),
-            last_activity_at: Set(now),
-            ..Default::default()
-        };
-        if let Err(e) = active.update(self.db.as_ref()).await {
+        let deadline = idle_deadline(now, timeout_secs);
+        let result = sandboxes::Entity::update_many()
+            .col_expr(sandboxes::Column::LastActivityAt, Expr::value(now))
+            .col_expr(
+                sandboxes::Column::ExpiresAt,
+                Expr::cust_with_values(
+                    "CASE WHEN expires_at < $1 THEN $2 ELSE expires_at END",
+                    [deadline, deadline],
+                ),
+            )
+            .filter(sandboxes::Column::Id.eq(sandbox_id))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(e) = result {
             tracing::debug!(
                 "touch: failed to bump last_activity_at for {}: {}",
                 sandbox_id,
@@ -1571,10 +1895,35 @@ TEMPS_ASKPASS_EOF\n\
 
     // ── Helpers shared with the exec/fs modules ──────────────────────────
 
+    /// Load + authorize + return the internal ID **without** waking a
+    /// suspended workspace.
+    ///
+    /// For endpoints that only need to prove ownership and then answer from
+    /// the row or from in-memory state — preview URLs, job listings, job
+    /// status. Those are reads; booting a container as a side effect of a
+    /// `GET` is a surprise that costs real memory on a 3 vCPU / 4 GB host, and
+    /// in the job cases it is pure waste: the in-memory job table was emptied
+    /// when the container stopped, so waking it cannot change the answer.
+    ///
+    /// Use [`Self::resolve_id`] on paths that genuinely need the container
+    /// running (exec, filesystem, terminal).
+    pub async fn resolve_id_no_wake(
+        &self,
+        public_id_value: &str,
+        user_id: i32,
+    ) -> Result<(sandboxes::Model, i32), SandboxError> {
+        let row = self.find_by_public_id(public_id_value, user_id).await?;
+        let id = row.id;
+        Ok((row, id))
+    }
+
     /// Load + authorize + return the internal ID, or a typed error that
     /// already includes the public ID. Exec/fs modules call this first.
     /// Rejects stopped sandboxes with `InvalidState` (→ HTTP 409) — the
     /// user must call `/resume` before running commands.
+    ///
+    /// **Wakes a suspended workspace as a side effect** (ADR-036), so only
+    /// call it where the container must actually be running.
     pub async fn resolve_id(
         &self,
         public_id_value: &str,
@@ -1582,6 +1931,14 @@ TEMPS_ASKPASS_EOF\n\
     ) -> Result<(sandboxes::Model, i32), SandboxError> {
         let row = self.find_by_public_id(public_id_value, user_id).await?;
         if row.status == "stopped" {
+            // Workspaces (ADR-036) are places a human comes back to, so a
+            // suspended one wakes instead of erroring. Ephemeral sandboxes
+            // keep the 409: their lifetime belongs to whoever created them,
+            // and `@vercel/sandbox` consumers rely on a stopped sandbox
+            // staying stopped rather than silently restarting under them.
+            if SandboxLifecycle::from_row(&row) == SandboxLifecycle::Workspace {
+                return self.wake_workspace(row).await;
+            }
             return Err(SandboxError::InvalidState {
                 sandbox_id: public_id_value.to_string(),
                 state: row.status.clone(),
@@ -1590,6 +1947,65 @@ TEMPS_ASKPASS_EOF\n\
         }
         let id = row.id;
         Ok((row, id))
+    }
+
+    /// Start a suspended workspace's container and flip its row back to
+    /// `running`. Called from [`Self::resolve_id`] on the access path, so
+    /// the caller experiences it as a slow first request rather than a
+    /// failure.
+    ///
+    /// A wake is a container start, not a create: the image is local, the
+    /// home volume exists, and the work dir is still populated on the
+    /// host. Nothing is re-cloned and nothing is lost.
+    ///
+    /// If the provider can't start it, the row stays `stopped` and the
+    /// caller gets the provider's error — deliberately not swallowed. A
+    /// workspace that silently fails to wake and then reports "not found"
+    /// on every subsequent call is exactly the debugging dead end
+    /// self-hosted users can't escape.
+    async fn wake_workspace(
+        &self,
+        row: sandboxes::Model,
+    ) -> Result<(sandboxes::Model, i32), SandboxError> {
+        let public_id_value = row.public_id.clone();
+        let sandbox_id = row.id;
+        tracing::info!(
+            "Waking workspace sandbox {} (internal {}) on access",
+            public_id_value,
+            sandbox_id
+        );
+        // Bounded: a wake happens inline on a user's request, and a wedged
+        // container runtime would otherwise hang that request forever with no
+        // way for the caller to tell a slow start from a dead daemon.
+        match tokio::time::timeout(
+            WAKE_TIMEOUT,
+            self.registry.start(sandbox_id, &public_id_value),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| from_agent_error(&public_id_value, e))?,
+            Err(_) => {
+                return Err(SandboxError::InvalidState {
+                    sandbox_id: public_id_value.clone(),
+                    state: "stopped".to_string(),
+                    operation: format!(
+                        "wake timed out after {}s; the container runtime did not \
+                         start the workspace. Check the daemon, then retry",
+                        WAKE_TIMEOUT.as_secs()
+                    ),
+                });
+            }
+        }
+
+        let now = Utc::now();
+        let new_expires = idle_deadline(now, row.timeout_secs);
+        let mut active: sandboxes::ActiveModel = row.into();
+        active.status = Set("running".to_string());
+        active.last_activity_at = Set(now);
+        active.expires_at = Set(new_expires);
+        let updated = active.update(self.db.as_ref()).await?;
+        self.record_event(sandbox_id, "woken", None).await;
+        Ok((updated, sandbox_id))
     }
 
     /// Build a typed provider error into a `SandboxError` carrying the
@@ -1623,8 +2039,9 @@ TEMPS_ASKPASS_EOF\n\
             });
         }
         // Ownership + validity check. The numeric id is intentionally
-        // discarded — the preview URL never embeds it.
-        let _ = self.resolve_id(public_id_value, user_id).await?;
+        // discarded — the preview URL never embeds it. No wake: building a
+        // URL string does not need the container running.
+        let _ = self.resolve_id_no_wake(public_id_value, user_id).await?;
         let parts = self.preview_parts().await;
         Ok(parts.url_for(public_id_value, port))
     }
@@ -1653,7 +2070,8 @@ TEMPS_ASKPASS_EOF\n\
                 message: "port must be between 1 and 65535".into(),
             });
         }
-        let (row, _) = self.resolve_id(public_id_value, user_id).await?;
+        // No wake: minting a share link reads the row's password hash.
+        let (row, _) = self.resolve_id_no_wake(public_id_value, user_id).await?;
         let password_hash =
             row.preview_password_hash
                 .as_deref()
@@ -1929,6 +2347,9 @@ mod tests {
             expires_at: now,
             preview_password_hash: None,
             preview_password_hint: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
         }
     }
 
@@ -2124,12 +2545,55 @@ mod tests {
             expires_at: now,
             preview_password_hash: None,
             preview_password_hint: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
         };
         let s = SandboxSummary::from(&m);
         assert_eq!(s.public_id, "sbx_abc1234567890def");
         assert_eq!(s.status, "running");
         assert_eq!(s.image.as_deref(), Some("node:20"));
         assert_eq!(s.agent_run_id, Some(42));
+    }
+
+    /// `extend_timeout` deliberately pushes `expires_at` past the idle window
+    /// and leaves `timeout_secs` alone. `touch` then runs on the very next
+    /// exec — the long operation the extension was bought for — so if it
+    /// assigned the idle deadline unconditionally it would silently cancel the
+    /// extension the caller just paid for. The guard has to live in the SQL,
+    /// because `touch` must stay a single statement with no read-modify-write
+    /// on the exec hot path.
+    #[tokio::test]
+    async fn touch_never_moves_the_deadline_backwards() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = preview_test_service_with_db(db.clone());
+
+        service.touch(42, 3600).await;
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service owns no database references after drop")
+            .into_transaction_log();
+        let statements = format!("{log:?}");
+
+        assert!(
+            statements.contains("CASE WHEN"),
+            "touch must guard the deadline in SQL so an extendTimeout() is \
+             never silently undone; log: {statements}"
+        );
+        assert!(statements.contains("expires_at"), "log: {statements}");
+        assert!(
+            statements.contains("last_activity_at"),
+            "activity is always recorded, only the deadline is guarded; \
+             log: {statements}"
+        );
     }
 }
 
@@ -2165,7 +2629,10 @@ mod storage_cleanup_tests {
         /// `destroy` errors — the case where the container may still be
         /// running and we delete the work dir anyway.
         fail_destroy: bool,
+        /// `start` errors — the wake-on-access failure path.
+        fail_start: bool,
         destroys: AtomicUsize,
+        starts: AtomicUsize,
     }
 
     impl FakeProvider {
@@ -2174,7 +2641,9 @@ mod storage_cleanup_tests {
                 fail_create: false,
                 fail_exec: false,
                 fail_destroy: false,
+                fail_start: false,
                 destroys: AtomicUsize::new(0),
+                starts: AtomicUsize::new(0),
             }
         }
     }
@@ -2275,6 +2744,19 @@ mod storage_cleanup_tests {
                         "daemon unreachable while destroying {}",
                         handle.sandbox_name
                     ),
+                });
+            }
+            Ok(())
+        }
+
+        /// The trait's default `start` returns "not supported", so the
+        /// wake path needs a real implementation here.
+        async fn start(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            if self.fail_start {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "fake".into(),
+                    reason: format!("daemon unreachable while starting {}", handle.sandbox_name),
                 });
             }
             Ok(())
@@ -2424,6 +2906,9 @@ mod storage_cleanup_tests {
             expires_at: now + chrono::Duration::seconds(3600),
             preview_password_hash: None,
             preview_password_hint: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
         }
     }
 
@@ -2438,6 +2923,383 @@ mod storage_cleanup_tests {
     }
 
     const PUBLIC_ID: &str = "sbx_deadbeef01234567";
+
+    /// A row in the given lifecycle class and status. Used by the
+    /// workspace wake tests below.
+    fn row_with(public_id: &str, lifecycle: &str, status: &str) -> sandboxes::Model {
+        sandboxes::Model {
+            status: status.to_string(),
+            lifecycle: lifecycle.to_string(),
+            ..row(public_id, None)
+        }
+    }
+
+    // ── Lifecycle class (ADR-036) ────────────────────────────────────────
+
+    #[test]
+    fn lifecycle_parses_both_public_values() {
+        assert_eq!(
+            SandboxLifecycle::parse("ephemeral").expect("ephemeral is valid"),
+            SandboxLifecycle::Ephemeral
+        );
+        assert_eq!(
+            SandboxLifecycle::parse("workspace").expect("workspace is valid"),
+            SandboxLifecycle::Workspace
+        );
+    }
+
+    #[test]
+    fn lifecycle_rejects_unknown_values_with_a_helpful_message() {
+        // Silently falling back to ephemeral would cost the caller their
+        // work at the first idle sweep, so a typo must be a 400.
+        let err = SandboxLifecycle::parse("workspaces").expect_err("typo must not be accepted");
+        let msg = err.to_string();
+        assert!(msg.contains("workspaces"), "msg: {}", msg);
+        assert!(msg.contains("ephemeral"), "must list valid values: {}", msg);
+        assert!(msg.contains("workspace"), "must list valid values: {}", msg);
+    }
+
+    #[test]
+    fn lifecycle_from_row_treats_unrecognised_values_as_ephemeral() {
+        // Forward-compat: a row written by a newer binary and then rolled
+        // back must not auto-start containers this binary doesn't
+        // understand. Ephemeral is the conservative reading.
+        let unknown = row_with(PUBLIC_ID, "hibernating", "stopped");
+        assert_eq!(
+            SandboxLifecycle::from_row(&unknown),
+            SandboxLifecycle::Ephemeral
+        );
+    }
+
+    #[test]
+    fn lifecycle_default_is_ephemeral() {
+        // Every existing caller and SDK client omits the field.
+        assert_eq!(SandboxLifecycle::default(), SandboxLifecycle::Ephemeral);
+        assert_eq!(SandboxLifecycle::default().as_str(), "ephemeral");
+    }
+
+    #[test]
+    fn idle_deadline_is_now_plus_timeout() {
+        let now = Utc::now();
+        assert_eq!(idle_deadline(now, 3600), now + chrono::Duration::hours(1));
+        // Degenerate but representable: a zero timeout is already expired
+        // rather than infinite. The service clamps to >= 60 before this
+        // is reached, so this only pins the arithmetic.
+        assert_eq!(idle_deadline(now, 0), now);
+    }
+
+    #[tokio::test]
+    async fn resolve_id_wakes_a_stopped_workspace() {
+        let data_root = unique_data_root("wake-workspace");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // find_by_public_id → a suspended workspace
+            .append_query_results([vec![row_with(PUBLIC_ID, "workspace", "stopped")]])
+            // wake_workspace's status update (RETURNING the running row)
+            .append_query_results([vec![row_with(PUBLIC_ID, "workspace", "running")]])
+            .into_connection();
+
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+        let (row, id) = service
+            .resolve_id(PUBLIC_ID, 1)
+            .await
+            .expect("a stopped workspace must wake, not error");
+
+        assert_eq!(id, 7);
+        assert_eq!(
+            row.status, "running",
+            "the caller must receive the woken row, not the stale stopped one"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resolve_id_still_rejects_a_stopped_ephemeral_sandbox() {
+        // `@vercel/sandbox` consumers rely on a stopped sandbox staying
+        // stopped. Waking one under them would restart billing on a
+        // container they deliberately shut down.
+        let data_root = unique_data_root("no-wake-ephemeral");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "stopped")]])
+            .into_connection();
+
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+        let err = service
+            .resolve_id(PUBLIC_ID, 1)
+            .await
+            .expect_err("ephemeral sandboxes must not auto-wake");
+
+        match err {
+            SandboxError::InvalidState { state, .. } => assert_eq!(state, "stopped"),
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resolve_id_passes_through_a_running_workspace_without_starting_it() {
+        // A running workspace is the common case and must not pay for the
+        // wake path. Proven with a provider whose `start` always fails: if
+        // the resolve path touched it, this would error.
+        let data_root = unique_data_root("running-workspace");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "workspace", "running")]])
+            .into_connection();
+
+        let provider = FakeProvider {
+            fail_start: true,
+            ..FakeProvider::new()
+        };
+        let (service, _) = build_service(db, provider, data_root.clone());
+        let (row, _) = service
+            .resolve_id(PUBLIC_ID, 1)
+            .await
+            .expect("a running workspace resolves without a provider start");
+        assert_eq!(row.status, "running");
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resolve_id_surfaces_a_failed_wake_instead_of_swallowing_it() {
+        // A workspace that silently fails to wake and then reports
+        // "not found" on every later call is exactly the dead end a
+        // self-hosted user can't debug. The provider error must reach them.
+        let data_root = unique_data_root("wake-fails");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "workspace", "stopped")]])
+            .into_connection();
+
+        let provider = FakeProvider {
+            fail_start: true,
+            ..FakeProvider::new()
+        };
+        let (service, _) = build_service(db, provider, data_root.clone());
+        let err = service
+            .resolve_id(PUBLIC_ID, 1)
+            .await
+            .expect_err("a provider start failure must not be swallowed");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("daemon unreachable"),
+            "the provider's reason must reach the caller: {}",
+            msg
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    // ── Workspace-from-project (ADR-036 §5) ──────────────────────────────
+
+    fn project_row(git_url: Option<&str>) -> projects::Model {
+        let now = Utc::now();
+        projects::Model {
+            id: 12,
+            name: "acme-api".into(),
+            repo_name: "api".into(),
+            repo_owner: "acme".into(),
+            directory: String::new(),
+            main_branch: "main".into(),
+            preset: temps_entities::preset::Preset::NextJs,
+            preset_config: None,
+            deployment_config: None,
+            created_at: now,
+            updated_at: now,
+            slug: "acme-api".into(),
+            is_deleted: false,
+            deleted_at: None,
+            last_deployment: None,
+            is_public_repo: true,
+            git_url: git_url.map(str::to_string),
+            git_provider_connection_id: Some(3),
+            attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_debug_chat_enabled: None,
+            ai_write_actions_enabled: false,
+            error_source_context_enabled: false,
+            error_source_root: None,
+            enable_preview_environments: false,
+            preview_envs_on_demand: false,
+            preview_envs_idle_timeout_seconds: 0,
+            preview_envs_wake_timeout_seconds: 0,
+            source_type: Default::default(),
+            template_slug: None,
+            gitlab_webhook_id: None,
+            gitlab_webhook_signing_token: None,
+            gitea_webhook_signing_token: None,
+            bitbucket_webhook_token: None,
+            bitbucket_webhook_hook_id: None,
+            generic_webhook_token: None,
+            cross_project_trace_sharing: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn source_from_project_uses_the_projects_repo_branch_and_connection() {
+        let data_root = unique_data_root("project-source-ok");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![project_row(Some("https://github.com/acme/api.git"))]])
+            .into_connection();
+
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+        let source = service
+            .source_from_project(12)
+            .await
+            .expect("a connected project yields a git source");
+
+        match source {
+            SandboxSource::Git {
+                url,
+                revision,
+                depth,
+                git_connection_id,
+                username,
+                password,
+            } => {
+                assert_eq!(url, "https://github.com/acme/api.git");
+                assert_eq!(revision.as_deref(), Some("main"));
+                assert!(
+                    depth.is_none(),
+                    "a workspace gets full history — you cannot rebase in a shallow clone"
+                );
+                assert_eq!(git_connection_id, Some(3));
+                assert!(
+                    username.is_none() && password.is_none(),
+                    "credentials must resolve server-side from the connection, \
+                     never be materialised here"
+                );
+            }
+            other => panic!("expected a git source, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn source_from_project_errors_when_the_project_has_no_repo() {
+        let data_root = unique_data_root("project-no-repo");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![project_row(None)]])
+            .into_connection();
+
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+        let err = service
+            .source_from_project(12)
+            .await
+            .expect_err("a project with no git_url cannot seed a workspace");
+
+        match err {
+            SandboxError::ProjectHasNoRepo { project_id, name } => {
+                assert_eq!(project_id, 12);
+                assert_eq!(name, "acme-api");
+            }
+            other => panic!("expected ProjectHasNoRepo, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn source_from_project_errors_when_the_project_is_missing() {
+        let data_root = unique_data_root("project-missing");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<projects::Model>::new()])
+            .into_connection();
+
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+        let err = service
+            .source_from_project(999)
+            .await
+            .expect_err("a missing project is a 404, not a silent empty workspace");
+
+        assert!(matches!(
+            err,
+            SandboxError::ProjectNotFound { project_id: 999 }
+        ));
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    // ── Resolved-source validation ───────────────────────────────────────
+
+    #[test]
+    fn embedded_credentials_are_detected_only_in_userinfo() {
+        assert!(url_has_embedded_credentials(
+            "https://user:secret@github.com/org/repo.git"
+        ));
+        // A bare user is not a credential — git treats it as "prompt".
+        assert!(!url_has_embedded_credentials(
+            "https://user@github.com/org/repo.git"
+        ));
+        assert!(!url_has_embedded_credentials(
+            "https://github.com/org/repo.git"
+        ));
+        // An `@` in the *path* must not be mistaken for userinfo, or every
+        // pinned-ref URL would be rejected as leaking a password.
+        assert!(!url_has_embedded_credentials(
+            "https://github.com/org/repo@v1.git"
+        ));
+        assert!(!url_has_embedded_credentials("git@github.com:org/repo.git"));
+        // A `:` and `@` in the query or fragment are not userinfo either —
+        // userinfo always precedes the first `/`, `?` or `#`. Splitting on
+        // `/` alone read this as `user:password` and rejected a valid URL.
+        assert!(!url_has_embedded_credentials(
+            "https://github.com/org/repo.git?ref=a:b@c"
+        ));
+        assert!(!url_has_embedded_credentials("https://host?ref=a:b@c"));
+        assert!(!url_has_embedded_credentials("https://host#frag=a:b@c"));
+        // ...but real userinfo before a query is still caught.
+        assert!(url_has_embedded_credentials(
+            "https://user:pw@github.com/org/repo.git?ref=main"
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolved_source_rejects_embedded_credentials() {
+        // This is the project-derived path's guard: a legacy `projects.git_url`
+        // carrying a password would otherwise be persisted to
+        // `source_repo_url` and echoed back out of the API.
+        let source = SandboxSource::Git {
+            url: "https://user:secret@github.com/org/repo.git".into(),
+            revision: None,
+            depth: None,
+            username: None,
+            password: None,
+            git_connection_id: None,
+        };
+        let err = validate_resolved_source(&source)
+            .await
+            .expect_err("credentials in the url must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("embedded credentials"), "msg: {msg}");
+        // The message must not echo the secret back at the caller.
+        assert!(!msg.contains("secret"), "error leaked the password: {msg}");
+    }
+
+    #[tokio::test]
+    async fn resolved_source_rejects_loopback_and_metadata_hosts() {
+        for url in [
+            "http://127.0.0.1/repo.git",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/repo.git",
+        ] {
+            let source = SandboxSource::Git {
+                url: url.into(),
+                revision: None,
+                depth: None,
+                username: None,
+                password: None,
+                git_connection_id: None,
+            };
+            assert!(
+                validate_resolved_source(&source).await.is_err(),
+                "{url} must be rejected as an SSRF target"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_source_rejects_non_http_schemes() {
+        let source = SandboxSource::Tarball {
+            url: "file:///etc/passwd".into(),
+        };
+        assert!(validate_resolved_source(&source).await.is_err());
+    }
 
     #[tokio::test]
     async fn destroy_sandbox_removes_the_work_dir() {
