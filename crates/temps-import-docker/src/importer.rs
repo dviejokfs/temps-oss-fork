@@ -658,7 +658,12 @@ impl WorkloadImporter for DockerImporter {
                     .env_vars
                     .iter()
                     .filter(|ev| !ev.is_secret)
-                    .map(|ev| (ev.key.clone(), ev.value.clone()))
+                    .map(|ev| {
+                        temps_projects::services::types::CreateProjectEnvVar::plain(
+                            ev.key.clone(),
+                            ev.value.clone(),
+                        )
+                    })
                     .collect(),
             ),
             automatic_deploy: true,

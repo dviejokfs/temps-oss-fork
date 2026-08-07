@@ -119,11 +119,18 @@ const formSchema = z.object({
   // Common settings
   port: z.number().int().min(1).max(65535).optional(),
   environmentVariables: z.array(
-    z.object({
-      key: z.string(),
-      value: z.string(),
-      isSecret: z.boolean(),
-    })
+    z
+      .object({
+        key: z.string(),
+        value: z.string(),
+        isSecret: z.boolean(),
+      })
+      // A secret is write-only once saved, so an empty one could never be
+      // filled in afterwards — the server rejects it too.
+      .refine((v) => !v.isSecret || v.value.length > 0, {
+        message: 'A secret needs a value — it cannot be filled in later',
+        path: ['value'],
+      })
   ),
   storageServices: z.array(z.number()),
 })
@@ -306,7 +313,11 @@ export function ManualProjectConfigurator({
             storage_service_ids: finalData.storageServices || [],
             environment_variables: finalData.environmentVariables
               ?.filter(env => env.key.trim() !== '')
-              ?.map((env) => [env.key, env.value] as [string, string]),
+              ?.map((env) => ({
+                key: env.key,
+                value: env.value,
+                is_secret: env.isSecret,
+              })),
           },
         })
       }

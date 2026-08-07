@@ -2,6 +2,11 @@ export interface DropEnvironmentVariable {
   id: string
   key: string
   value: string
+  /**
+   * Write-only: temps stores the value encrypted and never returns the
+   * plaintext again, so it can be replaced but never read back.
+   */
+  isSecret: boolean
 }
 
 const ENVIRONMENT_VARIABLE_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -18,6 +23,11 @@ export function validateDropEnvironmentVariables(
       return `${key} is not a valid environment variable key`
     }
     if (seen.has(key)) return `${key} is defined more than once`
+    // A secret is write-only once saved, so an empty one could never be
+    // filled in afterwards. The server rejects it too.
+    if (variable.isSecret && !variable.value) {
+      return `${key} is marked as a secret but has no value — secrets cannot be filled in later`
+    }
     seen.add(key)
   }
 
@@ -26,6 +36,10 @@ export function validateDropEnvironmentVariables(
 
 export function serializeDropEnvironmentVariables(
   variables: DropEnvironmentVariable[]
-): Array<[string, string]> {
-  return variables.map((variable) => [variable.key.trim(), variable.value])
+): Array<{ key: string; value: string; is_secret: boolean }> {
+  return variables.map((variable) => ({
+    key: variable.key.trim(),
+    value: variable.value,
+    is_secret: variable.isSecret,
+  }))
 }

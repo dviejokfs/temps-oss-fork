@@ -13,7 +13,8 @@ use temps_git::services::public_repo::PublicRepoProviderFactory;
 use serde::Serialize;
 
 use super::types::{
-    CreateProjectRequest, Project, ProjectError, ProjectStatistics, UpdateDeploymentSettingsRequest,
+    CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectStatistics,
+    UpdateDeploymentSettingsRequest,
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::UpdateDeploymentConfigRequest;
@@ -306,6 +307,27 @@ impl ProjectService {
                 "Template slug cannot exceed {} characters",
                 temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
             )));
+        }
+
+        // Reject unusable env vars before the project row exists. Catching this
+        // here keeps it a 400 on the request that caused it, instead of a 500
+        // from the post-insert finalize step that then rolls the project back.
+        if let Some(env_vars) = request.environment_variables.as_ref() {
+            for env_var in env_vars {
+                if env_var.key.trim().is_empty() {
+                    return Err(ProjectError::InvalidInput(
+                        "Environment variable names cannot be empty".to_string(),
+                    ));
+                }
+                if env_var.is_secret && env_var.value.is_empty() {
+                    return Err(ProjectError::InvalidInput(format!(
+                        "Environment variable '{}' is marked as a secret but has no value. \
+                         Secrets are write-only and cannot be filled in later — \
+                         provide a value or clear the secret flag.",
+                        env_var.key
+                    )));
+                }
+            }
         }
 
         // Verify storage service IDs exist if provided
@@ -685,7 +707,7 @@ impl ProjectService {
     async fn finalize_project_creation(
         &self,
         project: &projects::Model,
-        environment_variables: Option<Vec<(String, String)>>,
+        environment_variables: Option<Vec<CreateProjectEnvVar>>,
         storage_service_ids: Vec<i32>,
     ) -> Result<temps_entities::environments::Model, ProjectError> {
         let default_environment = self
@@ -712,13 +734,19 @@ impl ProjectService {
         );
 
         if let Some(env_vars) = environment_variables {
-            for (key, value) in env_vars {
+            for env_var in env_vars {
+                let CreateProjectEnvVar {
+                    key,
+                    value,
+                    is_secret,
+                } = env_var;
                 self.env_var_service
                     .create_environment_variable(
                         project.id,
                         vec![default_environment.id],
                         key.clone(),
                         value,
+                        is_secret,
                     )
                     .await
                     .map_err(|e| ProjectError::EnvVarCreationFailed {
@@ -2816,9 +2844,10 @@ impl ProjectService {
         environment_ids: Vec<i32>,
         key: String,
         value: String,
+        is_secret: bool,
     ) -> Result<EnvVarWithEnvironments, ProjectError> {
         self.env_var_service
-            .create_environment_variable(project_id, environment_ids, key, value)
+            .create_environment_variable(project_id, environment_ids, key, value, is_secret)
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))
     }

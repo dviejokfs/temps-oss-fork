@@ -217,6 +217,11 @@ pub struct EnvVarInput {
     pub name: String,
     /// Variable value
     pub value: String,
+    /// Mark the variable as a write-only secret. Secret values are encrypted at
+    /// rest and never returned in plaintext by the API — they can only be
+    /// replaced, not read back. Defaults to `false`.
+    #[serde(default)]
+    pub is_secret: bool,
 }
 
 /// Response after creating a project from template

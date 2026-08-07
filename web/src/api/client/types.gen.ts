@@ -1105,16 +1105,7 @@ export type AppSettings = {
     require_mfa_for_admins?: boolean;
     screenshots?: ScreenshotSettings;
     security_headers?: SecurityHeadersSettings;
-    /**
-     * One-click "Update now" from the console. Enabled by default; an admin
-     * can turn it off here to keep upgrades on the CLI/config-management path.
-     *
-     * This is the *soft* switch — it is stored in the database, so whoever can
-     * write settings can also turn it back on. Operators who need an upgrade
-     * path that no console session can re-open should start the server with
-     * `--disable-self-update`, which wins over this field unconditionally.
-     */
-    self_update?: SelfUpdateSettings;
+    self_update?: null | SelfUpdateSettings;
     /**
      * Set to `true` by `temps setup` (all modes) once initial configuration
      * has been applied. The web onboarding wizard reads this from the server
@@ -3751,10 +3742,14 @@ export type CreateProjectRequest = {
     build_command?: string | null;
     custom_domain?: string | null;
     directory: string;
-    environment_variables?: Array<[
-        string,
-        string
-    ]> | null;
+    /**
+     * Environment variables to seed the default (production) environment with.
+     *
+     * Accepts objects — `{"key": "API_KEY", "value": "sk-...", "is_secret": true}`
+     * — or the legacy two-element form `["API_KEY", "sk-..."]`, which implies
+     * `is_secret: false`.
+     */
+    environment_variables?: Array<ProjectEnvVarInput> | null;
     /**
      * Port exposed by the container (fallback when image has no EXPOSE directive)
      *
@@ -6138,6 +6133,12 @@ export type EntityResponse = {
  * Input for environment variable
  */
 export type EnvVarInput = {
+    /**
+     * Mark the variable as a write-only secret. Secret values are encrypted at
+     * rest and never returned in plaintext by the API — they can only be
+     * replaced, not read back. Defaults to `false`.
+     */
+    is_secret?: boolean;
     /**
      * Variable name
      */
@@ -12133,6 +12134,31 @@ export type ProjectDashboardAnalytics = {
      * Unique visitor count in the current time range
      */
     unique_visitors: number;
+};
+
+/**
+ * Documentation-only schema for a project-creation environment variable.
+ *
+ * The wire format is deserialized by [`CreateProjectEnvVar`], which also
+ * accepts the legacy `["KEY", "value"]` tuple form. This struct exists so the
+ * OpenAPI spec (and the generated clients) describe the preferred object form
+ * with its `is_secret` flag.
+ */
+export type ProjectEnvVarInput = {
+    /**
+     * Mark the variable as a write-only secret. Secret values are encrypted at
+     * rest and never returned in plaintext by the API — they can only be
+     * replaced, not read back. Defaults to `false`.
+     */
+    is_secret?: boolean;
+    /**
+     * Variable name, e.g. `DATABASE_URL`
+     */
+    key: string;
+    /**
+     * Variable value
+     */
+    value: string;
 };
 
 /**

@@ -94,7 +94,11 @@ const SERVICE_TYPES = [
     name: 'Redis',
     description: 'In-Memory Data Store',
   },
-  { id: 's3' as ServiceTypeRoute, name: 'S3 / RustFS', description: 'S3-compatible Object Storage' },
+  {
+    id: 's3' as ServiceTypeRoute,
+    name: 'S3 / RustFS',
+    description: 'S3-compatible Object Storage',
+  },
   {
     id: 'libsql' as ServiceTypeRoute,
     name: 'LibSQL',
@@ -121,11 +125,18 @@ const formSchema = z.object({
   rootDirectory: z.string(),
   branch: z.string().min(1, 'Branch is required'),
   environmentVariables: z.array(
-    z.object({
-      key: z.string(),
-      value: z.string(),
-      isSecret: z.boolean(),
-    })
+    z
+      .object({
+        key: z.string(),
+        value: z.string(),
+        isSecret: z.boolean(),
+      })
+      // A secret is write-only once saved, so an empty one could never be
+      // filled in afterwards — the server rejects it too.
+      .refine((v) => !v.isSecret || v.value.length > 0, {
+        message: 'A secret needs a value — it cannot be filled in later',
+        path: ['value'],
+      })
   ),
   storageServices: z.array(z.number()),
   dockerfilePath: z.string().optional(),
@@ -141,7 +152,16 @@ function ComposeFileSelector({
   presetData,
 }: {
   form: ReturnType<typeof useForm<ProjectFormValues>>
-  presetData: { presets?: { preset: string; compose_files?: string[] | null; composeFiles?: string[] | null }[] } | undefined | null
+  presetData:
+    | {
+        presets?: {
+          preset: string
+          compose_files?: string[] | null
+          composeFiles?: string[] | null
+        }[]
+      }
+    | undefined
+    | null
 }) {
   const [isCustomPath, setIsCustomPath] = useState(false)
   const rootDirectory = form.watch('rootDirectory') || './'
@@ -154,7 +174,8 @@ function ComposeFileSelector({
       (p) => p.preset === 'docker-compose'
     )
     // Handle both camelCase (from API) and snake_case
-    const allFiles = composePreset?.composeFiles ?? composePreset?.compose_files ?? []
+    const allFiles =
+      composePreset?.composeFiles ?? composePreset?.compose_files ?? []
 
     // Normalize root directory: strip leading ./ and trailing /
     const normalizedRoot = rootDirectory.replace(/^\.\//, '').replace(/\/$/, '')
@@ -212,7 +233,8 @@ function ComposeFileSelector({
               />
             </FormControl>
             <p className="text-xs text-muted-foreground">
-              Path to your compose file (e.g., docker-compose.yml, compose.yaml).
+              Path to your compose file (e.g., docker-compose.yml,
+              compose.yaml).
             </p>
             <FormMessage />
           </FormItem>
@@ -257,8 +279,9 @@ function ComposeFileSelector({
             ))}
           </div>
           <p className="text-xs text-muted-foreground">
-            {composeFiles.length} compose file{composeFiles.length !== 1 ? 's' : ''} found.
-            Each service with exposed ports gets a subdomain automatically.
+            {composeFiles.length} compose file
+            {composeFiles.length !== 1 ? 's' : ''} found. Each service with
+            exposed ports gets a subdomain automatically.
           </p>
           <FormMessage />
         </FormItem>
@@ -274,7 +297,7 @@ type WizardStep = 'repo-config' | 'services' | 'env-vars' | 'review'
 interface ProjectConfiguratorProps {
   // Repository data
   repository: RepositoryResponse
-  connectionId?: number  // Optional for public repos
+  connectionId?: number // Optional for public repos
 
   // Optional data
   branches?: BranchInfo[]
@@ -367,7 +390,8 @@ export function ProjectConfigurator({
       query: { connection_id: connectionId! },
       path: { owner: repository.owner || '', repo: repository.name || '' },
     }),
-    enabled: !branches && !!connectionId && !!repository.owner && !!repository.name,
+    enabled:
+      !branches && !!connectionId && !!repository.owner && !!repository.name,
   })
 
   const effectiveBranches = useMemo(
@@ -597,7 +621,11 @@ export function ProjectConfigurator({
             automatic_deploy: finalData.autoDeploy,
             storage_service_ids: finalData.storageServices || [],
             environment_variables: finalData.environmentVariables?.map(
-              (env) => [env.key, env.value] as [string, string]
+              (env) => ({
+                key: env.key,
+                value: env.value,
+                is_secret: env.isSecret,
+              })
             ),
             preset_config:
               finalData.preset === 'dockerfile' && finalData.dockerfilePath
@@ -860,15 +888,14 @@ export function ProjectConfigurator({
       )}
 
       {/* Docker Compose Configuration */}
-      {form.watch('preset')?.split('::')[0]?.toLowerCase() === 'docker-compose' && (
-        <ComposeFileSelector
-          form={form}
-          presetData={presetData}
-        />
+      {form.watch('preset')?.split('::')[0]?.toLowerCase() ===
+        'docker-compose' && (
+        <ComposeFileSelector form={form} presetData={presetData} />
       )}
 
       {/* Application Port - hide for docker-compose (multiple services have their own ports) */}
-      {form.watch('preset')?.split('::')[0]?.toLowerCase() !== 'docker-compose' && (
+      {form.watch('preset')?.split('::')[0]?.toLowerCase() !==
+        'docker-compose' && (
         <FormField
           control={form.control}
           name="port"
@@ -1084,7 +1111,9 @@ export function ProjectConfigurator({
         <ImportEnvDialog
           isOpen={isImportEnvOpen}
           onOpenChange={setIsImportEnvOpen}
-          existingKeys={new Set(watchedEnvVars.map((v) => v.key).filter(Boolean))}
+          existingKeys={
+            new Set(watchedEnvVars.map((v) => v.key).filter(Boolean))
+          }
           showEnvironmentSelection={false}
           onImport={async (variables) => {
             const currentVars = form.getValues('environmentVariables') || []
@@ -1103,56 +1132,85 @@ export function ProjectConfigurator({
               <Card key={index} className="border-dashed">
                 <CardContent className="p-4">
                   <div className="flex items-start gap-3">
-                    <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-3">
-                      <FormField
-                        control={form.control}
-                        name={`environmentVariables.${index}.key`}
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel className="text-sm">Key</FormLabel>
-                            <FormControl>
-                              <Input {...field} placeholder="DATABASE_URL" />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={form.control}
-                        name={`environmentVariables.${index}.value`}
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel className="text-sm">Value</FormLabel>
-                            <div className="relative">
+                    <div className="flex-1 space-y-3">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <FormField
+                          control={form.control}
+                          name={`environmentVariables.${index}.key`}
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel className="text-sm">Key</FormLabel>
                               <FormControl>
-                                <Input
-                                  {...field}
-                                  type={
-                                    showSecrets[index] ? 'text' : 'password'
-                                  }
-                                  placeholder="Enter value"
-                                />
+                                <Input {...field} placeholder="DATABASE_URL" />
                               </FormControl>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="sm"
-                                className="absolute right-0 top-0 h-full px-3"
-                                onClick={() =>
-                                  setShowSecrets((prev) => ({
-                                    ...prev,
-                                    [index]: !prev[index],
-                                  }))
-                                }
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name={`environmentVariables.${index}.value`}
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel className="text-sm">Value</FormLabel>
+                              <div className="relative">
+                                <FormControl>
+                                  <Input
+                                    {...field}
+                                    type={
+                                      showSecrets[index] ? 'text' : 'password'
+                                    }
+                                    placeholder="Enter value"
+                                  />
+                                </FormControl>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  className="absolute right-0 top-0 h-full px-3"
+                                  onClick={() =>
+                                    setShowSecrets((prev) => ({
+                                      ...prev,
+                                      [index]: !prev[index],
+                                    }))
+                                  }
+                                >
+                                  {showSecrets[index] ? (
+                                    <EyeOff className="h-4 w-4" />
+                                  ) : (
+                                    <Eye className="h-4 w-4" />
+                                  )}
+                                </Button>
+                              </div>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      </div>
+                      <FormField
+                        control={form.control}
+                        name={`environmentVariables.${index}.isSecret`}
+                        render={({ field }) => (
+                          <FormItem className="flex items-start space-x-2 space-y-0">
+                            <FormControl>
+                              <Checkbox
+                                id={`env-var-secret-${index}`}
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                            <div className="space-y-0.5 leading-none">
+                              <FormLabel
+                                htmlFor={`env-var-secret-${index}`}
+                                className="text-xs font-medium"
                               >
-                                {showSecrets[index] ? (
-                                  <EyeOff className="h-4 w-4" />
-                                ) : (
-                                  <Eye className="h-4 w-4" />
-                                )}
-                              </Button>
+                                Secret
+                              </FormLabel>
+                              <p className="text-muted-foreground text-xs">
+                                Write-only. The value is stored encrypted and
+                                can be replaced but never shown again.
+                              </p>
                             </div>
-                            <FormMessage />
                           </FormItem>
                         )}
                       />
@@ -1192,9 +1250,12 @@ export function ProjectConfigurator({
   return (
     <div className={cn('space-y-6', className)}>
       <Form {...form}>
-        <form onSubmit={form.handleSubmit(handleSubmit, (errors) => {
-          console.error('Form validation errors:', errors)
-        })} className="space-y-6">
+        <form
+          onSubmit={form.handleSubmit(handleSubmit, (errors) => {
+            console.error('Form validation errors:', errors)
+          })}
+          className="space-y-6"
+        >
           {/* All sections in one view for inline/compact mode */}
           <Card>
             <CardHeader>

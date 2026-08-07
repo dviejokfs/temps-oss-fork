@@ -7770,17 +7770,9 @@
             "type": "string"
           },
           "environment_variables": {
+            "description": "Environment variables to seed the default (production) environment with.\n\nAccepts objects — `{\"key\": \"API_KEY\", \"value\": \"sk-...\", \"is_secret\": true}`\n— or the legacy two-element form `[\"API_KEY\", \"sk-...\"]`, which implies\n`is_secret: false`.",
             "items": {
-              "items": false,
-              "prefixItems": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "string"
-                }
-              ],
-              "type": "array"
+              "$ref": "#/components/schemas/ProjectEnvVarInput"
             },
             "type": [
               "array",
@@ -8121,6 +8113,13 @@
               "null"
             ]
           },
+          "lifecycle": {
+            "description": "Lifecycle class (ADR-036, temps-native): `\"ephemeral\"` (default) or\n`\"workspace\"`.\n\nA workspace is a long-lived development environment: it is still\nsuspended after `timeout_secs` of inactivity, but the next exec or\nfilesystem call wakes it transparently instead of returning 409, and\nnothing ever destroys it automatically. Use it for \"give me a place\nto work on this repo\"; leave it unset for throwaway sandboxes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "memory_limit_mb": {
             "format": "int64",
             "minimum": 0,
@@ -8162,6 +8161,14 @@
           "projectId": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Create the sandbox against a temps project (temps-native). The\nproject's connected repo and git credential seed the work dir when\nno explicit `source` is given, and the sandbox is attributed to the\nproject so it can be listed alongside it.\n\nRequires access to the project — the same team/scope rules that\ngate every other project-scoped endpoint apply.",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -13169,6 +13176,10 @@
       "EnvVarInput": {
         "description": "Input for environment variable",
         "properties": {
+          "is_secret": {
+            "description": "Mark the variable as a write-only secret. Secret values are encrypted at\nrest and never returned in plaintext by the API — they can only be\nreplaced, not read back. Defaults to `false`.",
+            "type": "boolean"
+          },
           "name": {
             "description": "Variable name",
             "type": "string"
@@ -26894,6 +26905,28 @@
         ],
         "type": "object"
       },
+      "ProjectEnvVarInput": {
+        "description": "Documentation-only schema for a project-creation environment variable.\n\nThe wire format is deserialized by [`CreateProjectEnvVar`], which also\naccepts the legacy `[\"KEY\", \"value\"]` tuple form. This struct exists so the\nOpenAPI spec (and the generated clients) describe the preferred object form\nwith its `is_secret` flag.",
+        "properties": {
+          "is_secret": {
+            "description": "Mark the variable as a write-only secret. Secret values are encrypted at\nrest and never returned in plaintext by the API — they can only be\nreplaced, not read back. Defaults to `false`.",
+            "type": "boolean"
+          },
+          "key": {
+            "description": "Variable name, e.g. `DATABASE_URL`",
+            "type": "string"
+          },
+          "value": {
+            "description": "Variable value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      },
       "ProjectHealthSummary": {
         "description": "Health summary for a single project (last 1 hour)",
         "properties": {
@@ -31329,6 +31362,10 @@
               "null"
             ]
           },
+          "lifecycle": {
+            "description": "Lifecycle class (ADR-036): `\"ephemeral\"` or `\"workspace\"`. Always\npresent — a client that doesn't know about workspaces sees\n`\"ephemeral\"` and behaves exactly as before.",
+            "type": "string"
+          },
           "memory": {
             "format": "int64",
             "minimum": 0,
@@ -31346,6 +31383,14 @@
           "preview_url_template": {
             "type": "string"
           },
+          "project_id": {
+            "description": "Project this sandbox was created from, when created from one.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "region": {
             "type": "string"
           },
@@ -31356,6 +31401,13 @@
           },
           "runtime": {
             "type": "string"
+          },
+          "source_repo_url": {
+            "description": "Repo the work dir was seeded from. Never carries credentials.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "status": {
             "type": "string"
@@ -31388,7 +31440,8 @@
           "updatedAt",
           "cwd",
           "name",
-          "preview_url_template"
+          "preview_url_template",
+          "lifecycle"
         ],
         "type": "object"
       },
@@ -89853,6 +89906,25 @@
               "minimum": 0,
               "type": "integer"
             }
+          },
+          {
+            "description": "Filter by lifecycle class: \"ephemeral\" or \"workspace\"",
+            "in": "query",
+            "name": "lifecycle",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter to sandboxes created from a project",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -89865,6 +89937,9 @@
               }
             },
             "description": "List sandboxes"
+          },
+          "400": {
+            "description": "Unknown lifecycle value"
           }
         },
         "security": [
@@ -91211,6 +91286,88 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Sandboxes"
+        ]
+      }
+    },
+    "/v1/sandboxes/{id}/terminal": {
+      "get": {
+        "operationId": "terminal",
+        "parameters": [
+          {
+            "description": "Sandbox public ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Tab to attach to (default \"main\"); reusing an id reattaches to the running program",
+            "in": "query",
+            "name": "tab",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Program to launch when the tab is created (default: login shell)",
+            "in": "query",
+            "name": "cmd",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Initial columns (default 80)",
+            "in": "query",
+            "name": "cols",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Initial rows (default 24)",
+            "in": "query",
+            "name": "rows",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket established; PTY attached"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Sandbox not found"
+          },
+          "409": {
+            "description": "Sandbox is not in a state that can be attached to"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Attach an interactive terminal to a sandbox.",
         "tags": [
           "Sandboxes"
         ]
