@@ -128,8 +128,15 @@ pub struct AppSettings {
     /// write settings can also turn it back on. Operators who need an upgrade
     /// path that no console session can re-open should start the server with
     /// `--disable-self-update`, which wins over this field unconditionally.
+    /// `None` means the client did not express an opinion, NOT "reset to
+    /// default". Every other field on this struct is safe to re-default on a
+    /// partial write, but this one gates whether the server may replace its own
+    /// binary — silently flipping it back on because an older client PUT a
+    /// settings document without it would undo a deliberate security decision.
+    /// The update handler preserves the stored value when this is absent; read
+    /// it through `self_update()`.
     #[serde(default)]
-    pub self_update: SelfUpdateSettings,
+    pub self_update: Option<SelfUpdateSettings>,
 
     /// Binary version tag (e.g. "v0.1.0") of the *console* process
     /// (`temps serve`, role=all or role=console) that last started. Written
@@ -915,9 +922,18 @@ impl Default for AppSettings {
             observability_retention: ObservabilityRetentionSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
-            self_update: SelfUpdateSettings::default(),
+            self_update: None,
             console_version: None,
         }
+    }
+}
+
+impl AppSettings {
+    /// Effective self-update settings, treating "never configured" as the
+    /// default. Use this everywhere instead of touching the `Option` directly,
+    /// so absence and an explicit default behave identically at read time.
+    pub fn self_update(&self) -> SelfUpdateSettings {
+        self.self_update.clone().unwrap_or_default()
     }
 }
 

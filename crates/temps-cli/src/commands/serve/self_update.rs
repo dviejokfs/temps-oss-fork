@@ -311,11 +311,36 @@ impl BinarySelfUpdater {
         None
     }
 
+    /// Test-only: production code moves the phase through `try_claim` and the
+    /// job itself, which owns the transitions after the claim succeeds.
+    #[cfg(test)]
     fn set_phase(&self, phase: SelfUpdatePhase, phase_error: Option<String>) {
         if let Ok(mut state) = self.state.write() {
             state.phase = phase;
             state.phase_error = phase_error;
         }
+    }
+
+    /// Take exclusive ownership of the updater, or report who already has it.
+    ///
+    /// Tests and sets the phase in ONE lock acquisition. The equivalent check
+    /// inside `find_blocker` is advisory only: two concurrent callers can both
+    /// observe `Idle` there and both proceed, which would put two jobs on the
+    /// same binary, backup and temp files — capable of leaving a truncated
+    /// executable behind. This is the check that actually excludes them.
+    fn try_claim(&self) -> Result<(), SelfUpdateError> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.phase.is_active() {
+            return Err(SelfUpdateError::AlreadyRunning {
+                phase: state.phase.as_str(),
+            });
+        }
+        state.phase = SelfUpdatePhase::Resolving;
+        state.phase_error = None;
+        Ok(())
     }
 }
 
@@ -397,8 +422,24 @@ impl SelfUpdater for BinarySelfUpdater {
             return Err(SelfUpdateError::Unavailable { blocker, reason });
         }
 
+        // Validate the pin BEFORE claiming the updater, so a typo fails the
+        // request outright rather than occupying the updater and surfacing as
+        // a background failure the caller has to go hunting for. This is also
+        // the security boundary for the tag — see `normalize_release_tag`.
+        let target_version = match target_version {
+            Some(version) => Some(
+                crate::commands::upgrade::normalize_release_tag(&version).map_err(|e| {
+                    SelfUpdateError::InvalidVersion {
+                        reason: e.to_string(),
+                    }
+                })?,
+            ),
+            None => None,
+        };
+
+        self.try_claim()?;
+
         let current_version = current_version_tag();
-        self.set_phase(SelfUpdatePhase::Resolving, None);
 
         let restart_mode = self.supervisor.restart_mode();
         let (channel, _) = resolve_channel(policy.channel.as_deref(), &current_version);
@@ -711,7 +752,7 @@ fn detect_supervisor() -> SupervisorKind {
     if in_container() {
         return SupervisorKind::Container;
     }
-    if std::env::var_os("INVOCATION_ID").is_some() {
+    if std::env::var_os("INVOCATION_ID").is_some() && running_under_systemd_service() {
         return SupervisorKind::Systemd;
     }
     // launchd sets this for managed jobs; processes started from a terminal
@@ -720,6 +761,26 @@ fn detect_supervisor() -> SupervisorKind {
         return SupervisorKind::Launchd;
     }
     SupervisorKind::None
+}
+
+/// Corroborate `INVOCATION_ID` against the cgroup this process actually lives in.
+///
+/// `INVOCATION_ID` is inherited, so a shell started inside a unit — or anything
+/// launched via `systemd-run` — carries it without being a restartable service.
+/// Believing it there would make temps exit expecting a restart that never
+/// comes, i.e. turn an update into an outage. A real service lives in a
+/// `*.service` cgroup, so require that too. If the cgroup cannot be read (not
+/// Linux, or an unusual mount), fall back to trusting the env var rather than
+/// downgrading a legitimate systemd install to manual restarts.
+fn running_under_systemd_service() -> bool {
+    match std::fs::read_to_string("/proc/self/cgroup") {
+        Ok(cgroup) => cgroup.lines().any(|line| {
+            line.rsplit('/')
+                .next()
+                .is_some_and(|unit| unit.ends_with(".service"))
+        }),
+        Err(_) => true,
+    }
 }
 
 /// Run the downloaded binary's `--version` before trusting it.
@@ -732,7 +793,9 @@ fn preflight_binary(binary_path: &Path, new_binary: &[u8]) -> anyhow::Result<()>
     let parent = binary_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine the binary's directory"))?;
-    let probe_path = parent.join(".temps-update-probe");
+    // Unique per process: a stale probe from another temps (or a crashed run)
+    // must never be executed or overwritten mid-flight by a concurrent one.
+    let probe_path = parent.join(format!(".temps-update-probe.{}", std::process::id()));
 
     std::fs::write(&probe_path, new_binary).map_err(|e| {
         anyhow::anyhow!(
@@ -972,7 +1035,34 @@ mod tests {
         let err = updater(&dir, false, SupervisorKind::Systemd)
             .start(None, Some(1), &policy(false))
             .expect_err("must refuse when disabled in settings");
-        assert_eq!(err.blocker(), SelfUpdateBlocker::DisabledBySetting);
+        assert_eq!(err.blocker(), Some(SelfUpdateBlocker::DisabledBySetting));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_start_rejects_a_bad_version_without_claiming_the_updater() {
+        // A typo must fail the request outright and leave the updater free,
+        // not occupy it and surface later as a background failure.
+        let dir = temp_dir("bad-version");
+        let updater = updater(&dir, false, SupervisorKind::Systemd);
+        let err = updater
+            .start(
+                Some("v/../../../../../owner/repo/releases/latest".to_string()),
+                Some(1),
+                &policy(true),
+            )
+            .expect_err("must reject a traversal-shaped version");
+        assert!(matches!(err, SelfUpdateError::InvalidVersion { .. }));
+        assert_eq!(
+            err.blocker(),
+            None,
+            "a bad argument is not an install blocker"
+        );
+        // Still idle, so a corrected retry works immediately.
+        assert_eq!(
+            updater.capability(&policy(true)).phase,
+            SelfUpdatePhase::Idle
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -985,6 +1075,50 @@ mod tests {
             .start(None, Some(1), &policy(true))
             .expect_err("must refuse a concurrent attempt");
         assert!(matches!(err, SelfUpdateError::AlreadyRunning { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_concurrent_starts_claim_the_updater_exactly_once() {
+        // Two callers racing on the same updater must not both win: they
+        // would share the binary, the .bak and the temp files, and can leave a
+        // truncated executable behind. The claim is a test-and-set under one
+        // lock, so exactly one wins however they interleave.
+        let dir = temp_dir("concurrent-claim");
+        let updater = Arc::new(updater(&dir, false, SupervisorKind::Systemd));
+
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rejected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let updater = updater.clone();
+                let accepted = accepted.clone();
+                let rejected = rejected.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    match updater.try_claim() {
+                        Ok(()) => accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                        Err(SelfUpdateError::AlreadyRunning { .. }) => {
+                            rejected.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        }
+                        Err(e) => panic!("unexpected error: {e}"),
+                    };
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one caller may claim the updater"
+        );
+        assert_eq!(rejected.load(std::sync::atomic::Ordering::SeqCst), 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1159,7 +1293,9 @@ mod tests {
             .expect_err("must reject");
         assert!(err.to_string().contains("left untouched"), "{err}");
         // The probe file must not be left behind.
-        assert!(!dir.join(".temps-update-probe").exists());
+        assert!(!dir
+            .join(format!(".temps-update-probe.{}", std::process::id()))
+            .exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

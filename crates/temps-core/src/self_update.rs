@@ -295,14 +295,21 @@ pub enum SelfUpdateError {
     },
     #[error("An update is already running (phase: {phase})")]
     AlreadyRunning { phase: &'static str },
+    /// The pinned version is not a release tag this install will accept.
+    /// Rejected before any work starts so the caller gets a straight answer
+    /// instead of a background failure they have to go looking for.
+    #[error("{reason}")]
+    InvalidVersion { reason: String },
 }
 
 impl SelfUpdateError {
     /// The blocker behind this error, for mapping to a response body.
-    pub fn blocker(&self) -> SelfUpdateBlocker {
+    pub fn blocker(&self) -> Option<SelfUpdateBlocker> {
         match self {
-            Self::Unavailable { blocker, .. } => *blocker,
-            Self::AlreadyRunning { .. } => SelfUpdateBlocker::InProgress,
+            Self::Unavailable { blocker, .. } => Some(*blocker),
+            Self::AlreadyRunning { .. } => Some(SelfUpdateBlocker::InProgress),
+            // Not a state of the install — a bad argument.
+            Self::InvalidVersion { .. } => None,
         }
     }
 }
@@ -398,7 +405,17 @@ mod tests {
         let err = SelfUpdateError::AlreadyRunning {
             phase: "downloading",
         };
-        assert_eq!(err.blocker(), SelfUpdateBlocker::InProgress);
+        assert_eq!(err.blocker(), Some(SelfUpdateBlocker::InProgress));
+    }
+
+    #[test]
+    fn test_invalid_version_is_not_an_install_blocker() {
+        // A bad argument says nothing about the install's capability, so it
+        // must not be reported as one (it maps to 400, not 409).
+        let err = SelfUpdateError::InvalidVersion {
+            reason: "bad tag".to_string(),
+        };
+        assert_eq!(err.blocker(), None);
     }
 
     #[test]

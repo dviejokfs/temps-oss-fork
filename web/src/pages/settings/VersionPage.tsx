@@ -187,9 +187,7 @@ export function VersionPage() {
                 currentVersion={capability?.current_version ?? null}
                 releaseUrl={latest?.release_url ?? status?.release_url ?? null}
                 checked={Boolean(latest)}
-                error={
-                  checkForUpdate.error ? String(checkForUpdate.error) : null
-                }
+                error={problemDetail(checkForUpdate.error)}
                 canApply={canApply}
                 onUpdate={() => setUpdateOpen(true)}
               />
@@ -323,6 +321,24 @@ export function VersionPage() {
         latestVersion={latest?.latest_version ?? status?.latest_version}
       />
     </div>
+  )
+}
+
+/**
+ * Pull the human-readable reason out of a failed request.
+ *
+ * The API returns RFC 7807 Problem Details, and `String(err)` on that object
+ * renders "[object Object]" — i.e. the user is told something failed but never
+ * why, which is exactly the state this page exists to avoid.
+ */
+function problemDetail(error: unknown): string | null {
+  if (!error) return null
+  const problem = error as { detail?: string; title?: string; message?: string }
+  return (
+    problem.detail ??
+    problem.title ??
+    problem.message ??
+    'The release check failed.'
   )
 }
 

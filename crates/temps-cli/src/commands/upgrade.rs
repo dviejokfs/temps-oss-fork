@@ -841,7 +841,7 @@ pub async fn update_notifier_loop(
             .get_settings()
             .await
             .ok()
-            .and_then(|s| s.self_update.channel);
+            .and_then(|s| s.self_update().channel);
         if let Some(notice) = check_for_newer_release(configured_channel.as_deref()).await {
             tracing::warn!(
                 current_version = %notice.current_version,
@@ -1196,7 +1196,10 @@ pub(crate) fn replace_binary(binary_path: &PathBuf, new_binary: &[u8]) -> anyhow
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory"))?;
 
-    let tmp_path = parent.join(".temps-upgrade-tmp");
+    // Unique per process so a concurrent upgrader (another temps, or the CLI
+    // run alongside the server) cannot half-write the file this one is about to
+    // rename over the live binary.
+    let tmp_path = parent.join(format!(".temps-upgrade-tmp.{}", std::process::id()));
 
     // Write the new binary to temp file
     fs::write(&tmp_path, new_binary)
@@ -1576,14 +1579,17 @@ mod tests {
     #[test]
     fn test_normalize_release_tag_blocks_path_traversal() {
         // The exploit this validation exists for: the `url` crate resolves
-        // `..` segments, so these escape gotempsh/temps and reach an arbitrary
-        // repository's release — whose asset would then be installed.
+        // `..` segments, so an unvalidated tag escapes gotempsh/temps and
+        // reaches an arbitrary repository's release — whose asset would then
+        // be downloaded, checksum-matched against ITS OWN published hash,
+        // executed by the preflight and installed over the running binary.
         for input in [
             "v/../../../../../rust-lang/rust/releases/latest",
             "v1.2.3/../../../../../owner/repo/releases/latest",
             "../../owner/repo/releases/latest",
             "v1.2.3/..",
             "v1.2.3/extra",
+            "v1.2.3%2f..%2fowner",
         ] {
             assert!(
                 normalize_release_tag(input).is_err(),
@@ -1593,7 +1599,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_release_tag_blocks_encoding_and_injection_tricks() {
+    fn test_normalize_release_tag_blocks_malformed_tags() {
         for input in [
             "",
             "   ",
@@ -1601,8 +1607,6 @@ mod tests {
             "v1.2",
             "v1.2.3.4",
             "v1.2.x",
-            "v1.2.3-beta/4",
-            "v1.2.3-beta%2F4",
             "v1.2.3-beta 4",
             "v1.2.3-",
             "v1.2.3-beta..4",

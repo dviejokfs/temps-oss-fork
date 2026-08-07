@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-08-04
+> Generated on: 2026-08-07
 
 ## Installation
 
@@ -234,6 +234,20 @@ Delete a project
 | `-p, --project <project>` | Project slug or ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+## `drop`
+
+Detect and deploy a local source directory or ZIP without Git
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | Project name (slugified automatically) | - | Yes |
+| `--preset <preset>` | Select a detected preset | - | Yes |
+| `--directory <directory>` | Select a detected project root | - | Yes |
+| `--no-wait` | Do not wait for deployment to complete | - | No |
+| `--timeout <seconds>` | Deployment timeout | `600` | Yes |
 
 ## `deploy`
 
@@ -695,7 +709,7 @@ Set an environment variable
 | `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | - | Yes |
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
-| `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — a secret cannot later be made non-secret | - | No |
+| `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
 
 #### `environments vars delete` (alias: `rm`, `unset`)
 
@@ -1972,6 +1986,99 @@ Set the preview domain pattern
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--domain <domain>` | Preview domain pattern | - | Yes |
+
+## `platform` (alias: `plat`)
+
+View platform and server information
+
+**Subcommands:**
+
+- `info` - Get platform information
+- `access` - Get access and networking information
+- `private-ip` - Get the server private IP address
+- `public-ip` - Get the server public IP address
+- `update` - Check for and apply temps releases on the server
+
+### `platform info`
+
+Get platform information
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform access`
+
+Get access and networking information
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform private-ip`
+
+Get the server private IP address
+
+### `platform public-ip`
+
+Get the server public IP address
+
+### `platform update`
+
+Check for and apply temps releases on the server
+
+**Subcommands:**
+
+- `status` - Show the available release and whether it can be applied from here
+- `check` - Ask the release API for the newest version on this channel now
+- `channel` - Show or set the release channel: stable, beta, nightly, or "auto" to follow the installed version
+- `apply` - Install a release on the server and restart it
+
+#### `platform update status`
+
+Show the available release and whether it can be applied from here
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `platform update check`
+
+Ask the release API for the newest version on this channel now
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `platform update channel`
+
+Show or set the release channel: stable, beta, nightly, or "auto" to follow the installed version
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `platform update apply`
+
+Install a release on the server and restart it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--version <version>` | Release tag to install (default: newest on this channel) | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `users`
 

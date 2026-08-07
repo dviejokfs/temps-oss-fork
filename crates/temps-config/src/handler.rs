@@ -329,6 +329,9 @@ pub struct DockerRegistrySettingsMasked {
 
 impl From<AppSettings> for AppSettingsResponse {
     fn from(settings: AppSettings) -> Self {
+        // Resolved before the literal below starts moving fields out of
+        // `settings`; absence means "never configured", which reads as default.
+        let self_update = settings.self_update();
         Self {
             external_url: settings.external_url,
             internal_url: settings.internal_url,
@@ -427,7 +430,7 @@ impl From<AppSettings> for AppSettingsResponse {
             cluster_dns: settings.cluster_dns,
             build_limits: settings.build_limits,
             ai_chat_limits: settings.ai_chat_limits,
-            self_update: settings.self_update,
+            self_update,
         }
     }
 }
@@ -961,10 +964,13 @@ pub struct StartUpdateResponse {
 /// capability the operator may have deliberately turned off.
 async fn load_self_update_policy(app_state: &SettingsState) -> temps_core::SelfUpdatePolicy {
     match app_state.config_service.get_settings().await {
-        Ok(settings) => temps_core::SelfUpdatePolicy {
-            enabled: settings.self_update.enabled,
-            channel: settings.self_update.channel,
-        },
+        Ok(settings) => {
+            let self_update = settings.self_update();
+            temps_core::SelfUpdatePolicy {
+                enabled: self_update.enabled,
+                channel: self_update.channel,
+            }
+        }
         Err(e) => {
             error!("Could not read self-update settings, treating as disabled: {e}");
             temps_core::SelfUpdatePolicy {
@@ -1092,7 +1098,14 @@ async fn get_update_capability(
         channel_is_pinned: capability.channel_is_pinned,
         supervisor: capability.supervisor,
         restart_mode: capability.restart_mode,
-        binary_path: capability.binary_path,
+        // Host filesystem layout is only useful to someone who can actually
+        // run an update; readers with `settings:read` alone get nothing from
+        // it but a hint about where the install lives.
+        binary_path: if allowed {
+            capability.binary_path
+        } else {
+            String::new()
+        },
         phase: capability.phase,
         phase_error: capability.phase_error,
         last_attempt: capability.last_attempt,
@@ -1194,14 +1207,20 @@ async fn start_update(
 fn self_update_error_to_problem(error: temps_core::SelfUpdateError) -> Problem {
     use temps_core::{SelfUpdateBlocker, SelfUpdateError};
     let status = match error {
-        // Every blocker describes current state that the caller can change
-        // (a flag, a setting, a running attempt, the host itself) rather than a
-        // malformed request, so they are all conflicts.
+        // These describe current state the caller can change (a flag, a
+        // setting, a running attempt) rather than a malformed request.
         SelfUpdateError::Unavailable { .. } | SelfUpdateError::AlreadyRunning { .. } => {
             StatusCode::CONFLICT
         }
+        // A bad argument, not a state of the install.
+        SelfUpdateError::InvalidVersion { .. } => StatusCode::BAD_REQUEST,
     };
-    let blocker = error.blocker();
+    let Some(blocker) = error.blocker() else {
+        return ErrorBuilder::new(status)
+            .title("Invalid Version")
+            .detail(error.to_string())
+            .build();
+    };
     let title = match blocker {
         SelfUpdateBlocker::DisabledByFlag | SelfUpdateBlocker::DisabledBySetting => {
             "Self-Update Disabled"
@@ -1337,6 +1356,22 @@ async fn get_disk_status(
 /// `None`). Kept as a small pure helper so the invariant is unit-testable.
 fn preserve_self_recorded_fields(incoming: &mut AppSettings, current: &AppSettings) {
     incoming.console_version = current.console_version.clone();
+}
+
+/// Keep security-relevant settings the client did not mention.
+///
+/// The settings PUT replaces the whole document and `AppSettings` deserializes
+/// with `#[serde(default)]`, so a field a client omits is indistinguishable
+/// from one it reset. That is harmless for presentation settings and dangerous
+/// for `self_update`: an operator who deliberately forbade console updates
+/// would have that silently undone by any unrelated save from a client built
+/// before the field existed — including a published CLI, or a stale browser
+/// tab. Absence therefore means "leave it alone", and only an explicit value
+/// changes it.
+fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSettings) {
+    if incoming.self_update.is_none() {
+        incoming.self_update = current.self_update.clone();
+    }
 }
 
 /// Trim and validate an optional URL setting (`external_url`/`internal_url`).
@@ -1573,6 +1608,7 @@ async fn update_settings(
             // `#[serde(default)]` → None). Done first, before any field is moved
             // out of `current_settings` below.
             preserve_self_recorded_fields(&mut settings, &current_settings);
+            preserve_omitted_security_fields(&mut settings, &current_settings);
 
             // Per-provider credentials: keep existing unless caller supplied a new one
             for (id, current_cfg) in current_settings.agent_sandbox.providers.iter() {
@@ -2025,6 +2061,72 @@ async fn refresh_route_table(
 mod tests {
     use super::*;
     use temps_core::{AgentSandboxSettings, AiChatLimitsSettings, AppSettings, ProviderConfig};
+
+    /// An operator's decision to forbid console updates must survive a save
+    /// from a client that has never heard of the field.
+    ///
+    /// `AppSettings` deserializes with `#[serde(default)]` and the PUT replaces
+    /// the whole document, so an omitted `self_update` used to come back as
+    /// "enabled" — silently re-arming the server's ability to replace its own
+    /// binary. Regression test for that: absence means "leave it alone".
+    #[test]
+    fn omitting_self_update_preserves_the_stored_value() {
+        let current = AppSettings {
+            self_update: Some(temps_core::SelfUpdateSettings {
+                enabled: false,
+                channel: Some("stable".to_string()),
+            }),
+            ..AppSettings::default()
+        };
+        // What serde produces for a body that never mentioned the field.
+        let mut incoming = AppSettings {
+            self_update: None,
+            ..AppSettings::default()
+        };
+
+        preserve_omitted_security_fields(&mut incoming, &current);
+
+        let effective = incoming.self_update();
+        assert!(
+            !effective.enabled,
+            "an omitted self_update must not re-enable console updates"
+        );
+        assert_eq!(effective.channel.as_deref(), Some("stable"));
+    }
+
+    /// An explicit value still wins — this is a preserve, not a freeze.
+    #[test]
+    fn an_explicit_self_update_value_overrides_the_stored_one() {
+        let current = AppSettings {
+            self_update: Some(temps_core::SelfUpdateSettings {
+                enabled: false,
+                channel: None,
+            }),
+            ..AppSettings::default()
+        };
+        let mut incoming = AppSettings {
+            self_update: Some(temps_core::SelfUpdateSettings {
+                enabled: true,
+                channel: Some("beta".to_string()),
+            }),
+            ..AppSettings::default()
+        };
+
+        preserve_omitted_security_fields(&mut incoming, &current);
+
+        let effective = incoming.self_update();
+        assert!(effective.enabled);
+        assert_eq!(effective.channel.as_deref(), Some("beta"));
+    }
+
+    /// A never-configured install reads as the documented default.
+    #[test]
+    fn absent_self_update_reads_as_enabled_by_default() {
+        let settings = AppSettings::default();
+        assert!(settings.self_update.is_none());
+        assert!(settings.self_update().enabled);
+        assert_eq!(settings.self_update().channel, None);
+    }
 
     /// The stored value and the effective value must be the same number.
     ///
