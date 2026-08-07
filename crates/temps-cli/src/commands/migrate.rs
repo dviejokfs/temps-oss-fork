@@ -173,6 +173,10 @@ impl MigrateCommand {
                 );
             }
 
+            // Non-blocking indexes cannot run in SeaORM's migration transaction.
+            // The explicit migrate command is the ideal place to wait for them.
+            temps_database::run_post_migration_indexes(&db).await?;
+
             // Continuous-aggregate backfill is idempotent and safe to run here
             // (the operator is already waiting on this command).
             if let Err(e) = temps_database::run_post_migration_backfill(&db).await {

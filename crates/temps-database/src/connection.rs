@@ -547,6 +547,115 @@ pub async fn get_pending_migration_names(db: &DbConnection) -> ServiceResult<Vec
     Ok(pending.iter().map(|m| m.name().to_string()).collect())
 }
 
+const PERMISSION_DENIED_RETENTION_INDEX: &str = "idx_audit_logs_permission_denied_retention";
+
+/// Build large, non-correctness-critical indexes outside SeaORM's migration
+/// transaction. The caller runs this after the server has bound (or explicitly
+/// from `temps migrate`), so a busy audit table cannot block application boot.
+///
+/// A single acquired pool connection is retained for the timeout settings and
+/// the concurrent index build. `CREATE INDEX CONCURRENTLY` allows audit writes
+/// to continue while PostgreSQL scans the existing history.
+pub async fn run_post_migration_indexes(db: &DatabaseConnection) -> ServiceResult<()> {
+    let pool = db.get_postgres_connection_pool();
+    let mut connection = pool.acquire().await.map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to acquire database connection for post-migration indexes: {error}"
+        ))
+    })?;
+
+    sqlx::query("SET lock_timeout = '5s'")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to set lock timeout for permission-denied retention index: {error}"
+            ))
+        })?;
+    if let Err(error) = sqlx::query("SET statement_timeout = '10min'")
+        .execute(&mut *connection)
+        .await
+    {
+        let _ = sqlx::query("RESET lock_timeout")
+            .execute(&mut *connection)
+            .await;
+        return Err(ServiceError::Database(format!(
+            "Failed to set statement timeout for permission-denied retention index: {error}"
+        )));
+    }
+
+    let maintenance_result: ServiceResult<()> = async {
+        let index_is_valid = sqlx::query_scalar::<_, bool>(
+            "SELECT index.indisvalid \
+             FROM pg_index AS index \
+             WHERE index.indexrelid = \
+                 to_regclass('idx_audit_logs_permission_denied_retention')",
+        )
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to inspect permission-denied retention index: {error}"
+            ))
+        })?;
+
+        // A cancelled/failed concurrent build leaves an invalid index behind.
+        // `IF NOT EXISTS` would otherwise accept it forever and prevent retries.
+        if index_is_valid == Some(false) {
+            sqlx::query(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_audit_logs_permission_denied_retention",
+            )
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| {
+                ServiceError::Database(format!(
+                    "Failed to remove invalid permission-denied retention index: {error}"
+                ))
+            })?;
+        }
+
+        sqlx::query(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+                 idx_audit_logs_permission_denied_retention \
+             ON audit_logs (audit_date ASC, id ASC) \
+             WHERE operation_type = 'PERMISSION_DENIED'",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to build concurrent permission-denied retention index \
+                 '{PERMISSION_DENIED_RETENTION_INDEX}': {error}"
+            ))
+        })?;
+
+        Ok(())
+    }
+    .await;
+
+    // Do not leak maintenance-specific session settings back into the pool.
+    let reset_lock_result = sqlx::query("RESET lock_timeout")
+        .execute(&mut *connection)
+        .await;
+    let reset_statement_result = sqlx::query("RESET statement_timeout")
+        .execute(&mut *connection)
+        .await;
+
+    maintenance_result?;
+    reset_lock_result.map_err(|error| {
+        ServiceError::Database(format!(
+            "Built permission-denied retention index but failed to reset lock timeout: {error}"
+        ))
+    })?;
+    reset_statement_result.map_err(|error| {
+        ServiceError::Database(format!(
+            "Built permission-denied retention index but failed to reset statement timeout: {error}"
+        ))
+    })?;
+
+    Ok(())
+}
+
 /// Run post-migration backfill for continuous aggregates.
 ///
 /// `CALL refresh_continuous_aggregate()` cannot run inside a transaction block,

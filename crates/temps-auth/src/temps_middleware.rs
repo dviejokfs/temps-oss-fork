@@ -25,6 +25,11 @@ use crate::{
     apikey_service::ApiKeyService, auth_service::AuthService,
     deployment_token_service::DeploymentTokenValidationService, user_service::UserService,
 };
+
+/// Permission-denial events are attacker-triggerable. Keep the queued and
+/// persisted origin metadata small even when the HTTP stack accepts a large
+/// request header block.
+const MAX_AUDIT_USER_AGENT_BYTES: usize = 512;
 use temps_core::CookieCrypto;
 
 /// Authentication middleware that implements TempsMiddleware
@@ -219,7 +224,7 @@ impl AuthMiddleware {
             .map(|metadata| {
                 (
                     Some(metadata.ip_address.clone()),
-                    metadata.user_agent.clone(),
+                    bounded_audit_user_agent(&metadata.user_agent),
                 )
             })
             .unwrap_or_else(|| (None, "unknown".to_string()));
@@ -258,6 +263,18 @@ impl AuthMiddleware {
         }
         None
     }
+}
+
+fn bounded_audit_user_agent(user_agent: &str) -> String {
+    if user_agent.len() <= MAX_AUDIT_USER_AGENT_BYTES {
+        return user_agent.to_string();
+    }
+
+    let mut end = MAX_AUDIT_USER_AGENT_BYTES;
+    while !user_agent.is_char_boundary(end) {
+        end -= 1;
+    }
+    user_agent[..end].to_string()
 }
 
 fn safe_principal(auth: &crate::context::AuthContext) -> SafePrincipal {
@@ -360,6 +377,16 @@ mod tests {
             Some("203.0.113.5".to_string()),
             "test-agent".to_string(),
         )
+    }
+
+    #[test]
+    fn denial_user_agent_is_utf8_safely_byte_bounded() {
+        let oversized = format!("{}{}", "a".repeat(MAX_AUDIT_USER_AGENT_BYTES - 1), "éé");
+        let bounded = bounded_audit_user_agent(&oversized);
+
+        assert!(bounded.len() <= MAX_AUDIT_USER_AGENT_BYTES);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert_eq!(bounded, "a".repeat(MAX_AUDIT_USER_AGENT_BYTES - 1));
     }
 
     #[test]

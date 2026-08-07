@@ -62,6 +62,96 @@ fn trim_extra<T>(values: &mut Vec<T>, limit: usize) -> bool {
 }
 
 impl RedisSource {
+    async fn scan_set_page(
+        conn: &mut ConnectionManager,
+        key: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<String>, bool)> {
+        let mut cursor = 0_u64;
+        let mut skipped = 0_usize;
+        let mut values = Vec::with_capacity(limit.saturating_add(1));
+        let count_hint = limit.saturating_add(1).clamp(1, 512);
+
+        loop {
+            let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SSCAN")
+                .arg(key)
+                .arg(cursor)
+                .arg("COUNT")
+                .arg(count_hint)
+                .query_async(conn)
+                .await
+                .map_err(|error: RedisError| {
+                    error!(error = %error, "failed to page Redis set");
+                    DataError::BackendQueryFailed {
+                        backend: "Redis",
+                        entity: key.to_string(),
+                    }
+                })?;
+
+            for value in batch {
+                if skipped < offset {
+                    skipped += 1;
+                } else if values.len() <= limit {
+                    values.push(value);
+                }
+            }
+            cursor = next_cursor;
+            if values.len() > limit || cursor == 0 {
+                break;
+            }
+        }
+
+        let has_more = values.len() > limit || cursor != 0;
+        values.truncate(limit);
+        Ok((values, has_more))
+    }
+
+    async fn scan_hash_page(
+        conn: &mut ConnectionManager,
+        key: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<(String, String)>, bool)> {
+        let mut cursor = 0_u64;
+        let mut skipped = 0_usize;
+        let mut values = Vec::with_capacity(limit.saturating_add(1));
+        let count_hint = limit.saturating_add(1).clamp(1, 512);
+
+        loop {
+            let (next_cursor, batch): (u64, Vec<(String, String)>) = redis::cmd("HSCAN")
+                .arg(key)
+                .arg(cursor)
+                .arg("COUNT")
+                .arg(count_hint)
+                .query_async(conn)
+                .await
+                .map_err(|error: RedisError| {
+                    error!(error = %error, "failed to page Redis hash");
+                    DataError::BackendQueryFailed {
+                        backend: "Redis",
+                        entity: key.to_string(),
+                    }
+                })?;
+
+            for value in batch {
+                if skipped < offset {
+                    skipped += 1;
+                } else if values.len() <= limit {
+                    values.push(value);
+                }
+            }
+            cursor = next_cursor;
+            if values.len() > limit || cursor == 0 {
+                break;
+            }
+        }
+
+        let has_more = values.len() > limit || cursor != 0;
+        values.truncate(limit);
+        Ok((values, has_more))
+    }
+
     /// Create a new Redis data source
     ///
     /// # Arguments
@@ -228,7 +318,7 @@ impl RedisSource {
         db: i32,
         key: &str,
         options: &QueryOptions,
-    ) -> Result<(DataRow, bool)> {
+    ) -> Result<(DataRow, bool, Option<String>)> {
         let mut conn = self.get_db_connection(db).await?;
 
         debug!("Getting value for key '{}' in database {}", key, db);
@@ -262,33 +352,42 @@ impl RedisSource {
             DataError::QueryFailed(format!("Failed to get key TTL: {}", e))
         })?;
 
-        // Reject a huge value before asking Redis to send it. Redis strings and
-        // collection members may each be hundreds of MiB; paging the collection
-        // alone does not protect the control plane from one giant member.
-        let memory_usage: Option<usize> = redis::cmd("MEMORY")
-            .arg("USAGE")
-            .arg(key)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e: RedisError| {
-                error!(key_type, error = %e, "failed to inspect Redis value size");
-                DataError::BackendQueryFailed {
-                    backend: "Redis",
-                    entity: key.to_string(),
-                }
-            })?;
-        if let Some(observed) = memory_usage {
+        // A string is one response cell, so reject it by logical length before
+        // transfer. Collection allocation is deliberately not compared with a
+        // per-cell limit: large collections remain safely browsable in pages.
+        if key_type == "string" {
+            let observed: usize = redis::cmd("STRLEN")
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e: RedisError| {
+                    error!(key_type, error = %e, "failed to inspect Redis string size");
+                    DataError::BackendQueryFailed {
+                        backend: "Redis",
+                        entity: key.to_string(),
+                    }
+                })?;
             if observed > options.budget.max_cell_bytes {
                 return Err(DataError::ResultLimitExceeded {
                     entity: key.to_string(),
-                    limit_kind: "redis_value_bytes",
+                    limit_kind: "cell_bytes",
                     limit: options.budget.max_cell_bytes,
                     observed,
                 });
             }
         }
 
-        let offset = options.offset.unwrap_or(0);
+        // Redis SCAN cursors cannot represent an exact item boundary because
+        // COUNT is only a hint. Expose a stable logical offset cursor and replay
+        // SCAN to that boundary, which avoids dropping the remainder of a batch.
+        let offset = match options.cursor.as_deref() {
+            Some(cursor) => cursor.parse::<usize>().map_err(|_| {
+                DataError::InvalidQuery(format!(
+                    "Invalid Redis value cursor '{cursor}': expected a non-negative offset"
+                ))
+            })?,
+            None => options.offset.unwrap_or(0),
+        };
         let aggregate_limit = redis_aggregate_limit(options);
         let start = isize::try_from(offset).unwrap_or(isize::MAX);
         let end = start.saturating_add(isize::try_from(aggregate_limit).unwrap_or(isize::MAX));
@@ -329,21 +428,9 @@ impl RedisSource {
                 serde_json::json!(v)
             }
             "set" => {
-                let (_cursor, mut v): (u64, Vec<String>) = redis::cmd("SSCAN")
-                    .arg(key)
-                    .arg(0)
-                    .arg("COUNT")
-                    .arg(aggregate_limit.saturating_add(1))
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|e: RedisError| {
-                        error!(error = %e, "failed to page Redis set");
-                        DataError::BackendQueryFailed {
-                            backend: "Redis",
-                            entity: key.to_string(),
-                        }
-                    })?;
-                truncated = trim_extra(&mut v, aggregate_limit);
+                let (v, has_more) =
+                    Self::scan_set_page(&mut conn, key, offset, aggregate_limit).await?;
+                truncated = has_more;
                 serde_json::json!(v)
             }
             "zset" => {
@@ -366,21 +453,9 @@ impl RedisSource {
                     .collect::<Vec<_>>())
             }
             "hash" => {
-                let (_cursor, mut values): (u64, Vec<(String, String)>) = redis::cmd("HSCAN")
-                    .arg(key)
-                    .arg(0)
-                    .arg("COUNT")
-                    .arg(aggregate_limit.saturating_add(1))
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|e: RedisError| {
-                        error!(error = %e, "failed to page Redis hash");
-                        DataError::BackendQueryFailed {
-                            backend: "Redis",
-                            entity: key.to_string(),
-                        }
-                    })?;
-                truncated = trim_extra(&mut values, aggregate_limit);
+                let (values, has_more) =
+                    Self::scan_hash_page(&mut conn, key, offset, aggregate_limit).await?;
+                truncated = has_more;
                 serde_json::json!(values.into_iter().collect::<HashMap<_, _>>())
             }
             "stream" => {
@@ -399,7 +474,8 @@ impl RedisSource {
         row.insert("ttl".to_string(), serde_json::Value::Number(ttl.into()));
         row.insert("value".to_string(), value);
 
-        Ok((row, truncated))
+        let next_cursor = truncated.then(|| offset.saturating_add(aggregate_limit).to_string());
+        Ok((row, truncated, next_cursor))
     }
 
     /// Get information about a specific key
@@ -704,7 +780,8 @@ impl Queryable for RedisSource {
         }
 
         // Get the key value
-        let (row, value_truncated) = self.get_key_value(db_num, entity_name, &options).await?;
+        let (row, value_truncated, next_cursor) =
+            self.get_key_value(db_num, entity_name, &options).await?;
         let execution_ms = start.elapsed().as_millis() as u64;
 
         // Define schema for the result
@@ -748,8 +825,8 @@ impl Queryable for RedisSource {
                 row_count: rows.len(),
                 total_rows: Some(1),
                 execution_ms,
-                has_more: false,
-                next_cursor: None,
+                has_more: value_truncated,
+                next_cursor,
                 truncated: value_truncated || budget_truncated,
             },
             rows,
@@ -833,8 +910,11 @@ impl Queryable for RedisSource {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use temps_query::QueryBudget;
+    use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage};
 
     #[test]
     fn test_source_type() {
@@ -870,5 +950,86 @@ mod tests {
         let mut values = vec!["value"; 11];
         assert!(trim_extra(&mut values, redis_aggregate_limit(&options)));
         assert_eq!(values.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn large_set_remains_pageable_by_offset() -> anyhow::Result<()> {
+        let container = match GenericImage::new("redis", "7-alpine")
+            .with_exposed_port(6379_u16.into())
+            .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!("Skipping Docker-dependent Redis paging test: {error}");
+                return Ok(());
+            }
+        };
+        let host = container.get_host().await?;
+        let port = container.get_host_port_ipv4(6379).await?;
+        let source = RedisSource::new(&format!("redis://{host}:{port}")).await?;
+        let mut connection = source.get_db_connection(0).await?;
+
+        for chunk_start in (0..4_000).step_by(200) {
+            let mut pipeline = redis::pipe();
+            for index in chunk_start..chunk_start + 200 {
+                pipeline
+                    .cmd("SADD")
+                    .arg("large-set")
+                    .arg(format!("member-{index:04}-{}", "x".repeat(300)))
+                    .ignore();
+            }
+            pipeline.query_async::<()>(&mut connection).await?;
+        }
+        let allocated: usize = redis::cmd("MEMORY")
+            .arg("USAGE")
+            .arg("large-set")
+            .query_async(&mut connection)
+            .await?;
+        assert!(allocated > QueryBudget::default().max_cell_bytes);
+
+        let path = ContainerPath::from_slice(&["0"]);
+        let page = |offset| QueryOptions {
+            limit: Some(2),
+            offset: Some(offset),
+            ..QueryOptions::default()
+        };
+        let first = source.query(&path, "large-set", None, page(0)).await?;
+        let second = source.query(&path, "large-set", None, page(2)).await?;
+        let cursor_page = source
+            .query(
+                &path,
+                "large-set",
+                None,
+                QueryOptions {
+                    limit: Some(2),
+                    cursor: first.stats.next_cursor.clone(),
+                    ..QueryOptions::default()
+                },
+            )
+            .await?;
+
+        let members = |result: &QueryResult| -> HashSet<String> {
+            result.rows[0]["value"]
+                .as_array()
+                .expect("set value is an array")
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        };
+        let first_members = members(&first);
+        let second_members = members(&second);
+        let cursor_members = members(&cursor_page);
+        assert_eq!(first_members.len(), 2);
+        assert_eq!(second_members.len(), 2);
+        assert!(first_members.is_disjoint(&second_members));
+        assert_eq!(second_members, cursor_members);
+        assert!(first.stats.has_more);
+        assert_eq!(first.stats.next_cursor.as_deref(), Some("2"));
+        assert!(first.stats.truncated);
+        assert!(second.stats.truncated);
+
+        Ok(())
     }
 }

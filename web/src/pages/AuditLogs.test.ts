@@ -1,12 +1,18 @@
 import { describe, expect, test } from 'bun:test'
 
-import { PERMISSION_DENIED_FILTER } from '@/lib/audit-operation-filters'
+import { buildOperationOptions } from './AuditLogs'
 
 describe('audit operation filters', () => {
   test('offers permission denials in the authentication group', () => {
-    expect(PERMISSION_DENIED_FILTER).toEqual({
+    expect(
+      buildOperationOptions().find(
+        (option) => option.value === 'PERMISSION_DENIED'
+      )
+    ).toEqual({
       value: 'PERMISSION_DENIED',
       label: 'Permission Denied',
+      group: 'Authentication',
+      keywords: 'PERMISSION_DENIED',
     })
   })
 })

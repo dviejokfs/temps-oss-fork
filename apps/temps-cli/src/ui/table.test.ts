@@ -14,4 +14,15 @@ describe('createTable', () => {
     expect(rendered).not.toContain(']52;')
     expect(rendered).not.toContain('\x1b[31m')
   })
+
+  test('applies trusted column styling after sanitizing accessor output', () => {
+    const rendered = createTable(
+      [{ status: '\x1b]52;c;Zm9yZ2Vk\x07inactive' }],
+      [{ header: 'Status', accessor: (row) => row.status, color: (value) => `\x1b[33m${value}\x1b[0m` }],
+      { style: 'minimal' },
+    )
+
+    expect(rendered).toContain('\x1b[33minactive\x1b[0m')
+    expect(rendered).not.toContain(']52;')
+  })
 })

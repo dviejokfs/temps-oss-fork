@@ -176,7 +176,6 @@ mod m20260804_000001_add_ai_data_access_to_external_services;
 mod m20260804_000001_add_must_change_password_to_users;
 pub mod m20260805_000001_index_normalized_managed_domains;
 pub mod m20260806_000001_sandbox_workspace_lifecycle;
-mod m20260806_000001_index_permission_denied_retention;
 
 pub struct Migrator;
 
@@ -368,7 +367,6 @@ impl MigratorTrait for Migrator {
             ),
             Box::new(m20260805_000001_index_normalized_managed_domains::Migration),
             Box::new(m20260806_000001_sandbox_workspace_lifecycle::Migration),
-            Box::new(m20260806_000001_index_permission_denied_retention::Migration),
         ]
     }
 }

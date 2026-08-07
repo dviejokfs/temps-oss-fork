@@ -607,22 +607,30 @@ impl Queryable for MariaDbSource {
                 entity: entity_name.to_string(),
             }
         })? {
-            let observed = row.try_get::<u64, _>("__temps_size").map_err(|_error| {
+            let observed = row.try_get::<i64, _>("__temps_size").map_err(|error| {
                 error!(
                     entity = entity_name,
-                    limit, "MariaDB bounded row size decode failed"
+                    limit,
+                    error = %error,
+                    "MariaDB bounded row size decode failed"
                 );
                 DataError::BackendQueryFailed {
                     backend: "MariaDB",
                     entity: entity_name.to_string(),
                 }
             })?;
-            let observed_cell = row
-                .try_get::<u64, _>("__temps_max_cell")
-                .map_err(|_error| DataError::BackendQueryFailed {
+            let observed_cell = row.try_get::<i64, _>("__temps_max_cell").map_err(|error| {
+                error!(
+                    entity = entity_name,
+                    limit,
+                    error = %error,
+                    "MariaDB bounded cell size decode failed"
+                );
+                DataError::BackendQueryFailed {
                     backend: "MariaDB",
                     entity: entity_name.to_string(),
-                })?;
+                }
+            })?;
             let payload = row
                 .try_get::<Option<String>, _>("__temps_row")
                 .map_err(|_error| {
@@ -1315,6 +1323,11 @@ pub(crate) fn is_mariadb_compatible_image(image: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use testcontainers::{
+        core::{ContainerPort, WaitFor},
+        runners::AsyncRunner,
+        GenericImage, ImageExt,
+    };
 
     #[test]
     fn generated_query_guards_encoded_row_before_wire_transfer() {
@@ -1368,6 +1381,81 @@ mod tests {
         )
         .expect_err("unknown encodings cannot be safely admitted");
         assert!(matches!(error, DataError::OperationNotSupported(_)));
+    }
+
+    #[tokio::test]
+    async fn real_mariadb_enforces_wire_budget_and_preserves_rows() -> anyhow::Result<()> {
+        let container = match GenericImage::new("mariadb", "11.4")
+            .with_exposed_port(ContainerPort::Tcp(3306))
+            .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
+            .with_env_var("MARIADB_ROOT_PASSWORD", "test")
+            .with_env_var("MARIADB_DATABASE", "app")
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!("Skipping Docker-dependent MariaDB budget test: {error}");
+                return Ok(());
+            }
+        };
+        let host = container.get_host().await?.to_string();
+        let port = container.get_host_port_ipv4(3306).await?;
+        let mut source = None;
+        for _ in 0..20 {
+            match MariaDbSource::connect(&host, port, "root", "test", "app").await {
+                Ok(connected) => {
+                    source = Some(connected);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        }
+        let source = source.ok_or_else(|| anyhow::anyhow!("MariaDB did not become reachable"))?;
+        sqlx::query("CREATE TABLE rows_budget (id BIGINT PRIMARY KEY, payload LONGTEXT NOT NULL)")
+            .execute(&source.pool)
+            .await?;
+        sqlx::query("INSERT INTO rows_budget VALUES (1, 'safe'), (2, REPEAT('x', 100000))")
+            .execute(&source.pool)
+            .await?;
+
+        let path = ContainerPath::from_slice(&["app"]);
+        let safe = source
+            .query(
+                &path,
+                "rows_budget",
+                Some(serde_json::json!({"where": "id = 1"})),
+                QueryOptions::default(),
+            )
+            .await?;
+        assert_eq!(safe.rows[0]["payload"], serde_json::json!("safe"));
+
+        let error = source
+            .query(
+                &path,
+                "rows_budget",
+                Some(serde_json::json!({"where": "id = 2"})),
+                QueryOptions {
+                    limit: Some(1),
+                    budget: QueryBudget {
+                        max_bytes: 16 * 1024,
+                        max_cell_bytes: 8 * 1024,
+                        ..QueryBudget::default()
+                    },
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect_err("oversized MariaDB row must be rejected before JSON transfer");
+        assert!(matches!(
+            error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "wire_cell_bytes",
+                ..
+            }
+        ));
+
+        Ok(())
     }
 
     fn assert_where_rejected(clause: &str) {

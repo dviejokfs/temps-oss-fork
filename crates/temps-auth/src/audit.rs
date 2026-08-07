@@ -705,6 +705,10 @@ pub struct PermissionDeniedAudit {
     /// per-window persistence budgets.
     pub suppressed_by_budget: bool,
     pub ip_address: Option<String>,
+    /// Persisted through [`AuditOperation::user_agent`] in the dedicated audit
+    /// column. Skipping it here avoids duplicating attacker-controlled origin
+    /// metadata in the JSON payload.
+    #[serde(skip_serializing)]
     pub user_agent: String,
 }
 
@@ -913,5 +917,6 @@ mod failure_audit_tests {
         assert!(json.contains("\"attempt_count\":4"));
         assert!(json.contains("\"credential_id\":17"));
         assert!(!json.contains("token_name"));
+        assert!(!json.contains("test-agent"));
     }
 }

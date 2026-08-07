@@ -52,12 +52,11 @@ fn pg_column_admission(column: &PgQueryColumn, row_budget: usize) -> Result<Stri
              THEN {} ELSE PG_COLUMN_SIZE({value})::bigint * 8 + 64 END",
             row_budget.saturating_add(1)
         ),
-        "ARRAY" => {
-            return Err(DataError::OperationNotSupported(
-                "PostgreSQL array columns are not supported by the bounded data browser"
-                    .to_string(),
-            ))
-        }
+        "ARRAY" => format!(
+            "CASE WHEN {value} IS NULL THEN 4 WHEN PG_COLUMN_COMPRESSION({value}) IS NOT NULL \
+             THEN {} ELSE PG_COLUMN_SIZE({value})::bigint * 8 + 64 END",
+            row_budget.saturating_add(1)
+        ),
         "boolean"
         | "smallint"
         | "integer"
@@ -175,6 +174,9 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAllVerifier {
 pub struct PostgresSource {
     client: Arc<Client>,
     database_name: String,
+    /// `statement_timeout` is session-scoped. Serialize the SET + query pair so
+    /// concurrent row/count calls cannot inherit one another's timeout.
+    query_timeout_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// True when `input` begins with `keyword` on a token boundary.
@@ -372,6 +374,7 @@ impl PostgresSource {
         Ok(Self {
             client: Arc::new(client),
             database_name: database.to_string(),
+            query_timeout_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -1982,6 +1985,7 @@ impl Queryable for PostgresSource {
         // and escape_ident() for identifiers. The database user should be read-only
         // as defense-in-depth.
         let client = &self.client;
+        let _timeout_guard = self.query_timeout_lock.lock().await;
 
         // SECURITY / AVAILABILITY: bound the query server-side before running it.
         //
@@ -2146,6 +2150,7 @@ impl Queryable for PostgresSource {
         }
 
         let client = &self.client;
+        let _timeout_guard = self.query_timeout_lock.lock().await;
 
         // SECURITY: bound this the same way `query` is bounded.
         //
@@ -2253,13 +2258,13 @@ mod wire_budget_tests {
     }
 
     #[test]
-    fn every_array_type_is_rejected_before_json_query_generation() {
+    fn arrays_use_compression_aware_admission_before_json_generation() {
         for name in [
             "token_tok_live_secret",
             "large_numeric_array",
             "custom_type_array",
         ] {
-            let error = with_wire_row_budget(
+            let sql = with_wire_row_budget(
                 "SELECT * FROM public.array_payloads",
                 &[PgQueryColumn {
                     name: name.to_string(),
@@ -2267,11 +2272,10 @@ mod wire_budget_tests {
                 }],
                 QueryBudget::default(),
             )
-            .expect_err("array output expansion has no generic stored-size bound");
-            let diagnostic = error.to_string();
-            assert!(diagnostic.contains("array columns are not supported"));
-            assert!(!diagnostic.contains("tok_live_secret"));
-            assert!(!diagnostic.contains("TO_JSONB"));
+            .expect("array columns should remain browsable through bounded admission");
+            assert!(sql.contains("PG_COLUMN_COMPRESSION"));
+            assert!(sql.contains("PG_COLUMN_SIZE"));
+            assert_eq!(sql.matches("TO_JSONB(__temps_source)").count(), 1);
         }
     }
 }
@@ -3024,6 +3028,29 @@ mod tests {
                 ..
             }
         ));
+
+        source
+            .client
+            .batch_execute(
+                "CREATE TABLE array_rows (id bigint, tags text[]); \
+                 INSERT INTO array_rows VALUES (1, ARRAY['alpha', 'beta']);",
+            )
+            .await
+            .expect("array fixture should be created");
+        let result = source
+            .query(
+                &ContainerPath::from_slice(&["postgres", "public"]),
+                "array_rows",
+                None,
+                QueryOptions {
+                    limit: Some(1),
+                    budget,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect("bounded PostgreSQL arrays should remain browsable");
+        assert_eq!(result.rows[0]["tags"], serde_json::json!(["alpha", "beta"]));
     }
 
     #[tokio::test]

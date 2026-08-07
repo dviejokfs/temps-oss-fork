@@ -308,6 +308,14 @@ impl ServeCommand {
             let backfill_db = db.clone();
             rt.spawn(async move {
                 if let Err(e) =
+                    temps_database::run_post_migration_indexes(backfill_db.as_ref()).await
+                {
+                    tracing::warn!(
+                        "Post-migration index build failed (will retry on next startup): {}",
+                        e
+                    );
+                }
+                if let Err(e) =
                     temps_database::run_post_migration_backfill(backfill_db.as_ref()).await
                 {
                     tracing::warn!(

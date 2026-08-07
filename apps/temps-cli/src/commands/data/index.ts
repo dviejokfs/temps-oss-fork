@@ -308,7 +308,9 @@ async function containersCmd(
           ? (c.entity_type_label ?? 'entities')
           : c.can_contain_containers
             ? (c.child_container_type ?? 'containers')
-            : colors.dim('—'),
+            : '—',
+      color: (value, c) =>
+        c.can_contain_entities || c.can_contain_containers ? value : colors.dim(value),
     },
   ]
   printTable(rows, columns, { style: 'minimal' })
@@ -375,7 +377,8 @@ async function tablesCmd(
     { header: 'Type', key: 'entity_type' },
     {
       header: 'Rows',
-      accessor: (e) => (e.row_count === null || e.row_count === undefined ? colors.dim('—') : String(e.row_count)),
+      accessor: (e) => (e.row_count === null || e.row_count === undefined ? '—' : String(e.row_count)),
+      color: (value, e) => e.row_count === null || e.row_count === undefined ? colors.dim(value) : value,
     },
     { header: 'Size', accessor: (e) => formatBytes(e.size_bytes) },
   ]

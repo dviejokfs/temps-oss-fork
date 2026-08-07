@@ -953,6 +953,12 @@ impl temps_query::Queryable for MongoDBSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_query::{QueryBudget, QueryOptions, Queryable};
+    use testcontainers::{
+        core::{ContainerPort, WaitFor},
+        runners::AsyncRunner,
+        GenericImage,
+    };
 
     #[test]
     fn aggregation_sizes_before_conditionally_projecting_document() {
@@ -974,6 +980,83 @@ mod tests {
         assert!(encoded.contains("65536"));
         assert_eq!(pipeline[2], doc! { "$skip": 25_i64 });
         assert_eq!(pipeline[3], doc! { "$limit": 10_i64 });
+    }
+
+    #[tokio::test]
+    async fn real_mongodb_enforces_wire_budget_and_preserves_documents() -> anyhow::Result<()> {
+        let container = match GenericImage::new("mongo", "8")
+            .with_exposed_port(ContainerPort::Tcp(27017))
+            .with_wait_for(WaitFor::message_on_stdout("Waiting for connections"))
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!("Skipping Docker-dependent MongoDB budget test: {error}");
+                return Ok(());
+            }
+        };
+        let host = container.get_host().await?;
+        let port = container.get_host_port_ipv4(27017).await?;
+        let url = format!("mongodb://{host}:{port}/app");
+        let mut source = None;
+        for _ in 0..20 {
+            match MongoDBSource::new_scoped(&url, Some("app")).await {
+                Ok(connected) => {
+                    source = Some(connected);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        }
+        let source = source.ok_or_else(|| anyhow::anyhow!("MongoDB did not become reachable"))?;
+        source
+            .client
+            .database("app")
+            .collection::<Document>("rows_budget")
+            .insert_many([
+                doc! { "row_id": 1_i32, "payload": "safe" },
+                doc! { "row_id": 2_i32, "payload": "x".repeat(100_000) },
+            ])
+            .await?;
+
+        let path = ContainerPath::from_slice(&["app"]);
+        let safe = source
+            .query(
+                &path,
+                "rows_budget",
+                Some(serde_json::json!({"row_id": 1})),
+                QueryOptions::default(),
+            )
+            .await?;
+        assert_eq!(safe.rows[0]["payload"], serde_json::json!("safe"));
+
+        let error = source
+            .query(
+                &path,
+                "rows_budget",
+                Some(serde_json::json!({"row_id": 2})),
+                QueryOptions {
+                    limit: Some(1),
+                    budget: QueryBudget {
+                        max_bytes: 16 * 1024,
+                        max_cell_bytes: 8 * 1024,
+                        ..QueryBudget::default()
+                    },
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect_err("oversized MongoDB document must be rejected before transfer");
+        assert!(matches!(
+            error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "wire_document_bytes",
+                ..
+            }
+        ));
+
+        Ok(())
     }
 
     #[test]

@@ -8,8 +8,8 @@ pub use approx_count::{approximate_row_count, count_for_pagination, CountKind};
 pub use connection::{
     cancel_migration_backend, connect_for_migrate, connect_without_migrations,
     establish_connection, get_pending_migration_names, run_migrations, run_migrations_reported,
-    run_migrations_streaming, run_post_migration_backfill, DbConnection, MigrationProgress,
-    MigrationRunReport, MigrationStepResult,
+    run_migrations_streaming, run_post_migration_backfill, run_post_migration_indexes,
+    DbConnection, MigrationProgress, MigrationRunReport, MigrationStepResult,
 };
 
 // Export test utilities for use by other crates in their tests
@@ -107,7 +107,7 @@ mod tests {
 
         // Retry connection setup
         let mut retries = 5;
-        let _connection = loop {
+        let connection = loop {
             match establish_connection(&database_url).await {
                 Ok(conn) => break conn,
                 Err(e) if retries > 0 => {
@@ -123,6 +123,27 @@ mod tests {
                 Err(e) => return Err(anyhow::anyhow!("Failed to establish connection: {}", e)),
             }
         };
+
+        // Heavy audit index creation is deliberately outside the migration
+        // transaction. Prove the post-migration path is idempotent and creates
+        // the expected partial concurrent index against a real PostgreSQL.
+        run_post_migration_indexes(connection.as_ref()).await?;
+        run_post_migration_indexes(connection.as_ref()).await?;
+        let index = connection
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT indexdef FROM pg_indexes \
+                 WHERE indexname = 'idx_audit_logs_permission_denied_retention'"
+                    .to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("permission-denied retention index was not created"))?;
+        let index_definition: String = index.try_get("", "indexdef")?;
+        assert!(index_definition.contains("audit_date"));
+        // PostgreSQL may render the predicate with type casts and additional
+        // parentheses, so assert its semantic pieces instead of one formatting.
+        assert!(index_definition.contains("operation_type"));
+        assert!(index_definition.contains("PERMISSION_DENIED"));
 
         // If we get here, migrations ran successfully and connection is established
         println!("✅ Database connection with migrations established successfully");
