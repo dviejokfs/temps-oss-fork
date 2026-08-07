@@ -314,6 +314,28 @@ jobs:
       - name: Type check
         run: cd web && bunx tsc --noEmit
 
+  openapi-canonical:
+    name: OpenAPI Spec Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # No `bun install`: the check reads the committed file and needs nothing
+      # but Bun itself, so it reports in seconds on every pull request.
+      #
+      # What it catches: the CLI's client is generated from a *committed* spec,
+      # and the server serves that document minified on one line. Writing the
+      # response straight to the file turns ~92,000 lines into 1, so the diff
+      # reports ~92,000 deletions and the real change becomes unreviewable.
+      - name: Check openapi.json is canonical
+        run: bun apps/temps-cli/scripts/check-openapi.ts
+
   clippy:
     name: Clippy (advisory)
     runs-on: ubuntu-latest
