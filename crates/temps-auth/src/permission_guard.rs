@@ -981,6 +981,10 @@ mod tests {
             "temps-projects",
             "temps-providers",
             "temps-revenue",
+            // Creating a sandbox *from* a project reads that project's repo
+            // URL and git credential, so it is gated like any other
+            // project-scoped read (ADR-036).
+            "temps-sandbox",
             "temps-status-page",
             // Who a project is shared with is part of that project's data:
             // the access-grant endpoints guard themselves with the very

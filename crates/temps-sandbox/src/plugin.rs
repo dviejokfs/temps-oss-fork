@@ -251,7 +251,16 @@ impl TempsPlugin for SandboxPlugin {
         // warn! in `register_services` is the operator-facing signal.
         let sandbox_service = context.get_service::<SandboxService>()?;
 
-        let app_state = Arc::new(SandboxAppState { sandbox_service });
+        // Optional: only present when a plugin registers a checker. Absent
+        // means `project_access_guard!` is inert and the scope guard plus
+        // per-sandbox ownership are the only gates — same posture as every
+        // other crate that takes this dependency optionally.
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+
+        let app_state = Arc::new(SandboxAppState {
+            sandbox_service,
+            project_access_checker,
+        });
         let router = configure_routes().with_state(app_state);
         Some(PluginRoutes::new(router))
     }

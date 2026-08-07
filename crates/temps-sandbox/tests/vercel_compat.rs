@@ -378,6 +378,9 @@ fn sandbox_response_matches_sdk_envelope() {
             preview_url_template: String::new(),
             preview_password_hint: None,
             agent_run_id: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
         },
         routes: Vec::new(),
     };
@@ -453,6 +456,9 @@ fn sandbox_status_uses_sdk_enum_values() {
                 preview_url_template: String::new(),
                 preview_password_hint: None,
                 agent_run_id: None,
+                lifecycle: "ephemeral".to_string(),
+                project_id: None,
+                source_repo_url: None,
             },
             routes: Vec::new(),
         };

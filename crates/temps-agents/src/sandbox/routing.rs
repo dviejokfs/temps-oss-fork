@@ -198,6 +198,13 @@ impl SandboxProvider for RoutingSandboxProvider {
         self.owner_of(handle).restart(handle).await
     }
 
+    /// Delegate to whichever backend owns this sandbox. Without this the
+    /// trait's default would fire and report "not supported by provider
+    /// 'routing'" even for a Docker sandbox that supports it perfectly well.
+    async fn attach_pty(&self, handle: &SandboxHandle) -> Result<super::PtyAttachment, AgentError> {
+        self.owner_of(handle).attach_pty(handle).await
+    }
+
     async fn resize_disk(
         &self,
         handle: &SandboxHandle,

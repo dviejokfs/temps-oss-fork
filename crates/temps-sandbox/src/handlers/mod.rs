@@ -3,6 +3,7 @@
 //! No business logic lives here.
 
 pub mod sandboxes;
+pub mod terminal;
 pub mod version_header;
 
 use std::sync::Arc;
@@ -14,9 +15,14 @@ use crate::services::sandbox_service::SandboxService;
 
 /// Shared state for sandbox HTTP handlers. Intentionally minimal — the
 /// service already owns db/registry/jobs/config, so handlers need only
-/// the service itself.
+/// the service itself plus the project access checker.
 pub struct SandboxAppState {
     pub sandbox_service: Arc<SandboxService>,
+    /// Team-membership gate for `project_id`-scoped creates (ADR-028).
+    /// `None` when no checker is registered (OSS builds without the
+    /// teams plugin), in which case `project_access_guard!` is a no-op
+    /// and ownership/scope checks alone apply.
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 /// OpenAPI document for the `/v1/sandboxes/*` surface.
@@ -64,6 +70,7 @@ pub struct SandboxAppState {
         sandboxes::list_events,
         sandboxes::rootfs_report,
         sandboxes::rootfs_gc,
+        terminal::terminal,
     ),
     components(schemas(
         sandboxes::CreateSandboxBody,
@@ -156,6 +163,7 @@ mod tests {
             "/v1/sandboxes/{id}/preview-link",
             "/v1/sandboxes/{id}/events",
             "/v1/sandboxes/{id}/resize",
+            "/v1/sandboxes/{id}/terminal",
             "/v1/sandboxes/rootfs",
             "/v1/sandboxes/rootfs/gc",
         ] {

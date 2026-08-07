@@ -13,10 +13,59 @@ use crate::{context::AuthContext, user_service::UserService};
 
 pub const STEP_UP_TTL_MINUTES: i64 = 5;
 
-/// Default policy: interactive browser sessions need recent MFA verification.
-/// Machine credentials are denied because they cannot satisfy an interactive
-/// identity check; installations that need narrowly scoped automation can
-/// provide a different policy through [`SensitiveActionAuthorizer`].
+/// Default policy: interactive browser sessions whose user has **enrolled**
+/// MFA need recent verification. Machine credentials are denied because they
+/// cannot satisfy an interactive identity check; installations that need
+/// narrowly scoped automation can provide a different policy through
+/// [`SensitiveActionAuthorizer`].
+///
+/// # Users without MFA
+///
+/// A user who has not enrolled MFA is **allowed through**, not blocked. Step-up
+/// is a re-authentication of a factor you already have — asking for one you
+/// never enrolled is not a check, it is a dead end. Previously such a user got
+/// `RequireVerification { mfa_setup_required: true }`, which on a fresh
+/// self-hosted instance meant the first admin could not create an API key or
+/// complete a CLI device login at all: every route to a token is gated by
+/// `SensitiveAction::CreateApiKey`, and the only way out was to enrol MFA they
+/// may not want.
+///
+/// The tradeoff is explicit and was accepted deliberately: because the gate now
+/// applies only to enrolled users, it can be avoided by not enrolling. It is
+/// therefore a protection for accounts that opted into MFA — limiting the blast
+/// radius of a stolen session cookie for those users — not a barrier an
+/// attacker who controls account settings must clear.
+///
+/// What it is *not* weakened by: a stolen session cannot unenrol to escape the
+/// challenge, because disabling MFA itself requires a valid TOTP code.
+///
+/// # Why this is not the loss it looks like — and what would change that
+///
+/// The gate this replaces was never a control for unenrolled users. Enrolment
+/// itself is guarded only by `permission_guard!(auth, UsersWrite)`:
+/// `POST /users/me/mfa/setup` and `/users/me/mfa/verify` ask for no password
+/// and no step-up. An attacker holding a stolen session for an unenrolled
+/// account could therefore enrol *their own* authenticator and satisfy the old
+/// challenge in two calls — while leaving their TOTP secret on the victim's
+/// account, which is both a persistence mechanism and a permanent lockout for
+/// the real owner. Removing the challenge for those users removes that
+/// incentive; it does not remove a barrier the attacker could not already
+/// cross.
+///
+/// **That reasoning is load-bearing.** If enrolment is ever put behind
+/// re-authentication (current password, or a step-up for re-enrolment), the
+/// pre-existing behaviour *would* become a real control, and this policy must
+/// be revisited at the same time — otherwise the fix to enrolment silently
+/// leaves this hole open behind it.
+///
+/// # Operators who want the stricter posture
+///
+/// `AppSettings::require_mfa_for_admins` is **not** sufficient on its own: it
+/// gates the password-login path only, and OIDC logins are intentionally
+/// unaffected. On an SSO instance, admins keep `users.mfa_enabled == false`
+/// and so pass this gate without a challenge. Closing that requires either
+/// enforcing enrolment in the identity provider, or registering a custom
+/// [`SensitiveActionAuthorizer`] that denies unenrolled principals.
 pub struct DefaultSensitiveActionAuthorizer {
     db: Arc<sea_orm::DatabaseConnection>,
 }
@@ -45,10 +94,22 @@ impl SensitiveActionAuthorizer for DefaultSensitiveActionAuthorizer {
             });
         };
 
+        // No enrolled factor, nothing to re-verify — allow. See the type-level
+        // docs for why this is a deliberate policy choice and what it costs.
+        //
+        // Logged at INFO, not DEBUG: this is the record that the action ran at
+        // a *reduced* assurance level. Without it the audit entry for e.g.
+        // `create_api_key` is indistinguishable from one where step-up was
+        // actually satisfied, and the difference is exactly what an incident
+        // responder needs.
         if !mfa_enabled {
-            return Ok(SensitiveActionDecision::RequireVerification {
-                mfa_setup_required: true,
-            });
+            tracing::info!(
+                user_id = *user_id,
+                action = action.as_str(),
+                step_up = "skipped_no_mfa",
+                "Sensitive action allowed without step-up: user has no MFA enrolled"
+            );
+            return Ok(SensitiveActionDecision::Allow);
         }
 
         let session = temps_entities::sessions::Entity::find_by_id(*session_id)
@@ -381,16 +442,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unenrolled_session_surfaces_setup_requirement() {
+    async fn unenrolled_session_is_allowed_without_step_up() {
+        // Step-up re-verifies a factor you already have. Demanding one from a
+        // user who never enrolled is a dead end, not a check — and it made the
+        // first admin of a fresh self-hosted instance unable to create an API
+        // key or complete a CLI device login at all.
         let authorizer = authorizer_with_sessions(vec![session(None)]);
         let decision = authorizer
             .authorize(&SensitiveAction::CreateApiKey, &browser_principal(false))
             .await
             .unwrap();
+        assert_eq!(decision, SensitiveActionDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn unenrolled_session_is_allowed_for_every_action_kind() {
+        // The policy is per-principal, not per-action: nothing should
+        // reintroduce the dead end for one action but not another.
+        let authorizer = authorizer_with_sessions(vec![session(None)]);
+        for action in [
+            SensitiveAction::CreateApiKey,
+            SensitiveAction::DeleteEnvironment {
+                project_id: 3,
+                environment_id: 7,
+            },
+        ] {
+            let decision = authorizer
+                .authorize(&action, &browser_principal(false))
+                .await
+                .unwrap();
+            assert_eq!(
+                decision,
+                SensitiveActionDecision::Allow,
+                "action {} must not demand step-up from an unenrolled user",
+                action.as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolled_session_without_recent_elevation_still_requires_verification() {
+        // The other half of the contract: opting into MFA must still buy you
+        // the protection. A user WITH a factor and no recent elevation is
+        // challenged exactly as before.
+        let authorizer = authorizer_with_sessions(vec![session(None)]);
+        let decision = authorizer
+            .authorize(&SensitiveAction::CreateApiKey, &browser_principal(true))
+            .await
+            .unwrap();
         assert_eq!(
             decision,
             SensitiveActionDecision::RequireVerification {
-                mfa_setup_required: true
+                mfa_setup_required: false
             }
         );
     }
