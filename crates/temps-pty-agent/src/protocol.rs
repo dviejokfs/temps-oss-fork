@@ -11,9 +11,14 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Hard cap on a single frame, matches the websocket frame cap in the
-/// terminal handler. Prevents a malicious or buggy client from asking the
-/// agent to allocate gigabytes before we know what's in the frame.
+/// Hard cap on a single frame. Prevents a malicious or buggy peer from asking
+/// the agent to allocate gigabytes before we know what's in the frame.
+///
+/// This bounds the *agent* side only, and it is checked after the length
+/// header rather than after buffering. It is deliberately **not** the bound on
+/// what a browser can send: the terminal handler caps WebSocket messages
+/// separately and far lower (`MAX_WS_MESSAGE_BYTES`), because a message is
+/// fully buffered before any agent-side check can see it.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 // Client → Agent

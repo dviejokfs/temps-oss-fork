@@ -39,6 +39,25 @@ pub const STEP_UP_TTL_MINUTES: i64 = 5;
 /// What it is *not* weakened by: a stolen session cannot unenrol to escape the
 /// challenge, because disabling MFA itself requires a valid TOTP code.
 ///
+/// # Why this is not the loss it looks like — and what would change that
+///
+/// The gate this replaces was never a control for unenrolled users. Enrolment
+/// itself is guarded only by `permission_guard!(auth, UsersWrite)`:
+/// `POST /users/me/mfa/setup` and `/users/me/mfa/verify` ask for no password
+/// and no step-up. An attacker holding a stolen session for an unenrolled
+/// account could therefore enrol *their own* authenticator and satisfy the old
+/// challenge in two calls — while leaving their TOTP secret on the victim's
+/// account, which is both a persistence mechanism and a permanent lockout for
+/// the real owner. Removing the challenge for those users removes that
+/// incentive; it does not remove a barrier the attacker could not already
+/// cross.
+///
+/// **That reasoning is load-bearing.** If enrolment is ever put behind
+/// re-authentication (current password, or a step-up for re-enrolment), the
+/// pre-existing behaviour *would* become a real control, and this policy must
+/// be revisited at the same time — otherwise the fix to enrolment silently
+/// leaves this hole open behind it.
+///
 /// # Operators who want the stricter posture
 ///
 /// `AppSettings::require_mfa_for_admins` is **not** sufficient on its own: it

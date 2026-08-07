@@ -32,6 +32,7 @@
 //! every PTY with it (`/run/temps-pty` is tmpfs). An attached terminal is
 //! activity; this is what makes that true.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,6 +81,85 @@ const MAX_CONCURRENT_TERMINALS: usize = 32;
 /// refactor builds more than one router.
 static TERMINAL_SLOTS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_CONCURRENT_TERMINALS);
+
+/// Concurrent terminals a *single* account may hold.
+///
+/// [`MAX_CONCURRENT_TERMINALS`] alone bounds the host, but it is global: one
+/// account opening 32 sessions locks every other user out of the feature with
+/// a 429. Nobody drives more than a handful of terminals by hand, so a small
+/// per-user sub-cap turns an instance-wide denial of service into a limit the
+/// offending account hits by itself.
+const MAX_TERMINALS_PER_USER: usize = 4;
+
+/// Live attachment count per user id, guarding [`MAX_TERMINALS_PER_USER`].
+/// A plain `Mutex` is fine here: it is taken twice per *session*, never on a
+/// data path.
+static TERMINALS_PER_USER: std::sync::Mutex<Option<HashMap<i32, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// RAII counter for [`TERMINALS_PER_USER`]. Decrements on drop, so every exit
+/// path — clean close, error, panic in the session future — returns the slot.
+struct UserSlot(i32);
+
+impl UserSlot {
+    /// Returns `None` when this user is already at their cap.
+    fn acquire(user_id: i32) -> Option<Self> {
+        let mut guard = TERMINALS_PER_USER.lock().ok()?;
+        let counts = guard.get_or_insert_with(HashMap::new);
+        let entry = counts.entry(user_id).or_insert(0);
+        if *entry >= MAX_TERMINALS_PER_USER {
+            return None;
+        }
+        *entry += 1;
+        Some(UserSlot(user_id))
+    }
+}
+
+impl Drop for UserSlot {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = TERMINALS_PER_USER.lock() {
+            if let Some(counts) = guard.as_mut() {
+                if let Some(entry) = counts.get_mut(&self.0) {
+                    *entry = entry.saturating_sub(1);
+                    // Don't let the map grow one entry per user id forever.
+                    if *entry == 0 {
+                        counts.remove(&self.0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Largest WebSocket message accepted from a terminal client.
+///
+/// A terminal client sends keystrokes and small JSON control frames; 64 KiB is
+/// already generous for a paste. axum's default is 64 MiB, which times
+/// [`MAX_CONCURRENT_TERMINALS`] is ~2 GiB of attacker-controlled buffering on
+/// the 3 vCPU / 4 GB reference host — and the agent-side
+/// `MAX_FRAME_BYTES` check only runs *after* the whole message is buffered,
+/// so it does not bound this.
+const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// How long a session may sit with no traffic from the client before we close
+/// it, and how many unanswered pings that allows.
+///
+/// Without this a half-open connection (closed laptop, NAT drop, dead Wi-Fi)
+/// leaves the heartbeat as the only firing branch, so the session keeps
+/// calling `touch` forever: the sandbox is never swept, the `docker exec`
+/// stays open, and a global slot is never returned. A live terminal answers
+/// pings; a dead one does not.
+const MISSED_PONGS_BEFORE_CLOSE: u32 = 3;
+
+/// Hard ceiling on a single attachment.
+///
+/// Authorization is evaluated once, at upgrade, and never revalidated — so a
+/// logout, an account deactivation, a password change with
+/// `revoke_other_sessions`, or a deleted API key leave this shell working.
+/// (The container-exec terminal has the same shape.) Bounding the session
+/// bounds that window: the client reconnects transparently and is
+/// re-authorized when it does.
+const MAX_SESSION_DURATION: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Longest accepted `tab` identifier, and the character set.
 ///
@@ -198,6 +278,18 @@ pub async fn terminal(
             ))
     })?;
 
+    // Per-user sub-cap, so one account cannot take every global slot and lock
+    // the whole instance out of the feature.
+    let user_slot = UserSlot::acquire(auth.user_id()).ok_or_else(|| {
+        problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+            .with_title("Too Many Terminals")
+            .with_detail(format!(
+                "You already have {} terminal sessions open. \
+                 Close one and retry.",
+                MAX_TERMINALS_PER_USER
+            ))
+    })?;
+
     // Resolve *before* the upgrade so ownership failures, a missing sandbox,
     // or a stopped ephemeral one surface as a real HTTP status instead of a
     // WebSocket that opens and immediately dies. This also wakes a suspended
@@ -250,25 +342,29 @@ pub async fn terminal(
     // "spawn_failed: No such file or directory".
     let work_dir = handle.work_dir.to_string_lossy().to_string();
 
-    Ok(ws.on_upgrade(move |socket| async move {
-        // Held for the session's lifetime; released when this future ends,
-        // however it ends.
-        let _permit = permit;
-        let session = TerminalSession {
-            socket,
-            attachment,
-            service,
-            sandbox_id: id,
-            internal_id,
-            timeout_secs,
-            tab,
-            cmd,
-            cols,
-            rows,
-            work_dir,
-        };
-        session.run().await;
-    }))
+    Ok(ws
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            // Held for the session's lifetime; released when this future ends,
+            // however it ends.
+            let _permit = permit;
+            let _user_slot = user_slot;
+            let session = TerminalSession {
+                socket,
+                attachment,
+                service,
+                sandbox_id: id,
+                internal_id,
+                timeout_secs,
+                tab,
+                cmd,
+                cols,
+                rows,
+                work_dir,
+            };
+            session.run().await;
+        }))
 }
 
 struct TerminalSession {
@@ -348,11 +444,53 @@ impl TerminalSession {
         // it means a sandbox seconds from expiry is rescued on connect.
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Liveness. `touch` on a tick keeps the sweeper off a sandbox someone
+        // is using — but only a *live* client should get that. Each tick pings
+        // and counts; any frame from the client (including the pong) clears
+        // the count. After MISSED_PONGS_BEFORE_CLOSE unanswered pings we treat
+        // the peer as gone, stop touching, and let the sandbox suspend
+        // normally. Without this a half-open socket pins the container
+        // forever, which is exactly the idle timeout this PR set out to fix.
+        let mut unanswered_pings: u32 = 0;
+        let deadline = tokio::time::sleep(MAX_SESSION_DURATION);
+        tokio::pin!(deadline);
+
         loop {
             tokio::select! {
+                // Bounded session: the client reconnects and is re-authorized.
+                _ = &mut deadline => {
+                    send_error(
+                        &mut ws_tx,
+                        "terminal session reached its maximum duration; reconnect to continue"
+                            .to_string(),
+                    )
+                    .await;
+                    break;
+                }
+
                 // Keep the sweeper honest while someone is attached.
                 _ = heartbeat.tick() => {
+                    if unanswered_pings >= MISSED_PONGS_BEFORE_CLOSE {
+                        tracing::debug!(
+                            "Terminal on sandbox {} tab '{}' stopped answering pings; closing",
+                            sandbox_id,
+                            tab
+                        );
+                        break;
+                    }
                     service.touch(internal_id, timeout_secs).await;
+                    // A closed receive window must not wedge the whole select!
+                    // loop (no more heartbeats, no more reads). Time it out
+                    // and drop the session instead.
+                    match tokio::time::timeout(
+                        ACTIVITY_HEARTBEAT,
+                        ws_tx.send(Message::Ping(Vec::new().into())),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => unanswered_pings += 1,
+                        _ => break,
+                    }
                 }
 
                 // Agent → client. Cancellation-safe: see the codec above.
@@ -375,10 +513,23 @@ impl TerminalSession {
 
                 // Client → agent.
                 msg = ws_rx.next() => {
+                    // Anything at all from the peer proves it is alive.
+                    unanswered_pings = 0;
                     match msg {
                         Some(Ok(Message::Binary(data))) => {
-                            if pty::write_frame(&mut agent_in, pty::OP_INPUT, &data).await.is_err() {
-                                break;
+                            match pty::write_frame(&mut agent_in, pty::OP_INPUT, &data).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    // Most likely an oversized paste. Say so
+                                    // instead of letting the terminal vanish
+                                    // with no explanation.
+                                    send_error(
+                                        &mut ws_tx,
+                                        format!("could not forward input: {}", e),
+                                    )
+                                    .await;
+                                    break;
+                                }
                             }
                         }
                         Some(Ok(Message::Text(text))) => {
@@ -423,7 +574,17 @@ async fn forward_agent_frame(
     match op {
         pty::OP_OUTPUT => ws_tx.send(Message::Binary(payload.into())).await.is_ok(),
         pty::OP_OPENED => {
-            let opened: Option<pty::OpenedResponse> = serde_json::from_slice(&payload).ok();
+            let opened: Option<pty::OpenedResponse> = serde_json::from_slice(&payload)
+                .inspect_err(|e| {
+                    // Falling back to a default silently makes a
+                    // protocol-version mismatch look like normal
+                    // operation. Say which frame failed.
+                    tracing::warn!(
+                        "terminal: could not decode OPENED frame from the pty agent: {}",
+                        e
+                    );
+                })
+                .ok();
             let (tab_id, existed) = opened
                 .as_ref()
                 .map(|o| (o.tab_id.as_str(), o.existed))
@@ -431,14 +592,34 @@ async fn forward_agent_frame(
             send_event(ws_tx, ServerEvent::Ready { tab_id, existed }).await
         }
         pty::OP_EXIT => {
-            let exit: Option<pty::ExitEvent> = serde_json::from_slice(&payload).ok();
+            let exit: Option<pty::ExitEvent> = serde_json::from_slice(&payload)
+                .inspect_err(|e| {
+                    // Falling back to a default silently makes a
+                    // protocol-version mismatch look like normal
+                    // operation. Say which frame failed.
+                    tracing::warn!(
+                        "terminal: could not decode EXIT frame from the pty agent: {}",
+                        e
+                    );
+                })
+                .ok();
             let (code, signal) = exit.map(|e| (e.code, e.signal)).unwrap_or((None, None));
             send_event(ws_tx, ServerEvent::Exit { code, signal }).await;
             // The program is gone; nothing left to relay.
             false
         }
         pty::OP_ERROR => {
-            let err: Option<pty::ErrorPayload> = serde_json::from_slice(&payload).ok();
+            let err: Option<pty::ErrorPayload> = serde_json::from_slice(&payload)
+                .inspect_err(|e| {
+                    // Falling back to a default silently makes a
+                    // protocol-version mismatch look like normal
+                    // operation. Say which frame failed.
+                    tracing::warn!(
+                        "terminal: could not decode ERROR frame from the pty agent: {}",
+                        e
+                    );
+                })
+                .ok();
             let message = err
                 .map(|e| format!("{}: {}", e.code, e.message))
                 .unwrap_or_else(|| "terminal agent reported an error".to_string());

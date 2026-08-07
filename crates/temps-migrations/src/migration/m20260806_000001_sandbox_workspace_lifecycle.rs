@@ -50,6 +50,20 @@ impl MigrationTrait for Migration {
             "CREATE INDEX IF NOT EXISTS idx_sandboxes_project_id ON sandboxes (project_id) WHERE project_id IS NOT NULL",
         )
         .await?;
+
+        // Backfill the work dir that `create_sandbox` used to hardcode.
+        //
+        // Rows created before the fix carry '/workspace', which does not exist
+        // in the sandbox image — the real directory is '/home/temps/workspace'.
+        // That column is handed to API clients as `cwd`, so an SDK caller
+        // using it as an exec working directory gets a path that has never
+        // existed. Correcting the code without correcting the rows leaves
+        // every pre-existing sandbox broken in exactly the way this PR set out
+        // to fix. Scoped to the wrong value so a custom work dir is untouched.
+        conn.execute_unprepared(
+            "UPDATE sandboxes SET work_dir = '/home/temps/workspace' WHERE work_dir = '/workspace'",
+        )
+        .await?;
         Ok(())
     }
 

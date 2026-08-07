@@ -195,26 +195,6 @@ pub enum SourceBody {
     },
 }
 
-/// Reject credentials baked into the URL (`https://user:pass@host/...`).
-/// We want credentials to flow through the `username`/`password` or
-/// `git_connection_id` channels so the token goes through the safe
-/// `GIT_ASKPASS` path and never lands in `.git/config` or logs.
-fn url_contains_credentials(url: &str) -> bool {
-    // Look for `://<something>@` where `<something>` contains `:` — that's
-    // the `user:password` form. A plain `@` without `:` is fine (user-only,
-    // which git treats as "prompt for password").
-    if let Some(scheme_end) = url.find("://") {
-        let rest = &url[scheme_end + 3..];
-        if let Some(at_idx) = rest.find('@') {
-            let userinfo = &rest[..at_idx];
-            if userinfo.contains(':') {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Reject URLs that point at private/loopback/metadata IPs or use
 /// non-HTTP schemes. Without this, an authenticated user can drive the
 /// sandbox to fetch from internal Docker network services (control
@@ -305,7 +285,7 @@ impl SourceBody {
                         message: "git source: url must not be empty".into(),
                     });
                 }
-                if url_contains_credentials(url) {
+                if crate::services::sandbox_service::url_has_embedded_credentials(url) {
                     return Err(SandboxError::Validation {
                         message: "git source: url must not contain embedded credentials — use username/password or git_connection_id".into(),
                     });

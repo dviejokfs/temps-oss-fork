@@ -287,7 +287,9 @@ impl SandboxService {
         user_id: i32,
         job_id: &str,
     ) -> Result<tokio::sync::broadcast::Receiver<JobLogEvent>, SandboxError> {
-        let (_row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        // Ownership only, no wake: job state lives in the in-process tracker,
+        // and a suspended container's jobs are already gone.
+        let (_row, internal_id) = self.resolve_id_no_wake(public_id, user_id).await?;
         self.jobs().subscribe(public_id, internal_id, job_id).await
     }
 
@@ -298,7 +300,7 @@ impl SandboxService {
         user_id: i32,
         job_id: &str,
     ) -> Result<JobState, SandboxError> {
-        let (_row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let (_row, internal_id) = self.resolve_id_no_wake(public_id, user_id).await?;
         self.jobs().status(public_id, internal_id, job_id).await
     }
 
@@ -310,7 +312,7 @@ impl SandboxService {
         public_id: &str,
         user_id: i32,
     ) -> Result<Vec<crate::services::job_tracker::JobSummary>, SandboxError> {
-        let (_row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let (_row, internal_id) = self.resolve_id_no_wake(public_id, user_id).await?;
         Ok(self.jobs().list(internal_id).await)
     }
 }

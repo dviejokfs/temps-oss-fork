@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 
 use temps_agents::sandbox::SandboxCreateConfig;
@@ -331,7 +331,14 @@ async fn validate_resolved_source(source: &SandboxSource) -> Result<(), SandboxE
 ///
 /// A bare `user@` is fine — git reads that as "prompt for a password" and it
 /// carries no secret. Only the colon form is a credential.
-fn url_has_embedded_credentials(url: &str) -> bool {
+///
+/// Shared with the handler so both entry points agree. The naive version —
+/// scanning for the first `@` anywhere after the scheme — false-positives on a
+/// URL that has an explicit port and an `@` later in the path
+/// (`https://host:8080/org/repo@v1.git`), because it reads the whole
+/// `host:8080/org/repo` as userinfo. Stopping at the first `/` is what makes
+/// that correct.
+pub(crate) fn url_has_embedded_credentials(url: &str) -> bool {
     let Some(scheme_end) = url.find("://") else {
         return false;
     };
@@ -407,6 +414,12 @@ fn work_dir_to_remove(data_root: &Path, public_id_value: &str) -> Option<PathBuf
 /// Bounds on `timeout_secs` at the service layer. The upper bound
 /// protects against "sandbox leaks" where a caller creates sandboxes
 /// with absurd timeouts and relies on the server never cleaning up.
+/// How long a wake-on-access container start may take before the request
+/// gives up. A wake blocks a user's exec/fs call, so it needs a ceiling: a
+/// wedged container runtime must surface as a clear error, not an
+/// indefinitely hung request.
+const WAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 const MIN_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60; // 24 hours
 const DEFAULT_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour
@@ -500,10 +513,14 @@ impl SandboxService {
 
     /// List the caller's non-destroyed sandboxes, newest first.
     ///
-    /// `lifecycle` and `project_id` are optional filters. Both ride
-    /// partial indexes added by the ADR-036 migration, so filtering to
-    /// "my workspaces" or "this project's workspaces" doesn't scan the
-    /// ephemeral rows, which are the overwhelming majority.
+    /// `lifecycle` and `project_id` are optional filters, both backed by
+    /// partial indexes from the ADR-036 migration — but only for the
+    /// selective side. The lifecycle index is `WHERE lifecycle <> 'ephemeral'`,
+    /// so `?lifecycle=workspace` avoids the ephemeral rows (the overwhelming
+    /// majority) while `?lifecycle=ephemeral` — an equally valid call — gets
+    /// no index and falls back to the `user_id` scan, which is the right
+    /// trade: one user's sandboxes are few, and indexing the common value
+    /// would cost writes on every row for no gain.
     pub async fn list_for_user(
         &self,
         user_id: i32,
@@ -1676,18 +1693,35 @@ TEMPS_ASKPASS_EOF\n\
     /// single UPDATE with no read-modify-write. `timeout_secs` is taken
     /// from the caller (who already has the row) to avoid a SELECT here.
     ///
+    /// **The deadline only ever moves forward.** `extend_timeout` (the SDK's
+    /// `extendTimeout()`) pushes `expires_at` past `now + timeout_secs`
+    /// precisely so a long operation can outlive the idle window — and the
+    /// first thing that operation does is exec, which lands here. Assigning
+    /// the idle deadline unconditionally would silently undo the extension
+    /// the caller just paid for, so the write is `CASE WHEN`-guarded in SQL:
+    /// still one statement, still no read-modify-write, but never a
+    /// regression. `last_activity_at` is always bumped — it records activity,
+    /// not a deadline.
+    ///
     /// Swallows DB errors: activity bumps are best-effort, and failing a
     /// user's exec because a bookkeeping write lost a race would be worse
     /// than a sandbox expiring slightly early.
     pub async fn touch(&self, sandbox_id: i32, timeout_secs: i32) {
         let now = Utc::now();
-        let active = sandboxes::ActiveModel {
-            id: Set(sandbox_id),
-            last_activity_at: Set(now),
-            expires_at: Set(idle_deadline(now, timeout_secs)),
-            ..Default::default()
-        };
-        if let Err(e) = active.update(self.db.as_ref()).await {
+        let deadline = idle_deadline(now, timeout_secs);
+        let result = sandboxes::Entity::update_many()
+            .col_expr(sandboxes::Column::LastActivityAt, Expr::value(now))
+            .col_expr(
+                sandboxes::Column::ExpiresAt,
+                Expr::cust_with_values(
+                    "CASE WHEN expires_at < $1 THEN $2 ELSE expires_at END",
+                    [deadline, deadline],
+                ),
+            )
+            .filter(sandboxes::Column::Id.eq(sandbox_id))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(e) = result {
             tracing::debug!(
                 "touch: failed to bump last_activity_at for {}: {}",
                 sandbox_id,
@@ -1859,10 +1893,35 @@ TEMPS_ASKPASS_EOF\n\
 
     // ── Helpers shared with the exec/fs modules ──────────────────────────
 
+    /// Load + authorize + return the internal ID **without** waking a
+    /// suspended workspace.
+    ///
+    /// For endpoints that only need to prove ownership and then answer from
+    /// the row or from in-memory state — preview URLs, job listings, job
+    /// status. Those are reads; booting a container as a side effect of a
+    /// `GET` is a surprise that costs real memory on a 3 vCPU / 4 GB host, and
+    /// in the job cases it is pure waste: the in-memory job table was emptied
+    /// when the container stopped, so waking it cannot change the answer.
+    ///
+    /// Use [`Self::resolve_id`] on paths that genuinely need the container
+    /// running (exec, filesystem, terminal).
+    pub async fn resolve_id_no_wake(
+        &self,
+        public_id_value: &str,
+        user_id: i32,
+    ) -> Result<(sandboxes::Model, i32), SandboxError> {
+        let row = self.find_by_public_id(public_id_value, user_id).await?;
+        let id = row.id;
+        Ok((row, id))
+    }
+
     /// Load + authorize + return the internal ID, or a typed error that
     /// already includes the public ID. Exec/fs modules call this first.
     /// Rejects stopped sandboxes with `InvalidState` (→ HTTP 409) — the
     /// user must call `/resume` before running commands.
+    ///
+    /// **Wakes a suspended workspace as a side effect** (ADR-036), so only
+    /// call it where the container must actually be running.
     pub async fn resolve_id(
         &self,
         public_id_value: &str,
@@ -1913,10 +1972,28 @@ TEMPS_ASKPASS_EOF\n\
             public_id_value,
             sandbox_id
         );
-        self.registry
-            .start(sandbox_id, &public_id_value)
-            .await
-            .map_err(|e| from_agent_error(&public_id_value, e))?;
+        // Bounded: a wake happens inline on a user's request, and a wedged
+        // container runtime would otherwise hang that request forever with no
+        // way for the caller to tell a slow start from a dead daemon.
+        match tokio::time::timeout(
+            WAKE_TIMEOUT,
+            self.registry.start(sandbox_id, &public_id_value),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| from_agent_error(&public_id_value, e))?,
+            Err(_) => {
+                return Err(SandboxError::InvalidState {
+                    sandbox_id: public_id_value.clone(),
+                    state: "stopped".to_string(),
+                    operation: format!(
+                        "wake timed out after {}s; the container runtime did not \
+                         start the workspace. Check the daemon, then retry",
+                        WAKE_TIMEOUT.as_secs()
+                    ),
+                });
+            }
+        }
 
         let now = Utc::now();
         let new_expires = idle_deadline(now, row.timeout_secs);
@@ -1960,8 +2037,9 @@ TEMPS_ASKPASS_EOF\n\
             });
         }
         // Ownership + validity check. The numeric id is intentionally
-        // discarded — the preview URL never embeds it.
-        let _ = self.resolve_id(public_id_value, user_id).await?;
+        // discarded — the preview URL never embeds it. No wake: building a
+        // URL string does not need the container running.
+        let _ = self.resolve_id_no_wake(public_id_value, user_id).await?;
         let parts = self.preview_parts().await;
         Ok(parts.url_for(public_id_value, port))
     }
@@ -1990,7 +2068,8 @@ TEMPS_ASKPASS_EOF\n\
                 message: "port must be between 1 and 65535".into(),
             });
         }
-        let (row, _) = self.resolve_id(public_id_value, user_id).await?;
+        // No wake: minting a share link reads the row's password hash.
+        let (row, _) = self.resolve_id_no_wake(public_id_value, user_id).await?;
         let password_hash =
             row.preview_password_hash
                 .as_deref()
@@ -2473,6 +2552,46 @@ mod tests {
         assert_eq!(s.status, "running");
         assert_eq!(s.image.as_deref(), Some("node:20"));
         assert_eq!(s.agent_run_id, Some(42));
+    }
+
+    /// `extend_timeout` deliberately pushes `expires_at` past the idle window
+    /// and leaves `timeout_secs` alone. `touch` then runs on the very next
+    /// exec — the long operation the extension was bought for — so if it
+    /// assigned the idle deadline unconditionally it would silently cancel the
+    /// extension the caller just paid for. The guard has to live in the SQL,
+    /// because `touch` must stay a single statement with no read-modify-write
+    /// on the exec hot path.
+    #[tokio::test]
+    async fn touch_never_moves_the_deadline_backwards() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = preview_test_service_with_db(db.clone());
+
+        service.touch(42, 3600).await;
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service owns no database references after drop")
+            .into_transaction_log();
+        let statements = format!("{log:?}");
+
+        assert!(
+            statements.contains("CASE WHEN"),
+            "touch must guard the deadline in SQL so an extendTimeout() is \
+             never silently undone; log: {statements}"
+        );
+        assert!(statements.contains("expires_at"), "log: {statements}");
+        assert!(
+            statements.contains("last_activity_at"),
+            "activity is always recorded, only the deadline is guarded; \
+             log: {statements}"
+        );
     }
 }
 

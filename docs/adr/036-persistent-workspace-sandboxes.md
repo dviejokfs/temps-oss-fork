@@ -69,9 +69,11 @@ Wake latency is a container start, not a create: the image is local, the volumes
 
 ### 5. Create a workspace from a project
 
-`POST /v1/sandboxes` accepts `lifecycle` and an optional `project_id`. When `project_id` is present and no explicit `source` was given, the repo URL and git connection are resolved from the project row, so "give me a workspace on this project's code" needs no copy-pasted clone URL. `project_id` is persisted (nullable, `ON DELETE SET NULL`) so workspaces can be listed per project.
+`POST /v1/sandboxes` accepts `lifecycle` and an optional `project_id`. When `project_id` is present and no explicit `source` was given, the repo URL and git connection are resolved from the project row, so "give me a workspace on this project's code" needs no copy-pasted clone URL. `project_id` is persisted nullable, with **no foreign key** — deliberately. The column is only ever read as a list filter inside an already `user_id`-scoped query, and at create time behind the project access guard, so a dangling id grants nothing; leaving the FK off keeps project deletion from taking a lock on `sandboxes` and avoids a cascade that would silently rewrite sandbox rows.
 
 Explicit `source` always wins over the project-derived one — the project is a convenience default, not an override.
+
+The project-derived path clones with **the caller's own git connection**. A private repo therefore resolves only for the user who owns the connection the project was set up with — lending one user's token to another is exactly the vulnerability we are not going to build. A teammate with project access but no connection of their own must pass an explicit `source`, or connect their own provider.
 
 ### 6. Interactive terminal, and why it must heartbeat
 
