@@ -104,6 +104,17 @@ function runSession(
     let rawModeEngaged = false
     let exitCode = 0
     let settled = false
+    // Did the *program* end, or did we just disconnect? The closing message
+    // is a different fact in each case, and getting it wrong tells the user
+    // their session survived when it did not.
+    let programExited = false
+    // Set when the user detached deliberately with the escape sequence, so
+    // the closing message can confirm it rather than read like a dropout.
+    let detachRequested = false
+    // Whether this attach landed in an existing tab. Reported on exit so a
+    // reattach is distinguishable from a fresh spawn without printing over
+    // the replayed screen at connect time.
+    let reattached = false
 
     // Every exit path goes through here. Leaving the terminal in raw mode
     // is the classic failure of this kind of tool — the user's shell is
@@ -126,9 +137,40 @@ function runSession(
       else resolve()
     }
 
+    // Detach escape: Ctrl-P Ctrl-Q, the same sequence `docker attach` uses.
+    //
+    // Without it there is no way to leave a session alive from inside it —
+    // `exit` ends the program (killing the tab), and every other key is
+    // forwarded to the remote shell by design. Closing the window works but
+    // is not something to have to reach for.
+    const CTRL_P = 0x10
+    const CTRL_Q = 0x11
+    let sawCtrlP = false
+
     const onStdin = (chunk: Buffer) => {
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(chunk)
+      if (socket.readyState !== WebSocket.OPEN) return
+
+      // Handle the escape without swallowing a legitimate Ctrl-P: only the
+      // *pair* detaches. A lone Ctrl-P is held back one keystroke and then
+      // forwarded, so readline's "previous history" still works — it just
+      // arrives with the following key.
+      for (let i = 0; i < chunk.length; i++) {
+        const byte = chunk[i]!
+        if (sawCtrlP) {
+          sawCtrlP = false
+          if (byte === CTRL_Q) {
+            detachRequested = true
+            socket.close()
+            return
+          }
+          socket.send(Buffer.from([CTRL_P, byte]))
+          continue
+        }
+        if (byte === CTRL_P) {
+          sawCtrlP = true
+          continue
+        }
+        socket.send(Buffer.from([byte]))
       }
     }
 
@@ -153,14 +195,31 @@ function runSession(
       }
       // Text frames are control events, not terminal output — writing them
       // to stdout would splatter JSON into the user's session.
-      let event: { type?: string; code?: number; message?: string }
+      let event: {
+        type?: string
+        code?: number
+        message?: string
+        existed?: boolean
+      }
       try {
         event = JSON.parse(data.toString())
       } catch {
         return
       }
-      if (event.type === 'exit') {
+      if (event.type === 'ready') {
+        reattached = event.existed === true
+        // Say which one this is, once, before the replay arrives. Without it
+        // there is no way to tell a restored session from a brand-new shell:
+        // both just render a prompt, so a tab that legitimately ended looks
+        // identical to reattach being broken.
+        process.stdout.write(
+          reattached
+            ? `${colors.muted(`— reattached to tab '${options.tab ?? 'main'}', restoring recent output —`)}\r\n`
+            : `${colors.muted(`— new session in tab '${options.tab ?? 'main'}' —`)}\r\n`,
+        )
+      } else if (event.type === 'exit') {
         exitCode = event.code ?? 0
+        programExited = true
         socket.close()
       } else if (event.type === 'error') {
         restore()
@@ -195,11 +254,28 @@ function runSession(
         )
         return
       }
+      const tab = options.tab ?? 'main'
       newline()
-      info(
-        `Detached from ${colors.primary(id)} (tab ${options.tab ?? 'main'}). ` +
-          'Anything running in it keeps running — reattach with the same command.',
-      )
+      if (programExited) {
+        // The program ended, so the agent dropped the tab with it. Saying
+        // "anything running keeps running" here would be plainly false, and
+        // it is what made a fresh shell on the next attach look like lost
+        // history rather than the expected result of typing `exit`.
+        info(
+          `Session ended in ${colors.primary(id)} (tab ${tab}${
+            exitCode !== 0 ? `, exit ${exitCode}` : ''
+          }). ` +
+            'That tab is gone — reattaching starts a fresh shell. To keep a ' +
+            'session alive, detach with Ctrl-P Ctrl-Q or just close the ' +
+            'window instead of exiting.',
+        )
+      } else {
+        info(
+          `${detachRequested ? 'Detached' : 'Disconnected'} from ${colors.primary(id)} (tab ${tab}). ` +
+            'Anything running in it keeps running — reattach with the same ' +
+            'command to pick up where you left off.',
+        )
+      }
       if (exitCode !== 0) {
         process.exitCode = exitCode
       }

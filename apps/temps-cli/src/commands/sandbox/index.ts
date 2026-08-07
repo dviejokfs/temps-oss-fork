@@ -382,7 +382,7 @@ export function registerSandboxCommands(program: Command): void {
     .command('shell <id>')
     .alias('attach')
     .description(
-      'Open an interactive terminal in a sandbox. Detaching leaves the program running — reattach with the same --tab',
+      'Open an interactive terminal in a sandbox. Detach with Ctrl-P Ctrl-Q to leave the program running; `exit` ends it. Reattach with the same --tab',
     )
     .option(
       '--tab <name>',
