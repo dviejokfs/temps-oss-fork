@@ -11,7 +11,7 @@ use std::sync::Arc;
 use temps_core::{
     JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
 };
-use temps_deployer::compose::{ComposeDeployRequest, ComposeExecutor};
+use temps_deployer::compose::{ComposeDeployRequest, ComposeExecutor, EnvFileSource};
 use temps_logs::LogService;
 use tracing::debug;
 
@@ -327,6 +327,34 @@ impl WorkflowTask for DeployComposeJob {
         } else {
             None
         };
+
+        // Report every `env_file:` Temps is about to satisfy on the operator's
+        // behalf. Synthesizing configuration silently is how a stack boots with
+        // an empty DATABASE_URL and fails later with something unrelated — the
+        // person debugging this has no support channel, so the deployment log
+        // has to say what was created and where it came from.
+        for plan in ComposeExecutor::plan_env_files(&compose_content, repo_path.as_deref()) {
+            let message = match plan.source {
+                EnvFileSource::Repository(_) => format!(
+                    "Compose references env file '{}' — copied from the repository",
+                    plan.path
+                ),
+                EnvFileSource::ProjectEnvironment if self.environment_vars.is_empty() => format!(
+                    "Compose references env file '{}', which is not in the repository — created it empty. \
+                     If the stack needs values, set them in the environment's variables and redeploy.",
+                    plan.path
+                ),
+                EnvFileSource::ProjectEnvironment => format!(
+                    "Compose references env file '{}', which is not in the repository — created it from \
+                     this environment's {} variable(s)",
+                    plan.path,
+                    self.environment_vars.len()
+                ),
+            };
+            if let Some(ref log_id) = self.log_id {
+                let _ = self.log_service.log_info(log_id, &message).await;
+            }
+        }
 
         // Validate the compose security policy BEFORE tearing down the existing
         // stack. Rejecting after teardown would cause downtime on the running
