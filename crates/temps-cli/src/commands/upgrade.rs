@@ -944,19 +944,88 @@ fn pick_release_for_channel(
     releases.into_iter().find(|r| channel.includes(r))
 }
 
-/// Fetch a specific release by tag from GitHub.
-pub(crate) async fn fetch_specific_release(version: &str) -> anyhow::Result<GitHubRelease> {
-    // Ensure the version starts with 'v'
-    let tag = if version.starts_with('v') {
-        version.to_string()
-    } else {
-        format!("v{}", version)
+/// Normalize a caller-supplied version into a release tag, rejecting anything
+/// that is not a plain semver-shaped tag.
+///
+/// **This is a security boundary, not cosmetics.** The tag is interpolated into
+/// a GitHub API path, and the `url` crate resolves `..` segments when parsing —
+/// so an unvalidated tag like `v/../../../../../owner/repo/releases/latest`
+/// walks out of `gotempsh/temps` and resolves to *another repository's* release.
+/// Everything downstream then behaves normally: it downloads that release's
+/// `temps-<target>.tar.gz`, checks it against that release's own `.sha256`
+/// (which of course matches), executes it for the version preflight, and
+/// installs it over the running binary. In other words, a caller who can reach
+/// `temps upgrade --version` or `POST /settings/update` could install an
+/// arbitrary binary. Keep this strict.
+pub(crate) fn normalize_release_tag(version: &str) -> anyhow::Result<String> {
+    let trimmed = version.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("Version must not be empty"));
+    }
+
+    let core = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    // Split off the prerelease/build suffix; the numeric core is validated
+    // separately so `1.2.3` and `1.2.3-beta.4` are both accepted but
+    // `1.2.3/../x` is not.
+    let (numeric, suffix) = match core.split_once(['-', '+']) {
+        Some((numeric, suffix)) => (numeric, Some(suffix)),
+        None => (core, None),
     };
 
-    let url = format!(
-        "https://api.github.com/repos/gotempsh/temps/releases/tags/{}",
-        tag
-    );
+    let mut parts = numeric.split('.');
+    let mut components = 0;
+    for _ in 0..3 {
+        let component = parts.next().ok_or_else(|| {
+            anyhow::anyhow!("Version '{version}' must look like 'v1.2.3' or 'v1.2.3-beta.4'")
+        })?;
+        if component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(anyhow::anyhow!(
+                "Version '{version}' has a non-numeric component '{component}'"
+            ));
+        }
+        components += 1;
+    }
+    if components != 3 || parts.next().is_some() {
+        return Err(anyhow::anyhow!(
+            "Version '{version}' must have exactly three numeric components"
+        ));
+    }
+
+    if let Some(suffix) = suffix {
+        // Deliberately narrow: alphanumerics, dot and dash only. No slashes, no
+        // percent-encoding, nothing that can add or escape a path segment.
+        if suffix.is_empty()
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        {
+            return Err(anyhow::anyhow!(
+                "Version '{version}' has an unsupported prerelease suffix"
+            ));
+        }
+        if suffix.split('.').any(|segment| segment.is_empty()) {
+            return Err(anyhow::anyhow!(
+                "Version '{version}' has an empty prerelease segment"
+            ));
+        }
+    }
+
+    Ok(format!("v{core}"))
+}
+
+/// Fetch a specific release by tag from GitHub.
+pub(crate) async fn fetch_specific_release(version: &str) -> anyhow::Result<GitHubRelease> {
+    let tag = normalize_release_tag(version)?;
+
+    // Built by pushing a validated segment rather than string interpolation, so
+    // even a future validation slip cannot alter the path structure.
+    let mut url = reqwest::Url::parse("https://api.github.com/repos/gotempsh/temps/releases/tags/")
+        .map_err(|e| anyhow::anyhow!("Failed to build the release URL: {e}"))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Failed to build the release URL"))?
+        .pop_if_empty()
+        .push(&tag);
+    let url = url.to_string();
 
     let client = reqwest::Client::new();
     let response = client
@@ -1482,6 +1551,71 @@ mod tests {
         // systemctl — the console is unmanaged by design.
         let g = restart_guidance(true);
         assert!(!g.contains("systemctl"));
+    }
+
+    #[test]
+    fn test_normalize_release_tag_accepts_real_tags() {
+        for (input, expected) in [
+            ("v1.2.3", "v1.2.3"),
+            ("1.2.3", "v1.2.3"),
+            ("v0.1.0-beta.55", "v0.1.0-beta.55"),
+            (
+                "v0.1.0-nightly.20260806.c64e8f98",
+                "v0.1.0-nightly.20260806.c64e8f98",
+            ),
+            ("  v1.0.0  ", "v1.0.0"),
+        ] {
+            assert_eq!(
+                normalize_release_tag(input).expect(input),
+                expected,
+                "should accept {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_release_tag_blocks_path_traversal() {
+        // The exploit this validation exists for: the `url` crate resolves
+        // `..` segments, so these escape gotempsh/temps and reach an arbitrary
+        // repository's release — whose asset would then be installed.
+        for input in [
+            "v/../../../../../rust-lang/rust/releases/latest",
+            "v1.2.3/../../../../../owner/repo/releases/latest",
+            "../../owner/repo/releases/latest",
+            "v1.2.3/..",
+            "v1.2.3/extra",
+        ] {
+            assert!(
+                normalize_release_tag(input).is_err(),
+                "must reject traversal: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_release_tag_blocks_encoding_and_injection_tricks() {
+        for input in [
+            "",
+            "   ",
+            "v",
+            "v1.2",
+            "v1.2.3.4",
+            "v1.2.x",
+            "v1.2.3-beta/4",
+            "v1.2.3-beta%2F4",
+            "v1.2.3-beta 4",
+            "v1.2.3-",
+            "v1.2.3-beta..4",
+            "v1.2.3?foo=bar",
+            "v1.2.3#frag",
+            "v1.2.3@evil.com",
+            "http://evil.com/v1.2.3",
+        ] {
+            assert!(
+                normalize_release_tag(input).is_err(),
+                "must reject malformed tag: {input:?}"
+            );
+        }
     }
 
     #[test]
