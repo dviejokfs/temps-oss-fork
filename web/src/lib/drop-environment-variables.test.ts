@@ -4,7 +4,12 @@ import {
   validateDropEnvironmentVariables,
 } from './drop-environment-variables'
 
-const variable = (key: string, value = '') => ({ id: key, key, value })
+const variable = (key: string, value = '', isSecret = false) => ({
+  id: key,
+  key,
+  value,
+  isSecret,
+})
 
 describe('drop environment variables', () => {
   test('accepts empty values and serializes trimmed keys', () => {
@@ -15,9 +20,15 @@ describe('drop environment variables', () => {
 
     expect(validateDropEnvironmentVariables(variables)).toBeNull()
     expect(serializeDropEnvironmentVariables(variables)).toEqual([
-      ['API_URL', 'https://example.com'],
-      ['EMPTY', ''],
+      { key: 'API_URL', value: 'https://example.com', is_secret: false },
+      { key: 'EMPTY', value: '', is_secret: false },
     ])
+  })
+
+  test('carries the secret flag through serialization', () => {
+    expect(
+      serializeDropEnvironmentVariables([variable('TOKEN', 'sk-live', true)])
+    ).toEqual([{ key: 'TOKEN', value: 'sk-live', is_secret: true }])
   })
 
   test('rejects missing, invalid, and duplicate keys', () => {
@@ -33,5 +44,12 @@ describe('drop environment variables', () => {
         variable('API_URL'),
       ])
     ).toContain('more than once')
+  })
+
+  test('rejects a secret with no value', () => {
+    // Write-only means it could never be filled in afterwards.
+    expect(
+      validateDropEnvironmentVariables([variable('TOKEN', '', true)])
+    ).toContain('marked as a secret but has no value')
   })
 })

@@ -1,4 +1,5 @@
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import type { DropEnvironmentVariable } from '@/lib/drop-environment-variables'
@@ -31,8 +32,19 @@ export function DropEnvironmentVariables({
     )
   }
 
+  const setSecret = (id: string, isSecret: boolean) => {
+    onChange(
+      variables.map((variable) =>
+        variable.id === id ? { ...variable, isSecret } : variable
+      )
+    )
+  }
+
   const add = () => {
-    onChange([...variables, { id: createVariableId(), key: '', value: '' }])
+    onChange([
+      ...variables,
+      { id: createVariableId(), key: '', value: '', isSecret: false },
+    ])
   }
 
   const remove = (id: string) => {
@@ -150,6 +162,23 @@ export function DropEnvironmentVariables({
                 >
                   <Trash2 className="size-4" />
                 </Button>
+                <div className="flex items-center gap-2 sm:col-span-3">
+                  <Checkbox
+                    id={`drop-env-secret-${variable.id}`}
+                    checked={variable.isSecret}
+                    disabled={disabled}
+                    onCheckedChange={(checked) =>
+                      setSecret(variable.id, checked === true)
+                    }
+                  />
+                  <Label
+                    htmlFor={`drop-env-secret-${variable.id}`}
+                    className="text-xs font-normal text-muted-foreground"
+                  >
+                    Secret — stored encrypted and never shown again, only
+                    replaceable
+                  </Label>
+                </div>
               </div>
             )
           })}

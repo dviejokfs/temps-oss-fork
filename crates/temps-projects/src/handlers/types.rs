@@ -7,7 +7,7 @@ use utoipa::ToSchema;
 
 use crate::services::custom_domains::CustomDomainService;
 use crate::services::project::ProjectService;
-use crate::services::types::ProjectError;
+use crate::services::types::{CreateProjectEnvVar, ProjectError};
 use http::StatusCode;
 use std::sync::Arc;
 use temps_core::problemdetails;
@@ -145,6 +145,25 @@ pub struct ProjectList {
     pub projects: Vec<ProjectResponse>,
 }
 
+/// Documentation-only schema for a project-creation environment variable.
+///
+/// The wire format is deserialized by [`CreateProjectEnvVar`], which also
+/// accepts the legacy `["KEY", "value"]` tuple form. This struct exists so the
+/// OpenAPI spec (and the generated clients) describe the preferred object form
+/// with its `is_secret` flag.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ProjectEnvVarInput {
+    /// Variable name, e.g. `DATABASE_URL`
+    pub key: String,
+    /// Variable value
+    pub value: String,
+    /// Mark the variable as a write-only secret. Secret values are encrypted at
+    /// rest and never returned in plaintext by the API — they can only be
+    /// replaced, not read back. Defaults to `false`.
+    #[serde(default)]
+    pub is_secret: bool,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
     pub name: String,
@@ -174,7 +193,13 @@ pub struct CreateProjectRequest {
     pub output_dir: Option<String>,
     pub build_command: Option<String>,
     pub install_command: Option<String>,
-    pub environment_variables: Option<Vec<(String, String)>>,
+    /// Environment variables to seed the default (production) environment with.
+    ///
+    /// Accepts objects — `{"key": "API_KEY", "value": "sk-...", "is_secret": true}`
+    /// — or the legacy two-element form `["API_KEY", "sk-..."]`, which implies
+    /// `is_secret: false`.
+    #[schema(value_type = Option<Vec<ProjectEnvVarInput>>)]
+    pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
     pub automatic_deploy: Option<bool>,
     pub project_type: Option<String>,
     pub is_web_app: Option<bool>,
@@ -741,7 +766,8 @@ pub struct CreateProjectFromTemplateRequest {
     pub github_owner: String,
     pub github_name: String,
     pub template_name: String,
-    pub environment_variables: Option<Vec<(String, String)>>,
+    #[schema(value_type = Option<Vec<ProjectEnvVarInput>>)]
+    pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
     pub automatic_deploy: Option<bool>,
     pub performance_metrics_enabled: Option<bool>,
     pub storage_service_ids: Vec<i32>,

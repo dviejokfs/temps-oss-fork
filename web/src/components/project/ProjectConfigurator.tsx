@@ -121,11 +121,18 @@ const formSchema = z.object({
   rootDirectory: z.string(),
   branch: z.string().min(1, 'Branch is required'),
   environmentVariables: z.array(
-    z.object({
-      key: z.string(),
-      value: z.string(),
-      isSecret: z.boolean(),
-    })
+    z
+      .object({
+        key: z.string(),
+        value: z.string(),
+        isSecret: z.boolean(),
+      })
+      // A secret is write-only once saved, so an empty one could never be
+      // filled in afterwards — the server rejects it too.
+      .refine((v) => !v.isSecret || v.value.length > 0, {
+        message: 'A secret needs a value — it cannot be filled in later',
+        path: ['value'],
+      })
   ),
   storageServices: z.array(z.number()),
   dockerfilePath: z.string().optional(),
@@ -597,7 +604,11 @@ export function ProjectConfigurator({
             automatic_deploy: finalData.autoDeploy,
             storage_service_ids: finalData.storageServices || [],
             environment_variables: finalData.environmentVariables?.map(
-              (env) => [env.key, env.value] as [string, string]
+              (env) => ({
+                key: env.key,
+                value: env.value,
+                is_secret: env.isSecret,
+              })
             ),
             preset_config:
               finalData.preset === 'dockerfile' && finalData.dockerfilePath
@@ -1153,6 +1164,33 @@ export function ProjectConfigurator({
                               </Button>
                             </div>
                             <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField
+                        control={form.control}
+                        name={`environmentVariables.${index}.isSecret`}
+                        render={({ field }) => (
+                          <FormItem className="flex items-start space-x-2 space-y-0 md:col-span-2">
+                            <FormControl>
+                              <Checkbox
+                                id={`env-var-secret-${index}`}
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                            <div className="space-y-0.5 leading-none">
+                              <FormLabel
+                                htmlFor={`env-var-secret-${index}`}
+                                className="text-xs font-medium"
+                              >
+                                Secret
+                              </FormLabel>
+                              <p className="text-muted-foreground text-xs">
+                                Write-only. The value is stored encrypted and
+                                can be replaced but never shown again.
+                              </p>
+                            </div>
                           </FormItem>
                         )}
                       />

@@ -1916,7 +1916,12 @@ async fn execute_plan(
                 .env_vars
                 .iter()
                 .filter(|env| !env.is_secret)
-                .map(|env| (env.key.clone(), env.value.clone()))
+                .map(|env| {
+                    temps_projects::services::types::CreateProjectEnvVar::plain(
+                        env.key.clone(),
+                        env.value.clone(),
+                    )
+                })
                 .collect(),
         ),
         automatic_deploy: true,
