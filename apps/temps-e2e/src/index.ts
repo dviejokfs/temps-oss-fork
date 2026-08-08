@@ -5,6 +5,23 @@ import { makeClient, resolveConfig, unwrap } from './lib/client.ts'
 import { loadCommand } from './commands/load.ts'
 import { scenarioCommand } from './commands/scenario.ts'
 import { examplesCommand } from './commands/examples.ts'
+import { tlsScenarioCommand } from './commands/tls-scenario.ts'
+import { dns01WildcardScenarioCommand } from './commands/dns01-wildcard-scenario.ts'
+import { emailScenarioCommand } from './commands/email-scenario.ts'
+import { cliScenarioCommand } from './commands/cli-scenario.ts'
+import { kvScenarioCommand } from './commands/kv-scenario.ts'
+import { blobScenarioCommand } from './commands/blob-scenario.ts'
+import { flagsScenarioCommand } from './commands/flags-scenario.ts'
+import { backupRestoreScenarioCommand } from './commands/backup-restore-scenario.ts'
+import { auditScenarioCommand } from './commands/audit-scenario.ts'
+import { managedServicesScenarioCommand } from './commands/managed-services-scenario.ts'
+import { rbacScenarioCommand } from './commands/rbac-scenario.ts'
+import { monitoringScenarioCommand } from './commands/monitoring-scenario.ts'
+import { errorTrackingScenarioCommand } from './commands/error-tracking-scenario.ts'
+import { logsScenarioCommand } from './commands/logs-scenario.ts'
+import { analyticsScenarioCommand } from './commands/analytics-scenario.ts'
+import { sessionReplayScenarioCommand } from './commands/session-replay-scenario.ts'
+import { gitDeployScenarioCommand } from './commands/git-deploy-scenario.ts'
 
 const program = new Command()
 
@@ -66,6 +83,223 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await scenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('tls-scenario')
+  .description(
+    'Deploy an app, provision a real TLS certificate via Pebble (HTTP-01), and verify it is served correctly',
+  )
+  .option('--image <ref>', 'public Docker image to deploy', 'ghcr.io/temps-sh/e2e-hello:latest')
+  .option('--port <port>', 'container port the image listens on', '80')
+  .option('--tls-port <port>', 'the target instance TLS listener port to dial', '8443')
+  .option('--tls-host <host>', 'the target instance TLS listener host to dial', '127.0.0.1')
+  .option('--pebble-network <name>', 'docker network pebble-challtestsrv is on', 'temps-e2e-pebble-net')
+  .option('--pebble-management-url <url>', 'pebble-challtestsrv management API URL', 'http://localhost:8056')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await tlsScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('dns01-wildcard-scenario')
+  .description(
+    'Register a Pebble DNS provider, issue a wildcard certificate via a real DNS-01 challenge, and verify it',
+  )
+  .option('--pebble-management-url <url>', 'pebble-challtestsrv management API URL', 'http://localhost:8056')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await dns01WildcardScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('email-scenario')
+  .description(
+    'Create an SMTP provider pointed at Mailpit, send a tracked email, and verify real receipt + open/click tracking',
+  )
+  .option('--smtp-host <host>', 'Mailpit SMTP host, from the target instance\'s point of view', 'localhost')
+  .option('--smtp-port <port>', 'Mailpit SMTP port', '1025')
+  .option('--mailpit-url <url>', 'Mailpit web/REST API base URL', 'http://localhost:8025')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await emailScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('cli-scenario')
+  .description(
+    'Genuine CLI e2e: spawns the real @temps-sdk/cli binary as a subprocess for every step (create/list/show/delete a project, env vars, a service, a deploy polled to a terminal state, a domain, and a minted API key that is then used to authenticate a real call) -- proves argv parsing, command wiring, and stdout formatting, not just the API',
+  )
+  .option('--image <ref>', 'public Docker image to deploy', 'traefik/whoami:latest')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await cliScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('kv-scenario')
+  .description(
+    'Real kv-storage data-plane round trip: set/get/incr/expire/ttl/keys/del, nx/xx conditionals, and cross-project tenant isolation -- no console UI exists for this feature beyond an enabled/healthy status badge, so this is the only coverage that exists',
+  )
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await kvScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('blob-scenario')
+  .description(
+    'Real blob-storage (RustFS) data-plane round trip: put/download/head/list/copy/delete, deleted-blob 404, and cross-project tenant isolation',
+  )
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await blobScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('flags-scenario')
+  .description(
+    'Feature flags driven through the real @temps-sdk/node-sdk FlagsClient: defaults, per-environment overrides, the kill switch, ETag/304 caching, and exposure reporting',
+  )
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await flagsScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('backup-restore-scenario')
+  .description(
+    'Backup + restore a real postgres service via MinIO: real wal-g backup-push, real S3 upload, real in-place restore proven by reverting post-backup writes',
+  )
+  .option('--registry <host:port>', 'registry to push the db-probe image to (or $TEMPS_E2E_REGISTRY)')
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await backupRestoreScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('git-deploy-scenario')
+  .description(
+    'Real git-triggered deploy against a public repo (github.com/gotempsh/temps-examples): clone + build a language-preset subdirectory, trigger-pipeline, verify the exact response body baked into the real repo source',
+  )
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for the build+deploy to go healthy (real clone + real build)', '600000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await gitDeployScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('audit-scenario')
+  .description(
+    'Real audit-log round trip: create + delete a project, then read back the exact PROJECT_CREATED/PROJECT_DELETED rows via GET /audit/logs and /audit/logs/{id} (id/data/actor/timestamp match, not just "the list is non-empty"), and confirm the read endpoint itself is RBAC-gated',
+  )
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await auditScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('managed-services-scenario')
+  .description(
+    'Real managed-database round trip: provision + link a postgres service to a project BEFORE deploying, deploy an app that writes through the injected POSTGRES_URL, verify an exact row-count round trip through /probe, verify the resolved-env-vars reveal endpoint, then unlink',
+  )
+  .option('--registry <host>', 'registry to push the probe image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--probe-requests <n>', 'number of /probe hits (== expected final row count)', '5')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await managedServicesScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('rbac-scenario')
+  .description(
+    'Real RBAC permission-boundary proof: a second, independently-authenticated low-privilege user is granted team access to a project at viewer/deployer/admin tiers, asserting the exact 200/403 transitions and permission strings the guard enforces -- not just that team/access CRUD returns 2xx',
+  )
+  .option('--temps-root <path>', 'checkout root (needs crates/temps-cli) to mint a second user\'s bearer key via DB-direct `temps api-key`; or $TEMPS_ROOT')
+  .option('--database-url <url>', 'Postgres URL the temps binary can reach directly; or $TEMPS_DATABASE_URL')
+  .option('--image <ref>', 'image to deploy for the deployer-role assertion', 'ghcr.io/temps-sh/e2e-hello:latest')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await rbacScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('monitoring-scenario')
+  .description(
+    'Real uptime-monitoring lifecycle: confirm a fresh project auto-gets a default monitor, create an explicit second one, deploy a toggleable app, wait for the FIXED 60s check cycle to catch a real 5xx outage (raw status "major_outage") and later its recovery, and assert the incident/bucketed-chart/status-overview side effects at each step -- not just that monitor/incident CRUD returns 2xx',
+  )
+  .option('--registry <host>', 'registry to push the toggle-app image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await monitoringScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('error-tracking-scenario')
+  .description(
+    'Real Sentry-compatible error-tracking lifecycle: create a DSN, POST real Sentry-shaped events authenticated with the DSN key (not the bearer token), and assert fingerprint-based grouping actually groups repeats and separates distinct exceptions -- not just that the error-group CRUD routes return 2xx',
+  )
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await errorTrackingScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('logs-scenario')
+  .description(
+    'Real log-aggregation lifecycle: deploy an app that emits structured JSON stdout/stderr lines, wait out the actual chunk-flush window, and verify full-text search, level filtering, JSONB `fields` passthrough, env filtering, grep-style context, and purge -- through the real Docker log collector, not synthetic rows',
+  )
+  .option('--registry <host>', 'registry to push the log-emitter image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await logsScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('analytics-scenario')
+  .description(
+    'Real web-analytics lifecycle: deploy an HTML app so the proxy actually issues visitor/session cookies, replay them on POST /api/_temps/event the way a real tracking snippet would, and verify event-entries custom-property round-trip plus visitor-journey session stitching -- not just that the query routes return 2xx',
+  )
+  .option('--registry <host>', 'registry to push the analytics-app image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await analyticsScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('session-replay-scenario')
+  .description(
+    'Real session-replay lifecycle: deploy an HTML app so the proxy issues a visitor cookie, init a replay session (retrying past the visitor-upsert race), POST base64+zlib event batches, verify the project/visitor list surfaces it once duration is computed, playback returns all events with custom fields intact, a manual duration override sticks, and delete soft-removes it -- not just that the routes return 2xx',
+  )
+  .option('--registry <host>', 'registry to push the analytics-app image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await sessionReplayScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
