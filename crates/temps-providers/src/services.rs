@@ -2617,20 +2617,27 @@ impl ExternalServiceManager {
                         member.container_name
                     ),
                 })?;
-        let port = u16::try_from(raw_port).map_err(|_| {
-            ExternalServiceError::ParameterValidationFailed {
+        let port = u16::try_from(raw_port)
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| ExternalServiceError::ParameterValidationFailed {
                 service_id,
                 reason: format!(
-                    "Persisted port {} for cluster member '{}' is outside the valid TCP range",
+                    "Persisted port {} for cluster member '{}' is outside the valid TCP range 1-65535",
                     raw_port, member.container_name
                 ),
-            }
-        })?;
+            })?;
 
         let host = if let Some(node_id) = member.node_id {
             let node = nodes::Entity::find_by_id(node_id)
                 .one(self.db.as_ref())
-                .await?
+                .await
+                .map_err(|error| ExternalServiceError::DatabaseError {
+                    reason: format!(
+                        "Failed to resolve node {} for cluster member '{}' in service {}: {}",
+                        node_id, member.container_name, service_id, error
+                    ),
+                })?
                 .ok_or_else(|| ExternalServiceError::InternalError {
                     reason: format!(
                         "Cannot resolve cluster member '{}' for service {}: node {} was not found",
@@ -4275,11 +4282,10 @@ echo "[restore] Pre-seed complete"
     /// primary if it doesn't already exist. Idempotent — uses
     /// `pg_database` lookup before issuing CREATE.
     ///
-    /// Connects to the cluster the same way Browse Data does:
-    /// resolve the primary's host:port via the monitor, dial it
-    /// through the existing `temps-query-postgres` TLS-then-plain
-    /// fallback. The CP can reach worker-mapped ports because they
-    /// bind to the worker's underlay IP.
+    /// The monitor selects the primary by persisted member identity; the
+    /// credential destination is then rebuilt from stored topology and dialed
+    /// through the pinned private-only PostgreSQL ladder. The control plane can
+    /// reach worker-mapped ports because they bind to the worker's underlay IP.
     async fn ensure_cluster_app_database(
         &self,
         service_id: i32,
@@ -10338,6 +10344,139 @@ mod tests {
         assert!(trusted_primary_member(&duplicates, "cluster-node-5").is_none());
     }
 
+    #[tokio::test]
+    async fn stored_member_endpoint_resolves_local_and_remote_members() {
+        let remote_node = nodes::Model {
+            id: 17,
+            name: "worker-17".to_owned(),
+            token_hash: "hash".to_owned(),
+            token_encrypted: None,
+            address: "https://worker-17:3100".to_owned(),
+            private_address: "10.100.0.17".to_owned(),
+            public_endpoint: None,
+            wg_public_key: None,
+            role: "worker".to_owned(),
+            status: "active".to_owned(),
+            labels: serde_json::json!({}),
+            capacity: serde_json::json!({}),
+            last_heartbeat: None,
+            edge_public_key: None,
+            compute_cidr: None,
+            architecture: None,
+            underlay_address: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![remote_node]])
+                .into_connection(),
+        ));
+
+        let local = service_member_info(1, "cluster-node-1", "node", "running");
+        assert_eq!(
+            manager
+                .stored_member_endpoint(41, &local)
+                .await
+                .expect("local persisted member should resolve"),
+            ("localhost".to_owned(), 5432)
+        );
+
+        let mut remote = service_member_info(2, "cluster-node-2", "node", "running");
+        remote.node_id = Some(17);
+        remote.port = Some(6432);
+        assert_eq!(
+            manager
+                .stored_member_endpoint(41, &remote)
+                .await
+                .expect("remote persisted member should resolve through its stored node"),
+            ("10.100.0.17".to_owned(), 6432)
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_member_endpoint_rejects_missing_and_invalid_ports() {
+        let manager = mock_service_manager(vec![]);
+        let mut member = service_member_info(1, "cluster-node-1", "node", "running");
+
+        member.port = None;
+        let missing = manager
+            .stored_member_endpoint(52, &member)
+            .await
+            .expect_err("member without a stored port must be rejected");
+        assert!(matches!(
+            missing,
+            ExternalServiceError::ParameterValidationFailed { service_id: 52, .. }
+        ));
+
+        member.port = Some(70_000);
+        let invalid = manager
+            .stored_member_endpoint(52, &member)
+            .await
+            .expect_err("member with an invalid TCP port must be rejected");
+        assert!(matches!(
+            invalid,
+            ExternalServiceError::ParameterValidationFailed { service_id: 52, .. }
+        ));
+
+        member.port = Some(0);
+        let zero = manager
+            .stored_member_endpoint(52, &member)
+            .await
+            .expect_err("TCP port zero must be rejected");
+        assert!(matches!(
+            zero,
+            ExternalServiceError::ParameterValidationFailed { service_id: 52, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stored_member_endpoint_reports_missing_node_with_context() {
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([Vec::<nodes::Model>::new()])
+                .into_connection(),
+        ));
+        let mut member = service_member_info(1, "cluster-node-1", "node", "running");
+        member.node_id = Some(404);
+
+        let error = manager
+            .stored_member_endpoint(63, &member)
+            .await
+            .expect_err("missing persisted node must be reported");
+        assert!(matches!(
+            error,
+            ExternalServiceError::InternalError { ref reason }
+                if reason.contains("cluster-node-1")
+                    && reason.contains("service 63")
+                    && reason.contains("node 404")
+        ));
+    }
+
+    #[tokio::test]
+    async fn stored_member_endpoint_preserves_database_failure_context() {
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("connection lost".to_owned())])
+                .into_connection(),
+        ));
+        let mut member = service_member_info(1, "cluster-node-1", "node", "running");
+        member.node_id = Some(17);
+
+        let error = manager
+            .stored_member_endpoint(74, &member)
+            .await
+            .expect_err("database failure must retain endpoint lookup context");
+        assert!(matches!(
+            error,
+            ExternalServiceError::DatabaseError { ref reason }
+                if reason.contains("node 17")
+                    && reason.contains("cluster-node-1")
+                    && reason.contains("service 74")
+                    && reason.contains("connection lost")
+        ));
+    }
+
     /// The total-outage case, and the reason `health` is read at all: when
     /// every node dies at once the monitor has nothing to promote, so it never
     /// demotes anyone and `reportedstate` still says primary/secondary. Judging
@@ -11976,11 +12115,14 @@ mod tests {
     fn mock_service_manager(
         query_results: Vec<Vec<external_services::Model>>,
     ) -> ExternalServiceManager {
-        let db = Arc::new(
+        mock_service_manager_with_db(Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
                 .append_query_results(query_results)
                 .into_connection(),
-        );
+        ))
+    }
+
+    fn mock_service_manager_with_db(db: Arc<DatabaseConnection>) -> ExternalServiceManager {
         ExternalServiceManager::new(
             db.clone(),
             Arc::new(EncryptionService::new_from_password(

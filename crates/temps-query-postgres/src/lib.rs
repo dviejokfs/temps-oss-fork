@@ -293,6 +293,29 @@ impl PostgresSource {
         password: &str,
         database: &str,
     ) -> Result<Self> {
+        Self::connect_with_policy(host, port, username, password, database, false).await
+    }
+
+    /// Create a PostgreSQL data source for a managed endpoint that must remain
+    /// on the operator's private network.
+    pub async fn connect_private(
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+        database: &str,
+    ) -> Result<Self> {
+        Self::connect_with_policy(host, port, username, password, database, true).await
+    }
+
+    async fn connect_with_policy(
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+        database: &str,
+        private_only: bool,
+    ) -> Result<Self> {
         // SECURITY: build the config with typed setters, never `format!`.
         //
         // This used to interpolate into a libpq keyword/value string:
@@ -318,7 +341,11 @@ impl PostgresSource {
             "Connecting to PostgreSQL: {}@{}:{}/{}",
             username, host, port, database
         );
-        let client = connect_with_tls_ladder(host, port, username, password, database).await?;
+        let client = if private_only {
+            connect_with_private_tls_ladder(host, port, username, password, database).await?
+        } else {
+            connect_with_tls_ladder(host, port, username, password, database).await?
+        };
 
         debug!(
             "Successfully connected to PostgreSQL database: {}",
