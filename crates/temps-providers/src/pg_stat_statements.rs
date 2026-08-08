@@ -15,7 +15,9 @@
 
 use std::sync::Arc;
 
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DbErr, Statement};
+use sea_orm::DbErr;
+#[cfg(test)]
+use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, error, warn};
@@ -24,6 +26,76 @@ use utoipa::ToSchema;
 use crate::externalsvc::postgres::PostgresInputConfig;
 use crate::externalsvc::ServiceType;
 use crate::services::ExternalServiceManager;
+
+const RESET_FUNCTION_LOOKUP_SQL: &str = r#"
+    SELECT
+        n.nspname AS schema_name,
+        p.pronargs::integer AS argument_count
+    FROM pg_catalog.pg_extension e
+    JOIN pg_catalog.pg_depend d
+      ON d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+     AND d.refobjid = e.oid
+     AND d.deptype = 'e'
+    JOIN pg_catalog.pg_proc p
+      ON d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+     AND d.objid = p.oid
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+    WHERE e.extname = 'pg_stat_statements'
+      AND p.proname = 'pg_stat_statements_reset'
+      AND p.proargtypes IN (
+          '26 26 20'::pg_catalog.oidvector,
+          '26 26 20 16'::pg_catalog.oidvector
+      )
+    ORDER BY p.pronargs DESC
+    LIMIT 1
+"#;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PgStatConnectionPolicy {
+    Standard,
+    ManagedPrivate,
+}
+
+impl PgStatConnectionPolicy {
+    async fn connect(
+        self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+        database: &str,
+    ) -> temps_query::Result<tokio_postgres::Client> {
+        match self {
+            Self::Standard => {
+                temps_query_postgres::connect_with_tls_ladder(
+                    host, port, username, password, database,
+                )
+                .await
+            }
+            Self::ManagedPrivate => {
+                temps_query_postgres::connect_with_private_tls_ladder(
+                    host, port, username, password, database,
+                )
+                .await
+            }
+        }
+    }
+}
+
+fn pg_stat_connection_target(
+    cluster_primary: Option<(String, u16)>,
+    standalone_host: String,
+    standalone_port: u16,
+) -> (String, u16, PgStatConnectionPolicy) {
+    match cluster_primary {
+        Some((host, port)) => (host, port, PgStatConnectionPolicy::ManagedPrivate),
+        None => (
+            standalone_host,
+            standalone_port,
+            PgStatConnectionPolicy::Standard,
+        ),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -254,13 +326,13 @@ impl PgStatStatementsService {
         }
     }
 
-    /// Build a dedicated `DatabaseConnection` scoped to a single request
-    /// against the user-provisioned Postgres service. The connection is closed
-    /// when it goes out of scope.
+    /// Build a dedicated pinned tokio-postgres client scoped to one request.
+    /// Managed clusters require a private destination; standalone external
+    /// services retain the verified-public TLS policy.
     async fn connect_to_service(
         &self,
         service_id: i32,
-    ) -> Result<(sea_orm::DatabaseConnection, i32), PgStatStatementsError> {
+    ) -> Result<(tokio_postgres::Client, i32), PgStatStatementsError> {
         let service_config = self
             .external_service_manager
             .get_service_config(service_id)
@@ -281,7 +353,7 @@ impl PgStatStatementsService {
             })?;
 
         // Resolve host/port: for clustered services use the primary's address.
-        let (host, port) = match self
+        let (host, port, connection_policy) = match self
             .external_service_manager
             .get_cluster_primary_address(service_id)
             .await
@@ -293,7 +365,11 @@ impl PgStatStatementsService {
                     primary_port,
                     "Using cluster primary for pg_stat_statements query"
                 );
-                (primary_host, primary_port)
+                pg_stat_connection_target(
+                    Some((primary_host, primary_port)),
+                    config.host.clone(),
+                    5432,
+                )
             }
             Ok(None) => {
                 let port_str = config.port.clone().unwrap_or_else(|| "5432".to_string());
@@ -303,7 +379,7 @@ impl PgStatStatementsService {
                         reason: format!("invalid port '{}': {}", port_str, e),
                     }
                 })?;
-                (config.host.clone(), port)
+                pg_stat_connection_target(None, config.host.clone(), port)
             }
             Err(e) => {
                 return Err(PgStatStatementsError::ConnectionFailed {
@@ -315,33 +391,18 @@ impl PgStatStatementsService {
             }
         };
 
-        let password = config.password.clone().unwrap_or_default();
+        let password = config.password.unwrap_or_default();
+        let connection = connection_policy
+            .connect(&host, port, &config.username, &password, &config.database)
+            .await
+            .map_err(|error| PgStatStatementsError::ConnectionFailed {
+                service_id,
+                host: host.clone(),
+                port,
+                reason: error.to_string(),
+            })?;
 
-        // Use urlencoding for the password so special characters don't break the URL.
-        let url = format!(
-            "postgres://{}:{}@{}:{}/{}",
-            urlencoding::encode(&config.username),
-            urlencoding::encode(&password),
-            host,
-            port,
-            urlencoding::encode(&config.database),
-        );
-
-        let mut opts = ConnectOptions::new(url);
-        // Single connection — this is a one-off admin query, not a connection pool.
-        opts.max_connections(1).min_connections(0);
-
-        let db =
-            Database::connect(opts)
-                .await
-                .map_err(|e| PgStatStatementsError::ConnectionFailed {
-                    service_id,
-                    host: host.clone(),
-                    port,
-                    reason: e.to_string(),
-                })?;
-
-        Ok((db, service_id))
+        Ok((connection, service_id))
     }
 
     /// Enable `pg_stat_statements` on a standalone Postgres service by
@@ -415,10 +476,86 @@ impl PgStatStatementsService {
         &self,
         service_id: i32,
     ) -> Result<(), PgStatStatementsError> {
-        let (db, service_id) = self.connect_to_service(service_id).await?;
-        Self::reset_on_connection(&db, service_id).await
+        let (client, service_id) = self.connect_to_service(service_id).await?;
+        Self::reset_on_client(&client, service_id).await
     }
 
+    async fn reset_on_client(
+        client: &tokio_postgres::Client,
+        service_id: i32,
+    ) -> Result<(), PgStatStatementsError> {
+        let function_row = client
+            .query_opt(RESET_FUNCTION_LOOKUP_SQL, &[])
+            .await
+            .map_err(|db_error| {
+                error!(
+                    service_id,
+                    error = %db_error,
+                    "Failed to resolve the extension-owned pg_stat_statements reset function"
+                );
+                PgStatStatementsError::ResetFailed { service_id }
+            })?
+            .ok_or(PgStatStatementsError::ExtensionNotAvailable { service_id })?;
+
+        let schema_name: String = function_row.try_get("schema_name").map_err(|db_error| {
+            error!(
+                service_id,
+                error = %db_error,
+                "Failed to read pg_stat_statements extension schema"
+            );
+            PgStatStatementsError::ResetFailed { service_id }
+        })?;
+        let argument_count: i32 = function_row.try_get("argument_count").map_err(|db_error| {
+            error!(
+                service_id,
+                error = %db_error,
+                "Failed to read pg_stat_statements reset function signature"
+            );
+            PgStatStatementsError::ResetFailed { service_id }
+        })?;
+        let reset_sql = Self::build_reset_sql(&schema_name, argument_count, service_id)?;
+
+        client.execute(&reset_sql, &[]).await.map_err(|db_error| {
+            error!(
+                service_id,
+                extension_schema = schema_name,
+                error = %db_error,
+                "Target Postgres rejected pg_stat_statements reset"
+            );
+            PgStatStatementsError::ResetFailed { service_id }
+        })?;
+        Ok(())
+    }
+
+    fn build_reset_sql(
+        schema_name: &str,
+        argument_count: i32,
+        service_id: i32,
+    ) -> Result<String, PgStatStatementsError> {
+        // The function is resolved through its pg_extension dependency, not
+        // merely by schema and name, so an unrelated same-schema overload
+        // cannot influence the selected signature. The schema is still quoted
+        // as an identifier so unusual extension schemas remain valid.
+        let quoted_schema = format!("\"{}\"", schema_name.replace('"', "\"\""));
+        match argument_count {
+            3 => Ok(format!(
+                "SELECT {quoted_schema}.pg_stat_statements_reset(0::oid, 0::oid, 0::bigint)"
+            )),
+            4 => Ok(format!(
+                "SELECT {quoted_schema}.pg_stat_statements_reset(0::oid, 0::oid, 0::bigint, false::boolean)"
+            )),
+            _ => {
+                error!(
+                    service_id,
+                    argument_count,
+                    "Resolved an unsupported pg_stat_statements reset function signature"
+                );
+                Err(PgStatStatementsError::ResetFailed { service_id })
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn reset_on_connection<C>(db: &C, service_id: i32) -> Result<(), PgStatStatementsError>
     where
         C: ConnectionTrait,
@@ -426,29 +563,7 @@ impl PgStatStatementsService {
         let function_row = db
             .query_one(Statement::from_string(
                 DatabaseBackend::Postgres,
-                r#"
-                SELECT
-                    n.nspname AS schema_name,
-                    p.pronargs::integer AS argument_count
-                FROM pg_catalog.pg_extension e
-                JOIN pg_catalog.pg_depend d
-                  ON d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
-                 AND d.refobjid = e.oid
-                 AND d.deptype = 'e'
-                JOIN pg_catalog.pg_proc p
-                  ON d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
-                 AND d.objid = p.oid
-                JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-                WHERE e.extname = 'pg_stat_statements'
-                  AND p.proname = 'pg_stat_statements_reset'
-                  AND p.proargtypes IN (
-                      '26 26 20'::pg_catalog.oidvector,
-                      '26 26 20 16'::pg_catalog.oidvector
-                  )
-                ORDER BY p.pronargs DESC
-                LIMIT 1
-                "#
-                .to_owned(),
+                RESET_FUNCTION_LOOKUP_SQL.to_owned(),
             ))
             .await
             .map_err(|db_error| {
@@ -483,27 +598,7 @@ impl PgStatStatementsService {
                     PgStatStatementsError::ResetFailed { service_id }
                 })?;
 
-        // The function is resolved through its pg_extension dependency, not
-        // merely by schema and name, so an unrelated same-schema overload
-        // cannot influence the selected signature. The schema is still quoted
-        // as an identifier so unusual extension schemas remain valid.
-        let quoted_schema = format!("\"{}\"", schema_name.replace('"', "\"\""));
-        let reset_sql = match argument_count {
-            3 => format!(
-                "SELECT {quoted_schema}.pg_stat_statements_reset(0::oid, 0::oid, 0::bigint)"
-            ),
-            4 => format!(
-                "SELECT {quoted_schema}.pg_stat_statements_reset(0::oid, 0::oid, 0::bigint, false::boolean)"
-            ),
-            _ => {
-                error!(
-                    service_id,
-                    argument_count,
-                    "Resolved an unsupported pg_stat_statements reset function signature"
-                );
-                return Err(PgStatStatementsError::ResetFailed { service_id });
-            }
-        };
+        let reset_sql = Self::build_reset_sql(&schema_name, argument_count, service_id)?;
 
         db.execute(Statement::from_string(DatabaseBackend::Postgres, reset_sql))
             .await
@@ -550,19 +645,23 @@ impl PgStatStatementsService {
             });
         }
 
+        let (client, service_id) = self.connect_to_service(service_id).await?;
+        Self::top_slow_queries_on_client(&client, service_id, pagination).await
+    }
+
+    async fn top_slow_queries_on_client(
+        client: &tokio_postgres::Client,
+        service_id: i32,
+        pagination: SlowQueryPage,
+    ) -> Result<(Vec<SlowQueryRow>, u64), PgStatStatementsError> {
         let limit = pagination.page_size;
         let offset = (pagination.page - 1) * pagination.page_size;
-
-        let (db, service_id) = self.connect_to_service(service_id).await?;
 
         // Ensure the extension is installed. This is idempotent and fast when
         // it's already present. It will fail if shared_preload_libraries does
         // not yet include pg_stat_statements (requires a container restart).
-        if let Err(e) = db
-            .execute(Statement::from_string(
-                DatabaseBackend::Postgres,
-                "CREATE EXTENSION IF NOT EXISTS pg_stat_statements".to_owned(),
-            ))
+        if let Err(e) = client
+            .batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
             .await
         {
             warn!(
@@ -576,11 +675,8 @@ impl PgStatStatementsService {
 
         // Verify the view is accessible (the library may not be loaded yet on
         // older containers even if the extension row exists).
-        let view_check = db
-            .execute(Statement::from_string(
-                DatabaseBackend::Postgres,
-                "SELECT 1 FROM pg_stat_statements LIMIT 0".to_owned(),
-            ))
+        let view_check = client
+            .query("SELECT 1 FROM pg_stat_statements LIMIT 0", &[])
             .await;
 
         if view_check.is_err() {
@@ -589,11 +685,8 @@ impl PgStatStatementsService {
 
         // Total count for pagination controls.
         let count_sql = "SELECT COUNT(*)::bigint AS n FROM pg_stat_statements WHERE calls > 0";
-        let count_row = db
-            .query_one(Statement::from_string(
-                DatabaseBackend::Postgres,
-                count_sql.to_owned(),
-            ))
+        let count_row = client
+            .query_opt(count_sql, &[])
             .await
             .map_err(|e| PgStatStatementsError::QueryError {
                 service_id,
@@ -605,7 +698,7 @@ impl PgStatStatementsService {
             })?;
         let total_count: i64 =
             count_row
-                .try_get("", "n")
+                .try_get("n")
                 .map_err(|e| PgStatStatementsError::QueryError {
                     service_id,
                     reason: format!("failed to read count: {}", e),
@@ -626,14 +719,14 @@ impl PgStatStatementsService {
                 s.mean_exec_time,
                 s.rows,
                 COALESCE(d.datname, '(dropped database)') AS database,
-                CASE
+                (CASE
                     WHEN (s.shared_blks_hit + s.shared_blks_read) = 0 THEN NULL
                     ELSE ROUND(
                         (s.shared_blks_hit::numeric /
                          (s.shared_blks_hit + s.shared_blks_read)) * 100,
                         2
                     ) / 100.0
-                END AS cache_hit_ratio
+                END)::double precision AS cache_hit_ratio
             FROM pg_stat_statements s
             LEFT JOIN pg_database d ON d.oid = s.dbid
             WHERE s.calls > 0
@@ -643,49 +736,50 @@ impl PgStatStatementsService {
             "#
         );
 
-        let rows = db
-            .query_all(Statement::from_string(DatabaseBackend::Postgres, sql))
-            .await
-            .map_err(|e| PgStatStatementsError::QueryError {
-                service_id,
-                reason: e.to_string(),
-            })?;
+        let rows =
+            client
+                .query(&sql, &[])
+                .await
+                .map_err(|e| PgStatStatementsError::QueryError {
+                    service_id,
+                    reason: e.to_string(),
+                })?;
 
         let mut result = Vec::with_capacity(rows.len());
         for row in rows {
             let query: String =
-                row.try_get("", "query")
+                row.try_get("query")
                     .map_err(|e| PgStatStatementsError::QueryError {
                         service_id,
                         reason: format!("failed to read 'query' column: {}", e),
                     })?;
             let calls: i64 =
-                row.try_get("", "calls")
+                row.try_get("calls")
                     .map_err(|e| PgStatStatementsError::QueryError {
                         service_id,
                         reason: format!("failed to read 'calls' column: {}", e),
                     })?;
-            let total_exec_time: f64 = row.try_get("", "total_exec_time").map_err(|e| {
-                PgStatStatementsError::QueryError {
-                    service_id,
-                    reason: format!("failed to read 'total_exec_time' column: {}", e),
-                }
-            })?;
-            let mean_exec_time: f64 = row.try_get("", "mean_exec_time").map_err(|e| {
-                PgStatStatementsError::QueryError {
-                    service_id,
-                    reason: format!("failed to read 'mean_exec_time' column: {}", e),
-                }
-            })?;
+            let total_exec_time: f64 =
+                row.try_get("total_exec_time")
+                    .map_err(|e| PgStatStatementsError::QueryError {
+                        service_id,
+                        reason: format!("failed to read 'total_exec_time' column: {}", e),
+                    })?;
+            let mean_exec_time: f64 =
+                row.try_get("mean_exec_time")
+                    .map_err(|e| PgStatStatementsError::QueryError {
+                        service_id,
+                        reason: format!("failed to read 'mean_exec_time' column: {}", e),
+                    })?;
             let rows_count: i64 =
-                row.try_get("", "rows")
+                row.try_get("rows")
                     .map_err(|e| PgStatStatementsError::QueryError {
                         service_id,
                         reason: format!("failed to read 'rows' column: {}", e),
                     })?;
-            let cache_hit_ratio: Option<f64> = row.try_get("", "cache_hit_ratio").ok();
+            let cache_hit_ratio: Option<f64> = row.try_get("cache_hit_ratio").ok();
             let database: String =
-                row.try_get("", "database")
+                row.try_get("database")
                     .map_err(|e| PgStatStatementsError::QueryError {
                         service_id,
                         reason: format!("failed to read 'database' column: {}", e),
@@ -715,6 +809,26 @@ mod tests {
     use super::*;
     use sea_orm::{MockDatabase, MockExecResult, Value};
     use std::collections::BTreeMap;
+    use testcontainers::{
+        core::{ContainerPort, WaitFor},
+        runners::AsyncRunner,
+        GenericImage, ImageExt,
+    };
+
+    fn container_runtime_unavailable(error: &str) -> bool {
+        let message = error.to_ascii_lowercase();
+        [
+            "hyper legacy client: client error (connect)",
+            "failed to connect to docker",
+            "error connecting to docker",
+            "docker daemon is unavailable",
+            "docker client is unavailable",
+            "could not find docker environment",
+            "docker socket",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
+    }
 
     fn extension_function_row(schema_name: &str, argument_count: i32) -> BTreeMap<String, Value> {
         let mut row = BTreeMap::new();
@@ -727,6 +841,130 @@ mod tests {
             Value::Int(Some(argument_count)),
         );
         row
+    }
+
+    #[test]
+    fn test_pg_stat_connection_target_selects_policy_from_cluster_primary() {
+        let cluster = pg_stat_connection_target(
+            Some(("10.0.0.9".to_string(), 6432)),
+            "public.example".to_string(),
+            5432,
+        );
+        assert_eq!(cluster.0, "10.0.0.9");
+        assert_eq!(cluster.1, 6432);
+        assert_eq!(cluster.2, PgStatConnectionPolicy::ManagedPrivate);
+
+        let standalone = pg_stat_connection_target(None, "public.example".to_string(), 5433);
+        assert_eq!(standalone.0, "public.example");
+        assert_eq!(standalone.1, 5433);
+        assert_eq!(standalone.2, PgStatConnectionPolicy::Standard);
+    }
+
+    #[tokio::test]
+    async fn test_pg_stat_connection_policy_managed_private_rejects_public_credentials() {
+        let error = PgStatConnectionPolicy::ManagedPrivate
+            .connect(
+                "203.0.113.10",
+                5432,
+                "cluster_admin",
+                "secret host=attacker.example sslmode=disable",
+                "postgres",
+            )
+            .await
+            .expect_err("managed cluster statistics must reject a public endpoint");
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to send cluster credentials even over verified TLS"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_client_lists_and_resets_pg_stat_statements() {
+        let container = match GenericImage::new("postgres", "18-alpine")
+            .with_exposed_port(ContainerPort::Tcp(5432))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_cmd([
+                "postgres".to_owned(),
+                "-c".to_owned(),
+                "shared_preload_libraries=pg_stat_statements".to_owned(),
+            ])
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) if container_runtime_unavailable(&error.to_string()) => {
+                eprintln!(
+                    "Docker unavailable; skipping pg_stat_statements production-client test: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("failed to start pg_stat_statements test container: {error}"),
+        };
+
+        let host = container
+            .get_host()
+            .await
+            .expect("started PostgreSQL container must expose its host")
+            .to_string();
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("started PostgreSQL container must expose port 5432");
+
+        let client = PgStatConnectionPolicy::ManagedPrivate
+            .connect(&host, port, "postgres", "", "postgres")
+            .await
+            .expect("private transport should connect to the local PostgreSQL container");
+        client
+            .batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+            .await
+            .expect("pg_stat_statements should be available in the stock PostgreSQL image");
+        for _ in 0..3 {
+            client
+                .query("SELECT 42::integer /* temps_pgstat_reset_probe */", &[])
+                .await
+                .expect("sample query should be recorded");
+        }
+
+        let (rows, total_count) = PgStatStatementsService::top_slow_queries_on_client(
+            &client,
+            42,
+            SlowQueryPage::default(),
+        )
+        .await
+        .expect("production tokio-postgres row decoding should succeed");
+        assert!(total_count > 0, "sample queries should produce statistics");
+        assert!(!rows.is_empty(), "statistics page should contain rows");
+        assert!(rows.iter().all(|row| row.calls > 0));
+        assert!(
+            rows.iter()
+                .any(|row| row.query.contains("temps_pgstat_reset_probe")),
+            "statistics page should decode the tagged sample query"
+        );
+
+        PgStatStatementsService::reset_on_client(&client, 42)
+            .await
+            .expect("production reset lookup and invocation should succeed");
+        let reset_probe_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM pg_stat_statements WHERE query LIKE $1",
+                &[&"%temps_pgstat_reset_probe%"],
+            )
+            .await
+            .expect("statistics should remain queryable after reset")
+            .get(0);
+        assert_eq!(
+            reset_probe_count, 0,
+            "reset should clear the tagged sample query statistics"
+        );
     }
 
     #[test]

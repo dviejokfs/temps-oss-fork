@@ -293,6 +293,29 @@ impl PostgresSource {
         password: &str,
         database: &str,
     ) -> Result<Self> {
+        Self::connect_with_policy(host, port, username, password, database, false).await
+    }
+
+    /// Create a PostgreSQL data source for a managed endpoint that must remain
+    /// on the operator's private network.
+    pub async fn connect_private(
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+        database: &str,
+    ) -> Result<Self> {
+        Self::connect_with_policy(host, port, username, password, database, true).await
+    }
+
+    async fn connect_with_policy(
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+        database: &str,
+        private_only: bool,
+    ) -> Result<Self> {
         // SECURITY: build the config with typed setters, never `format!`.
         //
         // This used to interpolate into a libpq keyword/value string:
@@ -314,113 +337,14 @@ impl PostgresSource {
         // messages and to reject nonsense early.
         Self::validate_database_identifier(database)?;
 
-        // SECURITY: every TLS rung must carry `SslMode::Require`.
-        //
-        // tokio-postgres defaults to `SslMode::Prefer` (see `Config::default`),
-        // and under Prefer `connect_tls` returns `Ok(MaybeTlsStream::Raw)` — an
-        // ordinary cleartext socket — whenever the server answers anything but
-        // `S` to the SSLRequest. That made the previous version of this ladder
-        // inert: rung 1 "succeeded" over an unencrypted connection, logged
-        // "Connected to PostgreSQL with verified TLS", and rungs 2 and 3 never
-        // ran, so the `host_is_private` guard below was dead code. An on-path
-        // attacker forced it by answering `N` — an SSL-strip needing no
-        // certificate at all. Require makes a server that will not do TLS an
-        // error, which is what lets the explicit cleartext rung stay the only
-        // way to reach an unencrypted socket.
-        let tls_cfg = |ssl_mode| {
-            connect_config_with_ssl_mode(host, port, username, password, database, ssl_mode)
-        };
-        let cfg = tls_cfg(tokio_postgres::config::SslMode::Require);
-
         debug!(
             "Connecting to PostgreSQL: {}@{}:{}/{}",
             username, host, port, database
         );
-
-        // SECURITY: try genuine certificate verification first, and only give
-        // up one rung at a time.
-        //
-        // This used to go straight to `AcceptAllVerifier` and then, on any
-        // failure at all, silently to cleartext. Both steps sent this service's
-        // admin password to whoever answered: accept-all authenticates nothing,
-        // and the plaintext fallback put the password on the wire in the clear
-        // for any observer. Nothing in the UI showed which of the three had
-        // happened.
-        //
-        // Now: verified TLS → self-signed TLS → cleartext. The last TWO rungs
-        // are restricted to private hosts. Rung 2 needs the restriction as much
-        // as rung 3 does: an active attacker never presents a properly-issued
-        // certificate, they present a self-signed one, so an unrestricted
-        // accept-anything rung hands over the password on exactly the same
-        // terms as cleartext — it just requires an active rather than a passive
-        // attacker. Temps-managed clusters use self-signed certs and live on
-        // loopback or the mesh, so gating rung 2 on the same predicate keeps
-        // them working while closing the public-internet case. Each downgrade
-        // logs which rung landed and why.
-        let client = match connect_with_verified_tls(&cfg).await {
-            Ok(client) => {
-                debug!(host = %host, "Connected to PostgreSQL with verified TLS");
-                client
-            }
-            Err(verified_err) => {
-                // Both remaining rungs are restricted to private hosts, so the
-                // check happens once here rather than in each arm.
-                if !host_is_private(host).await {
-                    return Err(DataError::ConnectionFailed(format!(
-                        "PostgreSQL at '{host}' did not present a certificate that validates \
-                         against the system roots, and the host does not resolve to a private \
-                         network. Refusing to fall back to an unverified certificate or to \
-                         cleartext, because either would hand this service's password to whoever \
-                         answered. Install a valid certificate, or reach the database over a \
-                         private address or the Temps mesh. (error: {})",
-                        format_chain(&verified_err),
-                    )));
-                }
-
-                match Self::connect_with_tls(&cfg).await {
-                    Ok(client) => {
-                        warn!(
-                            host = %host,
-                            "PostgreSQL certificate did not validate against the system roots ({}); \
-                             connected with an unverified (self-signed) certificate. Traffic is \
-                             encrypted but the server is NOT authenticated. Permitted only because \
-                             the host is loopback or private.",
-                            format_chain(&verified_err)
-                        );
-                        client
-                    }
-                    Err(tls_err) => {
-                        // Cleartext carries the password in the clear. Reached only
-                        // for a private host (checked above), and only with an
-                        // explicitly non-Require config so the downgrade is a
-                        // deliberate step rather than something `Prefer` did for us.
-                        warn!(
-                            host = %host,
-                            "PostgreSQL refused TLS ({}); falling back to an UNENCRYPTED connection. \
-                             Permitted only because the host is loopback or private.",
-                            format_chain(&tls_err)
-                        );
-
-                        let cfg = tls_cfg(tokio_postgres::config::SslMode::Disable);
-
-                        let (client, connection) = cfg.connect(NoTls).await.map_err(|e| {
-                            DataError::ConnectionFailed(format!(
-                                "PostgreSQL connection failed (TLS error: {}, plain error: {})",
-                                format_chain(&tls_err),
-                                format_chain(&e),
-                            ))
-                        })?;
-
-                        tokio::spawn(async move {
-                            if let Err(e) = connection.await {
-                                error!("PostgreSQL connection error: {}", e);
-                            }
-                        });
-
-                        client
-                    }
-                }
-            }
+        let client = if private_only {
+            connect_with_private_tls_ladder(host, port, username, password, database).await?
+        } else {
+            connect_with_tls_ladder(host, port, username, password, database).await?
         };
 
         debug!(
@@ -443,14 +367,6 @@ impl PostgresSource {
             .await
             .map_err(|e| DataError::QueryFailed(format!("Execute failed: {}", e)))?;
         Ok(())
-    }
-
-    /// Attempt a TLS connection using rustls configured to accept self-signed certificates.
-    /// Returns the Client after spawning the connection task.
-    async fn connect_with_tls(
-        config: &tokio_postgres::Config,
-    ) -> std::result::Result<Client, tokio_postgres::Error> {
-        connect_with_self_signed_tls_config(config).await
     }
 }
 
@@ -564,26 +480,84 @@ pub fn reject_subqueries_and_function_calls(without_strings: &str) -> Result<()>
     Ok(())
 }
 
-/// Whether `token` appears in `sql` as a whole SQL token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResolvedHost {
+    UnixSocket(String),
+    Tcp {
+        hostname: String,
+        addresses: Vec<std::net::IpAddr>,
+    },
+}
+
+impl ResolvedHost {
+    fn permits_unverified_transport(&self) -> bool {
+        match self {
+            Self::UnixSocket(_) => true,
+            Self::Tcp { addresses, .. } => {
+                !addresses.is_empty() && addresses.iter().all(|address| ip_is_private(*address))
+            }
+        }
+    }
+}
+
+/// Resolve a PostgreSQL host exactly once for the whole TLS ladder.
 ///
-/// Shared by the PostgreSQL and MariaDB denylists, which previously used a raw
-/// `contains(" keyword ")`. Substring matching produced false *rejections* on
-/// ordinary columns — `payload = 'x'` matched `"load "`, `charset = 'utf8'`
-/// matched `"set "`, and any Postgres column literally named `commit`, `update`
-/// or `copy` was unfilterable. That is not a cosmetic problem: a validator that
-/// blocks legitimate queries is a validator someone eventually switches off.
+/// The resulting addresses are installed in `Config::hostaddr`, so
+/// tokio-postgres dials the addresses approved here instead of resolving the
+/// hostname again after the private-network decision. The original hostname
+/// remains in `Config::host` for certificate/SNI verification.
+async fn resolve_host_once(host: &str, port: u16) -> Result<ResolvedHost> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(DataError::ConnectionFailed(
+            "PostgreSQL host cannot be empty".to_string(),
+        ));
+    }
+
+    if host.starts_with('/') {
+        return Ok(ResolvedHost::UnixSocket(host.to_string()));
+    }
+
+    let hostname = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_string();
+    let resolved = tokio::net::lookup_host((hostname.as_str(), port))
+        .await
+        .map_err(|error| {
+            DataError::ConnectionFailed(format!(
+                "Failed to resolve PostgreSQL host '{hostname}' on port {port}: {error}"
+            ))
+        })?;
+
+    let mut addresses = Vec::new();
+    for address in resolved {
+        if !addresses.contains(&address.ip()) {
+            addresses.push(address.ip());
+        }
+    }
+    if addresses.is_empty() {
+        return Err(DataError::ConnectionFailed(format!(
+            "PostgreSQL host '{hostname}' resolved to no addresses"
+        )));
+    }
+
+    Ok(ResolvedHost::Tcp {
+        hostname,
+        addresses,
+    })
+}
+
+/// Build the connection config for a resolved host and a given SSL mode.
 ///
-/// Expects already-lowercased, whitespace-normalised, string-stripped input.
-/// A token boundary is anything that cannot continue an identifier, matching
-/// the rule `starts_with_sql_keyword` uses at the other end.
-/// Build the connection config for a given SSL mode.
-///
-/// Named rather than inlined so the TLS regression test can assert against the
-/// *production* config instead of a hand-rolled copy — the first version of
-/// that test built its own and therefore could not observe `.ssl_mode(...)`
-/// being removed from the real path.
+/// Each original hostname is paired with one pre-resolved `hostaddr`. This
+/// preserves hostname-based certificate verification while preventing a
+/// second DNS lookup from changing the address between authorization and use.
+/// Named rather than inlined so security regression tests assert against the
+/// production config instead of a hand-rolled copy.
 fn connect_config_with_ssl_mode(
-    host: &str,
+    resolved_host: &ResolvedHost,
     port: u16,
     username: &str,
     password: &str,
@@ -591,8 +565,20 @@ fn connect_config_with_ssl_mode(
     ssl_mode: tokio_postgres::config::SslMode,
 ) -> tokio_postgres::Config {
     let mut cfg = tokio_postgres::Config::new();
-    cfg.host(host)
-        .port(port)
+    match resolved_host {
+        ResolvedHost::UnixSocket(path) => {
+            cfg.host(path);
+        }
+        ResolvedHost::Tcp {
+            hostname,
+            addresses,
+        } => {
+            for address in addresses {
+                cfg.host(hostname).hostaddr(*address);
+            }
+        }
+    }
+    cfg.port(port)
         .user(username)
         .password(password)
         .dbname(database)
@@ -605,14 +591,14 @@ fn connect_config_with_ssl_mode(
 /// against a different SSL mode than production uses.
 #[cfg(test)]
 fn connect_config_for(
-    host: &str,
+    resolved_host: &ResolvedHost,
     port: u16,
     username: &str,
     password: &str,
     database: &str,
 ) -> tokio_postgres::Config {
     connect_config_with_ssl_mode(
-        host,
+        resolved_host,
         port,
         username,
         password,
@@ -621,6 +607,161 @@ fn connect_config_for(
     )
 }
 
+/// Connect with the credential-safe PostgreSQL transport ladder.
+///
+/// The hostname is resolved once, then the exact approved addresses are used
+/// for every rung: verified TLS, self-signed TLS, and (for private addresses
+/// only) cleartext. This prevents DNS rebinding between the private-network
+/// check and the credential-bearing connection.
+pub async fn connect_with_tls_ladder(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    database: &str,
+) -> Result<Client> {
+    connect_with_tls_ladder_policy(
+        host,
+        port,
+        username,
+        password,
+        database,
+        TransportPolicy::VerifiedPublicAllowed,
+    )
+    .await
+}
+
+/// Connect to a managed PostgreSQL endpoint that must remain private even when
+/// it presents a publicly trusted certificate.
+///
+/// Managed cluster credentials never need to leave the operator's own host or
+/// mesh. Rejecting public addresses before the first TLS rung prevents stored
+/// topology mistakes or forged control-plane data from turning verified TLS
+/// into authorization to release those credentials.
+pub async fn connect_with_private_tls_ladder(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    database: &str,
+) -> Result<Client> {
+    connect_with_tls_ladder_policy(
+        host,
+        port,
+        username,
+        password,
+        database,
+        TransportPolicy::PrivateOnly,
+    )
+    .await
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TransportPolicy {
+    VerifiedPublicAllowed,
+    PrivateOnly,
+}
+
+async fn connect_with_tls_ladder_policy(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    database: &str,
+    policy: TransportPolicy,
+) -> Result<Client> {
+    let resolved_host = resolve_host_once(host, port).await?;
+    if policy == TransportPolicy::PrivateOnly && !resolved_host.permits_unverified_transport() {
+        return Err(DataError::ConnectionFailed(format!(
+            "Managed PostgreSQL endpoint '{host}' resolved outside the private network; refusing \
+             to send cluster credentials even over verified TLS"
+        )));
+    }
+    let config = |ssl_mode| {
+        connect_config_with_ssl_mode(&resolved_host, port, username, password, database, ssl_mode)
+    };
+
+    // SECURITY: every TLS rung must carry `SslMode::Require`.
+    // tokio-postgres defaults to `Prefer`, which silently accepts a raw socket
+    // when a server refuses TLS and would bypass the explicit downgrade gate.
+    let tls_config = config(tokio_postgres::config::SslMode::Require);
+
+    match connect_with_verified_tls(&tls_config).await {
+        Ok(client) => {
+            debug!(host = %host, "Connected to PostgreSQL with verified TLS");
+            Ok(client)
+        }
+        Err(verified_error) => {
+            // Both weaker rungs are restricted to the exact addresses resolved
+            // above. The driver receives those same addresses through
+            // `hostaddr`, so DNS cannot change the destination after this gate.
+            if !resolved_host.permits_unverified_transport() {
+                return Err(DataError::ConnectionFailed(format!(
+                    "PostgreSQL at '{host}' did not present a certificate that validates \
+                     against the system roots, and at least one resolved address is outside \
+                     the private network. Refusing to fall back to an unverified certificate \
+                     or to cleartext, because either would hand this service's password to \
+                     whoever answered. Install a valid certificate, or reach the database over \
+                     a private address or the Temps mesh. (error: {})",
+                    format_chain(&verified_error),
+                )));
+            }
+
+            match connect_with_self_signed_tls_config(&tls_config).await {
+                Ok(client) => {
+                    warn!(
+                        host = %host,
+                        "PostgreSQL certificate did not validate against the system roots ({}); \
+                         connected with an unverified (self-signed) certificate. Traffic is \
+                         encrypted but the server is NOT authenticated. Permitted only because \
+                         every resolved address is loopback or private.",
+                        format_chain(&verified_error)
+                    );
+                    Ok(client)
+                }
+                Err(tls_error) => {
+                    warn!(
+                        host = %host,
+                        "PostgreSQL refused TLS ({}); falling back to an UNENCRYPTED connection. \
+                         Permitted only because every resolved address is loopback or private.",
+                        format_chain(&tls_error)
+                    );
+
+                    let plain_config = config(tokio_postgres::config::SslMode::Disable);
+                    let (client, connection) =
+                        plain_config.connect(NoTls).await.map_err(|error| {
+                            DataError::ConnectionFailed(format!(
+                                "PostgreSQL connection to '{host}:{port}/{database}' failed \
+                             (TLS error: {}, plain error: {})",
+                                format_chain(&tls_error),
+                                format_chain(&error),
+                            ))
+                        })?;
+
+                    tokio::spawn(async move {
+                        if let Err(error) = connection.await {
+                            error!("PostgreSQL connection error: {}", error);
+                        }
+                    });
+                    Ok(client)
+                }
+            }
+        }
+    }
+}
+
+/// Whether `token` appears in `sql` as a whole SQL token.
+///
+/// Shared by the PostgreSQL and MariaDB denylists, which previously used a raw
+/// `contains(" keyword ")`. Substring matching produced false *rejections* on
+/// ordinary columns — `payload = 'x'` matched `"load "`, `charset = 'utf8'`
+/// matched `"set "`, and any Postgres column literally named `commit`, `update`
+/// or `copy` was unfilterable. That is not a cosmetic problem: a validator that
+/// blocks legitimate queries is a validator someone eventually switches off.
+///
+/// Expects already-lowercased, whitespace-normalised, string-stripped input.
+/// A token boundary is anything that cannot continue an identifier, matching
+/// the rule `starts_with_sql_keyword` uses at the other end.
 pub fn contains_sql_token(sql: &str, token: &str) -> bool {
     let is_ident_char =
         |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii();
@@ -701,63 +842,9 @@ pub async fn connect_with_self_signed_tls(
 /// Preferred whenever any component of the connection is caller-supplied: a
 /// `Config` carries values, so nothing in it can be mistaken for connection
 /// syntax the way an interpolated keyword/value string can.
-/// Whether cleartext to this host stays inside the operator's own machine or
-/// private network.
-///
-/// Used to decide whether an unencrypted fallback is tolerable. A Temps-managed
-/// database is a container on the same host, or a peer on the WireGuard mesh —
-/// its traffic never touches a network the operator does not control, so
-/// cleartext there leaks nothing new. A public hostname is the opposite case:
-/// the password would cross the open internet in the clear.
-///
-/// SECURITY: this resolves the host and classifies the resulting addresses. It
-/// deliberately does NOT classify the hostname string.
-///
-/// Classifying the string was wrong in a way that inverted the guard. A host of
-/// `134744072` is not dotted-quad, so `IpAddr::parse` rejects it, and the old
-/// "no dot means it's a container name" rule then called it private — but
-/// `getaddrinfo`/`inet_aton` accepts the integer form and resolves it to
-/// `8.8.8.8`. Same for `0x08080808`. Someone with `ExternalServicesWrite` but
-/// no credential-reveal rights could set a service host to that, force TLS to
-/// fail, and collect the password at a listener they control. A bare
-/// single-label name is also not reliably private: it resolves through the
-/// resolver's DNS search domain, which need not be.
-///
-/// Every resolved address must be private — one public address in the set is
-/// enough to refuse, since we do not control which the driver picks. Resolution
-/// failure is also a refusal: this decides whether a password may cross the
-/// network in cleartext, so the unknown case has to fail closed.
-async fn host_is_private(host: &str) -> bool {
-    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
-
-    if host.is_empty() {
-        return false;
-    }
-
-    // A unix socket path never touches a network.
-    if host.starts_with('/') {
-        return true;
-    }
-
-    // Port is irrelevant to the classification; `lookup_host` needs one.
-    let Ok(addrs) = tokio::net::lookup_host((host, 5432u16)).await else {
-        return false;
-    };
-
-    let mut saw_any = false;
-    for addr in addrs {
-        saw_any = true;
-        if !ip_is_private(addr.ip()) {
-            return false;
-        }
-    }
-
-    saw_any
-}
-
 /// Whether an address is one the operator's own machine or private network.
 ///
-/// Split out from [`host_is_private`] so the classification itself is
+/// Split out from [`ResolvedHost::permits_unverified_transport`] so the classification itself is
 /// synchronous and unit-testable without a resolver.
 fn ip_is_private(ip: std::net::IpAddr) -> bool {
     match ip {
@@ -2543,23 +2630,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_is_private_resolves_before_classifying() {
+    async fn resolved_host_classifies_the_addresses_that_will_be_dialed() {
         // Loopback and unix sockets stay private...
-        assert!(host_is_private("127.0.0.1").await);
-        assert!(host_is_private("localhost").await);
-        assert!(host_is_private("/var/run/postgresql").await);
+        for host in ["127.0.0.1", "localhost", "/var/run/postgresql"] {
+            assert!(
+                resolve_host_once(host, 5432)
+                    .await
+                    .expect("private test host should resolve")
+                    .permits_unverified_transport(),
+                "should permit private host: {host}"
+            );
+        }
 
         // ...and the numeric-IPv4 forms that defeated string classification are
         // now resolved and rejected. `134744072` == 0x08080808 == 8.8.8.8:
         // `IpAddr::parse` rejects it, so the old "no dot means container name"
         // rule called it private, while getaddrinfo resolves it publicly.
-        assert!(!host_is_private("134744072").await);
-        assert!(!host_is_private("0x08080808").await);
+        for host in ["134744072", "0x08080808"] {
+            assert!(
+                !resolve_host_once(host, 5432)
+                    .await
+                    .expect("numeric public host should resolve")
+                    .permits_unverified_transport(),
+                "should reject public host: {host}"
+            );
+        }
 
         // Unresolvable is a refusal, not a pass: this decides whether a
         // password may cross the network in cleartext.
-        assert!(!host_is_private("no-such-host.invalid").await);
-        assert!(!host_is_private("").await);
+        assert!(resolve_host_once("no-such-host.invalid", 5432)
+            .await
+            .is_err());
+        assert!(resolve_host_once("", 5432).await.is_err());
+    }
+
+    #[test]
+    fn connection_config_pins_every_preapproved_address() {
+        let addresses = vec![
+            "10.0.0.8".parse().expect("test IPv4 address should parse"),
+            "fd00::8".parse().expect("test IPv6 address should parse"),
+        ];
+        let resolved = ResolvedHost::Tcp {
+            hostname: "database.internal".to_string(),
+            addresses: addresses.clone(),
+        };
+
+        let config = connect_config_for(&resolved, 6432, "admin", "secret", "postgres");
+
+        assert_eq!(config.get_hostaddrs(), addresses.as_slice());
+        assert_eq!(config.get_hosts().len(), addresses.len());
+        assert!(config.get_hosts().iter().all(|host| {
+            matches!(host, tokio_postgres::config::Host::Tcp(name) if name == "database.internal")
+        }));
+        assert_eq!(config.get_ports(), &[6432]);
+    }
+
+    #[test]
+    fn connection_config_treats_credentials_as_values_and_requires_tls() {
+        let resolved = ResolvedHost::Tcp {
+            hostname: "database.internal".to_string(),
+            addresses: vec!["10.0.0.8".parse().expect("test IPv4 address should parse")],
+        };
+        let username = "admin host=attacker.example sslmode=disable";
+        let password = "secret dbname=postgres host=attacker.example";
+        let database = "postgres sslmode=disable";
+
+        let config = connect_config_for(&resolved, 5432, username, password, database);
+
+        assert_eq!(config.get_user(), Some(username));
+        assert_eq!(config.get_password(), Some(password.as_bytes()));
+        assert_eq!(config.get_dbname(), Some(database));
+        assert_eq!(
+            config.get_ssl_mode(),
+            tokio_postgres::config::SslMode::Require
+        );
+        assert_eq!(config.get_hosts().len(), 1);
+        assert_eq!(config.get_hostaddrs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn private_ladder_rejects_a_public_address_before_connecting() {
+        let error = connect_with_private_tls_ladder(
+            "203.0.113.10",
+            5432,
+            "cluster-admin",
+            "secret",
+            "postgres",
+        )
+        .await
+        .expect_err("a managed-cluster credential must never be sent to a public address");
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to send cluster credentials even over verified TLS"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -3043,7 +3209,10 @@ mod tests {
         // production path left the test still passing, since it was asserting
         // against its own copy. A regression test that cannot observe the
         // regression is worse than none: it reports safety it never checked.
-        let cfg = connect_config_for(&host, port, "postgres", "", "postgres");
+        let resolved_host = resolve_host_once(&host, port)
+            .await
+            .expect("started PostgreSQL container host should resolve");
+        let cfg = connect_config_for(&resolved_host, port, "postgres", "", "postgres");
 
         // Retry while the server finishes coming up, so a slow start is not
         // mistaken for the TLS refusal we are actually asserting.

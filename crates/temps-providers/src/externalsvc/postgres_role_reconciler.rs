@@ -430,10 +430,11 @@ async fn query_monitor(
     host: &str,
     port: i32,
 ) -> Result<Vec<MonitorNode>, ReconcilerError> {
+    // SECURITY: this probe carries no password, and `sslmode=require`
+    // prevents the self-signed connector from silently accepting cleartext.
     // pg_auto_failover only opens hba for `autoctl_node` over SSL
-    // (`hostssl pg_auto_failover autoctl_node 0.0.0.0/0 trust`). Plain
-    // TCP gets rejected with "no pg_hba.conf entry". Use the same
-    // self-signed-accepting TLS connector the cluster_health probe uses.
+    // (`hostssl pg_auto_failover autoctl_node 0.0.0.0/0 trust`), so there is no
+    // reusable credential for a forged monitor endpoint to collect.
     let conn_str = format!(
         "host={host} port={port} user=autoctl_node dbname=pg_auto_failover \
          sslmode=require connect_timeout=3"
