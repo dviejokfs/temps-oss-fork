@@ -351,16 +351,29 @@ tool-level allowlist. That boundary is enforced by:
   credential from its own standard config path (`~/.claude/.credentials.json`
   etc.); `AgentCliAiService` never reads or copies the credential
 - `Semaphore` limiting concurrent CLI processes on the host
+- A 32 KB cap on the flattened prompt (`check_prompt_size`), rejected before
+  any permit/tempdir/subprocess resource is acquired for the request — bounds
+  the memory and permit-hold-time cost of an adversarial caller-controlled
+  prompt within the semaphore's small default concurrency budget
+- Error text reaching `AiError::Provider.reason` is re-scrubbed through
+  `scrub_and_bound` (the same credential-pattern redaction `temps-agents` uses
+  for CLI stderr) as defense-in-depth against a future error path that skips
+  the upstream scrub; tempdir-creation failures return a fixed generic message
+  with the real path/error logged server-side only, not returned to the caller
 
 **Scope constraint.** This isolation posture is valid only while `AiService`
 delegation to agent CLIs is restricted to single-pass, tool-less workloads. The
 `chat()` method returns `Err(AiError::NotAvailable)` unconditionally — it is not
 overridden, so it inherits the trait default. `chat_stream()` rejects any
-request where `!request.tools.is_empty()`. `chat_stream_turn()` is likewise not
-separately overridden: its trait default delegates to `chat_stream()`
-(`crates/temps-ai/src/service.rs:106`), so it inherits the same tool-list
-rejection — `NotAvailable` for tool-bearing requests, but a tool-less multi-turn
-chat request is still served. These guards are load-bearing: removing them without first implementing a
+request where `!request.tools.is_empty()`. `chat_stream_turn()` is explicitly
+overridden to return `Err(AiError::NotAvailable)` unconditionally, rather than
+inheriting the trait default that delegates to `chat_stream()`
+(`crates/temps-ai/src/service.rs:106`) — relying on that default would still be
+*correct* for tool-bearing requests, but would also *execute* the CLI for a
+tool-less multi-turn request, since `chat_stream()`'s gate only checks
+`tools.is_empty()`. The explicit override makes "multi-turn conversation entry
+points never reach the CLI" a property of `AgentCliAiService` itself, not a
+side effect of `chat_stream()`'s gating happening to stay correct. These guards are load-bearing: removing them without first implementing a
 per-tool permission bridge (see Alternatives Considered) would expose native CLI
 tools — including `bash` — to unreviewed execution on the Temps host under a
 blanket-bypass flag.
@@ -452,9 +465,9 @@ autofixer provider settings page.
   and protocol complexity are not justified for workloads where no tool calls
   occur. The guards at the `AgentCliAiService` boundary (`chat()` always
   returns `NotAvailable` via the unoverridden trait default; `chat_stream()`
-  rejects non-empty tool lists, and `chat_stream_turn()` inherits that
-  rejection because its own trait default delegates to `chat_stream()`) are
-  what keep the blanket bypass safe. **If those guards are relaxed in a
+  rejects non-empty tool lists; `chat_stream_turn()` is explicitly overridden
+  to always return `NotAvailable`, independent of `chat_stream()`'s gating)
+  are what keep the blanket bypass safe. **If those guards are relaxed in a
   future phase, the permission architecture must change before that expansion
   ships** — `--dangerously-skip-permissions` is not a valid posture for
   workloads that invoke `bash` or file-editing tools on the Temps host.

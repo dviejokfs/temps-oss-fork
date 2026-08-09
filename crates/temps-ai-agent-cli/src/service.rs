@@ -8,11 +8,19 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::Semaphore;
 
-use temps_agents::ai_cli::{AiCliProvider, AiRunConfig, OnEventCallback};
+use temps_agents::ai_cli::{scrub_and_bound, AiCliProvider, AiRunConfig, OnEventCallback};
 use temps_agents::error::AgentError;
 use temps_ai::{
-    extract_json_block, AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, TokenStream,
+    extract_json_block, AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, ChatTurnStream,
+    TokenStream,
 };
+
+/// Hard cap on the flattened prompt size sent to an agent CLI subprocess.
+/// Without this, a caller-controlled `AiRequest`/`ChatTurnRequest` could hold
+/// a semaphore permit for the full timeout window with a multi-MB prompt,
+/// pressuring subprocess memory and starving other tenants of the small
+/// (default 2) concurrency budget.
+const MAX_PROMPT_BYTES: usize = 32 * 1024;
 
 /// An [`AiService`] implementation that delegates eligible workloads to an
 /// [`AiCliProvider`] (Claude Code, Codex, OpenCode).
@@ -29,12 +37,15 @@ use temps_ai::{
 /// Tool-calling (`chat_stream` with non-empty `tools`) returns
 /// [`AiError::NotAvailable`] immediately — agent CLIs cannot be fed an
 /// external function-calling protocol. See the workload eligibility table in
-/// ADR-037 Decision §1. `chat()` and `chat_stream_turn()` inherit the trait's
-/// default implementations, which mean:
-/// - `chat()` → `Err(AiError::NotAvailable)`
-/// - `chat_stream_turn()` → delegates to `chat_stream()`, which rejects
-///   tool-bearing requests, so tool-calling chat also returns
-///   `Err(AiError::NotAvailable)`.
+/// ADR-037 Decision §1. `chat()` inherits the trait's default implementation
+/// (`Err(AiError::NotAvailable)`, unconditionally — agent CLIs have no
+/// non-streaming function-calling path). `chat_stream_turn()` is explicitly
+/// overridden to always return `Err(AiError::NotAvailable)` rather than
+/// inheriting the trait default (which would delegate to `chat_stream()` and
+/// — correctly, but only incidentally — execute the CLI for a *tool-less*
+/// multi-turn request). Multi-turn conversation entry points must stay on the
+/// BYOK gateway unconditionally; this keeps that guarantee a property of the
+/// type itself, not of `chat_stream()`'s gating staying correct over time.
 pub struct AgentCliAiService {
     provider: Arc<dyn AiCliProvider>,
     /// Root directory for per-invocation tempdirs. Must exist before any call.
@@ -51,12 +62,23 @@ impl AgentCliAiService {
     /// `concurrency_limit` caps how many CLI subprocesses may run concurrently
     /// on the host (ADR-037 §5 recommends 2). `timeout` applies to every
     /// `provider.run()` invocation (ADR-037 §5 recommends 30s).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `concurrency_limit` is `0`. A zero-capacity semaphore would
+    /// make every call fail with "concurrency limit reached" silently — this
+    /// is a misconfiguration that must fail loudly at construction, not
+    /// degrade into a service that appears registered but never runs.
     pub fn new(
         provider: Arc<dyn AiCliProvider>,
         scratch_dir: PathBuf,
         timeout: Duration,
         concurrency_limit: usize,
     ) -> Self {
+        assert!(
+            concurrency_limit > 0,
+            "AgentCliAiService concurrency_limit must be at least 1, got 0"
+        );
         Self {
             provider,
             scratch_dir,
@@ -99,11 +121,34 @@ fn build_chat_prompt(request: &ChatTurnRequest) -> String {
 
 /// Map an [`AgentError`] to an [`AiError::Provider`] with the request's
 /// purpose tag and a descriptive reason.
+///
+/// Defensively re-scrubs the error text through [`scrub_and_bound`] before it
+/// reaches `AiError::Provider.reason` (which callers may surface to end users
+/// or ship to logs). Today every `AgentError::AiCliFailed` already passes
+/// through `summarize_cli_failure` (which scrubs) before reaching here, but
+/// this function accepts any `AgentError` — a future provider or error path
+/// that skips that upstream scrub must not be able to leak a credential
+/// pattern through this boundary.
 fn map_agent_error(purpose: &str, err: AgentError) -> AiError {
     AiError::Provider {
         purpose: purpose.to_owned(),
-        reason: err.to_string(),
+        reason: scrub_and_bound(&err.to_string()),
     }
+}
+
+/// Reject prompts over [`MAX_PROMPT_BYTES`] before any resource (semaphore
+/// permit, tempdir, subprocess) is acquired for them.
+fn check_prompt_size(purpose: &str, prompt: &str) -> Result<(), AiError> {
+    if prompt.len() > MAX_PROMPT_BYTES {
+        return Err(AiError::Provider {
+            purpose: purpose.to_owned(),
+            reason: format!(
+                "prompt exceeds maximum size ({} bytes > {MAX_PROMPT_BYTES} byte limit)",
+                prompt.len()
+            ),
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +174,8 @@ impl AiService for AgentCliAiService {
     /// providers — see ADR-037 Consequences).
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {
         let purpose = request.purpose.clone();
+        let prompt = build_prompt(&request);
+        check_prompt_size(&purpose, &prompt)?;
 
         let _permit = Arc::clone(&self.concurrency)
             .try_acquire_owned()
@@ -137,14 +184,22 @@ impl AiService for AgentCliAiService {
                 reason: "agent CLI concurrency limit reached — try again shortly".into(),
             })?;
 
-        let run_dir = tempfile::tempdir_in(&self.scratch_dir).map_err(|e| AiError::Provider {
-            purpose: purpose.clone(),
-            reason: format!("failed to create scratch tempdir: {}", e),
+        let run_dir = tempfile::tempdir_in(&self.scratch_dir).map_err(|e| {
+            tracing::error!(
+                purpose = %purpose,
+                scratch_dir = %self.scratch_dir.display(),
+                error = %e,
+                "failed to create agent CLI scratch tempdir"
+            );
+            AiError::Provider {
+                purpose: purpose.clone(),
+                reason: "scratch directory unavailable; contact your administrator".into(),
+            }
         })?;
 
         let cfg = AiRunConfig {
             work_dir: run_dir.path().to_owned(),
-            prompt: build_prompt(&request),
+            prompt,
             api_key: String::new(), // subscription mode — ambient credential
             max_turns: 1,
             timeout: self.timeout,
@@ -187,6 +242,8 @@ impl AiService for AgentCliAiService {
         }
 
         let purpose = request.purpose.clone();
+        let prompt = build_chat_prompt(&request);
+        check_prompt_size(&purpose, &prompt)?;
 
         let permit = Arc::clone(&self.concurrency)
             .try_acquire_owned()
@@ -195,9 +252,17 @@ impl AiService for AgentCliAiService {
                 reason: "agent CLI concurrency limit reached — try again shortly".into(),
             })?;
 
-        let run_dir = tempfile::tempdir_in(&self.scratch_dir).map_err(|e| AiError::Provider {
-            purpose: purpose.clone(),
-            reason: format!("failed to create scratch tempdir: {}", e),
+        let run_dir = tempfile::tempdir_in(&self.scratch_dir).map_err(|e| {
+            tracing::error!(
+                purpose = %purpose,
+                scratch_dir = %self.scratch_dir.display(),
+                error = %e,
+                "failed to create agent CLI scratch tempdir"
+            );
+            AiError::Provider {
+                purpose: purpose.clone(),
+                reason: "scratch directory unavailable; contact your administrator".into(),
+            }
         })?;
 
         // Channel capacity 64 provides enough buffer for a burst of lines
@@ -219,7 +284,7 @@ impl AiService for AgentCliAiService {
         let work_dir = run_dir.path().to_owned();
         let cfg = AiRunConfig {
             work_dir,
-            prompt: build_chat_prompt(&request),
+            prompt,
             api_key: String::new(),
             max_turns: 1,
             timeout: self.timeout,
@@ -251,14 +316,27 @@ impl AiService for AgentCliAiService {
         Ok(Box::pin(stream))
     }
 
-    // chat() and chat_stream_turn() are intentionally NOT overridden.
-    //
-    // - chat() defaults to Err(AiError::NotAvailable): agent CLIs have no
-    //   non-streaming function-calling path.
-    // - chat_stream_turn() defaults to calling self.chat_stream(request):
-    //   when tools is non-empty chat_stream() returns NotAvailable, so
-    //   chat_stream_turn() correctly rejects tool-calling requests too
-    //   (ADR-037 Phase 1 §2).
+    // chat() is intentionally NOT overridden: it defaults to
+    // Err(AiError::NotAvailable), which is exactly right — agent CLIs have no
+    // non-streaming function-calling path.
+
+    /// Always returns [`AiError::NotAvailable`], regardless of whether
+    /// `request.tools` is empty.
+    ///
+    /// This is a defensive override. The trait's default implementation of
+    /// `chat_stream_turn` delegates to [`Self::chat_stream`], which already
+    /// rejects tool-bearing requests — so relying on the default would still
+    /// be *correct* for tool-calling callers, but it would also *execute* the
+    /// CLI for a tool-less multi-turn request, since `chat_stream`'s gate
+    /// only checks `tools.is_empty()`. Multi-turn conversation entry points
+    /// (debug chat, write actions) must stay on the BYOK gateway
+    /// unconditionally (ADR-037 Decision §1 / §5 scope constraint) —
+    /// overriding this method makes that a property of `AgentCliAiService`
+    /// itself, not a side effect of `chat_stream`'s gating happening to be
+    /// correct.
+    async fn chat_stream_turn(&self, _request: ChatTurnRequest) -> Result<ChatTurnStream, AiError> {
+        Err(AiError::NotAvailable)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +654,137 @@ mod tests {
         assert!(
             !service.is_available().await,
             "unauthenticated should not be available"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 6: chat_stream_turn() always returns NotAvailable, even tool-less
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_chat_stream_turn_always_returns_not_available() {
+        let called = Arc::new(AtomicBool::new(false));
+        let provider: Arc<dyn AiCliProvider> = Arc::new(MockProvider {
+            status: available_status(),
+            output: "irrelevant".into(),
+            model: None,
+            called: called.clone(),
+        });
+
+        let scratch = tempfile::tempdir().unwrap();
+        let service = AgentCliAiService::new(
+            provider,
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            2,
+        );
+
+        // Deliberately tool-less: this is the exact request shape that
+        // chat_stream() would otherwise happily execute via the CLI.
+        let request = ChatTurnRequest {
+            purpose: "test.chat_turn".into(),
+            tools: vec![],
+            ..Default::default()
+        };
+
+        let result = service.chat_stream_turn(request).await;
+
+        assert!(
+            matches!(result, Err(AiError::NotAvailable)),
+            "expected NotAvailable even for a tool-less request, got: {:?}",
+            result.err()
+        );
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "provider.run() must not be called via chat_stream_turn()"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7: oversized prompt is rejected before any resource is acquired
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_complete_rejects_oversized_prompt_without_acquiring_resources() {
+        let called = Arc::new(AtomicBool::new(false));
+        let provider: Arc<dyn AiCliProvider> = Arc::new(MockProvider {
+            status: available_status(),
+            output: "irrelevant".into(),
+            model: None,
+            called: called.clone(),
+        });
+
+        let scratch = tempfile::tempdir().unwrap();
+        // concurrency_limit 1 makes it easy to prove no permit was held: if
+        // check_prompt_size() ran after acquiring, a second call would fail
+        // with "concurrency limit reached" instead of the size error.
+        let service = AgentCliAiService::new(
+            provider,
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+
+        let oversized_prompt = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let result = service
+            .complete(AiRequest {
+                purpose: "test.oversized".into(),
+                prompt: oversized_prompt,
+                ..Default::default()
+            })
+            .await;
+
+        match &result {
+            Err(AiError::Provider { purpose, reason }) => {
+                assert_eq!(purpose, "test.oversized");
+                assert!(
+                    reason.contains("exceeds maximum size"),
+                    "expected a size-limit reason, got: {}",
+                    reason
+                );
+            }
+            other => panic!("expected AiError::Provider, got: {:?}", other),
+        }
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "provider.run() must not be called for an oversized prompt"
+        );
+
+        // The rejected call must not have held the sole permit: a normal
+        // request should still succeed right after.
+        let ok = service
+            .complete(AiRequest {
+                purpose: "test.after_oversized".into(),
+                prompt: "small".into(),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            ok.is_ok(),
+            "a normal request after an oversized one should still succeed, got: {:?}",
+            ok
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 8: constructing with concurrency_limit = 0 panics
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[should_panic(expected = "concurrency_limit must be at least 1")]
+    async fn test_new_panics_on_zero_concurrency_limit() {
+        let provider: Arc<dyn AiCliProvider> = Arc::new(MockProvider {
+            status: available_status(),
+            output: String::new(),
+            model: None,
+            called: Arc::new(AtomicBool::new(false)),
+        });
+        let scratch = tempfile::tempdir().unwrap();
+        let _ = AgentCliAiService::new(
+            provider,
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            0,
         );
     }
 }
