@@ -68,6 +68,20 @@ pub enum SandboxError {
     )]
     ManagedByAgentRun { sandbox_id: String, run_id: i32 },
 
+    /// A workspace was requested for a project that doesn't exist (or was
+    /// soft-deleted). Mapped to HTTP 404.
+    #[error("Project {project_id} not found")]
+    ProjectNotFound { project_id: i32 },
+
+    /// The project exists but has no git repository attached, so there is
+    /// nothing to clone into the workspace. Mapped to HTTP 400 — the fix
+    /// is to connect a repo to the project, or to pass an explicit
+    /// `source`, and the message says so.
+    #[error(
+        "Project {project_id} ('{name}') has no git repository connected — connect a repo to the project, or pass an explicit `source` to seed the sandbox from a different URL"
+    )]
+    ProjectHasNoRepo { project_id: i32, name: String },
+
     /// An operation exceeded the per-sandbox timeout.
     #[error("Operation timed out in sandbox {sandbox_id} after {timeout_secs}s")]
     Timeout {

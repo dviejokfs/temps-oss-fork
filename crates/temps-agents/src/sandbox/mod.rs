@@ -30,12 +30,14 @@ pub use user::{
 };
 
 use async_trait::async_trait;
+use futures::Stream;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWrite;
 
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
@@ -250,6 +252,29 @@ pub struct SandboxExecResult {
     /// (e.g. `LocalSandboxProvider`) or when no stderr was produced.
     pub stderr: String,
 }
+
+/// A live bidirectional byte channel into a sandbox's PTY agent.
+///
+/// Returned by [`SandboxProvider::attach_pty`]. The two halves are separate
+/// so a caller can split them across tasks — a terminal needs to pump both
+/// directions concurrently, which a single `AsyncRead + AsyncWrite` object
+/// makes awkward behind `dyn`.
+///
+/// The bytes are `temps-pty-agent`'s framed protocol (see ADR-008), not raw
+/// PTY output. Framing is the caller's job; the provider only moves bytes.
+pub struct PtyAttachment {
+    /// Frames from the agent. Ends when the underlying exec exits.
+    pub output: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, AgentError>> + Send>>,
+    /// Frames to the agent. Dropping this closes the agent-side stdin,
+    /// which makes the in-container relay exit and the attach terminate.
+    pub input: Pin<Box<dyn AsyncWrite + Send>>,
+}
+
+/// Absolute path of the PTY agent's control socket inside every sandbox.
+///
+/// Fixed by the sandbox Dockerfile (`RUN mkdir -p /run/temps-pty …`), so it
+/// is a property of the image rather than something a caller chooses.
+pub const PTY_AGENT_SOCKET: &str = "/run/temps-pty/agent.sock";
 
 /// Pluggable sandbox backend. Implementations provide container/VM isolation
 /// for agent runs. The executor and autofixer interact only with this trait,
@@ -525,6 +550,28 @@ pub trait SandboxProvider: Send + Sync {
     fn supports_backend(&self, backend: SandboxBackend) -> bool {
         let _ = backend;
         true
+    }
+
+    /// Open a bidirectional channel to the sandbox's PTY agent (ADR-008).
+    ///
+    /// Powers interactive terminals: the caller speaks the agent's framed
+    /// protocol over the returned stream to open a tab, send keystrokes,
+    /// forward resizes, and receive output.
+    ///
+    /// Default: unsupported. Backends that can't reach an in-sandbox unix
+    /// socket say so explicitly rather than returning an empty stream that
+    /// looks like a terminal which simply never echoes — a user facing that
+    /// has no way to tell "not implemented" from "my shell is broken".
+    async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
+        let _ = handle;
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: String::new(),
+            reason: format!(
+                "interactive terminals are not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
     }
 
     /// Provider name for logging and error messages.

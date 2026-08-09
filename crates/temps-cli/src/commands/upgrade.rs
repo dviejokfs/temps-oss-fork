@@ -64,7 +64,19 @@ fn is_nightly_tag(tag: &str) -> bool {
 }
 
 impl UpgradeChannel {
-    fn as_str(self) -> &'static str {
+    /// Parse a channel configured in settings. Unknown values return `None` so
+    /// the caller falls back to inferring from the running version rather than
+    /// silently tracking the wrong channel.
+    pub fn from_setting(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stable" => Some(Self::Stable),
+            "beta" => Some(Self::Beta),
+            "nightly" => Some(Self::Nightly),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Stable => "stable",
             Self::Beta => "beta",
@@ -184,9 +196,9 @@ pub struct GitHubRelease {
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-    size: u64,
+    pub(crate) name: String,
+    pub(crate) browser_download_url: String,
+    pub(crate) size: u64,
 }
 
 impl UpgradeCommand {
@@ -747,7 +759,7 @@ fn version_sort_key(tag: &str) -> Option<VersionSortKey> {
 /// exotic tags. This is deliberately stricter than `temps upgrade`, which
 /// treats any tag difference as upgradeable (including downgrades the
 /// operator explicitly pins with `--version`).
-fn is_newer_version(candidate: &str, current: &str) -> bool {
+pub(crate) fn is_newer_version(candidate: &str, current: &str) -> bool {
     match (version_sort_key(candidate), version_sort_key(current)) {
         (Some(candidate_key), Some(current_key)) => candidate_key > current_key,
         _ => false,
@@ -759,9 +771,13 @@ fn is_newer_version(candidate: &str, current: &str) -> bool {
 /// binary. Every failure path (network, GitHub quota, unparsable tags)
 /// collapses to `None` with a debug log — the notifier is advisory and must
 /// never surface errors to an operator who didn't ask for a check.
-pub async fn check_for_newer_release() -> Option<UpdateNotice> {
+pub async fn check_for_newer_release(configured_channel: Option<&str>) -> Option<UpdateNotice> {
     let current_version = current_version_tag();
-    let channel = UpgradeChannel::for_installed_version(&current_version);
+    // An explicit channel from settings wins; otherwise fall back to the tag
+    // the running binary carries, which is what the CLI has always done.
+    let channel = configured_channel
+        .and_then(UpgradeChannel::from_setting)
+        .unwrap_or_else(|| UpgradeChannel::for_installed_version(&current_version));
 
     let release = match tokio::time::timeout(
         UPDATE_CHECK_TIMEOUT,
@@ -815,10 +831,18 @@ pub async fn check_for_newer_release() -> Option<UpdateNotice> {
 pub async fn update_notifier_loop(
     slot: Arc<temps_core::UpdateStatusSlot>,
     interval: std::time::Duration,
+    config_service: Arc<temps_config::ConfigService>,
 ) {
     tokio::time::sleep(UPDATE_CHECK_STARTUP_DELAY).await;
     loop {
-        if let Some(notice) = check_for_newer_release().await {
+        // Re-read every pass so switching channel in the console takes effect
+        // on the next check instead of requiring a restart.
+        let configured_channel = config_service
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|s| s.self_update().channel);
+        if let Some(notice) = check_for_newer_release(configured_channel.as_deref()).await {
             tracing::warn!(
                 current_version = %notice.current_version,
                 latest_version = %notice.latest_version,
@@ -843,7 +867,7 @@ pub async fn update_notifier_loop(
 }
 
 /// Determine the platform target string matching release asset names.
-fn platform_target() -> anyhow::Result<String> {
+pub(crate) fn platform_target() -> anyhow::Result<String> {
     let target = match (OS, ARCH) {
         ("macos", "x86_64") => "darwin-amd64",
         ("macos", "aarch64") => "darwin-arm64",
@@ -920,19 +944,88 @@ fn pick_release_for_channel(
     releases.into_iter().find(|r| channel.includes(r))
 }
 
-/// Fetch a specific release by tag from GitHub.
-async fn fetch_specific_release(version: &str) -> anyhow::Result<GitHubRelease> {
-    // Ensure the version starts with 'v'
-    let tag = if version.starts_with('v') {
-        version.to_string()
-    } else {
-        format!("v{}", version)
+/// Normalize a caller-supplied version into a release tag, rejecting anything
+/// that is not a plain semver-shaped tag.
+///
+/// **This is a security boundary, not cosmetics.** The tag is interpolated into
+/// a GitHub API path, and the `url` crate resolves `..` segments when parsing —
+/// so an unvalidated tag like `v/../../../../../owner/repo/releases/latest`
+/// walks out of `gotempsh/temps` and resolves to *another repository's* release.
+/// Everything downstream then behaves normally: it downloads that release's
+/// `temps-<target>.tar.gz`, checks it against that release's own `.sha256`
+/// (which of course matches), executes it for the version preflight, and
+/// installs it over the running binary. In other words, a caller who can reach
+/// `temps upgrade --version` or `POST /settings/update` could install an
+/// arbitrary binary. Keep this strict.
+pub(crate) fn normalize_release_tag(version: &str) -> anyhow::Result<String> {
+    let trimmed = version.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("Version must not be empty"));
+    }
+
+    let core = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    // Split off the prerelease/build suffix; the numeric core is validated
+    // separately so `1.2.3` and `1.2.3-beta.4` are both accepted but
+    // `1.2.3/../x` is not.
+    let (numeric, suffix) = match core.split_once(['-', '+']) {
+        Some((numeric, suffix)) => (numeric, Some(suffix)),
+        None => (core, None),
     };
 
-    let url = format!(
-        "https://api.github.com/repos/gotempsh/temps/releases/tags/{}",
-        tag
-    );
+    let mut parts = numeric.split('.');
+    let mut components = 0;
+    for _ in 0..3 {
+        let component = parts.next().ok_or_else(|| {
+            anyhow::anyhow!("Version '{version}' must look like 'v1.2.3' or 'v1.2.3-beta.4'")
+        })?;
+        if component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(anyhow::anyhow!(
+                "Version '{version}' has a non-numeric component '{component}'"
+            ));
+        }
+        components += 1;
+    }
+    if components != 3 || parts.next().is_some() {
+        return Err(anyhow::anyhow!(
+            "Version '{version}' must have exactly three numeric components"
+        ));
+    }
+
+    if let Some(suffix) = suffix {
+        // Deliberately narrow: alphanumerics, dot and dash only. No slashes, no
+        // percent-encoding, nothing that can add or escape a path segment.
+        if suffix.is_empty()
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        {
+            return Err(anyhow::anyhow!(
+                "Version '{version}' has an unsupported prerelease suffix"
+            ));
+        }
+        if suffix.split('.').any(|segment| segment.is_empty()) {
+            return Err(anyhow::anyhow!(
+                "Version '{version}' has an empty prerelease segment"
+            ));
+        }
+    }
+
+    Ok(format!("v{core}"))
+}
+
+/// Fetch a specific release by tag from GitHub.
+pub(crate) async fn fetch_specific_release(version: &str) -> anyhow::Result<GitHubRelease> {
+    let tag = normalize_release_tag(version)?;
+
+    // Built by pushing a validated segment rather than string interpolation, so
+    // even a future validation slip cannot alter the path structure.
+    let mut url = reqwest::Url::parse("https://api.github.com/repos/gotempsh/temps/releases/tags/")
+        .map_err(|e| anyhow::anyhow!("Failed to build the release URL: {e}"))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Failed to build the release URL"))?
+        .pop_if_empty()
+        .push(&tag);
+    let url = url.to_string();
 
     let client = reqwest::Client::new();
     let response = client
@@ -1037,7 +1130,7 @@ pub(crate) fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Resul
 }
 
 /// Extract the `temps` binary from a gzipped tarball.
-fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -1061,7 +1154,7 @@ fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Result<Vec<u8>> 
 }
 
 /// Check we have write permission to the binary path.
-fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()> {
+pub(crate) fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()> {
     // Check the parent directory is writable (for atomic rename)
     let parent = binary_path
         .parent()
@@ -1098,12 +1191,15 @@ fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()> {
 /// 1. Write new binary to a temp file next to the target
 /// 2. Set executable permissions
 /// 3. Rename temp file over the target (atomic on the same filesystem)
-fn replace_binary(binary_path: &PathBuf, new_binary: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn replace_binary(binary_path: &PathBuf, new_binary: &[u8]) -> anyhow::Result<()> {
     let parent = binary_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory"))?;
 
-    let tmp_path = parent.join(".temps-upgrade-tmp");
+    // Unique per process so a concurrent upgrader (another temps, or the CLI
+    // run alongside the server) cannot half-write the file this one is about to
+    // rename over the live binary.
+    let tmp_path = parent.join(format!(".temps-upgrade-tmp.{}", std::process::id()));
 
     // Write the new binary to temp file
     fs::write(&tmp_path, new_binary)
@@ -1458,6 +1554,72 @@ mod tests {
         // systemctl — the console is unmanaged by design.
         let g = restart_guidance(true);
         assert!(!g.contains("systemctl"));
+    }
+
+    #[test]
+    fn test_normalize_release_tag_accepts_real_tags() {
+        for (input, expected) in [
+            ("v1.2.3", "v1.2.3"),
+            ("1.2.3", "v1.2.3"),
+            ("v0.1.0-beta.55", "v0.1.0-beta.55"),
+            (
+                "v0.1.0-nightly.20260806.c64e8f98",
+                "v0.1.0-nightly.20260806.c64e8f98",
+            ),
+            ("  v1.0.0  ", "v1.0.0"),
+        ] {
+            assert_eq!(
+                normalize_release_tag(input).expect(input),
+                expected,
+                "should accept {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_release_tag_blocks_path_traversal() {
+        // The exploit this validation exists for: the `url` crate resolves
+        // `..` segments, so an unvalidated tag escapes gotempsh/temps and
+        // reaches an arbitrary repository's release — whose asset would then
+        // be downloaded, checksum-matched against ITS OWN published hash,
+        // executed by the preflight and installed over the running binary.
+        for input in [
+            "v/../../../../../rust-lang/rust/releases/latest",
+            "v1.2.3/../../../../../owner/repo/releases/latest",
+            "../../owner/repo/releases/latest",
+            "v1.2.3/..",
+            "v1.2.3/extra",
+            "v1.2.3%2f..%2fowner",
+        ] {
+            assert!(
+                normalize_release_tag(input).is_err(),
+                "must reject traversal: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_release_tag_blocks_malformed_tags() {
+        for input in [
+            "",
+            "   ",
+            "v",
+            "v1.2",
+            "v1.2.3.4",
+            "v1.2.x",
+            "v1.2.3-beta 4",
+            "v1.2.3-",
+            "v1.2.3-beta..4",
+            "v1.2.3?foo=bar",
+            "v1.2.3#frag",
+            "v1.2.3@evil.com",
+            "http://evil.com/v1.2.3",
+        ] {
+            assert!(
+                normalize_release_tag(input).is_err(),
+                "must reject malformed tag: {input:?}"
+            );
+        }
     }
 
     #[test]

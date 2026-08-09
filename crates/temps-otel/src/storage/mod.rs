@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use crate::error::OtelError;
 use crate::types::{
     GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, Insight, InsightStatus,
-    LogQuery, LogRecord, MetricBucket, MetricPoint, MetricQuery, SpanRecord, StorageQuota,
-    TraceQuery, TraceSummary,
+    LogQuery, LogRecord, MetricBucket, MetricPoint, MetricQuery, SpanRecord, SpanStats,
+    SpanStatsQuery, StorageQuota, TraceQuery, TraceSummary,
 };
 
 /// Result type for storage operations.
@@ -105,6 +105,19 @@ pub trait OtelStorage: Send + Sync {
 
     /// Get all spans for a single trace ID.
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>>;
+
+    /// Aggregate spans into per-operation latency statistics — one row per
+    /// `(project, service, span name)` — for the queried window.
+    ///
+    /// This is the "which operations are slow, and which are *erratic*"
+    /// report. Rows are already sorted and paginated by the query; use
+    /// [`OtelStorage::count_span_stats`] for the total.
+    async fn query_span_stats(&self, query: SpanStatsQuery) -> StorageResult<Vec<SpanStats>>;
+
+    /// Count the distinct operations a span-stats query matches, for
+    /// pagination. Must apply exactly the same filters — including
+    /// `min_count` — as [`OtelStorage::query_span_stats`].
+    async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64>;
 
     /// Query log records from the fast-query store.
     async fn query_logs(&self, query: LogQuery) -> StorageResult<Vec<LogRecord>>;

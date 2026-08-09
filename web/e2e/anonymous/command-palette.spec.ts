@@ -73,25 +73,51 @@ test.describe('command palette', () => {
     await expect(themeAction.locator(':scope > svg')).toHaveCount(1)
   })
 
+  // Typing collapses the palette into ONE relevance-ranked list headed
+  // "Results" (the fixed per-section groups only render on an empty input) --
+  // so ordering, not grouping, is what carries the priority guarantee now.
+  // The section a hit came from rides along as a right-aligned label.
   test('prioritizes project matches over common pages', async ({ page }) => {
     await page.getByPlaceholder('Type a command or search...').fill('monitor')
 
     const headings = page.locator('[cmdk-group-heading]')
-    await expect(headings.first()).toHaveText('Projects')
-    await expect(headings.filter({ hasText: 'Navigation' })).toHaveCount(1)
+    await expect(headings.first()).toHaveText('Results')
 
-    const project = page.locator('[cmdk-item]').filter({
-      hasText: 'monitoring-app',
+    const items = page.locator('[cmdk-item]')
+    const project = items.filter({ hasText: 'monitoring-app' })
+    // `hasText` is a case-insensitive substring match, so 'Monitoring' alone
+    // would also select the monitoring-app row. Match the title span exactly.
+    const navigation = items.filter({
+      has: page.getByText('Monitoring', { exact: true }),
     })
+
     await expect(project).toBeVisible()
-    await expect(project.locator(':scope > span').first()).toBeVisible()
+    await expect(navigation).toBeVisible()
 
-    const navigationGroup = page.locator('[cmdk-group]').filter({
-      has: page.locator('[cmdk-group-heading]', { hasText: 'Navigation' }),
-    })
-    const navigation = navigationGroup.locator('[cmdk-item]').filter({
-      hasText: 'Monitoring',
-    })
+    // The actual guarantee: the project outranks the similarly-named common
+    // page. Both earn an identical title boost ("monitor" prefixes both
+    // "monitoring-app" and "Monitoring"), so the ordering rests on the Fuse
+    // score alone -- 0.5990 vs 0.5958 at the time of writing. That margin is
+    // thin by design of the scoring, which is exactly why it is pinned here:
+    // a scoring or keyword change that flips it should fail this test.
+    const texts = await items.allTextContents()
+    const projectIndex = texts.findIndex((t) => t.includes('monitoring-app'))
+    const navigationIndex = texts.findIndex(
+      (t) => t.includes('Monitoring') && t.includes('Navigation')
+    )
+    expect(projectIndex).toBeGreaterThanOrEqual(0)
+    expect(navigationIndex).toBeGreaterThanOrEqual(0)
+    expect(projectIndex).toBeLessThan(navigationIndex)
+
+    // Each hit still says which section it came from, since the grouping no
+    // longer does.
+    await expect(project.locator(':scope > span').last()).toHaveText('Project')
+    await expect(navigation.locator(':scope > span').last()).toHaveText(
+      'Navigation'
+    )
+
+    // Icons survive the flattening: projects render an avatar, pages an svg.
+    await expect(project.locator(':scope > span').first()).toBeVisible()
     await expect(navigation.locator(':scope > svg')).toHaveCount(1)
   })
 

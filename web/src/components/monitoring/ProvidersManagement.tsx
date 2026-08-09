@@ -12,6 +12,7 @@ import {
 import { revealNotificationProviderConfig } from '@/api/client/sdk.gen'
 import { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
@@ -31,7 +32,7 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { Bell, EllipsisVertical, Plus } from 'lucide-react'
+import { Bell, EllipsisVertical } from 'lucide-react'
 import { useNavigate } from 'react-router'
 import { useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
@@ -339,11 +340,13 @@ export function ProvidersManagement() {
           </p>
         </div>
 
+        {/* Only one of this and the empty-state button is ever mounted, so
+            the `N` shortcut is registered exactly once either way. */}
         {hasProviders && (
-          <Button onClick={() => navigate('/monitoring/providers/add')}>
-            <Plus className="h-4 w-4 mr-2" />
-            Add Provider
-          </Button>
+          <CreateActionButton
+            onClick={() => navigate('/monitoring/providers/add')}
+            label="Add Provider"
+          />
         )}
       </div>
 
@@ -353,10 +356,10 @@ export function ProvidersManagement() {
           title="No notification providers configured"
           description="Add your first notification provider to start receiving alerts about your deployments and infrastructure."
           action={
-            <Button onClick={() => navigate('/monitoring/providers/add')}>
-              <Plus className="h-4 w-4 mr-2" />
-              Add Provider
-            </Button>
+            <CreateActionButton
+              onClick={() => navigate('/monitoring/providers/add')}
+              label="Add Provider"
+            />
           }
         />
       ) : (

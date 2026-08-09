@@ -1111,6 +1111,16 @@ export type AppSettings = {
     screenshots?: ScreenshotSettings;
     security_headers?: SecurityHeadersSettings;
     /**
+     * One-click "Update now" from the console. Enabled by default; an admin
+     * can turn it off here to keep upgrades on the CLI/config-management path.
+     *
+     * This is the *soft* switch — it is stored in the database, so whoever can
+     * write settings can also turn it back on. Operators who need an upgrade
+     * path that no console session can re-open should start the server with
+     * `--disable-self-update`, which wins over this field unconditionally.
+     */
+    self_update?: SelfUpdateSettings;
+    /**
      * Set to `true` by `temps setup` (all modes) once initial configuration
      * has been applied. The web onboarding wizard reads this from the server
      * and skips itself when true, preventing the "Configure Base Domain" wall
@@ -1194,6 +1204,13 @@ export type AppSettingsResponse = {
     require_mfa_for_admins: boolean;
     screenshots: ScreenshotSettings;
     security_headers: SecurityHeadersSettings;
+    /**
+     * Whether admins may apply a release from the console. This is the
+     * database-backed toggle only — a server started with
+     * `--disable-self-update` refuses regardless of what this says, which
+     * `GET /settings/update` reports as the authoritative answer.
+     */
+    self_update: SelfUpdateSettings;
     /**
      * Whether `temps setup` has been run at least once. The web onboarding
      * wizard checks this field on load and skips itself when true.
@@ -3914,6 +3931,17 @@ export type CreateSandboxBody = {
      * Docker image override. `null` uses the platform default.
      */
     image?: string | null;
+    /**
+     * Lifecycle class (ADR-036, temps-native): `"ephemeral"` (default) or
+     * `"workspace"`.
+     *
+     * A workspace is a long-lived development environment: it is still
+     * suspended after `timeout_secs` of inactivity, but the next exec or
+     * filesystem call wakes it transparently instead of returning 409, and
+     * nothing ever destroys it automatically. Use it for "give me a place
+     * to work on this repo"; leave it unset for throwaway sandboxes.
+     */
+    lifecycle?: string | null;
     memory_limit_mb?: number | null;
     name?: string | null;
     networkPolicy?: unknown;
@@ -3934,6 +3962,16 @@ export type CreateSandboxBody = {
      */
     preview_password?: string | null;
     projectId?: string | null;
+    /**
+     * Create the sandbox against a temps project (temps-native). The
+     * project's connected repo and git credential seed the work dir when
+     * no explicit `source` is given, and the sandbox is attributed to the
+     * project so it can be listed alongside it.
+     *
+     * Requires access to the project — the same team/scope rules that
+     * gate every other project-scoped endpoint apply.
+     */
+    project_id?: number | null;
     resources?: null | ResourcesBody;
     source?: null | SourceBody;
     /**
@@ -13259,6 +13297,34 @@ export type ReinstallWebhookResponse = {
     message: string;
 };
 
+/**
+ * Outcome of an operator-triggered release check.
+ */
+export type ReleaseCheckResult = {
+    /**
+     * Channel that was queried.
+     */
+    channel: string;
+    /**
+     * Version tag of the running binary.
+     */
+    current_version: string;
+    /**
+     * Newest release published on that channel, if any could be resolved.
+     */
+    latest_version?: string | null;
+    /**
+     * Release-notes page for `latest_version`.
+     */
+    release_url?: string | null;
+    /**
+     * True when `latest_version` is strictly newer than what is running.
+     * False on a channel whose newest release is older — which is normal and
+     * expected right after switching a nightly box onto stable.
+     */
+    update_available: boolean;
+};
+
 export type ReleaseListResponse = {
     releases: Array<string>;
 };
@@ -14039,16 +14105,30 @@ export type SandboxInner = {
     disk_size_mb?: number | null;
     id: string;
     image?: string | null;
+    /**
+     * Lifecycle class (ADR-036): `"ephemeral"` or `"workspace"`. Always
+     * present — a client that doesn't know about workspaces sees
+     * `"ephemeral"` and behaves exactly as before.
+     */
+    lifecycle: string;
     memory: number;
     name: string;
     preview_password_hint?: string | null;
     preview_url_template: string;
+    /**
+     * Project this sandbox was created from, when created from one.
+     */
+    project_id?: number | null;
     region: string;
     /**
      * Creation time as Unix epoch milliseconds.
      */
     requestedAt: number;
     runtime: string;
+    /**
+     * Repo the work dir was seeded from. Never carries credentials.
+     */
+    source_repo_url?: string | null;
     status: string;
     /**
      * Idle timeout in milliseconds (SDK convention).
@@ -14543,6 +14623,88 @@ export type SecurityHeadersSettings = {
     x_frame_options?: string;
     x_xss_protection?: string;
 };
+
+/**
+ * A single update attempt. Persisted to `<data_dir>/self-update.json` so the
+ * result survives the restart it causes.
+ */
+export type SelfUpdateAttempt = {
+    /**
+     * Operator-facing failure reason. Always set when `status` is `Failed`.
+     */
+    error?: string | null;
+    /**
+     * When the outcome was decided. `None` while still `Pending`.
+     */
+    finished_at?: string | null;
+    /**
+     * Version the attempt started from.
+     */
+    from_version: string;
+    /**
+     * Where the replaced binary was kept, so a bad release can be reverted by
+     * hand (`mv <path> <binary>`). Set once the swap completes.
+     */
+    previous_binary_path?: string | null;
+    started_at: string;
+    status: SelfUpdateStatus;
+    /**
+     * Version the attempt targeted. `None` if it failed before resolving one.
+     */
+    to_version?: string | null;
+    /**
+     * User who clicked the button. `None` for attempts started by the CLI.
+     */
+    triggered_by_user_id?: number | null;
+};
+
+/**
+ * Why a one-click update is unavailable. Exactly one is reported — the most
+ * fundamental blocker wins, so the operator fixes the real problem first
+ * rather than clearing one only to hit the next.
+ */
+export type SelfUpdateBlocker = 'disabled_by_flag' | 'disabled_by_setting' | 'not_supported' | 'binary_not_writable' | 'unsupported_platform' | 'in_progress';
+
+/**
+ * Where an in-flight update has got to. Polled by the console so a long
+ * download shows progress instead of an indefinite spinner.
+ */
+export type SelfUpdatePhase = 'idle' | 'resolving' | 'downloading' | 'verifying' | 'installing' | 'restarting' | 'pending_restart' | 'failed';
+
+/**
+ * What happens to the running process once the new binary is in place.
+ */
+export type SelfUpdateRestartMode = 'automatic' | 'manual';
+
+/**
+ * Controls the console's one-click "Update now" action.
+ */
+export type SelfUpdateSettings = {
+    /**
+     * Release channel this install tracks: `stable`, `beta` or `nightly`.
+     *
+     * `None` (the default) means "infer from the running version tag", which
+     * is what the CLI has always done — a `-nightly.` build tracks nightly, a
+     * `-beta.N` build tracks beta, a plain tag tracks stable. Setting it
+     * explicitly pins the channel, so an operator can move a nightly box back
+     * onto stable without reinstalling.
+     */
+    channel?: string | null;
+    /**
+     * Allow admins to apply a release and restart the server from the console.
+     * `true` by default: the action is permission-gated, audited, and only
+     * ever installs an official release whose published SHA-256 matches.
+     *
+     * Turning this off hides nothing — the console still shows the update
+     * banner and the manual command, it just refuses to run it for you.
+     */
+    enabled?: boolean;
+};
+
+/**
+ * Outcome of an update attempt, as persisted in the journal.
+ */
+export type SelfUpdateStatus = 'pending' | 'succeeded' | 'installed_pending_restart' | 'failed';
 
 export type SendEmailRequestBody = {
     /**
@@ -15949,6 +16111,76 @@ export type SpanRow = {
 };
 
 /**
+ * Latency and error statistics for one operation, i.e. one
+ * `(project, service, span name)` triple over the queried window.
+ */
+export type SpanStats = {
+    avg_duration_ms: number;
+    /**
+     * `stddev / avg`, or `0` when `avg` is zero.
+     */
+    coefficient_of_variation: number;
+    /**
+     * Number of spans aggregated.
+     */
+    count: number;
+    error_count: number;
+    /**
+     * `error_count / count`, in `[0, 1]`.
+     */
+    error_rate: number;
+    /**
+     * The most common span kind for this operation.
+     */
+    kind: SpanKind;
+    /**
+     * Start time of the most recent span in this group.
+     */
+    last_seen: string;
+    max_duration_ms: number;
+    min_duration_ms: number;
+    p50_duration_ms: number;
+    p95_duration_ms: number;
+    p99_duration_ms: number;
+    project_id: number;
+    service_name: string;
+    /**
+     * The span name, which is the operation identity: `GET /api/checkout`,
+     * `SELECT carts`, `payments.charge`.
+     */
+    span_name: string;
+    /**
+     * Sample standard deviation. `0` when the operation has a single sample.
+     */
+    stddev_duration_ms: number;
+    /**
+     * `p99 / p50`, or `0` when `p50` is zero.
+     */
+    tail_ratio: number;
+    /**
+     * `SUM(duration_ms)` — total wall-clock attributable to this operation.
+     */
+    total_duration_ms: number;
+};
+
+/**
+ * Response for `GET /otel/span-stats`.
+ */
+export type SpanStatsResponse = {
+    data: Array<SpanStats>;
+    end_time: string;
+    /**
+     * The window actually aggregated, echoed back because it is defaulted
+     * server-side when the caller omits it.
+     */
+    start_time: string;
+    /**
+     * Total number of distinct operations matching the filters, for pagination.
+     */
+    total: number;
+};
+
+/**
  * Span status code.
  */
 export type SpanStatusCode = 'UNSET' | 'OK' | 'ERROR';
@@ -16111,6 +16343,37 @@ export type StartRestoreRequest = RestoreRequestMode & {
      * is used.
      */
     s3_source_id?: number | null;
+};
+
+/**
+ * Optional pin for the version to install.
+ */
+export type StartUpdateRequest = {
+    /**
+     * Release tag to install (e.g. `v0.2.0`). Omit to take the newest release
+     * on the channel this install already tracks.
+     */
+    version?: string | null;
+};
+
+/**
+ * Acknowledgement that an update was accepted and is running.
+ */
+export type StartUpdateResponse = {
+    /**
+     * Version the server is running as it accepts this request.
+     */
+    current_version: string;
+    /**
+     * How long to allow for the server to come back before treating the
+     * restart as failed. `0` when nothing restarts.
+     */
+    estimated_restart_secs: number;
+    message: string;
+    /**
+     * `automatic` (temps restarts itself) or `manual` (installed only).
+     */
+    restart_mode: SelfUpdateRestartMode;
 };
 
 export type StatResponse = {
@@ -16338,6 +16601,11 @@ export type StripeConfig = {
      */
     product_allowlist?: Array<string>;
 };
+
+/**
+ * What (if anything) will restart the process after it exits.
+ */
+export type SupervisorKind = 'systemd' | 'launchd' | 'container' | 'none';
 
 export type SyncedRepositoryListQuery = {
     direction?: string | null;
@@ -17270,6 +17538,77 @@ export type UpdateBlobResponse = {
      * Whether the operation succeeded
      */
     success: boolean;
+};
+
+/**
+ * Whether this install can apply a release update on request, and how the last
+ * attempt went.
+ *
+ * Deliberately answerable even when the answer is "no": an operator who cannot
+ * use the button still needs to know *why* and what to run instead, so this
+ * never 404s or returns an empty body when the feature is unavailable.
+ */
+export type UpdateCapabilityResponse = {
+    /**
+     * Whether the *caller* holds `platform:update`. Distinct from `can_apply`,
+     * which describes the server: the console shows the action only when both
+     * are true, so a reader is never offered a button that would 403.
+     */
+    allowed: boolean;
+    /**
+     * Binary that would be replaced.
+     */
+    binary_path: string;
+    blocker?: null | SelfUpdateBlocker;
+    /**
+     * True only when a request would actually download, install and restart.
+     */
+    can_apply: boolean;
+    /**
+     * Non-blocking warning to show with the confirmation (split topology).
+     */
+    caveat?: string | null;
+    /**
+     * Channel actually tracked, after applying the configured override or
+     * falling back to inference from the running version tag.
+     */
+    channel: string;
+    /**
+     * True when `channel` was set explicitly in settings rather than inferred.
+     */
+    channel_is_pinned: boolean;
+    /**
+     * Version tag of the running binary. Always present — the version page
+     * needs it whether or not an update exists.
+     */
+    current_version: string;
+    last_attempt?: null | SelfUpdateAttempt;
+    /**
+     * The equivalent command to run by hand. Always present.
+     */
+    manual_command: string;
+    /**
+     * Phase of an in-flight attempt: `idle` when none is running.
+     */
+    phase: SelfUpdatePhase;
+    /**
+     * Failure detail while `phase` is `failed`.
+     */
+    phase_error?: string | null;
+    /**
+     * Operator-facing explanation of `blocker`.
+     */
+    reason?: string | null;
+    /**
+     * `automatic` when applying an update also restarts temps; `manual` when
+     * it only installs the binary and the operator restarts on their own
+     * schedule. Lets the console set expectations before the click.
+     */
+    restart_mode: SelfUpdateRestartMode;
+    /**
+     * What would restart the process: `systemd`, `launchd`, `container`, `none`.
+     */
+    supervisor: SupervisorKind;
 };
 
 export type UpdateCloudflareProviderRequest = {
@@ -34410,6 +34749,116 @@ export type GetQuotaResponses = {
 
 export type GetQuotaResponse = GetQuotaResponses[keyof GetQuotaResponses];
 
+export type QuerySpanStatsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Single project to report on
+         */
+        project_id?: number;
+        /**
+         * Comma-separated project ids, e.g. `4,5,6` (max 50)
+         */
+        project_ids?: string;
+        /**
+         * Window start (RFC 3339); defaults to 24h before end_time. The window may not exceed 31 days
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); defaults to now
+         */
+        end_time?: string;
+        /**
+         * Restrict to one service
+         */
+        service_name?: string;
+        /**
+         * Restrict to one operation by exact span name
+         */
+        span_name?: string;
+        /**
+         * Case-insensitive substring match on the span name
+         */
+        name_pattern?: string;
+        /**
+         * server | client | internal | producer | consumer
+         */
+        kind?: string;
+        /**
+         * ok | error | unset
+         */
+        status?: string;
+        /**
+         * Restrict to one environment
+         */
+        environment_id?: number;
+        /**
+         * Restrict to one deployment
+         */
+        deployment_id?: number;
+        /**
+         * Comma-separated key=value span attribute filters
+         */
+        attributes?: string;
+        /**
+         * Ignore spans faster than this
+         */
+        min_duration_ms?: number;
+        /**
+         * Drop operations with fewer samples than this
+         */
+        min_count?: number;
+        /**
+         * total_time | p50 | p95 | p99 | max | avg | stddev | count | errors | error_rate | variability | tail_ratio
+         */
+        sort_by?: string;
+        /**
+         * asc | desc (default)
+         */
+        sort_order?: string;
+        /**
+         * Page size (default 20, max 100)
+         */
+        limit?: number;
+        /**
+         * Page offset
+         */
+        offset?: number;
+    };
+    url: '/otel/span-stats';
+};
+
+export type QuerySpanStatsErrors = {
+    /**
+     * Invalid query (no project, empty window)
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type QuerySpanStatsError = QuerySpanStatsErrors[keyof QuerySpanStatsErrors];
+
+export type QuerySpanStatsResponses = {
+    /**
+     * Per-operation latency statistics
+     */
+    200: SpanStatsResponse;
+};
+
+export type QuerySpanStatsResponse = QuerySpanStatsResponses[keyof QuerySpanStatsResponses];
+
 export type QueryTraceSummariesData = {
     body?: never;
     path?: never;
@@ -47404,6 +47853,70 @@ export type DownloadGlobalSkillArchiveResponses = {
 
 export type DownloadGlobalSkillArchiveResponse = DownloadGlobalSkillArchiveResponses[keyof DownloadGlobalSkillArchiveResponses];
 
+export type GetUpdateCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/update';
+};
+
+export type GetUpdateCapabilityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetUpdateCapabilityResponses = {
+    /**
+     * Self-update capability for this install
+     */
+    200: UpdateCapabilityResponse;
+};
+
+export type GetUpdateCapabilityResponse = GetUpdateCapabilityResponses[keyof GetUpdateCapabilityResponses];
+
+export type StartUpdateData = {
+    body: StartUpdateRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/update';
+};
+
+export type StartUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Update unavailable or already running
+     */
+    409: ProblemDetails;
+    /**
+     * This process cannot apply updates
+     */
+    501: ProblemDetails;
+};
+
+export type StartUpdateError = StartUpdateErrors[keyof StartUpdateErrors];
+
+export type StartUpdateResponses = {
+    /**
+     * Update accepted; the server will restart
+     */
+    202: StartUpdateResponse;
+};
+
+export type StartUpdateResponse2 = StartUpdateResponses[keyof StartUpdateResponses];
+
 export type GetUpdateStatusData = {
     body?: never;
     path?: never;
@@ -47430,6 +47943,43 @@ export type GetUpdateStatusResponses = {
 };
 
 export type GetUpdateStatusResponse = GetUpdateStatusResponses[keyof GetUpdateStatusResponses];
+
+export type CheckForUpdateData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/update/check';
+};
+
+export type CheckForUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * This process cannot check for updates
+     */
+    501: ProblemDetails;
+    /**
+     * The release API could not be reached
+     */
+    502: ProblemDetails;
+};
+
+export type CheckForUpdateError = CheckForUpdateErrors[keyof CheckForUpdateErrors];
+
+export type CheckForUpdateResponses = {
+    /**
+     * Result of the release check
+     */
+    200: ReleaseCheckResult;
+};
+
+export type CheckForUpdateResponse = CheckForUpdateResponses[keyof CheckForUpdateResponses];
 
 export type ListTeamsData = {
     body?: never;
@@ -48319,8 +48869,23 @@ export type ListSandboxesData = {
          * Items per page (default 20, max 100)
          */
         page_size?: number;
+        /**
+         * Filter by lifecycle class: "ephemeral" or "workspace"
+         */
+        lifecycle?: string;
+        /**
+         * Filter to sandboxes created from a project
+         */
+        project_id?: number;
     };
     url: '/v1/sandboxes';
+};
+
+export type ListSandboxesErrors = {
+    /**
+     * Unknown lifecycle value
+     */
+    400: unknown;
 };
 
 export type ListSandboxesResponses = {
@@ -49171,6 +49736,54 @@ export type StopSandboxResponses = {
 };
 
 export type StopSandboxResponse = StopSandboxResponses[keyof StopSandboxResponses];
+
+export type TerminalData = {
+    body?: never;
+    path: {
+        /**
+         * Sandbox public ID
+         */
+        id: string;
+    };
+    query?: {
+        /**
+         * Tab to attach to (default "main"); reusing an id reattaches to the running program
+         */
+        tab?: string;
+        /**
+         * Program to launch when the tab is created (default: login shell)
+         */
+        cmd?: string;
+        /**
+         * Initial columns (default 80)
+         */
+        cols?: number;
+        /**
+         * Initial rows (default 24)
+         */
+        rows?: number;
+    };
+    url: '/v1/sandboxes/{id}/terminal';
+};
+
+export type TerminalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+    /**
+     * Sandbox is not in a state that can be attached to
+     */
+    409: unknown;
+};
 
 export type CmdKillData = {
     body?: CmdKillBody;

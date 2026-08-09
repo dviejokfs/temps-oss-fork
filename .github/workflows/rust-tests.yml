@@ -481,6 +481,17 @@ jobs:
               package(temps-audit) or package(temps-analytics-performance))
               and kind(=lib)
           - group: unit-b
+            # `not (temps-git and *_real_api)`: those six tests call the live
+            # github.com / gitlab.com REST APIs unauthenticated, so they share
+            # a per-IP rate limit with every other job on the runner fleet.
+            # They only tolerate `RateLimitExceeded`, but a throttled provider
+            # answers with a body the parser can't decode, which surfaces as
+            # `ApiError("Failed to parse tree: error decoding response body")`
+            # and panics -- turning third-party availability into a red build
+            # on PRs that never touched temps-git. Same reasoning already
+            # applied to temps-auth::oidc_discovery_live and
+            # temps-git::gitea_e2e in unit-integration below. They still run
+            # (and still assert strictly) with `cargo test -p temps-git`.
             filter: >-
               (package(temps-proxy) or package(temps-error-tracking) or
               package(temps-git) or package(temps-screenshots) or
@@ -491,6 +502,7 @@ jobs:
               package(temps-dns) or package(temps-email) or
               package(temps-analytics) or package(temps-analytics-events) or
               package(temps-otel)) and kind(=lib)
+              and not (package(temps-git) and test(/_real_api$/))
           - group: unit-integration
             # The kind(=test) counterpart to the two groups above: crates
             # whose tests/*.rs files need neither Docker nor a database, and

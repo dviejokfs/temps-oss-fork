@@ -13,6 +13,7 @@ import {
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
@@ -70,7 +71,6 @@ import {
   Globe,
   HelpCircle,
   Loader2,
-  Plus,
   RefreshCw,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
@@ -531,19 +531,21 @@ export function EmailDomainsManagement() {
           title="No email domains configured"
           description="Add a domain to start sending emails. You'll need to configure DNS records for verification."
           action={
-            <Button onClick={() => setIsCreateDialogOpen(true)}>
-              <Plus className="mr-2 size-4" />
-              Add domain
-            </Button>
+            /* Mutually exclusive with the list-header button below, so the
+               `N` shortcut is only ever registered once. */
+            <CreateActionButton
+              onClick={() => setIsCreateDialogOpen(true)}
+              label="Add domain"
+            />
           }
         />
       ) : (
         <>
           <div className="mb-4 flex items-center justify-end">
-            <Button onClick={() => setIsCreateDialogOpen(true)}>
-              <Plus className="mr-2 size-4" />
-              Add Domain
-            </Button>
+            <CreateActionButton
+              onClick={() => setIsCreateDialogOpen(true)}
+              label="Add Domain"
+            />
           </div>
 
           <div className="overflow-hidden rounded-lg border">
