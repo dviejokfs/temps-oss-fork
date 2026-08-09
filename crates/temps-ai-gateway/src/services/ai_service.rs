@@ -74,16 +74,25 @@ impl GatewayAiService {
             .filter(temps_entities::ai_provider_keys::Column::IsActive.eq(true))
             .one(self.db.as_ref())
             .await
-            .ok()??;
-        if let Some(m) = key
-            .default_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            return Some(m.to_string());
+            .ok()
+            .flatten();
+        if let Some(key) = key {
+            if let Some(m) = key
+                .default_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(m.to_string());
+            }
+            if let Some(model) = default_model_for_provider(&key.provider) {
+                return Some(model);
+            }
         }
-        default_model_for_provider(&key.provider)
+        self.gateway
+            .managed_model()
+            .await
+            .map(|_| "temps-cloud".to_string())
     }
 }
 

@@ -48,6 +48,7 @@ pub struct CloudService {
     config: Arc<ConfigService>,
     cancel: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    backup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     allow_loopback_development: bool,
 }
 
@@ -63,7 +64,29 @@ impl CloudService {
             config,
             cancel,
             task: Mutex::new(None),
+            backup_task: Mutex::new(None),
             allow_loopback_development,
+        }
+    }
+
+    pub fn start_backup_mirror(
+        &self,
+        db: Arc<sea_orm::DatabaseConnection>,
+        encryption: Arc<temps_core::EncryptionService>,
+    ) {
+        let mut task = self
+            .backup_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if task.is_none() {
+            tracing::info!("Cloud service launching backup mirror task");
+            let link = self.link.clone();
+            let cancel = self.cancel.subscribe();
+            *task = Some(tokio::spawn(async move {
+                crate::backup_mirror::run(link, db, encryption, cancel).await;
+            }));
+        } else {
+            tracing::debug!("Cloud backup mirror task is already registered");
         }
     }
 
@@ -181,6 +204,14 @@ impl CloudService {
             if let Err(error) = task.await {
                 tracing::warn!(%error, "managed telemetry mirror task did not shut down cleanly");
             }
+        }
+        let backup_task = self
+            .backup_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(task) = backup_task {
+            let _ = task.await;
         }
     }
 }

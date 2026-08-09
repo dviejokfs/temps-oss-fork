@@ -65,11 +65,16 @@ impl TempsPlugin for CloudPlugin {
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            context
-                .require_service::<CloudService>()
+            let service = context.require_service::<CloudService>();
+            service
                 .initialize()
                 .await
-                .map_err(|error| PluginError::InitializationFailed(error.to_string()))
+                .map_err(|error| PluginError::InitializationFailed(error.to_string()))?;
+            service.start_backup_mirror(
+                context.require_service::<sea_orm::DatabaseConnection>(),
+                context.require_service::<temps_core::EncryptionService>(),
+            );
+            Ok(())
         })
     }
 

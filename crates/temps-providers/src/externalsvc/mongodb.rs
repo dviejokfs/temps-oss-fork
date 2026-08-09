@@ -918,6 +918,7 @@ impl MongodbService {
         walg_s3_prefix: &str,
         s3_credentials: &super::S3Credentials,
         mongodb_uri: &str,
+        backup_id: &str,
     ) -> anyhow::Result<()> {
         let stream_create_cmd = format!("mongodump --archive --uri=\"{}\"", mongodb_uri);
         let stream_restore_cmd = format!("mongorestore --archive --drop --uri=\"{}\"", mongodb_uri);
@@ -930,6 +931,10 @@ impl MongodbService {
             format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
             format!("WALG_STREAM_RESTORE_COMMAND={}", stream_restore_cmd),
             format!("MONGODB_URI={}", mongodb_uri),
+            format!(
+                "WALG_SENTINEL_USER_DATA={}",
+                serde_json::json!({ "temps_backup_id": backup_id })
+            ),
         ];
 
         if let Some(resolved_endpoint) = s3_credentials
@@ -2327,6 +2332,7 @@ impl ExternalService for MongodbService {
                 &walg_s3_prefix,
                 s3_credentials,
                 &mongodb_uri,
+                &backup.backup_id,
             )
             .await;
 

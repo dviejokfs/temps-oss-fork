@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod backup_mirror;
 mod handler;
 mod plugin;
 mod service;

@@ -669,6 +669,7 @@ impl RedisService {
         walg_s3_prefix: &str,
         s3_credentials: &super::S3Credentials,
         service_config: ServiceConfig,
+        backup_id: &str,
     ) -> anyhow::Result<()> {
         let redis_password = self
             .get_redis_config(service_config)
@@ -696,6 +697,10 @@ impl RedisService {
             format!("AWS_REGION={}", s3_credentials.region),
             format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
             "WALG_STREAM_RESTORE_COMMAND=cat > /data/dump.rdb".to_string(),
+            format!(
+                "WALG_SENTINEL_USER_DATA={}",
+                serde_json::json!({ "temps_backup_id": backup_id })
+            ),
         ];
 
         if !redis_password.is_empty() {
@@ -1970,6 +1975,7 @@ impl ExternalService for RedisService {
                 &walg_s3_prefix,
                 s3_credentials,
                 service_config,
+                &backup.backup_id,
             )
             .await;
 

@@ -11,12 +11,32 @@ const routeProviders = async (page: Page, body: unknown[]) => {
   })
 }
 
+const routeCloudStatus = async (page: Page, linked: boolean) => {
+  await page.route('**/cloud/status', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        status: linked ? 'linked' : 'not_configured',
+        status_message: linked ? 'Connected' : 'Not linked',
+        health: linked ? 'healthy' : 'not_linked',
+        health_message: linked ? 'Signals reach Cloud' : 'Not linked',
+        instance_id: linked ? '11111111-2222-3333-4444-555555555555' : null,
+        account_email: linked ? 'operator@example.com' : null,
+        spooled_spans: 0,
+        backend_url: 'http://127.0.0.1:19202/',
+      }),
+    })
+  })
+}
+
 test.describe('AI entry and Cloud onboarding', () => {
   test('keeps AI discoverable and routes both setup choices', async ({
     page,
     consoleErrors,
   }) => {
     await routeProviders(page, [])
+    await routeCloudStatus(page, false)
     await page.goto('/projects')
     await expectAppMounted(page)
 
@@ -72,6 +92,7 @@ test.describe('AI entry and Cloud onboarding', () => {
         updated_at: '2026-08-05T00:00:00Z',
       },
     ])
+    await routeCloudStatus(page, false)
     await page.goto('/projects')
     await expectAppMounted(page)
 
@@ -81,6 +102,29 @@ test.describe('AI entry and Cloud onboarding', () => {
     })
     await entry.click()
 
+    await expect(
+      page.getByRole('heading', { name: 'AI assistant', exact: true })
+    ).toBeVisible()
+    await expect(
+      page.getByRole('heading', {
+        name: 'Ask your stack. Keep the evidence attached.',
+      })
+    ).not.toBeVisible()
+    expect(consoleErrors).toEqual([])
+  })
+
+  test('opens the existing assistant when Temps Cloud is linked', async ({
+    page,
+    consoleErrors,
+  }) => {
+    await routeProviders(page, [])
+    await routeCloudStatus(page, true)
+    await page.goto('/projects')
+    await expectAppMounted(page)
+
+    await page
+      .getByRole('button', { name: 'AI assistant', exact: true })
+      .click()
     await expect(
       page.getByRole('heading', { name: 'AI assistant', exact: true })
     ).toBeVisible()

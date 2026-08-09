@@ -73,8 +73,8 @@ pub async fn resolve_engine_key(
         "redis" => Ok("redis"),
         "mongodb" => Ok("mongodb"),
         "mariadb" => {
-            // PITR needs both mariadb-backup (physical base) and
-            // mariadb-binlog (binary-log replay) inside the container.
+            // Cloud-grade PITR needs WAL-G, mariadb-backup (physical base),
+            // and mariadb-binlog (binary-log replay) inside the container.
             // Container naming must match the provider's
             // `get_container_name()` — `mariadb-{name}`
             // (see temps-providers/src/externalsvc/mariadb.rs:298-300).
@@ -104,7 +104,7 @@ pub async fn resolve_engine_key(
 /// Mirrors the implementation in `temps-providers/src/externalsvc/postgres.rs:536`
 /// but is a standalone free function so `temps-backup` does not need to depend
 /// on the full `ExternalService` trait.
-async fn container_has_walg(docker: &bollard::Docker, container_name: &str) -> bool {
+pub(crate) async fn container_has_walg(docker: &bollard::Docker, container_name: &str) -> bool {
     use bollard::exec::{CreateExecOptions, StartExecOptions};
 
     let exec = match docker
@@ -151,24 +151,24 @@ async fn container_has_walg(docker: &bollard::Docker, container_name: &str) -> b
     false
 }
 
-/// Probe whether the MariaDB PITR tools (`mariadb-backup` AND `mariadb-binlog`)
+/// Probe whether the MariaDB PITR tools (`wal-g`, `mariadb-backup` and `mariadb-binlog`)
 /// are available in `container_name`.
 ///
 /// Both are required: `mariadb-backup` for the physical base and
 /// `mariadb-binlog`/`mysqlbinlog` for replay. Returns `false` on any error or
-/// if either tool is missing, so the caller falls back to the logical
-/// `mariadb_dump` engine gracefully. The stock `mariadb:lts` image ships both,
-/// so this normally resolves to `mariadb_physical`.
+/// if any tool is missing, so existing stock MariaDB containers keep the
+/// logical `mariadb_dump` fallback while new managed images use WAL-G.
 async fn container_has_mariadb_pitr_tools(docker: &bollard::Docker, container_name: &str) -> bool {
     use bollard::exec::{CreateExecOptions, StartExecOptions};
 
-    // Single shell test: exit 0 only if BOTH tools resolve. `mariadb-binlog`
+    // Single shell test: exit 0 only if ALL tools resolve. `mariadb-binlog`
     // and `mysqlbinlog` are the same tool (symlink); accept either.
-    let probe = "command -v mariadb-backup >/dev/null 2>&1 || command -v mariabackup >/dev/null 2>&1; \
+    let probe = "command -v wal-g >/dev/null 2>&1; w=$?; \
+                 command -v mariadb-backup >/dev/null 2>&1 || command -v mariabackup >/dev/null 2>&1; \
                  a=$?; \
                  command -v mariadb-binlog >/dev/null 2>&1 || command -v mysqlbinlog >/dev/null 2>&1; \
                  b=$?; \
-                 [ $a -eq 0 ] && [ $b -eq 0 ]";
+                 [ $w -eq 0 ] && [ $a -eq 0 ] && [ $b -eq 0 ]";
 
     let exec = match docker
         .create_exec(

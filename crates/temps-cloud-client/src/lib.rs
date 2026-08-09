@@ -30,12 +30,16 @@ pub use link::{CloudLink, FlushOutcome};
 pub use state::EnrollmentState;
 pub use status::{LinkStatus, MirrorHealth};
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
+use sha2::{Digest, Sha256};
 use temps_cloud_protocol::{
-    EnrollRequest, EnrollResponse, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
-    ManagedAiCapability, ManagedNotificationAccepted, ManagedNotificationRequest, SpanRecord,
-    TelemetryBatch,
+    BackupArtifact, BackupCompleted, BackupTarget, BackupTargetRequest, EnrollRequest,
+    EnrollResponse, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
+    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedNotificationAccepted,
+    ManagedNotificationRequest, NativeSnapshot, NativeSnapshotRequest, SpanRecord, TelemetryBatch,
+    WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
+    WalGSnapshotCompleted, WalGSnapshotRequest,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -300,6 +304,265 @@ impl CloudClient {
         decode_managed_response(response).await
     }
 
+    /// Proxy one OpenAI-compatible completion. Retries reuse the request id so
+    /// Cloud and the upstream provider cannot reserve or charge twice when a
+    /// response is lost after either side has committed it.
+    pub async fn managed_ai_chat(
+        &self,
+        token: &str,
+        request: &ManagedAiChatRequest,
+    ) -> Result<ManagedAiChatResponse, CloudError> {
+        let mut last_failure = None;
+        for attempt in 0..3 {
+            match self
+                .http
+                .post(self.backend.endpoint("/v1/ai/chat/completions"))
+                .bearer_auth(token)
+                .timeout(AI_REQUEST_TIMEOUT)
+                .json(request)
+                .send()
+                .await
+            {
+                Ok(response) if !matches!(response.status().as_u16(), 429 | 500..=599) => {
+                    return decode_managed_response(response).await;
+                }
+                Ok(response) => {
+                    last_failure = Some(format!("managed backend returned {}", response.status()));
+                }
+                Err(error) => last_failure = Some(error.without_url().to_string()),
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await;
+            }
+        }
+        Err(CloudError::Unreachable {
+            reason: last_failure.unwrap_or_else(|| "managed backend returned no response".into()),
+            spooled_bytes: 0,
+        })
+    }
+
+    /// Stream one completed local backup directly to Cloud-owned object
+    /// storage. Every retry keeps the same client-generated backup id; target
+    /// creation, PUT and completion are therefore safe when a response is lost.
+    pub async fn upload_backup_file(
+        &self,
+        token: &str,
+        instance_id: Uuid,
+        backup_id: Uuid,
+        source: String,
+        artifact: BackupArtifact,
+        path: &Path,
+    ) -> Result<BackupTarget, CloudError> {
+        let (bytes, checksum_sha256) = inspect_local_backup(path).await?;
+        let request = BackupTargetRequest {
+            backup_id,
+            instance_id,
+            source,
+            estimated_bytes: bytes,
+            checksum_sha256: checksum_sha256.clone(),
+            artifact,
+        };
+        let target = self.backup_target(token, &request).await?;
+
+        if !target.upload_required {
+            return Ok(target);
+        }
+
+        let mut last_failure = None;
+        for attempt in 0..3 {
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|error| CloudError::Rejected {
+                    detail: format!("could not reopen backup artifact for upload: {error}"),
+                })?;
+            let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+            let mut upload = self.http.put(&target.upload_url).body(body);
+            for (name, value) in &target.headers {
+                upload = upload.header(name, value);
+            }
+            match upload.send().await {
+                Ok(response) if response.status().is_success() => {
+                    last_failure = None;
+                    break;
+                }
+                Ok(response)
+                    if matches!(response.status().as_u16(), 408 | 425 | 429 | 500..=599) =>
+                {
+                    last_failure = Some(format!("object storage returned {}", response.status()));
+                }
+                Ok(response) => {
+                    return Err(CloudError::Rejected {
+                        detail: format!(
+                            "object storage rejected the backup with {}",
+                            response.status()
+                        ),
+                    });
+                }
+                Err(error) => last_failure = Some(error.without_url().to_string()),
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await;
+            }
+        }
+        if let Some(reason) = last_failure {
+            return Err(CloudError::Unreachable {
+                reason: format!("backup upload did not complete after bounded retries: {reason}"),
+                spooled_bytes: bytes,
+            });
+        }
+
+        self.complete_backup(
+            token,
+            &BackupCompleted {
+                backup_id: target.backup_id,
+                bytes,
+                checksum_sha256,
+            },
+        )
+        .await?;
+        Ok(target)
+    }
+
+    async fn backup_target(
+        &self,
+        token: &str,
+        request: &BackupTargetRequest,
+    ) -> Result<BackupTarget, CloudError> {
+        self.retry_backup_json("/v1/backups/target", token, request)
+            .await
+    }
+
+    pub async fn declare_walg_snapshot(
+        &self,
+        token: &str,
+        request: &WalGSnapshotRequest,
+    ) -> Result<WalGSnapshot, CloudError> {
+        self.retry_backup_json("/v1/backups/walg/snapshots", token, request)
+            .await
+    }
+
+    pub async fn declare_native_snapshot(
+        &self,
+        token: &str,
+        request: &NativeSnapshotRequest,
+    ) -> Result<NativeSnapshot, CloudError> {
+        self.retry_backup_json("/v1/backups/native/snapshots", token, request)
+            .await
+    }
+
+    pub async fn native_object_target(
+        &self,
+        token: &str,
+        request: &WalGObjectTargetRequest,
+    ) -> Result<WalGObjectTarget, CloudError> {
+        self.retry_backup_json("/v1/backups/native/objects/target", token, request)
+            .await
+    }
+
+    pub async fn complete_native_object(
+        &self,
+        token: &str,
+        completion: &WalGObjectCompleted,
+    ) -> Result<(), CloudError> {
+        let _: serde_json::Value = self
+            .retry_backup_json("/v1/backups/native/objects/complete", token, completion)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn complete_native_snapshot(
+        &self,
+        token: &str,
+        completion: &WalGSnapshotCompleted,
+    ) -> Result<(), CloudError> {
+        let _: serde_json::Value = self
+            .retry_backup_json("/v1/backups/native/snapshots/complete", token, completion)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn walg_object_target(
+        &self,
+        token: &str,
+        request: &WalGObjectTargetRequest,
+    ) -> Result<WalGObjectTarget, CloudError> {
+        self.retry_backup_json("/v1/backups/walg/objects/target", token, request)
+            .await
+    }
+
+    pub async fn complete_walg_object(
+        &self,
+        token: &str,
+        completion: &WalGObjectCompleted,
+    ) -> Result<(), CloudError> {
+        let _: serde_json::Value = self
+            .retry_backup_json("/v1/backups/walg/objects/complete", token, completion)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn complete_walg_snapshot(
+        &self,
+        token: &str,
+        completion: &WalGSnapshotCompleted,
+    ) -> Result<(), CloudError> {
+        let _: serde_json::Value = self
+            .retry_backup_json("/v1/backups/walg/snapshots/complete", token, completion)
+            .await?;
+        Ok(())
+    }
+
+    async fn complete_backup(
+        &self,
+        token: &str,
+        completion: &BackupCompleted,
+    ) -> Result<(), CloudError> {
+        let _: serde_json::Value = self
+            .retry_backup_json("/v1/backups/complete", token, completion)
+            .await?;
+        Ok(())
+    }
+
+    async fn retry_backup_json<T, R>(
+        &self,
+        path: &str,
+        token: &str,
+        body: &T,
+    ) -> Result<R, CloudError>
+    where
+        T: serde::Serialize + ?Sized,
+        R: serde::de::DeserializeOwned,
+    {
+        let mut last_failure = None;
+        for attempt in 0..3 {
+            match self
+                .http
+                .post(self.backend.endpoint(path))
+                .bearer_auth(token)
+                .json(body)
+                .send()
+                .await
+            {
+                Ok(response)
+                    if !matches!(response.status().as_u16(), 408 | 425 | 429 | 500..=599) =>
+                {
+                    return decode_managed_response(response).await;
+                }
+                Ok(response) => {
+                    last_failure = Some(format!("managed backend returned {}", response.status()));
+                }
+                Err(error) => last_failure = Some(error.without_url().to_string()),
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await;
+            }
+        }
+        Err(CloudError::Unreachable {
+            reason: last_failure.unwrap_or_else(|| "managed backend returned no response".into()),
+            spooled_bytes: 0,
+        })
+    }
+
     /// Queue one OSS alert for Cloud-owned fan-out. A retry with the same
     /// source id is idempotent at the backend.
     pub async fn send_notification(
@@ -388,6 +651,47 @@ impl CloudClient {
     }
 }
 
+async fn inspect_local_backup(path: &Path) -> Result<(u64, String), CloudError> {
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| CloudError::Rejected {
+            detail: format!("could not open backup artifact: {error}"),
+        })?;
+    let mut checksum = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| CloudError::Rejected {
+                detail: format!("could not read backup artifact: {error}"),
+            })?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| CloudError::Rejected {
+                detail: "backup artifact size exceeded the supported range".into(),
+            })?;
+        checksum.update(&buffer[..read]);
+    }
+    if bytes == 0 {
+        return Err(CloudError::Rejected {
+            detail: "backup artifact is empty".into(),
+        });
+    }
+    let checksum_sha256 = checksum
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok((bytes, checksum_sha256))
+}
+
 async fn decode_managed_response<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, CloudError> {
@@ -420,7 +724,263 @@ async fn decode_managed_response<T: serde::de::DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    use axum::{
+        body::Body,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        routing::{post, put},
+        Json, Router,
+    };
+    use chrono::Utc;
+    use futures::StreamExt;
+    use serde_json::json;
+
     use super::*;
+
+    async fn managed_chat_stub(
+        State(calls): State<Arc<AtomicUsize>>,
+        Json(request): Json<ManagedAiChatRequest>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let attempt = calls.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"detail": "temporary outage"})),
+            );
+        }
+        (
+            StatusCode::OK,
+            Json(json!({
+                "request_id": request.request_id,
+                "settled_credits": 1,
+                "provider": "test-provider",
+                "model": "test-model",
+                "body": {"id": "completion-1", "choices": []}
+            })),
+        )
+    }
+
+    #[tokio::test]
+    async fn managed_chat_retries_transient_failure_with_the_same_request_id() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping managed-chat retry test: sandbox denied TCP bind");
+                return;
+            }
+            Err(error) => panic!("bind loopback stub: {error}"),
+        };
+        let address = listener.local_addr().expect("stub address");
+        let app = Router::new()
+            .route("/v1/ai/chat/completions", post(managed_chat_stub))
+            .with_state(calls.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve managed AI stub");
+        });
+
+        let client = CloudClient::new(
+            BackendUrl::loopback_development(&format!("http://{address}"))
+                .expect("loopback backend"),
+        )
+        .expect("cloud client");
+        let request_id = Uuid::new_v4();
+        let response = client
+            .managed_ai_chat(
+                "instance-token",
+                &ManagedAiChatRequest {
+                    request_id,
+                    requested_at: Utc::now(),
+                    body: json!({"messages": [{"role": "user", "content": "status?"}]}),
+                },
+            )
+            .await
+            .expect("transient outage recovers");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(response.request_id, request_id);
+        assert_eq!(response.settled_credits, 1);
+    }
+
+    struct BackupStub {
+        origin: String,
+        target_calls: AtomicUsize,
+        upload_calls: AtomicUsize,
+        complete_calls: AtomicUsize,
+        first_upload_bytes: AtomicUsize,
+        successful_upload_bytes: AtomicUsize,
+        expected_upload_bytes: usize,
+        backup_id: Mutex<Option<Uuid>>,
+    }
+
+    async fn backup_target_stub(
+        State(state): State<Arc<BackupStub>>,
+        Json(request): Json<BackupTargetRequest>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let attempt = state.target_calls.fetch_add(1, Ordering::SeqCst);
+        let mut observed = state.backup_id.lock().expect("backup id lock");
+        if let Some(id) = *observed {
+            assert_eq!(id, request.backup_id, "target retry changed backup id");
+        } else {
+            *observed = Some(request.backup_id);
+        }
+        if attempt == 0 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"detail": "target response lost"})),
+            );
+        }
+        (
+            StatusCode::CREATED,
+            Json(json!({
+                "backup_id": request.backup_id,
+                "upload_url": format!("{}/upload", state.origin),
+                "object_key": format!("backups/{}", request.backup_id),
+                "expires_at_millis": Utc::now().timestamp_millis() + 60_000,
+                "headers": {
+                    "content-length": request.estimated_bytes.to_string(),
+                    "x-amz-checksum-sha256": "provider-bound"
+                }
+            })),
+        )
+    }
+
+    async fn backup_upload_stub(
+        State(state): State<Arc<BackupStub>>,
+        headers: HeaderMap,
+        body: Body,
+    ) -> StatusCode {
+        assert_eq!(headers["x-amz-checksum-sha256"], "provider-bound");
+        let attempt = state.upload_calls.fetch_add(1, Ordering::SeqCst);
+        let mut stream = body.into_data_stream();
+        if attempt == 0 {
+            let bytes = match stream.next().await {
+                Some(Ok(bytes)) => bytes.len(),
+                _ => 0,
+            };
+            state.first_upload_bytes.store(bytes, Ordering::SeqCst);
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+
+        let mut received = 0_usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => return StatusCode::BAD_REQUEST,
+            };
+            received = match received.checked_add(chunk.len()) {
+                Some(total) => total,
+                None => return StatusCode::PAYLOAD_TOO_LARGE,
+            };
+        }
+        state
+            .successful_upload_bytes
+            .store(received, Ordering::SeqCst);
+        if received == state.expected_upload_bytes {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_REQUEST
+        }
+    }
+
+    async fn backup_complete_stub(
+        State(state): State<Arc<BackupStub>>,
+        Json(request): Json<BackupCompleted>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        assert_eq!(
+            Some(request.backup_id),
+            *state.backup_id.lock().expect("backup id lock")
+        );
+        if state.complete_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"detail": "completion response lost"})),
+            );
+        }
+        (StatusCode::OK, Json(json!({"state": "complete"})))
+    }
+
+    #[tokio::test]
+    async fn backup_upload_recovers_each_network_boundary_without_changing_identity() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping backup retry test: sandbox denied TCP bind");
+                return;
+            }
+            Err(error) => panic!("bind backup stub: {error}"),
+        };
+        let address = listener.local_addr().expect("backup stub address");
+        let state = Arc::new(BackupStub {
+            origin: format!("http://{address}"),
+            target_calls: AtomicUsize::new(0),
+            upload_calls: AtomicUsize::new(0),
+            complete_calls: AtomicUsize::new(0),
+            first_upload_bytes: AtomicUsize::new(0),
+            successful_upload_bytes: AtomicUsize::new(0),
+            expected_upload_bytes: 8 * 1024 * 1024,
+            backup_id: Mutex::new(None),
+        });
+        let app = Router::new()
+            .route("/v1/backups/target", post(backup_target_stub))
+            .route("/upload", put(backup_upload_stub))
+            .route("/v1/backups/complete", post(backup_complete_stub))
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve backup stub");
+        });
+        let temp = tempfile::tempdir().expect("backup tempdir");
+        let artifact_path = temp.path().join("backup.sql.gz");
+        tokio::fs::write(&artifact_path, vec![0x5a; state.expected_upload_bytes])
+            .await
+            .expect("write backup fixture");
+        let client = CloudClient::new(
+            BackendUrl::loopback_development(&format!("http://{address}"))
+                .expect("loopback backup backend"),
+        )
+        .expect("cloud client");
+        let backup_id = Uuid::new_v4();
+
+        let target = client
+            .upload_backup_file(
+                "instance-token",
+                Uuid::new_v4(),
+                backup_id,
+                "postgres/main".into(),
+                BackupArtifact {
+                    engine: temps_cloud_protocol::BackupEngine::Postgres,
+                    format: temps_cloud_protocol::BackupFormat::PgDumpPlain,
+                    compression: temps_cloud_protocol::BackupCompression::Gzip,
+                    postgres_major: 18,
+                },
+                &artifact_path,
+            )
+            .await
+            .expect("backup survives transient target, PUT and completion failures");
+
+        assert_eq!(Some(target.backup_id), *state.backup_id.lock().unwrap());
+        assert_eq!(target.backup_id, backup_id);
+        assert_eq!(state.target_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.upload_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.complete_calls.load(Ordering::SeqCst), 2);
+        let interrupted_bytes = state.first_upload_bytes.load(Ordering::SeqCst);
+        assert!(
+            interrupted_bytes > 0 && interrupted_bytes < state.expected_upload_bytes,
+            "the injected outage must interrupt a live stream, not wait for the whole file"
+        );
+        assert_eq!(
+            state.successful_upload_bytes.load(Ordering::SeqCst),
+            state.expected_upload_bytes,
+            "the retry must reopen and stream the complete artifact"
+        );
+    }
 
     #[test]
     fn only_transient_failures_are_retryable() {

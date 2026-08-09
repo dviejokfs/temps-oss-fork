@@ -32,8 +32,12 @@ pub use messages::{
     BackupArtifact, BackupCompleted, BackupCompression, BackupEngine, BackupFormat, BackupTarget,
     BackupTargetRequest, EnrollRequest, EnrollResponse, Envelope, Heartbeat, HeartbeatAck,
     IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability,
-    ManagedAiCitation, ManagedAiEvidence, ManagedAiTask, ManagedNotificationAccepted,
-    ManagedNotificationRequest, ManagedNotificationSeverity, SpanRecord, TelemetryBatch,
+    ManagedAiChatRequest, ManagedAiChatResponse, ManagedAiCitation, ManagedAiEvidence,
+    ManagedAiTask, ManagedNotificationAccepted, ManagedNotificationRequest,
+    ManagedNotificationSeverity, NativeSnapshot, NativeSnapshotIdentity,
+    NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind, NativeSnapshotRequest, SpanRecord,
+    TelemetryBatch, WalGObjectCompleted, WalGObjectDeclaration, WalGObjectKind, WalGObjectTarget,
+    WalGObjectTargetRequest, WalGSnapshot, WalGSnapshotCompleted, WalGSnapshotRequest,
 };
 
 use serde::{Deserialize, Serialize};

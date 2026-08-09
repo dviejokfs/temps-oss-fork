@@ -1,4 +1,4 @@
-use crate::engines::dispatch::{resolve_engine_key, ResolveEngineError};
+use crate::engines::dispatch::{container_has_walg, resolve_engine_key, ResolveEngineError};
 use crate::handlers::audit::{
     AuditContext, BackupDeletedAudit, BackupRetentionCleanupAudit, BackupRunAudit,
     BackupScheduleStatusChangedAudit, BackupScheduleUpdatedAudit, ExternalServiceBackupRunAudit,
@@ -38,7 +38,6 @@ impl From<ResolveEngineError> for Problem {
                 .with_title("Unsupported Service Type")
                 .with_detail(error.to_string()),
             ResolveEngineError::WalgProbeFailed { .. } => {
-                // Probe failure is non-fatal: caller should retry or fall back.
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Engine Detection Failed")
                     .with_detail(error.to_string())
@@ -144,6 +143,7 @@ impl From<BackupError> for Problem {
         enable_backup_schedule,
         update_backup_schedule,
         run_external_service_backup,
+        get_external_service_backup_capability,
         list_backup_alerts,
         list_schedule_services,
         attach_schedule_services,
@@ -163,6 +163,7 @@ impl From<BackupError> for Problem {
             BackupScheduleResponse,
             BackupResponse,
             ExternalServiceSummary,
+            ExternalServiceBackupCapabilityResponse,
             ExternalServiceBackupResponse,
             SourceBackupIndexResponse,
             SourceBackupEntry,
@@ -1286,7 +1287,114 @@ pub fn configure_routes() -> Router<Arc<BackupAppState>> {
             "/backups/external-services/{id}/run",
             post(run_external_service_backup),
         )
+        .route(
+            "/backups/external-services/{id}/capability",
+            get(get_external_service_backup_capability),
+        )
         .route("/backups/alerts", get(list_backup_alerts))
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ExternalServiceBackupCapabilityResponse {
+    /// Whether this running service can produce the physical WAL-G repository
+    /// required by Temps Cloud. Logical dump fallback is intentionally not
+    /// considered compatible.
+    pub cloud_backup_compatible: bool,
+    pub wal_g_installed: bool,
+    pub engine: String,
+    pub reason: Option<String>,
+    pub remediation: Option<String>,
+    pub recommended_image: Option<String>,
+}
+
+fn postgres_backup_capability(
+    service_name: &str,
+    topology: &str,
+    wal_g_installed: bool,
+) -> ExternalServiceBackupCapabilityResponse {
+    if wal_g_installed || topology == "cluster" {
+        return ExternalServiceBackupCapabilityResponse {
+            cloud_backup_compatible: true,
+            wal_g_installed: true,
+            engine: if topology == "cluster" {
+                "postgres_cluster"
+            } else {
+                "postgres_walg"
+            }
+            .into(),
+            reason: None,
+            remediation: None,
+            recommended_image: None,
+        };
+    }
+    ExternalServiceBackupCapabilityResponse {
+        cloud_backup_compatible: false,
+        wal_g_installed: false,
+        engine: "postgres_pgdump".into(),
+        reason: Some(format!(
+            "PostgreSQL service '{}' cannot create the WAL-G base backup and WAL archive required by Temps Cloud.",
+            service_name
+        )),
+        remediation: Some(
+            "Local pg_dump backups remain available. Upgrade the service to a Temps PostgreSQL WAL-G image, then run a new backup to enable Cloud mirroring and PITR."
+                .into(),
+        ),
+        recommended_image: Some("gotempsh/postgres-walg:18-bookworm".into()),
+    }
+}
+
+/// Report whether an existing service can produce a Cloud-restorable backup.
+///
+/// This probes the running container instead of trusting its configured image
+/// name: operators can build their own WAL-G image, and an image label alone
+/// cannot prove that the binary is actually executable.
+#[utoipa::path(
+    tag = "Backups",
+    get,
+    path = "/backups/external-services/{id}/capability",
+    responses(
+        (status = 200, description = "Cloud backup compatibility", body = ExternalServiceBackupCapabilityResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 404, description = "External service not found", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_external_service_backup_capability(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<BackupAppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BackupsRead);
+    let service = app_state.backup_service.get_external_service(id).await?;
+    if service.service_type != "postgres" {
+        return Ok(Json(ExternalServiceBackupCapabilityResponse {
+            cloud_backup_compatible: false,
+            wal_g_installed: false,
+            engine: "unsupported".into(),
+            reason: Some(format!(
+                "Cloud physical backup compatibility is currently available only for PostgreSQL; service {} is {}.",
+                id, service.service_type
+            )),
+            remediation: None,
+            recommended_image: None,
+        }));
+    }
+    let installed = if service.topology == "cluster" {
+        true
+    } else {
+        match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => container_has_walg(&docker, &format!("postgres-{}", service.name)).await,
+            Err(error) => {
+                tracing::warn!(service_id = id, %error, "Could not probe WAL-G capability");
+                false
+            }
+        }
+    };
+    Ok(Json(postgres_backup_capability(
+        &service.name,
+        &service.topology,
+        installed,
+    )))
 }
 
 /// List all S3 sources
@@ -2859,4 +2967,42 @@ ORDER BY a.opened_at DESC
         .collect();
 
     Ok(Json(BackupAlertListResponse { alerts }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::postgres_backup_capability;
+
+    #[test]
+    fn existing_postgres_without_walg_is_actionably_incompatible() {
+        let capability = postgres_backup_capability("legacy-db", "standalone", false);
+        assert!(!capability.cloud_backup_compatible);
+        assert!(!capability.wal_g_installed);
+        assert_eq!(capability.engine, "postgres_pgdump");
+        assert!(capability
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("legacy-db")));
+        assert!(capability
+            .remediation
+            .as_deref()
+            .is_some_and(|remediation| remediation.contains("Upgrade")));
+        assert_eq!(
+            capability.recommended_image.as_deref(),
+            Some("gotempsh/postgres-walg:18-bookworm")
+        );
+    }
+
+    #[test]
+    fn probed_walg_and_managed_clusters_are_compatible() {
+        for capability in [
+            postgres_backup_capability("db", "standalone", true),
+            postgres_backup_capability("ha", "cluster", false),
+        ] {
+            assert!(capability.cloud_backup_compatible);
+            assert!(capability.wal_g_installed);
+            assert!(capability.reason.is_none());
+            assert!(capability.remediation.is_none());
+        }
+    }
 }

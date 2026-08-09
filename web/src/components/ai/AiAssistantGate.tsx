@@ -1,4 +1,4 @@
-import { listProviderKeys } from '@/api/client'
+import { getCloudStatus, listProviderKeys } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
@@ -26,9 +26,19 @@ export function AiAssistantGate({
     staleTime: 60_000,
     retry: false,
   })
+  const cloud = useQuery({
+    queryKey: ['cloudStatus', 'ai'],
+    queryFn: async () => (await getCloudStatus()).data,
+    staleTime: 15_000,
+    retry: false,
+  })
 
-  if (providers.isPending) return <AiDockSkeleton onClose={onClose} />
-  if (!(providers.data ?? []).some((key) => key.is_active)) {
+  if (providers.isPending || cloud.isPending) {
+    return <AiDockSkeleton onClose={onClose} />
+  }
+  const hasLocalProvider = (providers.data ?? []).some((key) => key.is_active)
+  const hasManagedProvider = cloud.data?.status === 'linked'
+  if (!hasLocalProvider && !hasManagedProvider) {
     return <CloudAiEmptyState onClose={onClose} />
   }
   return children

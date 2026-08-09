@@ -45,7 +45,10 @@ impl TempsPlugin for AiGatewayPlugin {
                 Arc::new(ProviderKeyService::new(db.clone(), encryption_service));
             context.register_service(provider_key_service.clone());
 
-            let gateway_service = Arc::new(GatewayService::new(provider_key_service.clone()));
+            let gateway_service = Arc::new(
+                GatewayService::new(provider_key_service.clone())
+                    .with_cloud_link(context.get_service::<temps_cloud_client::CloudLink>()),
+            );
             context.register_service(gateway_service.clone());
 
             // ADR-022: register the general AI foundation so any feature can get

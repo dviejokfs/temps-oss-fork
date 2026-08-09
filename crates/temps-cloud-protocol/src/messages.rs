@@ -159,6 +159,10 @@ pub struct IngestAck {
 pub enum BackupEngine {
     Postgres,
     TimescaleDb,
+    MongoDb,
+    Redis,
+    MariaDb,
+    RustFs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,12 +170,184 @@ pub enum BackupEngine {
 pub enum BackupFormat {
     /// Plain SQL produced by `pg_dump` or `pg_dumpall` and restored with psql.
     PgDumpPlain,
+    /// A physical WAL-G repository snapshot: one completed base backup plus
+    /// the WAL interval needed to make it consistent and PITR-capable.
+    WalGRepository,
+    /// A `mongodump --archive` stream stored as immutable repository objects.
+    MongoDumpArchive,
+    /// A Redis RDB snapshot produced with `redis-cli --rdb`.
+    RedisRdb,
+    /// A physical `mariadb-backup --stream=mbstream` snapshot.
+    MariaDbPhysical,
+    /// An immutable set of object-store objects and their checksums.
+    ObjectSet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackupCompression {
+    None,
     Gzip,
+    /// Compression is owned by WAL-G per repository object. The snapshot is
+    /// not wrapped in another archive by Temps.
+    WalGNative,
+}
+
+/// Engine-specific identity required to prove that a native snapshot can be
+/// restored. This is tagged on the wire so Cloud never has to infer an engine
+/// from a source label or file name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NativeSnapshotIdentity {
+    PostgresWalG {
+        postgres_major: u16,
+        postgres_system_identifier: String,
+        backup_name: String,
+        timeline: u32,
+        start_lsn: String,
+        finish_lsn: String,
+    },
+    MongoDbStream {
+        engine_version: String,
+        backup_name: String,
+    },
+    RedisRdbStream {
+        engine_version: String,
+        backup_name: String,
+    },
+    MariaDbPhysical {
+        engine_version: String,
+        backup_name: String,
+        /// Present when binary logging was enabled at base-backup time.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        binlog_file: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        binlog_position: Option<u64>,
+    },
+    ObjectSet {
+        snapshot_name: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSnapshotObjectKind {
+    BaseBackup,
+    Sentinel,
+    Wal,
+    Metadata,
+    Data,
+    Binlog,
+    Object,
+}
+
+/// One immutable object in a native snapshot. Objects are uploaded directly
+/// from the self-hosted instance to Cloud object storage; the API only issues
+/// targets and records independently verified checksums.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSnapshotObjectDeclaration {
+    pub relative_key: String,
+    pub kind: NativeSnapshotObjectKind,
+    pub bytes: u64,
+    pub checksum_sha256: String,
+}
+
+/// Engine-neutral registration envelope for physical/native backups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSnapshotRequest {
+    pub backup_id: Uuid,
+    pub instance_id: Uuid,
+    pub source: String,
+    pub engine: BackupEngine,
+    pub format: BackupFormat,
+    pub compression: BackupCompression,
+    pub identity: NativeSnapshotIdentity,
+    pub objects: Vec<NativeSnapshotObjectDeclaration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSnapshot {
+    pub backup_id: Uuid,
+    pub upload_required: bool,
+    pub declared_objects: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalGObjectKind {
+    BaseBackup,
+    Sentinel,
+    Wal,
+    Metadata,
+}
+
+/// One immutable object declared by a completed WAL-G snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGObjectDeclaration {
+    /// Path relative to the repository root. Absolute paths, parent
+    /// traversal, empty segments and backslashes are rejected by Cloud.
+    pub relative_key: String,
+    pub kind: WalGObjectKind,
+    pub bytes: u64,
+    /// Hex SHA-256 computed by streaming the source object once. Cloud binds
+    /// it into the presigned PUT; the subsequent upload is a second bounded-
+    /// memory stream and never requires a local staging file.
+    pub checksum_sha256: String,
+}
+
+/// Register a physical PostgreSQL snapshot before mirroring its objects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGSnapshotRequest {
+    pub backup_id: Uuid,
+    pub instance_id: Uuid,
+    pub source: String,
+    pub engine: BackupEngine,
+    pub postgres_major: u16,
+    pub postgres_system_identifier: String,
+    /// Exact name returned by `wal-g backup-list`, never `LATEST`.
+    pub backup_name: String,
+    pub timeline: u32,
+    pub start_lsn: String,
+    pub finish_lsn: String,
+    pub objects: Vec<WalGObjectDeclaration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGSnapshot {
+    pub backup_id: Uuid,
+    pub upload_required: bool,
+    pub declared_objects: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGObjectTargetRequest {
+    pub backup_id: Uuid,
+    pub instance_id: Uuid,
+    pub relative_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGObjectTarget {
+    pub backup_id: Uuid,
+    pub relative_key: String,
+    pub upload_required: bool,
+    pub upload_url: String,
+    pub expires_at_millis: i64,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGObjectCompleted {
+    pub backup_id: Uuid,
+    pub relative_key: String,
+    pub bytes: u64,
+    pub checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGSnapshotCompleted {
+    pub backup_id: Uuid,
 }
 
 /// Machine-readable restore contract for one backup object.
@@ -193,6 +369,9 @@ pub struct BackupArtifact {
 /// a throughput bottleneck.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupTargetRequest {
+    /// Client-generated idempotency key. Retrying target creation after a lost
+    /// response must resolve to the same object instead of creating an orphan.
+    pub backup_id: Uuid,
     pub instance_id: Uuid,
     /// What is being backed up, e.g. a service or database name.
     pub source: String,
@@ -207,6 +386,12 @@ pub struct BackupTargetRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupTarget {
     pub backup_id: Uuid,
+    /// False when the same client-generated backup id was already completed.
+    /// This makes recovery after a lost completion response safe: the instance
+    /// records success without rewriting an object that may already have been
+    /// restore-verified.
+    #[serde(default = "default_true")]
+    pub upload_required: bool,
     /// Presigned PUT destination, scoped to this object key alone.
     pub upload_url: String,
     pub object_key: String,
@@ -215,6 +400,10 @@ pub struct BackupTarget {
     /// exact values; notably the provider-verified content checksum.
     #[serde(default)]
     pub headers: std::collections::BTreeMap<String, String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Instance reports the upload finished. Until this arrives the object is not
@@ -296,6 +485,27 @@ pub struct ManagedAiCapability {
     pub inference_region: Option<String>,
     pub reason: Option<String>,
     pub setup_path: String,
+}
+
+/// One OpenAI-compatible completion proxied by Cloud for a connected OSS
+/// instance. The body remains opaque at the control-plane protocol layer so
+/// OpenAI-compatible additive fields do not require a protocol-version bump.
+/// Cloud still validates its encoded size, message shape, and streaming mode
+/// before forwarding it to the deployment-approved provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiChatRequest {
+    pub request_id: Uuid,
+    pub requested_at: chrono::DateTime<chrono::Utc>,
+    pub body: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiChatResponse {
+    pub request_id: Uuid,
+    pub settled_credits: u64,
+    pub provider: String,
+    pub model: String,
+    pub body: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +710,7 @@ mod tests {
     #[test]
     fn backup_restore_contract_uses_stable_wire_names() {
         let request = BackupTargetRequest {
+            backup_id: Uuid::new_v4(),
             instance_id: Uuid::new_v4(),
             source: "timescaledb/telemetry".into(),
             estimated_bytes: 42,
@@ -517,5 +728,77 @@ mod tests {
         assert_eq!(value["artifact"]["format"], "pg_dump_plain");
         assert_eq!(value["artifact"]["compression"], "gzip");
         assert_eq!(value["artifact"]["postgres_major"], 18);
+    }
+
+    #[test]
+    fn walg_snapshot_contract_preserves_repository_identity() {
+        let request = WalGSnapshotRequest {
+            backup_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            source: "postgres/main".into(),
+            engine: BackupEngine::Postgres,
+            postgres_major: 18,
+            postgres_system_identifier: "758329011337".into(),
+            backup_name: "base_00000001000000000000000A".into(),
+            timeline: 1,
+            start_lsn: "0/A000028".into(),
+            finish_lsn: "0/B000090".into(),
+            objects: vec![WalGObjectDeclaration {
+                relative_key:
+                    "basebackups_005/base_00000001000000000000000A_backup_stop_sentinel.json".into(),
+                kind: WalGObjectKind::Sentinel,
+                bytes: 512,
+                checksum_sha256: "00".repeat(32),
+            }],
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["engine"], "postgres");
+        assert_eq!(value["objects"][0]["kind"], "sentinel");
+        assert_eq!(value["timeline"], 1);
+    }
+
+    #[test]
+    fn native_mongodb_snapshot_has_a_tagged_restore_identity() {
+        let request = NativeSnapshotRequest {
+            backup_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            source: "mongodb/primary".into(),
+            engine: BackupEngine::MongoDb,
+            format: BackupFormat::MongoDumpArchive,
+            compression: BackupCompression::WalGNative,
+            identity: NativeSnapshotIdentity::MongoDbStream {
+                engine_version: "8.0.12".into(),
+                backup_name: "mongo-2026-08-08T10:00:00Z".into(),
+            },
+            objects: vec![NativeSnapshotObjectDeclaration {
+                relative_key: "streams/mongodb.archive.lz4".into(),
+                kind: NativeSnapshotObjectKind::Data,
+                bytes: 1_024,
+                checksum_sha256: "ab".repeat(32),
+            }],
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["engine"], "mongo_db");
+        assert_eq!(value["format"], "mongo_dump_archive");
+        assert_eq!(value["identity"]["kind"], "mongo_db_stream");
+        assert_eq!(value["objects"][0]["kind"], "data");
+    }
+
+    #[test]
+    fn native_snapshot_wire_names_cover_all_new_engines() {
+        let cases = [
+            (BackupEngine::Redis, "redis"),
+            (BackupEngine::MariaDb, "maria_db"),
+            (BackupEngine::RustFs, "rust_fs"),
+        ];
+
+        for (engine, expected) in cases {
+            assert_eq!(serde_json::to_value(engine).unwrap(), expected);
+        }
+        assert_eq!(
+            serde_json::to_value(BackupFormat::ObjectSet).unwrap(),
+            "object_set"
+        );
     }
 }

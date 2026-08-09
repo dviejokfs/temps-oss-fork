@@ -14,14 +14,17 @@
 //! application. So it takes `&self`, returns `()`, and the worst it can do is
 //! silently... no: the worst it can do is *count a drop the operator can see*.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 use tokio::sync::mpsc;
 
 use temps_cloud_protocol::{
-    ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability,
-    ManagedNotificationAccepted, ManagedNotificationRequest, SpanRecord,
+    BackupArtifact, BackupTarget, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
+    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedNotificationAccepted,
+    ManagedNotificationRequest, NativeSnapshot, NativeSnapshotRequest, SpanRecord,
+    WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
+    WalGSnapshotCompleted, WalGSnapshotRequest,
 };
 use uuid::Uuid;
 
@@ -198,6 +201,14 @@ impl CloudLink {
             .map(|s| s.instance_id)
     }
 
+    pub fn tenant_id(&self) -> Option<Uuid> {
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|state| state.tenant_id)
+    }
+
     pub fn account_email(&self) -> Option<String> {
         self.state
             .read()
@@ -347,6 +358,124 @@ impl CloudLink {
             .await
     }
 
+    pub async fn managed_ai_chat(
+        &self,
+        request: &ManagedAiChatRequest,
+    ) -> Result<ManagedAiChatResponse, CloudError> {
+        let (base_url, token) = self.linked_credential()?;
+        let backend = self.parse_backend(&base_url)?;
+        CloudClient::new(backend)?
+            .managed_ai_chat(&token, request)
+            .await
+    }
+
+    /// Upload a completed local artifact without ever routing its bytes through
+    /// the Cloud API process. The instance credential is read only for the two
+    /// small lifecycle calls around the direct object-storage PUT.
+    pub async fn upload_backup_file(
+        &self,
+        backup_id: Uuid,
+        source: String,
+        artifact: BackupArtifact,
+        path: &Path,
+    ) -> Result<BackupTarget, CloudError> {
+        let (base_url, token, instance_id) = self.linked_backup_credential()?;
+        let backend = self.parse_backend(&base_url)?;
+        CloudClient::new(backend)?
+            .upload_backup_file(&token, instance_id, backup_id, source, artifact, path)
+            .await
+    }
+
+    fn walg_client(&self) -> Result<(CloudClient, String, Uuid), CloudError> {
+        let (base_url, token, instance_id) = self.linked_backup_credential()?;
+        let backend = self.parse_backend(&base_url)?;
+        Ok((CloudClient::new(backend)?, token, instance_id))
+    }
+
+    pub async fn declare_walg_snapshot(
+        &self,
+        request: &WalGSnapshotRequest,
+    ) -> Result<WalGSnapshot, CloudError> {
+        let (client, token, instance_id) = self.walg_client()?;
+        if request.instance_id != instance_id {
+            return Err(CloudError::Rejected {
+                detail: "WAL-G snapshot instance_id does not match this Cloud link".into(),
+            });
+        }
+        client.declare_walg_snapshot(&token, request).await
+    }
+
+    pub async fn declare_native_snapshot(
+        &self,
+        request: &NativeSnapshotRequest,
+    ) -> Result<NativeSnapshot, CloudError> {
+        let (client, token, instance_id) = self.walg_client()?;
+        if request.instance_id != instance_id {
+            return Err(CloudError::Rejected {
+                detail: "native snapshot instance_id does not match this Cloud link".into(),
+            });
+        }
+        client.declare_native_snapshot(&token, request).await
+    }
+
+    pub async fn native_object_target(
+        &self,
+        request: &WalGObjectTargetRequest,
+    ) -> Result<WalGObjectTarget, CloudError> {
+        let (client, token, instance_id) = self.walg_client()?;
+        if request.instance_id != instance_id {
+            return Err(CloudError::Rejected {
+                detail: "native object instance_id does not match this Cloud link".into(),
+            });
+        }
+        client.native_object_target(&token, request).await
+    }
+
+    pub async fn complete_native_object(
+        &self,
+        completion: &WalGObjectCompleted,
+    ) -> Result<(), CloudError> {
+        let (client, token, _) = self.walg_client()?;
+        client.complete_native_object(&token, completion).await
+    }
+
+    pub async fn complete_native_snapshot(
+        &self,
+        completion: &WalGSnapshotCompleted,
+    ) -> Result<(), CloudError> {
+        let (client, token, _) = self.walg_client()?;
+        client.complete_native_snapshot(&token, completion).await
+    }
+
+    pub async fn walg_object_target(
+        &self,
+        request: &WalGObjectTargetRequest,
+    ) -> Result<WalGObjectTarget, CloudError> {
+        let (client, token, instance_id) = self.walg_client()?;
+        if request.instance_id != instance_id {
+            return Err(CloudError::Rejected {
+                detail: "WAL-G object instance_id does not match this Cloud link".into(),
+            });
+        }
+        client.walg_object_target(&token, request).await
+    }
+
+    pub async fn complete_walg_object(
+        &self,
+        completion: &WalGObjectCompleted,
+    ) -> Result<(), CloudError> {
+        let (client, token, _) = self.walg_client()?;
+        client.complete_walg_object(&token, completion).await
+    }
+
+    pub async fn complete_walg_snapshot(
+        &self,
+        completion: &WalGSnapshotCompleted,
+    ) -> Result<(), CloudError> {
+        let (client, token, _) = self.walg_client()?;
+        client.complete_walg_snapshot(&token, completion).await
+    }
+
     pub async fn send_notification(
         &self,
         request: &ManagedNotificationRequest,
@@ -363,6 +492,13 @@ impl CloudLink {
         let state = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
         let token = state.token.clone().ok_or(CloudError::NotEnrolled)?;
         Ok((state.base_url.clone(), token))
+    }
+
+    fn linked_backup_credential(&self) -> Result<(String, String, Uuid), CloudError> {
+        let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
+        let state = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
+        let token = state.token.clone().ok_or(CloudError::NotEnrolled)?;
+        Ok((state.base_url.clone(), token, state.instance_id))
     }
 
     /// Forget the credential. Keeps the instance identity so re-linking later

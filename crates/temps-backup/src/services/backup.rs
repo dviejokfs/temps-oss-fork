@@ -1134,71 +1134,52 @@ impl BackupService {
         // Generate unique backup ID
         let backup_id = Uuid::new_v4().to_string();
 
-        // Create S3 client (needed for metadata upload and legacy fallback)
+        // Create S3 client for the portable OSS fallback.
         let s3_client = self.create_s3_client(&s3_source).await?;
 
-        // Try WAL-G backup first (requires the internal DB container to have WAL-G installed).
-        // Falls back to pg_dump sidecar if the DB is not running in a Docker container we can exec into.
-        let (s3_location, size_bytes, compression_type) =
-            match self.backup_postgres_walg(&s3_source, &backup_id).await {
-                Ok((location, size)) => {
-                    info!("WAL-G backup completed: {}", location);
-                    (location, size, "lz4".to_string())
+        // WAL-G is preferred because it supports PITR and streams directly to
+        // object storage. OSS remains usable with arbitrary PostgreSQL images,
+        // so a local-only pg_dump artifact is still a supported fallback. The
+        // Cloud mirror deliberately rejects that fallback and explains that a
+        // WAL-G-capable image is required for managed backups.
+        let (s3_location, size_bytes, compression_type) = match self
+            .backup_postgres_walg(&s3_source, &backup_id)
+            .await
+        {
+            Ok((location, size)) => {
+                info!("WAL-G backup completed: {}", location);
+                (location, size, "lz4".to_string())
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "WAL-G unavailable; creating a local OSS pg_dump backup that will not be mirrored to Cloud"
+                );
+                let mut temp_file = NamedTempFile::new().map_err(BackupError::Io)?;
+                self.backup_postgres_database(&mut temp_file).await?;
+                let size_bytes = temp_file
+                    .as_file()
+                    .metadata()
+                    .map_err(BackupError::Io)?
+                    .len() as i64;
+                if size_bytes == 0 {
+                    return Err(BackupError::Validation(
+                        "Backup failed: pg_dump produced an empty artifact".to_string(),
+                    ));
                 }
-                Err(e) => {
-                    // WAL-G not available (e.g., DB on localhost, no Docker container found).
-                    // Fall back to pg_dump sidecar approach.
-                    warn!(
-                        "WAL-G backup not available ({}), falling back to pg_dump sidecar",
-                        e
-                    );
-
-                    let mut temp_file = NamedTempFile::new().map_err(BackupError::Io)?;
-
-                    self.backup_postgres_database(&mut temp_file)
-                        .await
-                        .map_err(|e| {
-                            error!(
-                                "Database backup failed for S3 source {}: {}",
-                                s3_source_id, e
-                            );
-                            e
-                        })?;
-
-                    let size_bytes = temp_file
-                        .as_file()
-                        .metadata()
-                        .map_err(BackupError::Io)?
-                        .len() as i64;
-
-                    if size_bytes == 0 {
-                        return Err(BackupError::Validation(
-                            "Backup failed: backup file has zero size".to_string(),
-                        ));
-                    }
-
-                    let s3_location = build_s3_key(
-                        &s3_source.bucket_path,
-                        &format!(
-                            "backups/{}/{}/backup.sql.gz",
-                            Utc::now().format("%Y/%m/%d"),
-                            backup_id
-                        ),
-                    );
-
-                    self.upload_backup(&s3_client, &s3_source, &temp_file, &s3_location)
-                        .await
-                        .map_err(|e| {
-                            error!(
-                                "Failed to upload backup to S3 source {} at {}: {}",
-                                s3_source_id, s3_location, e
-                            );
-                            e
-                        })?;
-
-                    (s3_location, size_bytes, "gzip".to_string())
-                }
-            };
+                let s3_location = build_s3_key(
+                    &s3_source.bucket_path,
+                    &format!(
+                        "backups/{}/{}/backup.sql.gz",
+                        Utc::now().format("%Y/%m/%d"),
+                        backup_id
+                    ),
+                );
+                self.upload_backup(&s3_client, &s3_source, &temp_file, &s3_location)
+                    .await?;
+                (s3_location, size_bytes, "gzip".to_string())
+            }
+        };
 
         // Create backup record
         let new_backup = temps_entities::backups::ActiveModel {

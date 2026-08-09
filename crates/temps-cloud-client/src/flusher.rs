@@ -136,7 +136,7 @@ mod tests {
         received: Arc<AtomicUsize>,
     }
 
-    async fn serve(stub: Stub) -> String {
+    async fn serve(stub: Stub) -> Option<String> {
         let app = Router::new()
             .route(
                 "/v1/enroll",
@@ -178,16 +178,23 @@ mod tests {
                 ),
             )
             .with_state(stub);
-        let listener = tokio::net::TcpListener::bind::<SocketAddr>(
+        let listener = match tokio::net::TcpListener::bind::<SocketAddr>(
             "127.0.0.1:0".parse().expect("loopback address must parse"),
         )
         .await
-        .expect("test server must bind");
+        {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping flusher network test: sandbox denied TCP bind");
+                return None;
+            }
+            Err(error) => panic!("test server must bind: {error}"),
+        };
         let address = listener.local_addr().expect("test server has an address");
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        format!("http://{address}")
+        Some(format!("http://{address}"))
     }
 
     fn span() -> SpanRecord {
@@ -201,9 +208,9 @@ mod tests {
         }
     }
 
-    async fn linked_test_link(stub: Stub) -> (Arc<CloudLink>, tempfile::TempDir) {
+    async fn linked_test_link(stub: Stub) -> Option<(Arc<CloudLink>, tempfile::TempDir)> {
         let directory = tempfile::tempdir().expect("temporary directory must be created");
-        let backend = serve(stub).await;
+        let backend = serve(stub).await?;
         let link = Arc::new(CloudLink::load_for_loopback_development(
             directory.path().to_path_buf(),
             "shutdown-test",
@@ -216,7 +223,7 @@ mod tests {
         link.enroll("shutdown-code")
             .await
             .expect("test link must enroll");
-        (link, directory)
+        Some((link, directory))
     }
 
     async fn cancel_and_join(link: Arc<CloudLink>, timeout: Duration) {
@@ -293,7 +300,9 @@ mod tests {
             status: Arc::new(AtomicU16::new(200)),
             ..Default::default()
         };
-        let (link, _directory) = linked_test_link(stub.clone()).await;
+        let Some((link, _directory)) = linked_test_link(stub.clone()).await else {
+            return;
+        };
         link.record(vec![span()]);
 
         cancel_and_join(link.clone(), Duration::from_secs(1)).await;
@@ -308,7 +317,9 @@ mod tests {
             status: Arc::new(AtomicU16::new(200)),
             ..Default::default()
         };
-        let (link, _directory) = linked_test_link(stub.clone()).await;
+        let Some((link, _directory)) = linked_test_link(stub.clone()).await else {
+            return;
+        };
         stub.status.store(503, Ordering::SeqCst);
         link.record(vec![span()]);
 
@@ -329,7 +340,9 @@ mod tests {
             telemetry_delay_ms: Arc::new(AtomicU64::new(500)),
             ..Default::default()
         };
-        let (link, _directory) = linked_test_link(stub).await;
+        let Some((link, _directory)) = linked_test_link(stub).await else {
+            return;
+        };
         link.record(vec![span()]);
 
         cancel_and_join(link.clone(), Duration::from_millis(20)).await;

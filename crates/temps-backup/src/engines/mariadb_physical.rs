@@ -1,4 +1,5 @@
-//! `MariadbPhysicalEngine`: physical (`mariadb-backup`) base backup of an
+//! `MariadbPhysicalEngine`: WAL-G repository containing a physical
+//! (`mariadb-backup`) base backup of an
 //! external MariaDB service, implemented against `engine_v2::BackupEngine`.
 //!
 //! This is the **PITR** engine — the MariaDB analog of `postgres_walg`.
@@ -19,44 +20,29 @@
 //! ## Flow
 //! 1. Load + decrypt the external-service row for the root password.
 //! 2. Validate the configured S3 source.
-//! 3. `docker exec mariadb-backup --backup --stream=mbstream | gzip` inside the
-//!    running container, streaming the gzipped stream to a host temp file.
-//!    Credentials travel via `MYSQL_PWD` env — never argv (PR #149).
-//! 4. Verify success via the `"completed OK!"` stderr marker (the container's
-//!    `/bin/sh` is dash, which has no `pipefail`, so the pipeline exit code is
-//!    gzip's, not `mariadb-backup`'s).
-//! 5. Parse the binlog position from stderr.
-//! 6. Upload the `.mbstream.gz` to S3 and write `metadata.json` with the coords.
+//! 3. `docker exec wal-g backup-push` inside the running container. WAL-G runs
+//!    `mariadb-backup --stream=mbstream` and uploads the stream directly to S3.
+//!    No database-sized host file is created.
+//! 4. Parse the binlog position from the bounded WAL-G/mariadb-backup output.
+//! 5. Write `metadata.json` with the coordinates and exact backup identity.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use aws_sdk_s3::Client as S3Client;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use super::mariadb_exec::{exec_stream_stdout_to_file, parse_binlog_position};
+use super::mariadb_exec::parse_binlog_position;
+use super::postgres_walg::run_walg_exec;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 const ENGINE_KEY: &str = "mariadb_physical";
-const BASE_FILE_SUFFIX: &str = "base.mbstream.gz";
-
-/// In-container shell that streams a physical base backup to stdout and gzips
-/// it. Credentials are NOT present — `--user=root` relies on `MYSQL_PWD` from
-/// the exec env (libmariadb reads it). Keep it that way (PR #149).
-///
-/// `--target-dir` is a scratch dir mariadb-backup needs even when streaming.
-/// Success is asserted via the `"completed OK!"` stderr marker, since the
-/// pipe-to-gzip masks mariadb-backup's own exit code under dash.
-///
-/// CRITICAL: the `| gzip` must bind to the `mariadb-backup` command, NOT a
-/// trailing statement. In `sh`, `a; b; c | gzip` pipes only `c` to gzip - so
-/// the scratch-dir cleanup runs *before* the backup (rm-then-mkdir) and the
-/// command ends with the gzip pipeline, making stdout the gzipped mbstream.
-const PHYSICAL_SHELL: &str = "if command -v mariadb-backup >/dev/null 2>&1; then BK=mariadb-backup; else BK=mariabackup; fi; \
-     rm -rf /var/tmp/temps-mariadb-backup; mkdir -p /var/tmp/temps-mariadb-backup; \
-     \"$BK\" --backup --stream=mbstream --target-dir=/var/tmp/temps-mariadb-backup --user=root --host=localhost | gzip";
+const WALG_STREAM_CREATE_COMMAND: &str = "sh -ceu 'if command -v mariadb-backup >/dev/null 2>&1; then BK=mariadb-backup; else BK=mariabackup; fi; rm -rf /var/tmp/temps-mariadb-backup; mkdir -p /var/tmp/temps-mariadb-backup; exec \"$BK\" --backup --stream=mbstream --target-dir=/var/tmp/temps-mariadb-backup --user=root --host=127.0.0.1'";
+const WALG_STREAM_RESTORE_COMMAND: &str = "mbstream -x -C /data";
+const WALG_PREPARE_COMMAND: &str = "mariadb-backup --prepare --target-dir=/data";
 
 pub struct MariadbPhysicalDeps {
     pub db: Arc<DatabaseConnection>,
@@ -109,19 +95,21 @@ impl BackupEngine for MariadbPhysicalEngine {
         v2_common::assert_bucket_reachable(&s3_client, &s3_source.bucket_name).await?;
 
         let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
-        let s3_key = v2_common::build_external_service_s3_key(
-            &s3_source.bucket_path,
-            "mariadb",
-            &service.name,
-            &backup_uuid,
-            BASE_FILE_SUFFIX,
-        );
+        let bucket_path = s3_source.bucket_path.trim_matches('/');
+        let service_root = format!("external_services/mariadb/{}/walg", service.name);
+        let repository_key = if bucket_path.is_empty() {
+            service_root
+        } else {
+            format!("{bucket_path}/{service_root}")
+        };
+        let walg_prefix = format!("s3://{}/{}", s3_source.bucket_name, repository_key);
+        let list_prefix = format!("{repository_key}/");
 
         info!(
             backup_id,
             service_id,
-            s3_key = %s3_key,
-            "MariadbPhysicalEngine: starting physical base backup",
+            repository = %walg_prefix,
+            "MariadbPhysicalEngine: starting direct WAL-G physical base backup",
         );
 
         let config_json = deps
@@ -131,78 +119,81 @@ impl BackupEngine for MariadbPhysicalEngine {
         let root_password = root_password_from_config(&config_json);
 
         let container_name = format!("mariadb-{}", service.name);
-        let backup_dir = std::env::temp_dir().join("temps-mariadb-backup");
-        tokio::fs::create_dir_all(&backup_dir)
-            .await
-            .map_err(|e| BackupError::Failed {
-                reason: format!(
-                    "failed to create backup tmpdir {}: {}",
-                    backup_dir.display(),
-                    e
-                ),
+        let access_key = deps
+            .encryption_service
+            .decrypt_string(&s3_source.access_key_id)
+            .map_err(|error| BackupError::PermanentFailure {
+                reason: format!("decrypt MariaDB WAL-G access key: {error}"),
             })?;
-        let host_path = backup_dir.join(format!("{}.mbstream.gz", backup_uuid));
+        let secret_key = deps
+            .encryption_service
+            .decrypt_string(&s3_source.secret_key)
+            .map_err(|error| BackupError::PermanentFailure {
+                reason: format!("decrypt MariaDB WAL-G secret key: {error}"),
+            })?;
+        let container_endpoint = temps_providers::externalsvc::S3Credentials {
+            access_key_id: access_key.clone(),
+            secret_key: secret_key.clone(),
+            region: s3_source.region.clone(),
+            endpoint: s3_source.endpoint.clone(),
+            bucket_name: s3_source.bucket_name.clone(),
+            bucket_path: s3_source.bucket_path.clone(),
+            force_path_style: s3_source.force_path_style.unwrap_or(true),
+        }
+        .resolve_endpoint_for_container(&deps.docker, &container_name)
+        .await;
+        let mut env = build_walg_env(
+            &walg_prefix,
+            &s3_source.region,
+            &access_key,
+            &secret_key,
+            &root_password,
+            &backup_uuid,
+        );
+        if let Some(endpoint) = container_endpoint {
+            env.push(format!(
+                "AWS_ENDPOINT={}",
+                if endpoint.starts_with("http") {
+                    endpoint
+                } else {
+                    format!("http://{endpoint}")
+                }
+            ));
+        }
+        if s3_source.force_path_style.unwrap_or(true) {
+            env.push("AWS_S3_FORCE_PATH_STYLE=true".into());
+        }
 
-        // Credentials via env only (MYSQL_PWD / MARIADB_PWD) — never argv.
-        let env = vec![
-            format!("MYSQL_PWD={}", root_password),
-            format!("MARIADB_PWD={}", root_password),
-        ];
-
-        let exec = match exec_stream_stdout_to_file(
+        let exec = run_walg_exec(
             &deps.docker,
             &container_name,
-            // PHYSICAL_SHELL already ends with `| gzip` on the backup command.
-            PHYSICAL_SHELL,
+            "wal-g backup-push",
             &env,
-            &host_path,
             &ctx.cancel,
         )
-        .await
-        {
-            Ok(e) => e,
-            Err(BackupError::Cancelled) => {
-                v2_common::best_effort_remove(&host_path).await;
-                return Err(BackupError::Cancelled);
-            }
-            Err(e) => {
-                v2_common::best_effort_remove(&host_path).await;
-                return Err(e);
-            }
-        };
-
-        // dash has no pipefail, so the pipeline exit code is gzip's. Assert
-        // mariadb-backup success via its terminal stderr marker instead.
-        if !exec.stderr.contains("completed OK!") {
-            v2_common::best_effort_remove(&host_path).await;
+        .await?;
+        if exec.exit_code != 0 {
             return Err(BackupError::Failed {
                 reason: format!(
-                    "mariadb-backup did not report success (no 'completed OK!'). \
-                     pipeline exit={}. stderr tail: {}",
+                    "MariaDB wal-g backup-push exited with code {}. stderr: {}",
                     exec.exit_code,
                     stderr_tail(&exec.stderr),
                 ),
             });
         }
-
-        let meta = tokio::fs::metadata(&host_path)
-            .await
-            .map_err(|e| BackupError::Failed {
-                reason: format!("base file missing at {}: {}", host_path.display(), e),
-            })?;
-        if meta.len() == 0 {
-            v2_common::best_effort_remove(&host_path).await;
+        let file_size =
+            list_total_s3_size(&s3_client, &s3_source.bucket_name, &list_prefix).await?;
+        if file_size <= 0 {
             return Err(BackupError::Failed {
-                reason: "mariadb-backup produced an empty stream".into(),
+                reason: "MariaDB WAL-G repository contains no backup bytes after backup-push"
+                    .into(),
             });
         }
-        let file_size = meta.len() as i64;
-        let host_path_str = host_path.to_str().unwrap_or("").to_string();
 
         // Binlog coordinates anchor PITR replay. Absence means binary logging
         // is off on the source — the base is still a valid full backup, but
         // PITR will not be possible until binlog archiving is enabled.
-        let coord = parse_binlog_position(&exec.stderr);
+        let coord = parse_binlog_position(&format!("{}\n{}", exec.stdout, exec.stderr));
         match &coord {
             Some(c) => info!(
                 backup_id,
@@ -218,36 +209,19 @@ impl BackupEngine for MariadbPhysicalEngine {
             ),
         }
 
-        if ctx.cancel.is_cancelled() {
-            v2_common::best_effort_remove(&host_path).await;
-            return Err(BackupError::Cancelled);
-        }
-        let tags = v2_common::BackupTags::load_for_backup(&ctx.db, ctx.backup_id).await;
-        v2_common::upload_file(
-            &s3_client,
-            &s3_source.bucket_name,
-            &s3_key,
-            &host_path_str,
-            "application/x-gzip",
-            file_size,
-            Some(&tags),
-        )
-        .await?;
-        v2_common::best_effort_remove(&host_path).await;
-
-        let metadata_key = v2_common::derive_metadata_key(&s3_key);
+        let metadata_key = format!("{list_prefix}{backup_uuid}.metadata.json");
         v2_common::write_metadata_companion(
             &s3_client,
             &s3_source.bucket_name,
             &metadata_key,
             ENGINE_KEY,
             &backup_uuid,
-            &s3_key,
+            &walg_prefix,
             file_size,
             s3_source_id,
-            "gzip",
+            "wal-g-native",
             Some(json!({
-                "backup_tool": "mariadb-backup",
+                "backup_tool": "wal-g+mariadb-backup",
                 "stream_format": "mbstream",
                 "pitr": coord.is_some(),
                 "binlog_file": coord.as_ref().map(|c| c.file.clone()).unwrap_or_default(),
@@ -257,19 +231,20 @@ impl BackupEngine for MariadbPhysicalEngine {
             })),
         )
         .await?;
+        v2_common::record_walg_identity(deps.db.as_ref(), backup_id, &backup_uuid).await?;
 
         info!(
             backup_id,
-            key = %s3_key,
+            repository = %walg_prefix,
             size_bytes = file_size,
             pitr = coord.is_some(),
             "MariadbPhysicalEngine: backup complete",
         );
 
         Ok(BackupOutcome {
-            location: s3_key,
+            location: walg_prefix,
             size_bytes: Some(file_size),
-            compression: "gzip".to_string(),
+            compression: "wal-g-native".to_string(),
         })
     }
 }
@@ -293,6 +268,65 @@ fn root_password_from_config(config_json: &str) -> String {
         .to_string()
 }
 
+fn build_walg_env(
+    prefix: &str,
+    region: &str,
+    access_key: &str,
+    secret_key: &str,
+    root_password: &str,
+    backup_uuid: &str,
+) -> Vec<String> {
+    let mut env = vec![
+        format!("WALG_S3_PREFIX={prefix}"),
+        format!("AWS_ACCESS_KEY_ID={access_key}"),
+        format!("AWS_SECRET_ACCESS_KEY={secret_key}"),
+        format!("AWS_REGION={region}"),
+        format!("MYSQL_PWD={root_password}"),
+        format!("MARIADB_PWD={root_password}"),
+        format!("WALG_MYSQL_DATASOURCE_NAME=root:{root_password}@tcp(127.0.0.1:3306)/mysql"),
+        format!("WALG_STREAM_CREATE_COMMAND={WALG_STREAM_CREATE_COMMAND}"),
+        format!("WALG_STREAM_RESTORE_COMMAND={WALG_STREAM_RESTORE_COMMAND}"),
+        format!("WALG_MYSQL_BACKUP_PREPARE_COMMAND={WALG_PREPARE_COMMAND}"),
+        "WALG_UPLOAD_CONCURRENCY=4".into(),
+        "WALG_UPLOAD_DISK_CONCURRENCY=1".into(),
+        "WALG_UPLOAD_QUEUE=2".into(),
+        "WALG_TAR_SIZE_THRESHOLD=134217728".into(),
+    ];
+    env.extend(v2_common::walg_identity_env(backup_uuid));
+    env
+}
+
+async fn list_total_s3_size(
+    client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<i64, BackupError> {
+    let mut total = 0_i64;
+    let mut continuation = None;
+    loop {
+        let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
+        if let Some(token) = continuation {
+            request = request.continuation_token(token);
+        }
+        let response = request.send().await.map_err(|error| BackupError::Failed {
+            reason: format!("list MariaDB WAL-G repository {prefix}: {error}"),
+        })?;
+        for object in response.contents() {
+            total = total
+                .checked_add(object.size().unwrap_or(0))
+                .ok_or_else(|| BackupError::Failed {
+                    reason: format!("MariaDB WAL-G repository {prefix} size overflowed i64"),
+                })?;
+        }
+        if response.is_truncated().unwrap_or(false) {
+            continuation = response.next_continuation_token().map(str::to_owned);
+        } else {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,17 +334,39 @@ mod tests {
     /// PR #149 invariant: the base-backup shell must not contain credentials.
     /// Connection auth flows through `MYSQL_PWD` in the exec env.
     #[test]
-    fn physical_shell_contains_no_credentials() {
-        // PHYSICAL_SHELL is a const with no interpolation — guard against a
+    fn walg_stream_command_contains_no_credentials() {
+        // The stream command is a const with no interpolation — guard against a
         // future refactor hardcoding a password flag. (We can't assert
         // `!contains("-p")` because `mkdir -p` is a legitimate, benign use.)
-        assert!(!PHYSICAL_SHELL.contains("MYSQL_PWD"));
-        assert!(!PHYSICAL_SHELL.contains("--password"));
+        assert!(!WALG_STREAM_CREATE_COMMAND.contains("MYSQL_PWD"));
+        assert!(!WALG_STREAM_CREATE_COMMAND.contains("--password"));
         // No mysql-style short password flag (`-p<value>` / `-p'...'`).
-        assert!(!PHYSICAL_SHELL.contains("-p'"));
-        assert!(!PHYSICAL_SHELL.contains("-p\""));
-        assert!(PHYSICAL_SHELL.contains("--user=root"));
-        assert!(PHYSICAL_SHELL.contains("--stream=mbstream"));
+        assert!(!WALG_STREAM_CREATE_COMMAND.contains("-p'"));
+        assert!(!WALG_STREAM_CREATE_COMMAND.contains("-p\""));
+        assert!(WALG_STREAM_CREATE_COMMAND.contains("--user=root"));
+        assert!(WALG_STREAM_CREATE_COMMAND.contains("--stream=mbstream"));
+    }
+
+    #[test]
+    fn walg_env_keeps_password_out_of_commands() {
+        let password = "p4ss-word";
+        let env = build_walg_env(
+            "s3://bucket/path",
+            "auto",
+            "access",
+            "secret",
+            password,
+            "id",
+        );
+        let stream = env
+            .iter()
+            .find(|value| value.starts_with("WALG_STREAM_CREATE_COMMAND="))
+            .unwrap();
+        assert!(!stream.contains(password));
+        assert!(env
+            .iter()
+            .any(|value| value == &format!("MYSQL_PWD={password}")));
+        assert!(env.iter().any(|value| value.contains("root:p4ss-word@tcp")));
     }
 
     #[test]

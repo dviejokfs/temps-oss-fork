@@ -184,16 +184,16 @@ export function useServiceTypePreset(
 }
 
 // -----------------------------------------------------------------------------
-// MariaDB preset — official MariaDB LTS image + custom.
+// MariaDB preset — managed WAL-G image + custom.
 // -----------------------------------------------------------------------------
 
-const MARIADB_MANAGED_IMAGE = 'mariadb:lts'
+const MARIADB_MANAGED_IMAGE = 'gotempsh/mariadb-walg:11.4'
 
 const MARIADB_OPTIONS: PresetOption[] = [
   {
     id: 'managed',
-    title: 'MariaDB LTS',
-    subtitle: 'Official image',
+    title: 'MariaDB 11.4',
+    subtitle: 'Managed + WAL-G',
     value: MARIADB_MANAGED_IMAGE,
   },
   {

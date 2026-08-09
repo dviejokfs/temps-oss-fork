@@ -21,7 +21,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 const MARIADB_INTERNAL_PORT: &str = "3306";
-const DEFAULT_MARIADB_IMAGE: &str = "mariadb:lts";
+const DEFAULT_MARIADB_IMAGE: &str = "gotempsh/mariadb-walg:11.4";
 const MIN_PASSWORD_LENGTH: usize = 8;
 const MARIADB_BACKUP_EXEC_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 const MARIADB_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -4325,8 +4325,8 @@ mod tests {
     #[test]
     fn test_default_docker_image_constant() {
         // The default image tag the service provisions with.
-        assert_eq!(default_docker_image(), "mariadb:lts");
-        assert_eq!(DEFAULT_MARIADB_IMAGE, "mariadb:lts");
+        assert_eq!(default_docker_image(), "gotempsh/mariadb-walg:11.4");
+        assert_eq!(DEFAULT_MARIADB_IMAGE, "gotempsh/mariadb-walg:11.4");
     }
 
     // ── Address / env-var routing (parity with Postgres) ────────────────────

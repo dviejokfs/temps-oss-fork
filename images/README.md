@@ -13,6 +13,7 @@ repo screenshots and media live in [`assets/`](../assets/).
 | `postgres-ha/` | `gotempsh/postgres-ha` | PostgreSQL high-availability cluster image |
 | `redis-walg/` | `gotempsh/redis-walg` | Redis with WAL-G-based backups |
 | `mongodb-walg/` | `gotempsh/mongodb-walg` | MongoDB with WAL-G-based backups |
+| `mariadb-walg/` | `gotempsh/mariadb-walg` | MariaDB physical streaming backups through WAL-G |
 
 The default image tags used by the platform are set in
 `crates/temps-providers/src/externalsvc/`.
