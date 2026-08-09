@@ -7,6 +7,7 @@ description = "Optional client that links a self-hosted Temps instance to a mana
 
 [dependencies]
 temps-cloud-protocol = { path = "../temps-cloud-protocol" }
+temps-core = { path = "../temps-core" }
 
 chrono.workspace = true
 reqwest.workspace = true

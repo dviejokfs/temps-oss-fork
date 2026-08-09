@@ -865,7 +865,6 @@ async fn upload_repository_object(
         .map_err(|error| StageError::Retry(error.to_string()))?;
     if target.upload_required {
         let source_key = format!("{root}/{}", declaration.relative_key);
-        let http = reqwest::Client::new();
         let mut last_failure = None;
         for attempt in 0..3 {
             // Reopen the S3 source on every attempt. The stream is not
@@ -883,11 +882,10 @@ async fn upload_repository_object(
                 })?;
             let body =
                 reqwest::Body::wrap_stream(ReaderStream::new(response.body.into_async_read()));
-            let mut upload = http.put(&target.upload_url).body(body);
-            for (name, value) in &target.headers {
-                upload = upload.header(name, value);
-            }
-            match upload.send().await {
+            match link
+                .upload_backup_object(&target, body, declaration.bytes)
+                .await
+            {
                 Ok(response) if response.status().is_success() => {
                     last_failure = None;
                     break;
@@ -904,7 +902,15 @@ async fn upload_repository_object(
                         response.status()
                     )));
                 }
-                Err(error) => last_failure = Some(error.without_url().to_string()),
+                Err(error) if error.is_retryable() => {
+                    last_failure = Some(error.to_string());
+                }
+                Err(error) => {
+                    return Err(StageError::Unsupported(format!(
+                        "Cloud returned an invalid upload target for {}: {error}",
+                        declaration.relative_key
+                    )));
+                }
             }
             if attempt < 2 {
                 tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
@@ -946,7 +952,6 @@ async fn upload_native_object(
         .map_err(|error| StageError::Retry(error.to_string()))?;
     if target.upload_required {
         let source_key = format!("{root}/{}", declaration.relative_key);
-        let http = reqwest::Client::new();
         let mut last_failure = None;
         for attempt in 0..3 {
             let response = source_client
@@ -962,11 +967,10 @@ async fn upload_native_object(
                 })?;
             let body =
                 reqwest::Body::wrap_stream(ReaderStream::new(response.body.into_async_read()));
-            let mut upload = http.put(&target.upload_url).body(body);
-            for (name, value) in &target.headers {
-                upload = upload.header(name, value);
-            }
-            match upload.send().await {
+            match link
+                .upload_backup_object(&target, body, declaration.bytes)
+                .await
+            {
                 Ok(response) if response.status().is_success() => {
                     last_failure = None;
                     break;
@@ -983,7 +987,15 @@ async fn upload_native_object(
                         response.status()
                     )));
                 }
-                Err(error) => last_failure = Some(error.without_url().to_string()),
+                Err(error) if error.is_retryable() => {
+                    last_failure = Some(error.to_string());
+                }
+                Err(error) => {
+                    return Err(StageError::Unsupported(format!(
+                        "Cloud returned an invalid upload target for {}: {error}",
+                        declaration.relative_key
+                    )));
+                }
             }
             if attempt < 2 {
                 tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;

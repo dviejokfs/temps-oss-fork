@@ -460,6 +460,22 @@ impl CloudLink {
         client.walg_object_target(&token, request).await
     }
 
+    /// Stream a repository object to the exact short-lived destination Cloud
+    /// issued. Destination validation and redirect prevention live in
+    /// [`CloudClient`] and are therefore identical for WAL-G, native snapshots
+    /// and local backup files.
+    pub async fn upload_backup_object(
+        &self,
+        target: &WalGObjectTarget,
+        body: reqwest::Body,
+        spooled_bytes: u64,
+    ) -> Result<reqwest::Response, CloudError> {
+        let (client, _, _) = self.walg_client()?;
+        client
+            .upload_backup_object(target, body, spooled_bytes)
+            .await
+    }
+
     pub async fn complete_walg_object(
         &self,
         completion: &WalGObjectCompleted,

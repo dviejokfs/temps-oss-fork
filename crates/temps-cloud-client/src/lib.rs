@@ -30,7 +30,14 @@ pub use link::{CloudLink, FlushOutcome};
 pub use state::EnrollmentState;
 pub use status::{LinkStatus, MirrorHealth};
 
-use std::{path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
+    path::Path,
+    time::Duration,
+};
+
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use sha2::{Digest, Sha256};
 use temps_cloud_protocol::{
@@ -41,6 +48,7 @@ use temps_cloud_protocol::{
     WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
     WalGSnapshotCompleted, WalGSnapshotRequest,
 };
+use temps_core::url_validation::{validate_ipv4, validate_ipv6};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -117,6 +125,10 @@ impl BackendUrl {
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
+
+    fn permits_loopback_uploads(&self) -> bool {
+        self.0.scheme() == "http" && is_loopback_host(&self.0)
+    }
 }
 
 /// How long any single call to the backend may take.
@@ -125,6 +137,7 @@ impl BackendUrl {
 /// backend must never become the instance's latency.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const AI_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const UPLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum CloudError {
@@ -133,6 +146,9 @@ pub enum CloudError {
 
     #[error("Failed to configure the managed-backend HTTP client: {reason}")]
     ClientConfiguration { reason: String },
+
+    #[error("Managed backend returned an unsafe backup upload target: {reason}")]
+    InvalidBackupTarget { reason: String },
 
     #[error("Not linked to an account. Paste an enrollment code to connect one.")]
     NotEnrolled,
@@ -370,17 +386,21 @@ impl CloudClient {
 
         let mut last_failure = None;
         for attempt in 0..3 {
+            // Revalidate before every retry. A URL that expired during a
+            // failed attempt must not be replayed merely because it was valid
+            // when the retry loop began.
+            let validated = self.validate_backup_upload_target(
+                &target.upload_url,
+                target.expires_at_millis,
+                &target.headers,
+            )?;
             let file = tokio::fs::File::open(path)
                 .await
                 .map_err(|error| CloudError::Rejected {
                     detail: format!("could not reopen backup artifact for upload: {error}"),
                 })?;
             let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
-            let mut upload = self.http.put(&target.upload_url).body(body);
-            for (name, value) in &target.headers {
-                upload = upload.header(name, value);
-            }
-            match upload.send().await {
+            match self.send_backup_upload(&validated, body, bytes).await {
                 Ok(response) if response.status().is_success() => {
                     last_failure = None;
                     break;
@@ -398,7 +418,7 @@ impl CloudClient {
                         ),
                     });
                 }
-                Err(error) => last_failure = Some(error.without_url().to_string()),
+                Err(error) => last_failure = Some(error.to_string()),
             }
             if attempt < 2 {
                 tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await;
@@ -421,6 +441,68 @@ impl CloudClient {
         )
         .await?;
         Ok(target)
+    }
+
+    /// Send one streaming object from a native/WAL-G repository to the
+    /// short-lived destination issued by Cloud.
+    ///
+    /// This is deliberately shared with local-file uploads so repository
+    /// mirroring cannot accidentally regain reqwest's redirect-following
+    /// default or skip destination/header validation.
+    pub async fn upload_backup_object(
+        &self,
+        target: &WalGObjectTarget,
+        body: reqwest::Body,
+        spooled_bytes: u64,
+    ) -> Result<reqwest::Response, CloudError> {
+        if !target.upload_required {
+            return Err(CloudError::InvalidBackupTarget {
+                reason: format!(
+                    "object {} in backup {} did not require an upload",
+                    target.relative_key, target.backup_id
+                ),
+            });
+        }
+        let validated = self.validate_backup_upload_target(
+            &target.upload_url,
+            target.expires_at_millis,
+            &target.headers,
+        )?;
+        self.send_backup_upload(&validated, body, spooled_bytes)
+            .await
+    }
+
+    fn validate_backup_upload_target(
+        &self,
+        upload_url: &str,
+        expires_at_millis: i64,
+        headers: &BTreeMap<String, String>,
+    ) -> Result<ValidatedBackupUpload, CloudError> {
+        validate_backup_upload_target(
+            upload_url,
+            expires_at_millis,
+            headers,
+            self.backend.permits_loopback_uploads(),
+        )
+    }
+
+    async fn send_backup_upload(
+        &self,
+        target: &ValidatedBackupUpload,
+        body: reqwest::Body,
+        spooled_bytes: u64,
+    ) -> Result<reqwest::Response, CloudError> {
+        let upload_http = build_pinned_upload_client(target, spooled_bytes).await?;
+        upload_http
+            .put(target.url.clone())
+            .headers(target.headers.clone())
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| CloudError::Unreachable {
+                reason: format!("backup object upload failed: {}", error.without_url()),
+                spooled_bytes,
+            })
     }
 
     async fn backup_target(
@@ -648,6 +730,189 @@ impl CloudClient {
                 Err(CloudError::Rejected { detail })
             }
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedBackupUpload {
+    url: url::Url,
+    headers: HeaderMap,
+    allow_loopback: bool,
+}
+
+fn validate_backup_upload_target(
+    upload_url: &str,
+    expires_at_millis: i64,
+    headers: &BTreeMap<String, String>,
+    allow_loopback_http: bool,
+) -> Result<ValidatedBackupUpload, CloudError> {
+    if expires_at_millis <= chrono::Utc::now().timestamp_millis() {
+        return Err(CloudError::InvalidBackupTarget {
+            reason: "the presigned destination has expired".into(),
+        });
+    }
+
+    let url = url::Url::parse(upload_url).map_err(|error| CloudError::InvalidBackupTarget {
+        reason: format!("the destination URL is invalid: {error}"),
+    })?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(CloudError::InvalidBackupTarget {
+            reason: "credentials are not allowed in an upload URL".into(),
+        });
+    }
+    if url.fragment().is_some() {
+        return Err(CloudError::InvalidBackupTarget {
+            reason: "fragments are not allowed in an upload URL".into(),
+        });
+    }
+
+    let loopback = is_loopback_host(&url);
+    match url.scheme() {
+        "https" => {}
+        "http" if allow_loopback_http && loopback => {}
+        "http" => {
+            return Err(CloudError::InvalidBackupTarget {
+                reason: "HTTPS is required outside explicit loopback development".into(),
+            })
+        }
+        scheme => {
+            return Err(CloudError::InvalidBackupTarget {
+                reason: format!("unsupported destination scheme {scheme:?}; HTTPS is required"),
+            })
+        }
+    }
+
+    let host = url.host().ok_or_else(|| CloudError::InvalidBackupTarget {
+        reason: "the destination URL has no host".into(),
+    })?;
+    let unsafe_host = match host {
+        url::Host::Domain(domain) => {
+            domain.eq_ignore_ascii_case("localhost")
+                || domain.to_ascii_lowercase().ends_with(".localhost")
+        }
+        url::Host::Ipv4(address) => is_unsafe_ip(IpAddr::V4(address)),
+        url::Host::Ipv6(address) => is_unsafe_ip(IpAddr::V6(address)),
+    };
+    if unsafe_host && !(allow_loopback_http && loopback) {
+        return Err(CloudError::InvalidBackupTarget {
+            reason: format!("destination host {host} is not a public object-storage endpoint"),
+        });
+    }
+
+    let mut validated_headers = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            CloudError::InvalidBackupTarget {
+                reason: format!("upload header name {name:?} is invalid: {error}"),
+            }
+        })?;
+        if !is_allowed_upload_header(&header_name) {
+            return Err(CloudError::InvalidBackupTarget {
+                reason: format!("upload header {header_name} is not allowed"),
+            });
+        }
+        let header_value =
+            HeaderValue::from_str(value).map_err(|error| CloudError::InvalidBackupTarget {
+                reason: format!("upload header {header_name} has an invalid value: {error}"),
+            })?;
+        validated_headers.insert(header_name, header_value);
+    }
+
+    Ok(ValidatedBackupUpload {
+        url,
+        headers: validated_headers,
+        allow_loopback: allow_loopback_http && loopback,
+    })
+}
+
+async fn build_pinned_upload_client(
+    target: &ValidatedBackupUpload,
+    spooled_bytes: u64,
+) -> Result<reqwest::Client, CloudError> {
+    // Backup streams may legitimately run for hours. Bound connection
+    // establishment, but never impose a whole-request timeout. Redirects are
+    // disabled because a presigned destination is an authority boundary, not
+    // a navigation hint.
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(UPLOAD_CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
+
+    if let Some(url::Host::Domain(domain)) = target.url.host() {
+        let port =
+            target
+                .url
+                .port_or_known_default()
+                .ok_or_else(|| CloudError::InvalidBackupTarget {
+                    reason: "the destination URL has no known port".into(),
+                })?;
+        let addresses = tokio::net::lookup_host((domain, port))
+            .await
+            .map_err(|error| CloudError::Unreachable {
+                reason: format!("could not resolve backup destination {domain}: {error}"),
+                spooled_bytes,
+            })?
+            .collect::<Vec<_>>();
+        validate_resolved_upload_addresses(domain, &addresses, target.allow_loopback)?;
+        // Pin the exact addresses that passed validation. reqwest retains the
+        // original hostname for HTTP Host and TLS SNI/certificate checks, but
+        // cannot perform a second DNS lookup and rebind the request elsewhere.
+        builder = builder.resolve_to_addrs(domain, &addresses);
+    }
+
+    builder
+        .build()
+        .map_err(|error| CloudError::ClientConfiguration {
+            reason: format!("could not configure backup upload client: {error}"),
+        })
+}
+
+fn validate_resolved_upload_addresses(
+    domain: &str,
+    addresses: &[SocketAddr],
+    allow_loopback: bool,
+) -> Result<(), CloudError> {
+    if addresses.is_empty() {
+        return Err(CloudError::InvalidBackupTarget {
+            reason: format!("destination host {domain} resolved to no addresses"),
+        });
+    }
+    for address in addresses {
+        let ip = address.ip();
+        let permitted = if allow_loopback {
+            // The only plaintext exception is an actual loopback socket. A
+            // poisoned localhost answer containing even one public address
+            // must fail closed rather than pinning an HTTP route off-host.
+            ip.is_loopback()
+        } else {
+            !is_unsafe_ip(ip)
+        };
+        if !permitted {
+            return Err(CloudError::InvalidBackupTarget {
+                reason: format!("destination host {domain} resolved to unsafe address {ip}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_allowed_upload_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "content-length" | "content-type" | "content-md5" | "if-none-match"
+    ) || name.as_str().starts_with("x-amz-")
+}
+
+fn is_loopback_host(url: &url::Url) -> bool {
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("localhost"))
+        || matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
+        || matches!(url.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback())
+}
+
+fn is_unsafe_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => validate_ipv4(&address).is_err(),
+        IpAddr::V6(address) => validate_ipv6(&address).is_err(),
     }
 }
 
@@ -907,6 +1172,18 @@ mod tests {
         (StatusCode::OK, Json(json!({"state": "complete"})))
     }
 
+    async fn redirect_upload_stub() -> (StatusCode, [(axum::http::HeaderName, &'static str); 1]) {
+        (
+            StatusCode::TEMPORARY_REDIRECT,
+            [(axum::http::header::LOCATION, "/redirect-target")],
+        )
+    }
+
+    async fn redirect_target_stub(State(calls): State<Arc<AtomicUsize>>) -> StatusCode {
+        calls.fetch_add(1, Ordering::SeqCst);
+        StatusCode::NO_CONTENT
+    }
+
     #[tokio::test]
     async fn backup_upload_recovers_each_network_boundary_without_changing_identity() {
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
@@ -982,6 +1259,155 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn backup_upload_never_follows_provider_redirects() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping backup redirect test: sandbox denied TCP bind");
+                return;
+            }
+            Err(error) => panic!("bind backup redirect stub: {error}"),
+        };
+        let address = listener.local_addr().expect("backup redirect stub address");
+        let redirected_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/redirect", put(redirect_upload_stub))
+            .route("/redirect-target", put(redirect_target_stub))
+            .with_state(redirected_calls.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve backup redirect stub");
+        });
+
+        let client = CloudClient::new(
+            BackendUrl::loopback_development(&format!("http://{address}"))
+                .expect("loopback redirect backend"),
+        )
+        .expect("cloud client");
+        let target = WalGObjectTarget {
+            backup_id: Uuid::new_v4(),
+            relative_key: "basebackups_005/base.tar.lz4".into(),
+            upload_required: true,
+            upload_url: format!("http://localhost:{}/redirect", address.port()),
+            expires_at_millis: Utc::now().timestamp_millis() + 60_000,
+            headers: BTreeMap::new(),
+        };
+
+        let response = client
+            .upload_backup_object(&target, reqwest::Body::from("backup bytes"), 12)
+            .await
+            .expect("redirect response is returned without navigation");
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            redirected_calls.load(Ordering::SeqCst),
+            0,
+            "backup bytes must never be replayed to a redirect destination"
+        );
+    }
+
+    #[test]
+    fn production_backup_targets_require_https_public_hosts_and_safe_headers() {
+        let client = CloudClient::new(
+            BackendUrl::production("https://cloud.example.com").expect("production backend"),
+        )
+        .expect("cloud client");
+        let expires = Utc::now().timestamp_millis() + 60_000;
+        let allowed_headers = BTreeMap::from([
+            ("content-length".into(), "42".into()),
+            ("x-amz-checksum-sha256".into(), "checksum".into()),
+        ]);
+
+        assert!(client
+            .validate_backup_upload_target(
+                "https://objects.example.com/backup?X-Amz-Signature=signed",
+                expires,
+                &allowed_headers,
+            )
+            .is_ok());
+
+        for invalid in [
+            "http://objects.example.com/backup",
+            "https://user:secret@objects.example.com/backup",
+            "https://objects.example.com/backup#fragment",
+            "https://127.0.0.1/backup",
+            "https://10.0.0.1/backup",
+            "https://169.254.169.254/latest/meta-data",
+            "https://localhost/backup",
+            "file:///tmp/backup",
+        ] {
+            assert!(
+                client
+                    .validate_backup_upload_target(invalid, expires, &allowed_headers)
+                    .is_err(),
+                "accepted unsafe backup destination {invalid}"
+            );
+        }
+
+        let unsafe_headers = BTreeMap::from([("authorization".into(), "Bearer secret".into())]);
+        assert!(client
+            .validate_backup_upload_target(
+                "https://objects.example.com/backup",
+                expires,
+                &unsafe_headers,
+            )
+            .is_err());
+        assert!(client
+            .validate_backup_upload_target(
+                "https://objects.example.com/backup",
+                Utc::now().timestamp_millis() - 1,
+                &BTreeMap::new(),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn loopback_backup_targets_are_only_available_in_explicit_development() {
+        let client = CloudClient::new(
+            BackendUrl::loopback_development("http://127.0.0.1:19202").expect("loopback backend"),
+        )
+        .expect("cloud client");
+
+        assert!(client
+            .validate_backup_upload_target(
+                "http://127.0.0.1:19000/temps-backups/object?signature=dev",
+                Utc::now().timestamp_millis() + 60_000,
+                &BTreeMap::new(),
+            )
+            .is_ok());
+        assert!(client
+            .validate_backup_upload_target(
+                "http://192.168.1.20:9000/temps-backups/object",
+                Utc::now().timestamp_millis() + 60_000,
+                &BTreeMap::new(),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn resolved_backup_hosts_reject_private_or_mixed_dns_answers() {
+        let public = SocketAddr::from(([93, 184, 216, 34], 443));
+        let private = SocketAddr::from(([10, 20, 30, 40], 443));
+        let metadata = SocketAddr::from(([169, 254, 169, 254], 443));
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 19000));
+
+        assert!(validate_resolved_upload_addresses("objects.example", &[public], false).is_ok());
+        assert!(
+            validate_resolved_upload_addresses("objects.example", &[public, private], false,)
+                .is_err()
+        );
+        assert!(validate_resolved_upload_addresses("objects.example", &[metadata], false).is_err());
+        assert!(validate_resolved_upload_addresses("localhost", &[loopback], false).is_err());
+        assert!(validate_resolved_upload_addresses("localhost", &[loopback], true).is_ok());
+        assert!(
+            validate_resolved_upload_addresses("localhost", &[loopback, public], true,).is_err()
+        );
+        assert!(validate_resolved_upload_addresses("localhost", &[public], true).is_err());
+        assert!(validate_resolved_upload_addresses("objects.example", &[], false).is_err());
+    }
+
     #[test]
     fn only_transient_failures_are_retryable() {
         assert!(CloudError::Unreachable {
@@ -996,6 +1422,10 @@ mod tests {
         assert!(!CloudError::NotEnrolled.is_retryable());
         assert!(!CloudError::Rejected {
             detail: "bad".into()
+        }
+        .is_retryable());
+        assert!(!CloudError::InvalidBackupTarget {
+            reason: "unsafe destination".into()
         }
         .is_retryable());
     }
