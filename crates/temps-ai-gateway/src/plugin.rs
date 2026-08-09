@@ -51,9 +51,16 @@ impl TempsPlugin for AiGatewayPlugin {
             // ADR-022: register the general AI foundation so any feature can get
             // text or typed/structured output from the configured model through
             // one governed seam. Best-effort + self-gating, safe to always register.
-            let ai_service = Arc::new(crate::services::GatewayAiService::new(
-                gateway_service.clone(),
-                db.clone(),
+            //
+            // ADR-037 Phase 1: wrap GatewayAiService in DispatchingAiService so
+            // the dispatch seam exists before Phase 2/3 routing logic is added.
+            // In Phase 1 every call passes straight through to GatewayAiService —
+            // runtime behaviour is unchanged.
+            let gateway_ai_service: Arc<dyn temps_ai::AiService> = Arc::new(
+                crate::services::GatewayAiService::new(gateway_service.clone(), db.clone()),
+            );
+            let ai_service = Arc::new(temps_ai_agent_cli::DispatchingAiService::new(
+                gateway_ai_service,
             ));
             context.register_service(ai_service as Arc<dyn temps_ai::AiService>);
 

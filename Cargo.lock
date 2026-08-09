@@ -10173,6 +10173,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-ai-agent-cli"
+version = "0.1.0-beta.55"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde_json",
+ "tempfile",
+ "temps-agents",
+ "temps-ai",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "temps-ai-api-tools"
 version = "0.1.0-beta.55"
 dependencies = [
@@ -10244,6 +10258,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-ai",
+ "temps-ai-agent-cli",
  "temps-auth",
  "temps-core",
  "temps-entities",

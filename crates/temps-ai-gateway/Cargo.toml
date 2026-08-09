@@ -11,6 +11,7 @@ homepage.workspace = true
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-ai = { path = "../temps-ai" }
+temps-ai-agent-cli = { path = "../temps-ai-agent-cli" }
 temps-entities = { path = "../temps-entities" }
 
 serde = { workspace = true }
