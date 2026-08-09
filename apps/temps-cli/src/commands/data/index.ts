@@ -19,6 +19,7 @@ import type {
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
+import { sanitizeTerminalText } from '../../ui/terminal.js'
 import {
   newline,
   header,
@@ -132,9 +133,9 @@ async function resolveService(
       )
 
   if (!match) {
-    const available = services.map((s) => s.name).join(', ')
+    const available = services.map((s) => sanitizeTerminalText(s.name)).join(', ')
     throw new Error(
-      `Service "${nameOrId}" not found. Available: ${available || '(none)'}`,
+      `Service "${sanitizeTerminalText(nameOrId)}" not found. Available: ${available || '(none)'}`,
     )
   }
   return { id: match.id, name: match.name, service_type: match.service_type }
@@ -149,7 +150,8 @@ async function resolveService(
  */
 export function cell(value: unknown, maxLength = 40): string {
   if (value === null || value === undefined) return colors.dim('null')
-  const text = typeof value === 'string' ? value : JSON.stringify(value)
+  const raw = typeof value === 'string' ? value : JSON.stringify(value)
+  const text = sanitizeTerminalText(raw)
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text
 }
 
@@ -177,11 +179,10 @@ export function validateFilter(raw: string | undefined, service: string): string
   try {
     JSON.parse(raw)
     return raw
-  } catch (e) {
+  } catch {
     throw new Error(
-      `--filter must be JSON, but failed to parse: ${(e as Error).message}\n` +
-        `  Received: ${raw}\n` +
-        `  Run "temps data info ${service}" to see this backend's filter schema.`,
+      `--filter must be valid JSON. Received: ${sanitizeTerminalText(raw)}. ` +
+        `Run "temps data info ${sanitizeTerminalText(service)}" to see this backend's filter schema.`,
     )
   }
 }
@@ -214,7 +215,9 @@ async function infoCmd(
   }
 
   newline()
-  header(`${icons.info} ${service.name} (${service.service_type})`)
+  header(
+    `${icons.info} ${sanitizeTerminalText(service.name)} (${sanitizeTerminalText(service.service_type)})`,
+  )
   newline()
 
   if (!support?.supported) {
@@ -235,7 +238,7 @@ async function infoCmd(
         ? 'holds containers'
         : 'leaf'
     console.log(
-      `  ${colors.muted(`level ${level.level}`)} ${colors.bold(level.container_type)} ${colors.dim(`— ${holds}`)}`,
+      `  ${colors.muted(`level ${level.level}`)} ${colors.bold(sanitizeTerminalText(level.container_type))} ${colors.dim(`— ${holds}`)}`,
     )
   }
   newline()
@@ -246,7 +249,7 @@ async function infoCmd(
     newline()
   }
 
-  info(`Next: temps data containers ${service.name}`)
+  info(`Next: temps data containers ${sanitizeTerminalText(service.name)}`)
   newline()
 }
 
@@ -283,9 +286,11 @@ async function containersCmd(
     return
   }
 
-  const scope = options.path ? ` under ${options.path}` : ''
+  const scope = options.path ? ` under ${sanitizeTerminalText(options.path)}` : ''
   newline()
-  header(`${icons.folder} Containers in ${service.name}${scope} (${rows.length})`)
+  header(
+    `${icons.folder} Containers in ${sanitizeTerminalText(service.name)}${scope} (${rows.length})`,
+  )
 
   if (rows.length === 0) {
     info('No containers found.')
@@ -303,7 +308,9 @@ async function containersCmd(
           ? (c.entity_type_label ?? 'entities')
           : c.can_contain_containers
             ? (c.child_container_type ?? 'containers')
-            : colors.dim('—'),
+            : '—',
+      color: (value, c) =>
+        c.can_contain_entities || c.can_contain_containers ? value : colors.dim(value),
     },
   ]
   printTable(rows, columns, { style: 'minimal' })
@@ -312,11 +319,14 @@ async function containersCmd(
   // common thing to get wrong, so show a real one rather than a placeholder.
   const first = rows[0]
   if (first) {
-    const nextPath = options.path ? `${options.path}/${first.name}` : first.name
+    const nextPath = sanitizeTerminalText(
+      options.path ? `${options.path}/${first.name}` : first.name,
+    )
+    const safeServiceName = sanitizeTerminalText(service.name)
     if (first.can_contain_entities) {
-      info(`Next: temps data tables ${service.name} --path ${nextPath}`)
+      info(`Next: temps data tables ${safeServiceName} --path ${nextPath}`)
     } else if (first.can_contain_containers) {
-      info(`Next: temps data containers ${service.name} --path ${nextPath}`)
+      info(`Next: temps data containers ${safeServiceName} --path ${nextPath}`)
     }
   }
   newline()
@@ -349,10 +359,15 @@ async function tablesCmd(
   }
 
   newline()
-  header(`${icons.folder} ${options.path} in ${service.name} (${entities.length})`)
+  header(
+    `${icons.folder} ${sanitizeTerminalText(options.path)} in ${sanitizeTerminalText(service.name)} (${entities.length})`,
+  )
 
   if (entities.length === 0) {
-    info('No entities found. Check the path with: temps data containers ' + service.name)
+    info(
+      'No entities found. Check the path with: temps data containers ' +
+        sanitizeTerminalText(service.name),
+    )
     newline()
     return
   }
@@ -362,7 +377,8 @@ async function tablesCmd(
     { header: 'Type', key: 'entity_type' },
     {
       header: 'Rows',
-      accessor: (e) => (e.row_count === null || e.row_count === undefined ? colors.dim('—') : String(e.row_count)),
+      accessor: (e) => (e.row_count === null || e.row_count === undefined ? '—' : String(e.row_count)),
+      color: (value, e) => e.row_count === null || e.row_count === undefined ? colors.dim(value) : value,
     },
     { header: 'Size', accessor: (e) => formatBytes(e.size_bytes) },
   ]
@@ -373,7 +389,9 @@ async function tablesCmd(
   }
   const firstEntity = entities[0]
   if (firstEntity) {
-    info(`Next: temps data rows ${service.name} ${firstEntity.name} --path ${options.path}`)
+    info(
+      `Next: temps data rows ${sanitizeTerminalText(service.name)} ${sanitizeTerminalText(firstEntity.name)} --path ${sanitizeTerminalText(options.path)}`,
+    )
   }
   newline()
 }
@@ -403,7 +421,9 @@ async function schemaCmd(
   }
 
   newline()
-  header(`${icons.info} ${options.path}/${entity} (${info_?.entity_type ?? 'entity'})`)
+  header(
+    `${icons.info} ${sanitizeTerminalText(options.path)}/${sanitizeTerminalText(entity)} (${sanitizeTerminalText(info_?.entity_type ?? 'entity')})`,
+  )
   newline()
   if (info_?.row_count !== null && info_?.row_count !== undefined) {
     keyValue('Rows', String(info_.row_count))
@@ -474,7 +494,7 @@ async function rowsCmd(
 
   newline()
   header(
-    `${icons.info} ${options.path}/${entity} — ${result?.returned_count ?? rows.length} of ${result?.total_count ?? '?'} rows`,
+    `${icons.info} ${sanitizeTerminalText(options.path)}/${sanitizeTerminalText(entity)} — ${result?.returned_count ?? rows.length} of ${result?.total_count ?? '?'} rows`,
   )
 
   if (rows.length === 0) {
@@ -543,7 +563,7 @@ async function aiAccessCmd(
     }
 
     newline()
-    header(`${icons.info} AI data access — ${service.name}`)
+    header(`${icons.info} AI data access — ${sanitizeTerminalText(service.name)}`)
     newline()
     keyValue(
       'Built-in assistant may read rows',
@@ -552,8 +572,8 @@ async function aiAccessCmd(
     newline()
     info(
       current?.enabled
-        ? `Disable with: temps data ai-access ${service.name} --disable`
-        : `Enable with: temps data ai-access ${service.name} --enable`,
+        ? `Disable with: temps data ai-access ${sanitizeTerminalText(service.name)} --disable`
+        : `Enable with: temps data ai-access ${sanitizeTerminalText(service.name)} --enable`,
     )
     info(
       colors.dim(
@@ -587,14 +607,18 @@ async function aiAccessCmd(
 
   newline()
   if (enabled) {
-    success(`The built-in AI assistant can now read rows from ${service.name}.`)
+    success(
+      `The built-in AI assistant can now read rows from ${sanitizeTerminalText(service.name)}.`,
+    )
     newline()
     warning(
       'Rows are sent to your configured AI provider. If this service stores password',
     )
     warning('hashes, tokens or personal data, that data leaves your infrastructure.')
   } else {
-    success(`The built-in AI assistant can no longer read rows from ${service.name}.`)
+    success(
+      `The built-in AI assistant can no longer read rows from ${sanitizeTerminalText(service.name)}.`,
+    )
     info('Table and column names remain readable.')
   }
   newline()

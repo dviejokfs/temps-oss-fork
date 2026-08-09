@@ -680,6 +680,61 @@ impl_oidc_audit_op!(OidcProviderDeletedAudit, "OIDC_PROVIDER_DELETED");
 impl_oidc_audit_op!(OidcRoleMappingCreatedAudit, "OIDC_ROLE_MAPPING_CREATED");
 impl_oidc_audit_op!(OidcRoleMappingDeletedAudit, "OIDC_ROLE_MAPPING_DELETED");
 
+/// Aggregated authorization-guard denials. Only stable, server-derived
+/// principal metadata is recorded: credential names and secrets are never
+/// accepted by this type.
+#[derive(Debug, Clone, Serialize)]
+pub struct PermissionDeniedAudit {
+    pub user_id: Option<i32>,
+    pub auth_source: String,
+    pub credential_id: Option<i32>,
+    /// True when attempts in this aggregate used more than one credential.
+    /// In that case `credential_id` is cleared to avoid false attribution.
+    pub multiple_credentials: bool,
+    pub method: String,
+    /// Axum route template (for example `/projects/{project_id}`), or the
+    /// fixed value `unmatched`. Never a raw request URI.
+    pub route: String,
+    pub denial_kind: String,
+    pub required_permission: Option<String>,
+    pub attempt_count: u64,
+    /// True when the aggregate spans multiple IPs or user agents. Singular
+    /// origin fields are neutralized when this is set.
+    pub multiple_origins: bool,
+    /// Identifies the single reserved row summarizing attempts omitted by the
+    /// per-window persistence budgets.
+    pub suppressed_by_budget: bool,
+    pub ip_address: Option<String>,
+    /// Persisted through [`AuditOperation::user_agent`] in the dedicated audit
+    /// column. Skipping it here avoids duplicating attacker-controlled origin
+    /// metadata in the JSON payload.
+    #[serde(skip_serializing)]
+    pub user_agent: String,
+}
+
+impl AuditOperation for PermissionDeniedAudit {
+    fn operation_type(&self) -> String {
+        "PERMISSION_DENIED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
 /// Recorded when a login attempt is rejected before a session exists.
 ///
 /// Unlike most audit events the actor may be unknown (an attempt against an
@@ -836,5 +891,32 @@ mod failure_audit_tests {
         let json = AuditOperation::serialize(&audit).expect("step-up audit serializes");
         assert!(!json.contains("123456"));
         assert!(json.contains("invalid_code"));
+    }
+
+    #[test]
+    fn permission_denied_audit_supports_machine_principals_and_aggregation() {
+        let audit = PermissionDeniedAudit {
+            user_id: None,
+            auth_source: "deployment_token".to_string(),
+            credential_id: Some(17),
+            multiple_credentials: false,
+            method: "POST".to_string(),
+            route: "/projects/{project_id}/deployments".to_string(),
+            denial_kind: "cross_project_scope".to_string(),
+            required_permission: None,
+            attempt_count: 4,
+            multiple_origins: false,
+            suppressed_by_budget: false,
+            ip_address: Some("203.0.113.8".to_string()),
+            user_agent: "test-agent".to_string(),
+        };
+
+        assert_eq!(audit.operation_type(), "PERMISSION_DENIED");
+        assert_eq!(audit.user_id(), None);
+        let json = AuditOperation::serialize(&audit).expect("permission denial audit serializes");
+        assert!(json.contains("\"attempt_count\":4"));
+        assert!(json.contains("\"credential_id\":17"));
+        assert!(!json.contains("token_name"));
+        assert!(!json.contains("test-agent"));
     }
 }

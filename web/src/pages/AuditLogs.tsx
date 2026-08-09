@@ -23,6 +23,7 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { PERMISSION_DENIED_FILTER } from '@/lib/audit-operation-filters'
 import { useQuery } from '@tanstack/react-query'
 import { ScrollText, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
@@ -45,6 +46,7 @@ const OPERATION_GROUPS: OperationGroup[] = [
       { value: 'USER_LOGOUT', label: 'User Logout' },
       { value: 'PASSWORD_RESET', label: 'Password Reset' },
       { value: 'EMAIL_VERIFIED', label: 'Email Verified' },
+      PERMISSION_DENIED_FILTER,
     ],
   },
   {
@@ -299,6 +301,23 @@ const OPERATION_GROUPS: OperationGroup[] = [
   },
 ]
 
+export function buildOperationOptions(): SearchableSelectOption[] {
+  const options: SearchableSelectOption[] = [
+    { value: ALL_FILTER, label: 'All types' },
+  ]
+  for (const group of OPERATION_GROUPS) {
+    for (const operation of group.operations) {
+      options.push({
+        value: operation.value,
+        label: operation.label,
+        group: group.label,
+        keywords: operation.value,
+      })
+    }
+  }
+  return options
+}
+
 const ALL_FILTER = '__all__'
 
 export function AuditLogs() {
@@ -345,22 +364,7 @@ export function AuditLogs() {
   const hasFilters =
     !!dateRange || operation !== ALL_FILTER || selectedUserId !== ALL_FILTER
 
-  const operationOptions = useMemo<SearchableSelectOption[]>(() => {
-    const opts: SearchableSelectOption[] = [
-      { value: ALL_FILTER, label: 'All types' },
-    ]
-    for (const group of OPERATION_GROUPS) {
-      for (const op of group.operations) {
-        opts.push({
-          value: op.value,
-          label: op.label,
-          group: group.label,
-          keywords: op.value,
-        })
-      }
-    }
-    return opts
-  }, [])
+  const operationOptions = useMemo(buildOperationOptions, [])
 
   const userOptions = useMemo<SearchableSelectOption[]>(() => {
     const opts: SearchableSelectOption[] = [

@@ -28,6 +28,7 @@ use super::types::{
     TriggerPipelineResponse, UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest,
     UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
 };
+use crate::services::types::CreateProjectEnvVar;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -124,6 +125,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     components(
         schemas(
             CreateProjectRequest,
+            super::types::ProjectEnvVarInput,
             DropInspectionResponse,
             DropPresetCandidate,
             ChangeProjectSourceRequest,
@@ -1936,14 +1938,18 @@ pub async fn create_project_from_template(
     let template_provenance = temps_core::templates::template_provenance(&template).to_string();
 
     // 2. Build the environment variables from the request (shared by both modes).
-    let env_vars: Option<Vec<(String, String)>> = if request.environment_variables.is_empty() {
+    let env_vars: Option<Vec<CreateProjectEnvVar>> = if request.environment_variables.is_empty() {
         None
     } else {
         Some(
             request
                 .environment_variables
                 .iter()
-                .map(|ev| (ev.name.clone(), ev.value.clone()))
+                .map(|ev| CreateProjectEnvVar {
+                    key: ev.name.clone(),
+                    value: ev.value.clone(),
+                    is_secret: ev.is_secret,
+                })
                 .collect(),
         )
     };

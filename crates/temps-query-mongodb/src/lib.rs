@@ -28,14 +28,14 @@
 
 use async_trait::async_trait;
 use mongodb::{
-    bson::{doc, Document},
+    bson::{doc, Bson, Document},
     options::ClientOptions,
     Client,
 };
 use std::collections::HashMap;
 use temps_query::{
-    Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataError,
-    DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType, Result,
+    BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
+    DataError, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType, Result,
 };
 use tracing::{debug, error};
 
@@ -100,6 +100,43 @@ const ALLOWED_FILTER_OPERATORS: [&str; 15] = [
 /// Deep nesting is both a parser-stack risk and a way to hide an operator from
 /// a shallow check. Honest filters are one or two levels.
 const MAX_FILTER_DEPTH: usize = 8;
+
+fn bounded_document_pipeline(
+    filter: Document,
+    sort: Document,
+    skip: u64,
+    limit: i64,
+    max_document_bytes: usize,
+) -> Vec<Document> {
+    let byte_limit = i64::try_from(max_document_bytes).unwrap_or(i64::MAX);
+    vec![
+        doc! { "$match": filter },
+        doc! { "$sort": sort },
+        doc! { "$skip": i64::try_from(skip).unwrap_or(i64::MAX) },
+        doc! { "$limit": limit },
+        doc! {
+            "$replaceWith": {
+                "$let": {
+                    "vars": { "temps_size": { "$bsonSize": "$$ROOT" } },
+                    "in": {
+                        "$cond": [
+                            { "$lte": ["$$temps_size", byte_limit] },
+                            {
+                                "__temps_admitted": true,
+                                "__temps_size": "$$temps_size",
+                                "__temps_doc": "$$ROOT"
+                            },
+                            {
+                                "__temps_admitted": false,
+                                "__temps_size": "$$temps_size"
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    ]
+}
 
 /// Server-side ceiling for the standalone `count`, which carries no
 /// `QueryOptions` and therefore no caller deadline. Matches the SQL backends.
@@ -278,7 +315,9 @@ impl MongoDBSource {
                     row_count: None, // Would require counting documents
                     size_bytes: None,
                     schema: None,
-                    metadata: Some(serde_json::to_value(metadata_map).unwrap()),
+                    metadata: Some(serde_json::Value::Object(
+                        metadata_map.into_iter().collect(),
+                    )),
                 }
             })
             .collect();
@@ -361,7 +400,9 @@ impl MongoDBSource {
             row_count: doc_count.map(|c| c as usize),
             size_bytes,
             schema,
-            metadata: Some(serde_json::to_value(metadata_map).unwrap()),
+            metadata: Some(serde_json::Value::Object(
+                metadata_map.into_iter().collect(),
+            )),
         })
     }
 
@@ -630,8 +671,6 @@ impl temps_query::Queryable for MongoDBSource {
             Document::new()
         };
 
-        debug!("MongoDB filter: {:?}", filter_doc);
-
         // Apply pagination
         let limit = options.limit.unwrap_or(100) as i64;
         let skip = options.offset.unwrap_or(0) as u64;
@@ -642,14 +681,16 @@ impl temps_query::Queryable for MongoDBSource {
                 Some("desc") | Some("DESC") => -1,
                 _ => 1,
             };
-            doc! { sort_by: sort_order }
+            [(sort_by.clone(), Bson::Int32(sort_order))]
+                .into_iter()
+                .collect()
         } else {
             doc! { "_id": 1 } // Default sort by _id ascending
         };
 
         debug!(
-            "MongoDB query: filter={:?}, limit={}, skip={}, sort={:?}",
-            filter_doc, limit, skip, sort_doc
+            entity = entity_name,
+            limit, skip, "executing MongoDB data query"
         );
 
         let start_time = std::time::Instant::now();
@@ -663,31 +704,84 @@ impl temps_query::Queryable for MongoDBSource {
         // every skipped document regardless of `limit`.
         let max_time = std::time::Duration::from_millis(options.timeout_ms.unwrap_or(30_000));
 
-        // Execute query
+        // `$bsonSize` is evaluated by mongod before the conditional projection.
+        // Using the cell ceiling as the document ceiling is deliberately
+        // conservative: no individual nested value can cross the wire above
+        // the per-cell budget, even though MongoDB documents are dynamic.
+        let wire_document_limit = options.budget.max_bytes.min(options.budget.max_cell_bytes);
+        let pipeline = bounded_document_pipeline(
+            filter_doc.clone(),
+            sort_doc,
+            skip,
+            limit,
+            wire_document_limit,
+        );
         let mut cursor = collection
-            .find(filter_doc.clone())
-            .sort(sort_doc)
-            .limit(limit)
-            .skip(skip)
+            .aggregate(pipeline)
+            .batch_size(1)
             .max_time(max_time)
             .await
-            .map_err(|e| {
-                error!("MongoDB query failed: {}", e);
-                DataError::QueryFailed(format!("MongoDB query failed: {}", e))
+            .map_err(|_error| {
+                error!(entity = entity_name, limit, "MongoDB query failed");
+                DataError::BackendQueryFailed {
+                    backend: "MongoDB",
+                    entity: entity_name.to_string(),
+                }
             })?;
 
-        // Collect results
-        let mut rows = Vec::new();
-        while cursor.advance().await.map_err(|e| {
-            error!("Failed to iterate MongoDB cursor: {}", e);
-            DataError::QueryFailed(format!("Failed to iterate results: {}", e))
+        // Decode one cursor document at a time into the shared bounded
+        // collector. MongoDB itself caps one BSON document at 16 MiB; the
+        // tighter query budget rejects it before it can accumulate with peers.
+        let mut bounded = BoundedRows::new(options.budget);
+        while cursor.advance().await.map_err(|_error| {
+            error!(entity = entity_name, limit, "MongoDB cursor failed");
+            DataError::BackendQueryFailed {
+                backend: "MongoDB",
+                entity: entity_name.to_string(),
+            }
         })? {
-            let doc = cursor.deserialize_current().map_err(|e| {
-                error!("Failed to deserialize MongoDB document: {}", e);
-                DataError::QueryFailed(format!("Failed to deserialize document: {}", e))
+            let mut envelope = cursor.deserialize_current().map_err(|_error| {
+                error!(
+                    entity = entity_name,
+                    limit, "MongoDB document decode failed"
+                );
+                DataError::BackendQueryFailed {
+                    backend: "MongoDB",
+                    entity: entity_name.to_string(),
+                }
             })?;
 
-            // Convert Document to HashMap for DataRow
+            let observed = match envelope.remove("__temps_size") {
+                Some(Bson::Int32(value)) => usize::try_from(value).unwrap_or(usize::MAX),
+                Some(Bson::Int64(value)) => usize::try_from(value).unwrap_or(usize::MAX),
+                _ => {
+                    return Err(DataError::BackendQueryFailed {
+                        backend: "MongoDB",
+                        entity: entity_name.to_string(),
+                    })
+                }
+            };
+            let admitted = envelope
+                .remove("__temps_admitted")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if !admitted {
+                return Err(DataError::ResultLimitExceeded {
+                    entity: entity_name.to_string(),
+                    limit_kind: "wire_document_bytes",
+                    limit: wire_document_limit,
+                    observed,
+                });
+            }
+            let doc = envelope
+                .remove("__temps_doc")
+                .and_then(|value| value.as_document().cloned())
+                .ok_or_else(|| DataError::BackendQueryFailed {
+                    backend: "MongoDB",
+                    entity: entity_name.to_string(),
+                })?;
+
+            // Convert the admitted Document to HashMap for DataRow.
             let mut row_map = std::collections::HashMap::new();
             for (key, value) in doc {
                 // Convert BSON to serde_json::Value
@@ -696,8 +790,11 @@ impl temps_query::Queryable for MongoDBSource {
                     row_map.insert(key, json_value);
                 }
             }
-            rows.push(row_map);
+            if !bounded.push(entity_name, row_map)? {
+                break;
+            }
         }
+        let (rows, truncated) = bounded.into_parts();
 
         // Get total count (expensive, but needed for pagination).
         //
@@ -709,9 +806,12 @@ impl temps_query::Queryable for MongoDBSource {
             .count_documents(filter_doc)
             .max_time(max_time)
             .await
-            .map_err(|e| {
-                error!("Failed to count MongoDB documents: {}", e);
-                DataError::QueryFailed(format!("Failed to count documents: {}", e))
+            .map_err(|_error| {
+                error!(entity = entity_name, limit, "MongoDB count failed");
+                DataError::BackendQueryFailed {
+                    backend: "MongoDB",
+                    entity: entity_name.to_string(),
+                }
             })?;
 
         let execution_time = start_time.elapsed();
@@ -769,6 +869,7 @@ impl temps_query::Queryable for MongoDBSource {
                 execution_ms: execution_time.as_millis() as u64,
                 has_more,
                 next_cursor: None, // MongoDB uses offset-based pagination, not cursors
+                truncated,
             },
         })
     }
@@ -852,6 +953,127 @@ impl temps_query::Queryable for MongoDBSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_query::{QueryBudget, QueryOptions, Queryable};
+    use testcontainers::{
+        core::{ContainerPort, WaitFor},
+        runners::AsyncRunner,
+        GenericImage,
+    };
+
+    fn container_runtime_unavailable(error: &str) -> bool {
+        let message = error.to_ascii_lowercase();
+        [
+            "hyper legacy client: client error (connect)",
+            "failed to connect to docker",
+            "error connecting to docker",
+            "docker daemon is unavailable",
+            "docker client is unavailable",
+            "could not find docker environment",
+            "docker socket",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
+    }
+
+    #[test]
+    fn aggregation_sizes_before_conditionally_projecting_document() {
+        let pipeline = bounded_document_pipeline(
+            doc! { "status": "active" },
+            doc! { "created_at": -1 },
+            25,
+            10,
+            65_536,
+        );
+        let encoded = mongodb::bson::serialize_to_bson(&pipeline)
+            .expect("test pipeline should serialize")
+            .to_string();
+
+        assert!(encoded.contains("$bsonSize"));
+        assert!(encoded.contains("$cond"));
+        assert!(encoded.contains("__temps_admitted"));
+        assert!(encoded.contains("__temps_doc"));
+        assert!(encoded.contains("65536"));
+        assert_eq!(pipeline[2], doc! { "$skip": 25_i64 });
+        assert_eq!(pipeline[3], doc! { "$limit": 10_i64 });
+    }
+
+    #[tokio::test]
+    async fn real_mongodb_enforces_wire_budget_and_preserves_documents() -> anyhow::Result<()> {
+        let container = match GenericImage::new("mongo", "8")
+            .with_exposed_port(ContainerPort::Tcp(27017))
+            .with_wait_for(WaitFor::message_on_stdout("Waiting for connections"))
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) if container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping Docker-dependent MongoDB budget test: {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let host = container.get_host().await?;
+        let port = container.get_host_port_ipv4(27017).await?;
+        let url = format!("mongodb://{host}:{port}/app");
+        let mut source = None;
+        for _ in 0..20 {
+            match MongoDBSource::new_scoped(&url, Some("app")).await {
+                Ok(connected) => {
+                    source = Some(connected);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        }
+        let source = source.ok_or_else(|| anyhow::anyhow!("MongoDB did not become reachable"))?;
+        source
+            .client
+            .database("app")
+            .collection::<Document>("rows_budget")
+            .insert_many([
+                doc! { "row_id": 1_i32, "payload": "safe" },
+                doc! { "row_id": 2_i32, "payload": "x".repeat(100_000) },
+            ])
+            .await?;
+
+        let path = ContainerPath::from_slice(&["app"]);
+        let safe = source
+            .query(
+                &path,
+                "rows_budget",
+                Some(serde_json::json!({"row_id": 1})),
+                QueryOptions::default(),
+            )
+            .await?;
+        assert_eq!(safe.rows[0]["payload"], serde_json::json!("safe"));
+
+        let error = source
+            .query(
+                &path,
+                "rows_budget",
+                Some(serde_json::json!({"row_id": 2})),
+                QueryOptions {
+                    limit: Some(1),
+                    budget: QueryBudget {
+                        max_bytes: 16 * 1024,
+                        max_cell_bytes: 8 * 1024,
+                        ..QueryBudget::default()
+                    },
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect_err("oversized MongoDB document must be rejected before transfer");
+        assert!(matches!(
+            error,
+            DataError::ResultLimitExceeded {
+                limit_kind: "wire_document_bytes",
+                ..
+            }
+        ));
+
+        Ok(())
+    }
 
     #[test]
     fn test_source_type() {

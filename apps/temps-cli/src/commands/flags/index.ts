@@ -163,7 +163,7 @@ async function resolveEnvironmentId(projectId: number, nameOrSlug: string): Prom
  * set worker.batch_size 200` sends the number 200, not the string "200" — the
  * server rejects a type mismatch, and a shell has no types to offer.
  */
-function parseValue(raw: string, valueType: FlagValueType, key: string): unknown {
+export function parseValue(raw: string, valueType: FlagValueType, key: string): unknown {
   switch (valueType) {
     case 'bool':
       if (raw === 'true') return true
@@ -189,20 +189,20 @@ function parseValue(raw: string, valueType: FlagValueType, key: string): unknown
   }
 }
 
-function assertValueType(raw: string): FlagValueType {
+export function assertValueType(raw: string): FlagValueType {
   if (raw === 'bool' || raw === 'string' || raw === 'number' || raw === 'json') {
     return raw
   }
   throw new Error(`Invalid type "${raw}". Must be one of: bool, string, number, json`)
 }
 
-function formatValue(value: unknown): string {
+export function formatValue(value: unknown): string {
   if (value === null || value === undefined) return colors.dim('(inherits default)')
   return typeof value === 'string' ? value : JSON.stringify(value)
 }
 
 /** The value a flag resolves to in one environment, mirroring the evaluator. */
-function effectiveValue(flag: FlagResponse, environmentId: number): string {
+export function effectiveValue(flag: FlagResponse, environmentId: number): string {
   const override = flag.environments?.find((e) => e.environment_id === environmentId)
   if (!override) return `${formatValue(flag.default_value)} ${colors.dim('(default)')}`
   if (!override.enabled) {
@@ -279,7 +279,7 @@ async function listFlagsCmd(options: {
       ? { header: options.environment!, accessor: (f) => effectiveValue(f, environmentId) }
       : { header: 'Default', accessor: (f) => formatValue(f.default_value) },
     { header: 'Client', accessor: (f) => (f.client_visible ? 'yes' : 'no') },
-    { header: 'Status', accessor: (f) => (f.archived_at ? colors.dim('archived') : 'active') },
+    { header: 'Status', accessor: (f) => (f.archived_at ? 'archived' : 'active'), color: (value, f) => f.archived_at ? colors.dim(value) : value },
   ]
 
   printTable(flags, columns, { style: 'minimal' })
@@ -337,7 +337,7 @@ async function getFlagCmd(
       flag.environments,
       [
         { header: 'Environment ID', accessor: (e) => String(e.environment_id) },
-        { header: 'Enabled', accessor: (e) => (e.enabled ? 'yes' : colors.warning('no (kill switch)')) },
+        { header: 'Enabled', accessor: (e) => (e.enabled ? 'yes' : 'no (kill switch)'), color: (value, e) => e.enabled ? value : colors.warning(value) },
         { header: 'Value', accessor: (e) => formatValue(e.value) },
       ],
       { style: 'minimal' },

@@ -50,6 +50,12 @@ impl TempsPlugin for AuthPlugin {
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
             let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
 
+            let permission_denial_recorder =
+                crate::permission_denial_recorder::PermissionDenialRecorder::new(
+                    audit_service.clone(),
+                );
+            context.register_service(permission_denial_recorder);
+
             // Require notification service
             let notification_service =
                 context.require_service::<dyn temps_core::notifications::NotificationService>();
@@ -221,6 +227,9 @@ impl TempsPlugin for AuthPlugin {
         let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
         let api_key_service = context.require_service::<crate::apikey_service::ApiKeyService>();
         let db = context.require_service::<sea_orm::DatabaseConnection>();
+        let permission_denial_recorder =
+            context
+                .require_service::<crate::permission_denial_recorder::PermissionDenialRecorder>();
 
         // Request-metadata middleware (runs on BOTH admin and public routers
         // because public ingest endpoints — session-replay init, analytics
@@ -237,6 +246,7 @@ impl TempsPlugin for AuthPlugin {
             user_service,
             cookie_crypto,
             db,
+            permission_denial_recorder,
         );
         middleware_collection.add_temps_middleware(Arc::new(auth_middleware));
 

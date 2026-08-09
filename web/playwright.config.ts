@@ -32,10 +32,17 @@ export default defineConfig({
   // slower than a typical UI assertion but is the thing actually worth testing.
   timeout: 120_000,
   expect: { timeout: 15_000 },
-  // A shared Temps instance is mutated by these specs (projects get created), so
-  // running files in parallel against one backend invites cross-test flakiness.
-  fullyParallel: false,
-  workers: 1,
+  // Specs share one Temps instance, so parallel safety depends on every spec
+  // either avoiding real backend mutation (route-mocked specs) or cleaning up
+  // its own resources with a worker/retry-unique name (see `uniqueSlug` in
+  // fixtures.ts and project-create.spec.ts's try/finally). Genuinely singleton
+  // flows (the one seeded admin session) live in the serial `setup` project,
+  // which Playwright always runs to completion before any parallel project
+  // starts. Bounded rather than left at the CPU-count default so a laptop run
+  // doesn't open more browser contexts than the shared backend can usefully
+  // serve at once.
+  fullyParallel: true,
+  workers: process.env.CI ? 4 : 2,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI
@@ -64,12 +71,18 @@ export default defineConfig({
     {
       name: 'chromium-anonymous',
       testDir: './e2e/anonymous',
-      use: { ...devices['Desktop Chrome'], storageState: { cookies: [], origins: [] } },
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: { cookies: [], origins: [] },
+      },
     },
     {
       name: 'chromium',
       testDir: './e2e/authenticated',
-      use: { ...devices['Desktop Chrome'], storageState: 'e2e/.auth/user.json' },
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: 'e2e/.auth/user.json',
+      },
       dependencies: ['setup'],
     },
   ],

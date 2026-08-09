@@ -22,6 +22,18 @@ import {
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { createProject } from '../../api/sdk.gen.js'
 import type { RepositoryResponse, SourceType } from '../../api/types.gen.js'
+
+/**
+ * One environment variable to seed a new project with.
+ *
+ * `is_secret` marks the value write-only: temps stores it encrypted and never
+ * returns the plaintext again, so it can be replaced but never read back.
+ */
+interface ProjectEnvVar {
+  key: string
+  value: string
+  is_secret: boolean
+}
 import { readEnvFile, findEnvFiles } from '../../lib/env-file.js'
 
 // Shared utilities (extracted to avoid duplication with setup wizard)
@@ -83,7 +95,7 @@ const MANUAL_SOURCE_TYPES: {
  * Requiring exactly two segments rejected every repo in a subgroup, even
  * though the backend supported them.
  */
-function parseRepoPath(repo: string): { owner: string; name: string } | null {
+export function parseRepoPath(repo: string): { owner: string; name: string } | null {
   const lastSlash = repo.lastIndexOf('/')
   if (lastSlash <= 0 || lastSlash === repo.length - 1) return null
   return { owner: repo.slice(0, lastSlash), name: repo.slice(lastSlash + 1) }
@@ -507,7 +519,7 @@ async function configureProjectName(
 /**
  * Step 7: Configure Environment Variables
  */
-async function configureEnvironmentVariables(): Promise<[string, string][]> {
+async function configureEnvironmentVariables(): Promise<ProjectEnvVar[]> {
   newline()
 
   const addEnvVars = await promptConfirm({
@@ -519,7 +531,7 @@ async function configureEnvironmentVariables(): Promise<[string, string][]> {
     return []
   }
 
-  const envVars: [string, string][] = []
+  const envVars: ProjectEnvVar[] = []
 
   // Check for .env files in the current directory
   const envFiles = findEnvFiles()
@@ -594,8 +606,13 @@ async function configureEnvironmentVariables(): Promise<[string, string][]> {
       })
 
       if (confirm) {
+        const importAsSecret = await promptConfirm({
+          message: 'Mark these as secrets? (write-only: stored encrypted, never shown again)',
+          default: false,
+        })
+
         for (const [key, value] of entries) {
-          envVars.push([key, value])
+          envVars.push({ key, value, is_secret: importAsSecret })
         }
         success(`Imported ${entries.length} variable(s) from ${filePath}`)
       }
@@ -630,7 +647,12 @@ async function configureEnvironmentVariables(): Promise<[string, string][]> {
           required: true,
         })
 
-        envVars.push([key, value])
+        const isSecret = await promptConfirm({
+          message: `Is ${key} a secret? (write-only: stored encrypted, never shown again)`,
+          default: false,
+        })
+
+        envVars.push({ key, value, is_secret: isSecret })
 
         addMore = await promptConfirm({
           message: 'Add another variable?',

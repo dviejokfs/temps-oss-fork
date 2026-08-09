@@ -21,6 +21,7 @@ sea-orm = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
 

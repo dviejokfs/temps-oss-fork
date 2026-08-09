@@ -13,7 +13,8 @@ use temps_git::services::public_repo::PublicRepoProviderFactory;
 use serde::Serialize;
 
 use super::types::{
-    CreateProjectRequest, Project, ProjectError, ProjectStatistics, UpdateDeploymentSettingsRequest,
+    CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectStatistics,
+    UpdateDeploymentSettingsRequest,
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::UpdateDeploymentConfigRequest;
@@ -306,6 +307,27 @@ impl ProjectService {
                 "Template slug cannot exceed {} characters",
                 temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
             )));
+        }
+
+        // Reject unusable env vars before the project row exists. Catching this
+        // here keeps it a 400 on the request that caused it, instead of a 500
+        // from the post-insert finalize step that then rolls the project back.
+        if let Some(env_vars) = request.environment_variables.as_ref() {
+            for env_var in env_vars {
+                if env_var.key.trim().is_empty() {
+                    return Err(ProjectError::InvalidInput(
+                        "Environment variable names cannot be empty".to_string(),
+                    ));
+                }
+                if env_var.is_secret && env_var.value.is_empty() {
+                    return Err(ProjectError::InvalidInput(format!(
+                        "Environment variable '{}' is marked as a secret but has no value. \
+                         Secrets are write-only and cannot be filled in later — \
+                         provide a value or clear the secret flag.",
+                        env_var.key
+                    )));
+                }
+            }
         }
 
         // Verify storage service IDs exist if provided
@@ -685,7 +707,7 @@ impl ProjectService {
     async fn finalize_project_creation(
         &self,
         project: &projects::Model,
-        environment_variables: Option<Vec<(String, String)>>,
+        environment_variables: Option<Vec<CreateProjectEnvVar>>,
         storage_service_ids: Vec<i32>,
     ) -> Result<temps_entities::environments::Model, ProjectError> {
         let default_environment = self
@@ -712,13 +734,19 @@ impl ProjectService {
         );
 
         if let Some(env_vars) = environment_variables {
-            for (key, value) in env_vars {
+            for env_var in env_vars {
+                let CreateProjectEnvVar {
+                    key,
+                    value,
+                    is_secret,
+                } = env_var;
                 self.env_var_service
                     .create_environment_variable(
                         project.id,
                         vec![default_environment.id],
                         key.clone(),
                         value,
+                        is_secret,
                     )
                     .await
                     .map_err(|e| ProjectError::EnvVarCreationFailed {
@@ -1359,7 +1387,7 @@ impl ProjectService {
                 active_project.preset_config = Set(Some(merged));
             }
             if let Some(dir) = directory {
-                active_project.directory = Set(dir);
+                active_project.directory = Set(normalize_project_directory(&dir)?);
             }
 
             let updated_project = active_project.update(self.db.as_ref()).await?;
@@ -1524,7 +1552,7 @@ impl ProjectService {
         active_project.main_branch = Set(main_branch.clone());
         active_project.repo_owner = Set(repo_owner.clone());
         active_project.repo_name = Set(repo_name.clone());
-        active_project.directory = Set(directory);
+        active_project.directory = Set(normalize_project_directory(&directory)?);
         // Configuring a Git repository makes this a Git-source project — this is
         // how a docker_image / static_files project is converted to Git (the
         // reverse conversion goes through `set_source_type`).
@@ -2816,9 +2844,10 @@ impl ProjectService {
         environment_ids: Vec<i32>,
         key: String,
         value: String,
+        is_secret: bool,
     ) -> Result<EnvVarWithEnvironments, ProjectError> {
         self.env_var_service
-            .create_environment_variable(project_id, environment_ids, key, value)
+            .create_environment_variable(project_id, environment_ids, key, value, is_secret)
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))
     }
@@ -4763,6 +4792,115 @@ mod tests {
             !matches!(result, Err(ProjectError::NotFound(_))),
             "caller_user_id with no connection_id must not be rejected by the ownership guard"
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_project_settings_normalizes_blank_directory() {
+        // Regression: saving project settings with an empty "Base directory"
+        // used to persist "" verbatim, after which every deployment failed with
+        // "directory must be a non-empty relative path (got '')".
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Blank Dir Project".to_string()),
+            slug: Set("blank-dir-project".to_string()),
+            repo_name: Set("blank-dir-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("apps/web".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        project_service
+            .update_project_settings(
+                inserted_project.id,
+                None,
+                None,
+                Some("main".to_string()),
+                None,
+                None,
+                None,
+                Some(String::new()), // directory: blank field from the settings form
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None, // cross_project_trace_sharing
+                None, // error_source_context_enabled
+                None, // error_source_root
+            )
+            .await
+            .expect("update_project_settings should succeed");
+
+        let stored = temps_entities::projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.directory, ".",
+            "a blank directory must be stored as the repo-root marker, not \"\""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_git_settings_normalizes_blank_directory() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Blank Git Dir Project".to_string()),
+            slug: Set("blank-git-dir-project".to_string()),
+            repo_name: Set("blank-git-dir-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("apps/web".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        project_service
+            .update_git_settings(
+                inserted_project.id,
+                1,
+                None,
+                "main".to_string(),
+                "test-owner".to_string(),
+                "blank-git-dir-repo".to_string(),
+                None,
+                "/".to_string(), // absolute root, equally invalid downstream
+                None,
+                Some("https://github.com/test-owner/blank-git-dir-repo".to_string()),
+                Some(true),
+            )
+            .await
+            .expect("update_git_settings should succeed");
+
+        let stored = temps_entities::projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.directory, ".");
     }
 
     #[test]

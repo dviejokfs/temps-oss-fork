@@ -1214,7 +1214,17 @@ async fn execute_plan(
             plan.deployment
                 .env_vars
                 .iter()
-                .map(|env| (env.key.clone(), env.value.clone()))
+                // The plan's `is_secret` is a heuristic over the key name, not
+                // a flag the source platform asserts, so it is deliberately not
+                // forwarded as temps' write-only `is_secret`: that would hide
+                // imported values from the operator who still needs to verify
+                // them. Every value is encrypted at rest either way.
+                .map(|env| {
+                    temps_projects::services::types::CreateProjectEnvVar::plain(
+                        env.key.clone(),
+                        env.value.clone(),
+                    )
+                })
                 .collect(),
         ),
         automatic_deploy: true,

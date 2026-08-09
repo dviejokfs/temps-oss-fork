@@ -650,7 +650,11 @@ export function GitImportClone({
                   automatic_deploy: data.autoDeploy,
                   storage_service_ids: data.storageServices || [],
                   environment_variables: data.environmentVariables?.map(
-                    (env) => [env.key, env.value] as [string, string]
+                    (env) => ({
+                      key: env.key,
+                      value: env.value,
+                      is_secret: env.isSecret,
+                    })
                   ),
                   preset_config:
                     data.preset === 'dockerfile' && data.dockerfilePath

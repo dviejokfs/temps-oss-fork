@@ -42,6 +42,47 @@ impl TempsPlugin for AuditPlugin {
             // Create AuditService
             let audit_service = Arc::new(AuditService::new(db.clone(), ip_address_service.clone()));
             context.register_service(audit_service.clone());
+
+            // At the recorder's hard ceiling of 17 rows/minute, at most 1,020
+            // permission-denial rows are created per hour. The bounded 2,048-row
+            // hourly prune therefore cannot be outrun by allowed production
+            // writes, without ever issuing an unbounded delete transaction.
+            let retention_service = audit_service.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(
+                    crate::services::audit_service::PERMISSION_DENIED_PRUNE_INTERVAL,
+                );
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let cutoff = chrono::Utc::now()
+                        - chrono::Duration::days(
+                            crate::services::audit_service::PERMISSION_DENIED_RETENTION_DAYS,
+                        );
+                    match retention_service
+                        .prune_permission_denied_before(
+                            cutoff,
+                            crate::services::audit_service::PERMISSION_DENIED_PRUNE_BATCH_SIZE,
+                        )
+                        .await
+                    {
+                        Ok(rows_deleted) => tracing::debug!(
+                            rows_deleted,
+                            retention_days =
+                                crate::services::audit_service::PERMISSION_DENIED_RETENTION_DAYS,
+                            "pruned expired permission-denial audit rows"
+                        ),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            retention_days = crate::services::audit_service::PERMISSION_DENIED_RETENTION_DAYS,
+                            batch_size = crate::services::audit_service::PERMISSION_DENIED_PRUNE_BATCH_SIZE,
+                            "permission-denial audit retention pass failed; will retry"
+                        ),
+                    }
+                }
+            });
+
             let initial_logger: Arc<dyn AuditLogger> = audit_service.clone();
             let audit_slot = Arc::new(AuditLoggerSlot::new(initial_logger));
             context.register_service(audit_slot.clone());

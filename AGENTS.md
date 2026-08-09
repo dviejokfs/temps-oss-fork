@@ -92,6 +92,16 @@ hundred changed lines, never tens of thousands:
 git diff --numstat -- apps/temps-cli/openapi.json
 ```
 
+You do not have to remember any of this. `bun run spec:check` verifies
+the committed file and runs automatically as a pre-commit hook and as the
+**OpenAPI Spec Format** CI job, so a minified or reordered spec fails
+before review rather than after. It reads only the file on disk — no
+server, no network, no `bun install`.
+
+If it fails and the API did *not* change, `bun run spec:check --fix`
+reformats in place. If the API *did* change, `bun run spec:update` is
+what you want, since `--fix` never fetches.
+
 `web/src/api/client/` has no committed spec; it is generated straight
 from the live server by `bun run openapi-ts` (see above), so it does not
 have this failure mode.

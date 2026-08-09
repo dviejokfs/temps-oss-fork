@@ -38,6 +38,9 @@ pub enum EnvVarError {
     #[error("Secret env var '{key}' (id={var_id}) is write-only and cannot be revealed")]
     SecretValueCannotBeRevealed { var_id: i32, key: String },
 
+    #[error("Secret env var '{key}' requires a non-empty value: secrets are write-only and an empty one can never be read back or corrected")]
+    SecretValueRequired { key: String },
+
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -174,7 +177,15 @@ impl EnvVarService {
         environment_ids: Vec<i32>,
         key: String,
         value: String,
+        is_secret: bool,
     ) -> Result<EnvVarWithEnvironments, EnvVarError> {
+        // A secret is write-only, so an empty one can never be filled in later
+        // through the UI — reject it at creation instead of storing a variable
+        // nobody can repair without deleting it.
+        if is_secret && value.is_empty() {
+            return Err(EnvVarError::SecretValueRequired { key });
+        }
+
         let existing_env_vars = env_vars::Entity::find()
             .filter(env_vars::Column::ProjectId.eq(project_id))
             .filter(env_vars::Column::Key.eq(&key))
@@ -216,7 +227,7 @@ impl EnvVarService {
                         key: Set(key.clone()),
                         value: Set(encrypted_value),
                         is_encrypted: Set(true),
-                        is_secret: Set(false),
+                        is_secret: Set(is_secret),
                         created_at: Set(chrono::Utc::now()),
                         updated_at: Set(chrono::Utc::now()),
                         environment_id: Set(None),
@@ -415,5 +426,62 @@ impl EnvVarService {
         }
 
         self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    fn make_service(db: MockDatabase) -> EnvVarService {
+        EnvVarService::new(
+            Arc::new(db.into_connection()),
+            Arc::new(
+                EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .expect("test key is valid"),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_secret_with_an_empty_value() {
+        // A secret is write-only, so an empty one can never be inspected or
+        // corrected afterwards — it has to be refused up front.
+        let service = make_service(MockDatabase::new(DatabaseBackend::Postgres));
+
+        let error = service
+            .create_environment_variable(1, vec![1], "API_KEY".to_string(), String::new(), true)
+            .await
+            .expect_err("an empty secret must be refused");
+
+        assert!(matches!(
+            error,
+            EnvVarError::SecretValueRequired { ref key } if key == "API_KEY"
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_allows_a_non_secret_with_an_empty_value() {
+        // Empty is a legitimate value for a normal variable, and it stays
+        // readable, so the secret guard must not reject it. The mock returns no
+        // rows for the duplicate-key lookup, then fails the insert — reaching
+        // the DB at all proves validation passed.
+        let service = make_service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<env_vars::Model>::new()]),
+        );
+
+        let error = service
+            .create_environment_variable(1, vec![1], "OPTIONAL".to_string(), String::new(), false)
+            .await
+            .expect_err("the mock has no insert result to return");
+
+        assert!(
+            !matches!(error, EnvVarError::SecretValueRequired { .. }),
+            "a non-secret empty value must not trip the secret guard, got: {error}"
+        );
     }
 }

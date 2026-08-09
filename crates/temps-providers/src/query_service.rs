@@ -23,6 +23,47 @@ use crate::ExternalServiceManager;
 /// Cache of active connections by (service_id, database_name)
 type ConnectionCache = HashMap<(i32, String), Arc<dyn DataSource>>;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PostgresConnectionPolicy {
+    Standard,
+    ManagedPrivate,
+}
+
+impl PostgresConnectionPolicy {
+    async fn connect(
+        self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+        database: &str,
+    ) -> Result<PostgresSource> {
+        match self {
+            Self::Standard => {
+                PostgresSource::connect(host, port, username, password, database).await
+            }
+            Self::ManagedPrivate => {
+                PostgresSource::connect_private(host, port, username, password, database).await
+            }
+        }
+    }
+}
+
+fn postgres_connection_target(
+    cluster_primary: Option<(String, u16)>,
+    standalone_host: String,
+    standalone_port: u16,
+) -> (String, u16, PostgresConnectionPolicy) {
+    match cluster_primary {
+        Some((host, port)) => (host, port, PostgresConnectionPolicy::ManagedPrivate),
+        None => (
+            standalone_host,
+            standalone_port,
+            PostgresConnectionPolicy::Standard,
+        ),
+    }
+}
+
 /// Wall-clock ceiling applied to a data-browser query when the caller does not
 /// supply one.
 ///
@@ -76,6 +117,7 @@ impl QueryService {
         admin_user: &str,
         admin_password: &str,
         database: &str,
+        connection_policy: PostgresConnectionPolicy,
     ) -> std::result::Result<String, DataError> {
         // Deterministic password derived from admin password so it's stable across calls
         use std::collections::hash_map::DefaultHasher;
@@ -85,7 +127,8 @@ impl QueryService {
         let explorer_password = format!("te_{:x}", hasher.finish());
 
         // Connect as admin to the target database
-        let pg_source = PostgresSource::connect(host, port, admin_user, admin_password, database)
+        let pg_source = connection_policy
+            .connect(host, port, admin_user, admin_password, database)
             .await
             .map_err(|e| {
                 DataError::ConnectionFailed(format!(
@@ -253,7 +296,7 @@ impl QueryService {
                 // `<svc>.temps.local` because they run on the overlay and
                 // resolve via the local Hickory listener — but that's the
                 // app's path, not ours.
-                let (host, port) = match self
+                let (host, port, connection_policy) = match self
                     .external_service_manager
                     .get_cluster_primary_address(service_id)
                     .await
@@ -263,7 +306,11 @@ impl QueryService {
                             "Using cluster primary {}:{} for service {} explorer",
                             primary_host, primary_port, service_id
                         );
-                        (primary_host, primary_port)
+                        postgres_connection_target(
+                            Some((primary_host, primary_port)),
+                            config.host.clone(),
+                            5432,
+                        )
                     }
                     Ok(None) => {
                         // Standalone service — use config host/port as before
@@ -277,7 +324,7 @@ impl QueryService {
                                     e
                                 ))
                             })?;
-                        (config.host.clone(), port)
+                        postgres_connection_target(None, config.host.clone(), port)
                     }
                     Err(e) => {
                         return Err(DataError::ConnectionFailed(format!(
@@ -298,6 +345,7 @@ impl QueryService {
                     &config.username,
                     &admin_password,
                     database,
+                    connection_policy,
                 )
                 .await
                 {
@@ -312,21 +360,16 @@ impl QueryService {
                 };
 
                 // Connect to the specified database with the explorer (or fallback admin) user
-                let pg_source = PostgresSource::connect(
-                    &host,
-                    port,
-                    &connect_user,
-                    &connect_password,
-                    database,
-                )
-                .await
-                .map_err(|e| {
-                    error!(
-                        "Failed to connect to PostgreSQL service {} database {}: {}",
-                        service_id, database, e
-                    );
-                    e
-                })?;
+                let pg_source = connection_policy
+                    .connect(&host, port, &connect_user, &connect_password, database)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Failed to connect to PostgreSQL service {} database {}: {}",
+                            service_id, database, e
+                        );
+                        e
+                    })?;
 
                 Arc::new(pg_source)
             }
@@ -1101,5 +1144,50 @@ impl QueryService {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_postgres_connection_target_selects_policy_from_cluster_primary() {
+        let cluster = postgres_connection_target(
+            Some(("10.0.0.8".to_string(), 6432)),
+            "public.example".to_string(),
+            5432,
+        );
+        assert_eq!(cluster.0, "10.0.0.8");
+        assert_eq!(cluster.1, 6432);
+        assert_eq!(cluster.2, PostgresConnectionPolicy::ManagedPrivate);
+
+        let standalone = postgres_connection_target(None, "public.example".to_string(), 5433);
+        assert_eq!(standalone.0, "public.example");
+        assert_eq!(standalone.1, 5433);
+        assert_eq!(standalone.2, PostgresConnectionPolicy::Standard);
+    }
+
+    #[tokio::test]
+    async fn test_postgres_connection_policy_managed_private_rejects_public_credentials() {
+        for (username, password) in [
+            ("cluster_admin", "admin-secret"),
+            (QueryService::EXPLORER_USER, "explorer-secret"),
+        ] {
+            let result = PostgresConnectionPolicy::ManagedPrivate
+                .connect("203.0.113.10", 5432, username, password, "postgres")
+                .await;
+            let error = match result {
+                Ok(_) => panic!("managed cluster credentials must reject a public endpoint"),
+                Err(error) => error,
+            };
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("refusing to send cluster credentials even over verified TLS"),
+                "unexpected error for {username}: {error}"
+            );
+        }
     }
 }

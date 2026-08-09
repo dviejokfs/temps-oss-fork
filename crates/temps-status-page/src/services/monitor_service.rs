@@ -600,6 +600,12 @@ impl MonitorService {
             successful_checks: i64,
         }
 
+        // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
+        // row ("Monitor created - awaiting first health check") from the
+        // denominator -- without it, a monitor with a 100% real pass rate
+        // still reports <100% uptime for as long as that placeholder row
+        // stays within the window, since it counts toward total_checks but
+        // never toward successful_checks.
         let stats = status_checks::Entity::find()
             .filter(status_checks::Column::MonitorId.eq(monitor_id))
             .filter(status_checks::Column::CheckedAt.gte(start_date))
@@ -610,7 +616,7 @@ impl MonitorService {
                     COUNT(*) as total_checks,
                     COUNT(*) FILTER (WHERE status = 'operational') as successful_checks
                 FROM status_checks
-                WHERE monitor_id = $1 AND checked_at >= $2
+                WHERE monitor_id = $1 AND checked_at >= $2 AND status != 'unknown'
                 "#,
                 vec![monitor_id.into(), start_date.into()],
             ))
@@ -665,13 +671,18 @@ impl MonitorService {
             avg_time: Option<f64>,
         }
 
+        // Postgres' AVG() over an integer column returns NUMERIC, not
+        // double precision -- casting here keeps sqlx's try_get<f64> from
+        // erroring on the type mismatch (this silently failed
+        // get_monitor_status -> get_status_overview swallowed it into a
+        // fake "unknown" status for every monitor, even fully healthy ones).
         let result = status_checks::Entity::find()
             .filter(status_checks::Column::MonitorId.eq(monitor_id))
             .filter(status_checks::Column::CheckedAt.gte(start_date))
             .from_raw_sql(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r#"
-                SELECT AVG(response_time_ms) as avg_time
+                SELECT AVG(response_time_ms)::double precision as avg_time
                 FROM status_checks
                 WHERE monitor_id = $1 AND checked_at >= $2 AND response_time_ms IS NOT NULL
                 "#,
@@ -740,8 +751,12 @@ impl MonitorService {
                     time_bucket('{}', checked_at) AS bucket,
                     COUNT(*) as total_checks,
                     COUNT(*) FILTER (WHERE status = 'operational') as operational_count,
-                    COUNT(*) FILTER (WHERE status = 'degraded') as degraded_count,
-                    COUNT(*) FILTER (WHERE status = 'down') as down_count,
+                    -- health_check_service.rs writes 'partial_outage'/'major_outage' for
+                    -- the finer-grained cases, not just plain 'degraded'/'down' -- without
+                    -- these, a bucket made entirely of real outage checks fell through to
+                    -- "unknown" below instead of "down".
+                    COUNT(*) FILTER (WHERE status IN ('degraded', 'partial_outage')) as degraded_count,
+                    COUNT(*) FILTER (WHERE status IN ('down', 'major_outage')) as down_count,
                     AVG(response_time_ms) as avg_response_time_ms,
                     MIN(response_time_ms) as min_response_time_ms,
                     MAX(response_time_ms) as max_response_time_ms,
@@ -752,6 +767,9 @@ impl MonitorService {
                 WHERE monitor_id = $1
                   AND checked_at >= $2
                   AND checked_at < $3
+                  -- excludes create_monitor's synthetic bootstrap row -- see
+                  -- get_current_status_for_timeframe's identical comment.
+                  AND status != 'unknown'
                 GROUP BY bucket
             ) sub
             ORDER BY bucket ASC
@@ -850,7 +868,11 @@ impl MonitorService {
             _ => "24 hours", // Default
         };
 
-        // Query to calculate uptime percentage and current status
+        // Query to calculate uptime percentage and current status.
+        // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
+        // row from both the uptime denominator and the "latest status" pick --
+        // without it, a monitor with a 100% real pass rate still reports
+        // <100% uptime for as long as that placeholder row stays in the window.
         let query = format!(
             r#"
             WITH recent_checks AS (
@@ -862,6 +884,7 @@ impl MonitorService {
                 FROM status_checks
                 WHERE monitor_id = $1
                     AND checked_at >= NOW() - INTERVAL '{}'
+                    AND status != 'unknown'
             ),
             stats AS (
                 SELECT
@@ -935,7 +958,10 @@ impl MonitorService {
             last_check_at: Option<UtcDateTime>,
         }
 
-        // If custom time range provided, use it
+        // If custom time range provided, use it.
+        // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
+        // row from both the uptime denominator and the "latest status" pick --
+        // see get_current_status_for_timeframe's identical comment.
 
         let query = r#"
             WITH recent_checks AS (
@@ -948,6 +974,7 @@ impl MonitorService {
                 WHERE monitor_id = $1
                     AND checked_at >= $2
                     AND checked_at <= $3
+                    AND status != 'unknown'
             ),
             stats AS (
                 SELECT

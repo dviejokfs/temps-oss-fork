@@ -2316,10 +2316,16 @@ impl WorkflowExecutionService {
                 )
                 .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
 
+                // Projects created before directory normalization was applied on
+                // every write path can hold "" or "/" here. Both are rejected by
+                // the job's path confinement, so normalize to the repo root
+                // marker instead of failing the deployment.
                 let directory = config
                     .get("directory")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("./")
+                    .map(|d| d.trim().trim_start_matches('/'))
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or(".")
                     .to_string();
 
                 // Get dependencies to find the download job ID

@@ -2,6 +2,7 @@ import { AuditLogIpInfo, AuditLogUserInfo } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { TableCell, TableRow } from '@/components/ui/table'
+import { describePermissionDenial } from '@/lib/permission-denial-display'
 import { cn } from '@/lib/utils'
 import { format } from 'date-fns'
 import {
@@ -84,7 +85,8 @@ function categorize(op: string): Category {
     op.startsWith('AUTH_') ||
     op === 'USER_LOGOUT' ||
     op === 'PASSWORD_RESET' ||
-    op === 'EMAIL_VERIFIED'
+    op === 'EMAIL_VERIFIED' ||
+    op === 'PERMISSION_DENIED'
   )
     return 'auth'
   if (op.startsWith('USER_') || op.startsWith('ROLE_')) return 'user'
@@ -295,6 +297,8 @@ function describe(
       return 'Logged in successfully'
     case 'LOGIN_FAILURE':
       return `Failed login attempt${displayedAttemptedEmail ? ` for ${displayedAttemptedEmail}` : ''}${failureReason ? ` (${humanize(failureReason).toLowerCase()})` : ''}`
+    case 'PERMISSION_DENIED':
+      return describePermissionDenial(data)
     case 'USER_LOGOUT':
       return 'Logged out'
     case 'AUTH_INITIATED':

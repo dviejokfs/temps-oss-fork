@@ -286,7 +286,7 @@ struct ExistingContainer {
     running: bool,
     host_port_binding: Option<(String, String)>, // (host_ip, host_port)
     network_attached: bool,
-    has_shared_secret_env: bool,
+    shared_secret_env: Option<String>,
 }
 
 async fn inspect(docker: &Docker, name: &str) -> Result<Option<ExistingContainer>> {
@@ -340,25 +340,24 @@ async fn inspect(docker: &Docker, name: &str) -> Result<Option<ExistingContainer
         .map(|nets| nets.contains_key(PREVIEW_GATEWAY_NETWORK))
         .unwrap_or(false);
 
-    let has_shared_secret_env = inspected
+    let shared_secret_env = inspected
         .config
         .as_ref()
         .and_then(|c| c.env.as_ref())
-        .map(|env| {
-            env.iter().any(|v| {
+        .and_then(|env| {
+            env.iter().find_map(|v| {
                 v.strip_prefix("PREVIEW_GATEWAY_SHARED_SECRET=")
-                    .map(|val| !val.is_empty())
-                    .unwrap_or(false)
+                    .filter(|val| !val.is_empty())
+                    .map(|val| val.to_string())
             })
-        })
-        .unwrap_or(false);
+        });
 
     Ok(Some(ExistingContainer {
         image,
         running,
         host_port_binding,
         network_attached,
-        has_shared_secret_env,
+        shared_secret_env,
     }))
 }
 
@@ -369,11 +368,17 @@ fn container_matches(existing: &ExistingContainer, spec: &PreviewGatewaySpec) ->
     if !existing.network_attached {
         return false;
     }
-    // If the spec has a shared secret (it should in all non-legacy boots),
-    // the running container MUST have it in its env — otherwise the gateway
-    // crash-loops on startup with an empty-secret error and restart_policy
-    // masks it as "running".
-    if !spec.shared_secret.is_empty() && !existing.has_shared_secret_env {
+    // The running container's actual secret must equal the one this instance
+    // is about to inject, not merely be present. Presence-only matching can
+    // never detect drift: a container created (or last reconciled) by a
+    // different Temps instance/database keeps whatever secret it was born
+    // with forever, so this instance's proxy injects its own DB secret, the
+    // gateway compares against a different one, and every preview request
+    // gets rejected with "missing or invalid X-Temps-Preview-Token" even
+    // though a secret genuinely is configured — just the wrong one.
+    if !spec.shared_secret.is_empty()
+        && existing.shared_secret_env.as_deref() != Some(spec.shared_secret.as_str())
+    {
         return false;
     }
     match &existing.host_port_binding {

@@ -89,6 +89,18 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Install build dependencies
+        # `temps-agents` -> `temps-deployments` -> `temps-otel`, whose
+        # build script runs `prost-build` and shells out to `protoc`.
+        # The dependency is transitive and invisible from this workflow's
+        # `paths` filter, so a PR that never touches a sandbox path can
+        # still break this job. `release.yml`'s identical
+        # `prepare-sandbox-context` job installs the same package — keep
+        # the two in lock-step.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Cache cargo deps
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:

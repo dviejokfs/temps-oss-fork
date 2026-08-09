@@ -10426,6 +10426,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-geo",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "utoipa",
@@ -10841,6 +10842,7 @@ dependencies = [
  "once_cell",
  "sea-orm",
  "sea-orm-migration",
+ "sqlx 0.8.6",
  "temps-core",
  "temps-entities",
  "temps-migrations",
@@ -12041,6 +12043,7 @@ name = "temps-otel"
 version = "0.1.0-beta.55"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -12363,6 +12366,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-query",
+ "testcontainers",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -12374,6 +12378,7 @@ version = "0.1.0-beta.55"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures-util",
  "rustls",
  "serde_json",
  "temps-query",
@@ -12398,6 +12403,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-query",
+ "testcontainers",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
