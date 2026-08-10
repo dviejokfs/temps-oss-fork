@@ -44,7 +44,7 @@ use temps_providers::externalsvc::{
 };
 use tokio_util::sync::CancellationToken;
 
-const MARIADB_WALG_IMAGE: &str = "ghcr.io/gotempsh/mariadb-walg:11.4";
+const DEFAULT_MARIADB_WALG_IMAGE: &str = "ghcr.io/gotempsh/mariadb-walg:11.4";
 // A fixed 64-hex-char master key (== 32 bytes) shared by the test and every
 // EncryptionService instance, so encrypt-here / decrypt-in-engine round-trips.
 const MASTER_KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -176,6 +176,32 @@ async fn pull_image(docker: &Docker, image: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve the test image to the immutable local image ID Docker will execute.
+///
+/// CI builds the image from this checkout under a convenient tag, while local
+/// release-gate runs may provide a different tag through
+/// `TEMPS_MARIADB_WALG_IMAGE`. The application contract deliberately rejects
+/// mutable tags, so the service configuration used by backup and restore must
+/// contain the inspected `sha256:<image-id>`, not that setup tag.
+async fn resolve_mariadb_image(docker: &Docker) -> anyhow::Result<(String, String)> {
+    let requested = std::env::var("TEMPS_MARIADB_WALG_IMAGE")
+        .unwrap_or_else(|_| DEFAULT_MARIADB_WALG_IMAGE.to_string());
+    pull_image(docker, &requested).await?;
+    let inspected = docker
+        .inspect_image(&requested)
+        .await
+        .map_err(|error| anyhow::anyhow!("inspect MariaDB WAL-G image {requested}: {error}"))?;
+    let immutable = inspected
+        .id
+        .filter(|id| id.starts_with("sha256:") && id.len() == 71)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "MariaDB WAL-G image {requested} did not resolve to an immutable sha256 image ID"
+            )
+        })?;
+    Ok((requested, immutable))
+}
+
 fn find_available_port(start: u16) -> Option<u16> {
     use std::net::TcpListener;
     (start..start + 200).find(|&p| TcpListener::bind(("127.0.0.1", p)).is_ok())
@@ -281,16 +307,13 @@ async fn boot_mariadb_source(
     docker: &Docker,
     service_name: &str,
     minio_container_name: &str,
+    launch_image: &str,
 ) -> Option<(String, u16, ContainerGuard)> {
-    if pull_image(docker, MARIADB_WALG_IMAGE).await.is_err() {
-        eprintln!("Could not pull {MARIADB_WALG_IMAGE} image, skipping");
-        return None;
-    }
     let port = find_available_port(33060)?;
     let container_name = format!("mariadb-{service_name}");
 
     let config = bollard::models::ContainerCreateBody {
-        image: Some(MARIADB_WALG_IMAGE.to_string()),
+        image: Some(launch_image.to_string()),
         cmd: Some(vec![
             "--log-bin=mysql-bin".to_string(),
             "--server-id=1".to_string(),
@@ -386,7 +409,7 @@ async fn mysql_pool(port: u16) -> anyhow::Result<sqlx::MySqlPool> {
 /// The MariaDB ServiceConfig parameters JSON that both the engine and the
 /// provider parse (`MariaDbInputConfig`). `container_name` is set so the
 /// provider talks to our pre-created `mariadb-<name>` container.
-fn mariadb_params(service_name: &str, host_port: u16) -> serde_json::Value {
+fn mariadb_params(service_name: &str, host_port: u16, immutable_image: &str) -> serde_json::Value {
     serde_json::json!({
         "host": "localhost",
         "port": host_port.to_string(),
@@ -394,7 +417,7 @@ fn mariadb_params(service_name: &str, host_port: u16) -> serde_json::Value {
         "username": "root",
         "password": ROOT_PASSWORD,
         "root_password": ROOT_PASSWORD,
-        "docker_image": MARIADB_WALG_IMAGE,
+        "docker_image": immutable_image,
         "container_name": format!("mariadb-{service_name}"),
     })
 }
@@ -438,9 +461,12 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
         return;
     }
 
+    let (launch_image, immutable_image) = resolve_mariadb_image(&docker)
+        .await
+        .expect("resolve the MariaDB WAL-G test image to an immutable image ID");
     let service_name = format!("pitr{}", uuid::Uuid::new_v4().simple());
     let Some((container_name, mariadb_port, _mariadb_guard)) =
-        boot_mariadb_source(&docker, &service_name, &minio_container_name).await
+        boot_mariadb_source(&docker, &service_name, &minio_container_name, &launch_image).await
     else {
         return;
     };
@@ -456,6 +482,7 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
         &service_name,
         &container_name,
         mariadb_port,
+        &immutable_image,
     )
     .await
     .expect("PITR end-to-end flow");
@@ -470,6 +497,7 @@ async fn run_pitr_flow(
     service_name: &str,
     container_name: &str,
     mariadb_port: u16,
+    immutable_image: &str,
 ) -> anyhow::Result<()> {
     let pool: &temps_database::DbConnection = pool_arc.as_ref();
     eprintln!("Running PITR flow against source container {container_name}");
@@ -478,7 +506,7 @@ async fn run_pitr_flow(
     // Insert encrypted DB rows.
     // The engine decrypts `external_services.config` and the s3 creds with the
     // SAME EncryptionService, so we encrypt with it here.
-    let config_plaintext = mariadb_params(service_name, mariadb_port).to_string();
+    let config_plaintext = mariadb_params(service_name, mariadb_port, immutable_image).to_string();
     let config_encrypted = encryption.encrypt_string(&config_plaintext)?;
 
     let service_model = temps_entities::external_services::ActiveModel {
@@ -652,7 +680,7 @@ async fn run_pitr_flow(
     // the now-closed segments to MinIO. Run it twice so the segment that
     // contains B and C is closed by a later FLUSH and then shipped.
     let mariadb_svc = MariaDbService::new(service_name.to_string(), Arc::new(docker.clone()));
-    let mariadb_config = parse_mariadb_config(service_name, mariadb_port);
+    let mariadb_config = parse_mariadb_config(service_name, mariadb_port, immutable_image);
 
     // Decrypt the s3 source row the way the orchestrator does before calling
     // the provider: the archiver reads `s3_source.bucket_name`/`bucket_path`
@@ -718,7 +746,7 @@ async fn run_pitr_flow(
         name: service_name.to_string(),
         service_type: ServiceType::Mariadb,
         version: None,
-        parameters: mariadb_params(service_name, mariadb_port),
+        parameters: mariadb_params(service_name, mariadb_port, immutable_image),
     };
 
     let restored_name = format!("{service_name}-restored");
@@ -833,9 +861,10 @@ async fn run_pitr_flow(
 fn parse_mariadb_config(
     service_name: &str,
     host_port: u16,
+    immutable_image: &str,
 ) -> temps_providers::externalsvc::mariadb::MariaDbConfig {
     let input: temps_providers::externalsvc::mariadb::MariaDbInputConfig =
-        serde_json::from_value(mariadb_params(service_name, host_port))
+        serde_json::from_value(mariadb_params(service_name, host_port, immutable_image))
             .expect("parse MariaDbInputConfig");
     temps_providers::externalsvc::mariadb::MariaDbConfig::from(input)
 }
