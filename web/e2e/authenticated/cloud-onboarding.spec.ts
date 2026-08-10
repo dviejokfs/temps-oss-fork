@@ -12,11 +12,20 @@ const cloudStatus = (linked: boolean) => ({
   status_message: linked
     ? 'This instance is reporting to Temps Cloud'
     : 'Connect this instance to begin reporting',
+  telemetry_enabled: false,
+  backups_enabled: false,
+  notifications_enabled: false,
 })
 
 const routeCloudLifecycle = async (page: Page) => {
   let linked = false
   const enrollmentCodes: string[] = []
+  let featureState = {
+    telemetry_enabled: false,
+    backups_enabled: false,
+    notifications_enabled: false,
+  }
+  const featureUpdates: (typeof featureState)[] = []
 
   await page.route('**/cloud/capability', async (route) => {
     await route.fulfill({
@@ -33,7 +42,7 @@ const routeCloudLifecycle = async (page: Page) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify(cloudStatus(linked)),
+      body: JSON.stringify({ ...cloudStatus(linked), ...featureState }),
     })
   })
   await page.route('**/cloud/enroll', async (route) => {
@@ -42,7 +51,16 @@ const routeCloudLifecycle = async (page: Page) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify(cloudStatus(true)),
+      body: JSON.stringify({ ...cloudStatus(true), ...featureState }),
+    })
+  })
+  await page.route('**/cloud/features', async (route) => {
+    featureState = route.request().postDataJSON()
+    featureUpdates.push({ ...featureState })
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ...cloudStatus(true), ...featureState }),
     })
   })
   await page.route('**/cloud', async (route) => {
@@ -58,7 +76,7 @@ const routeCloudLifecycle = async (page: Page) => {
     })
   })
 
-  return { enrollmentCodes }
+  return { enrollmentCodes, featureUpdates }
 }
 
 test.describe('Temps Cloud activation onboarding', () => {
@@ -86,6 +104,43 @@ test.describe('Temps Cloud activation onboarding', () => {
     await expect(page.getByText('instance-e2')).toBeVisible()
     expect(cloud.enrollmentCodes).toEqual(['ABCD-EFGH'])
 
+    const telemetry = page.getByRole('switch', {
+      name: 'Export telemetry to Cloud',
+    })
+    const backups = page.getByRole('switch', {
+      name: 'Export backups to Cloud',
+    })
+    const notifications = page.getByRole('switch', {
+      name: 'Send notifications through Cloud',
+    })
+    await expect(telemetry).not.toBeChecked()
+    await expect(backups).not.toBeChecked()
+    await expect(notifications).not.toBeChecked()
+
+    await telemetry.click()
+    await expect(telemetry).toBeChecked()
+    await backups.click()
+    await expect(backups).toBeChecked()
+    await notifications.click()
+    await expect(notifications).toBeChecked()
+    expect(cloud.featureUpdates).toEqual([
+      {
+        telemetry_enabled: true,
+        backups_enabled: false,
+        notifications_enabled: false,
+      },
+      {
+        telemetry_enabled: true,
+        backups_enabled: true,
+        notifications_enabled: false,
+      },
+      {
+        telemetry_enabled: true,
+        backups_enabled: true,
+        notifications_enabled: true,
+      },
+    ])
+
     await page.getByRole('button', { name: 'Disconnect' }).click()
     await expect(
       page.getByRole('heading', { name: 'Connect this instance' })
@@ -95,6 +150,175 @@ test.describe('Temps Cloud activation onboarding', () => {
     await page.getByRole('button', { name: '2. Connect' }).click()
     await expect(page.getByRole('heading', { name: 'Connected' })).toBeVisible()
     expect(cloud.enrollmentCodes).toEqual(['ABCD-EFGH', 'WXYZ-IJKL'])
+    expect(consoleErrors).toEqual([])
+  })
+
+  test('shows an actionable capability error and recovers on retry', async ({
+    page,
+    consoleErrors,
+  }) => {
+    let capabilityAvailable = false
+    await page.route('**/cloud/status', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(cloudStatus(false)),
+      })
+    })
+    await page.route('**/cloud/capability', async (route) => {
+      await route.fulfill({
+        status: capabilityAvailable ? 200 : 503,
+        contentType: 'application/json',
+        body: JSON.stringify(
+          capabilityAvailable
+            ? { configured: true, reason: null, setup_path: '/settings/cloud' }
+            : {
+                type: 'https://temps.sh/probs/cloud-link',
+                title: 'Managed control plane unavailable',
+                status: 503,
+                detail:
+                  'Cloud capability checks timed out. Check connectivity and retry.',
+              }
+        ),
+      })
+    })
+
+    await page.goto('/settings/cloud')
+    await expectAppMounted(page)
+    await expect(
+      page.getByText('Temps Cloud capability unavailable')
+    ).toBeVisible()
+    await expect(
+      page.getByText(
+        'Cloud capability checks timed out. Check connectivity and retry.'
+      )
+    ).toBeVisible()
+
+    capabilityAvailable = true
+    await page.getByRole('button', { name: 'Try again' }).click()
+    await expect(
+      page.getByRole('heading', { name: 'Connect this instance' })
+    ).toBeVisible()
+    expect(consoleErrors).toEqual([])
+  })
+
+  test('explains when Cloud is unavailable and disables enrollment', async ({
+    page,
+    consoleErrors,
+  }) => {
+    await page.route('**/cloud/status', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(cloudStatus(false)),
+      })
+    })
+    await page.route('**/cloud/capability', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          configured: false,
+          reason: 'Set a valid managed backend URL before connecting.',
+          setup_path: '/settings/cloud',
+        }),
+      })
+    })
+
+    await page.goto('/settings/cloud')
+    await expectAppMounted(page)
+    await expect(
+      page.getByText('Cloud connection needs configuration')
+    ).toBeVisible()
+    await expect(
+      page.getByText('Set a valid managed backend URL before connecting.')
+    ).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: '2. Connect' })
+    ).toBeDisabled()
+    expect(consoleErrors).toEqual([])
+  })
+
+  test('surfaces a linked but degraded connection', async ({
+    page,
+    consoleErrors,
+  }) => {
+    await page.route('**/cloud/capability', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          configured: true,
+          reason: null,
+          setup_path: '/settings/cloud',
+        }),
+      })
+    })
+    await page.route('**/cloud/status', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ...cloudStatus(true),
+          health: 'buffering',
+          health_message:
+            'Cloud is unreachable; 12 spans are buffered locally.',
+          spooled_spans: 12,
+        }),
+      })
+    })
+
+    await page.goto('/settings/cloud')
+    await expectAppMounted(page)
+    await expect(page.getByText('Cloud connection is degraded')).toBeVisible()
+    await expect(
+      page.getByText('Cloud is unreachable; 12 spans are buffered locally.')
+    ).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: 'Check again' })
+    ).toBeVisible()
+    expect(consoleErrors).toEqual([])
+  })
+
+  test('blocks enrollment when the saved Cloud credential cannot be read', async ({
+    page,
+    consoleErrors,
+  }) => {
+    await page.route('**/cloud/capability', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          configured: true,
+          reason: null,
+          setup_path: '/settings/cloud',
+        }),
+      })
+    })
+    await page.route('**/cloud/status', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ...cloudStatus(false),
+          status: 'state_unreadable',
+          status_message:
+            'Cloud link state at /data/cloud-link/state.json is unreadable.',
+        }),
+      })
+    })
+
+    await page.goto('/settings/cloud')
+    await expectAppMounted(page)
+    await expect(
+      page.getByText('Cloud credentials need recovery')
+    ).toBeVisible()
+    await expect(
+      page.getByText(/Temps will not overwrite the existing credential file/)
+    ).toBeVisible()
+    await expect(
+      page.getByRole('heading', { name: 'Connect this instance' })
+    ).toHaveCount(0)
     expect(consoleErrors).toEqual([])
   })
 })

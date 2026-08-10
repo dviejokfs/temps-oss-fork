@@ -15,10 +15,11 @@ use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AppSettings, AuditContext,
-    AuditLogger, AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
-    ObservabilityCompressionSettings, ObservabilityRetentionSettings, PublicHostnameStrategy,
-    RateLimitSettings, RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
+    AuditLogger, AuditOperation, BuildLimitsSettings, CloudSettings, ClusterDnsSettings,
+    ContainerLogSettings, DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind,
+    MonitoringSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
+    PublicHostnameStrategy, RateLimitSettings, RequestMetadata, ScreenshotSettings,
+    SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -125,6 +126,9 @@ pub struct AppSettingsResponse {
     pub preview_domain: String,
     /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
     pub edge_target: Option<String>,
+
+    /// Managed control-plane destination and explicit export consent flags.
+    pub cloud: CloudSettings,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -337,6 +341,7 @@ impl From<AppSettings> for AppSettingsResponse {
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
             edge_target: settings.edge_target,
+            cloud: settings.cloud,
             screenshots: settings.screenshots,
             letsencrypt: settings.letsencrypt,
             dns_provider: DnsProviderSettingsMasked {
@@ -530,6 +535,7 @@ impl AppSettingsResponse {
         crate::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
         ClusterDnsSettings,
+        CloudSettings,
         PublicHostnameStrategy,
         DnsProviderSettingsMasked,
         DockerRegistrySettingsMasked,
@@ -1374,6 +1380,15 @@ fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSet
     }
 }
 
+/// Cloud exports require resource-specific permissions and are writable only
+/// through `PATCH /cloud/features`. A generic settings write must not bypass
+/// those guards, even when it submits a complete AppSettings document.
+fn preserve_cloud_export_consent(incoming: &mut AppSettings, current: &AppSettings) {
+    incoming.cloud.telemetry_enabled = current.cloud.telemetry_enabled;
+    incoming.cloud.backups_enabled = current.cloud.backups_enabled;
+    incoming.cloud.notifications_enabled = current.cloud.notifications_enabled;
+}
+
 /// Trim and validate an optional URL setting (`external_url`/`internal_url`).
 /// A blank value (after trimming) means "unset" and is normalized to `None`
 /// rather than rejected -- `external_url` previously validated the raw
@@ -1609,6 +1624,7 @@ async fn update_settings(
             // out of `current_settings` below.
             preserve_self_recorded_fields(&mut settings, &current_settings);
             preserve_omitted_security_fields(&mut settings, &current_settings);
+            preserve_cloud_export_consent(&mut settings, &current_settings);
 
             // Per-provider credentials: keep existing unless caller supplied a new one
             for (id, current_cfg) in current_settings.agent_sandbox.providers.iter() {
@@ -2126,6 +2142,36 @@ mod tests {
         assert!(settings.self_update.is_none());
         assert!(settings.self_update().enabled);
         assert_eq!(settings.self_update().channel, None);
+    }
+
+    #[test]
+    fn generic_settings_update_cannot_enable_cloud_exports() {
+        let current = AppSettings::default();
+        let mut incoming = AppSettings::default();
+        incoming.cloud.telemetry_enabled = true;
+        incoming.cloud.backups_enabled = true;
+        incoming.cloud.notifications_enabled = true;
+
+        preserve_cloud_export_consent(&mut incoming, &current);
+
+        assert!(!incoming.cloud.telemetry_enabled);
+        assert!(!incoming.cloud.backups_enabled);
+        assert!(!incoming.cloud.notifications_enabled);
+    }
+
+    #[test]
+    fn generic_settings_update_preserves_existing_cloud_export_consent() {
+        let mut current = AppSettings::default();
+        current.cloud.telemetry_enabled = true;
+        current.cloud.backups_enabled = true;
+        current.cloud.notifications_enabled = true;
+        let mut incoming = AppSettings::default();
+
+        preserve_cloud_export_consent(&mut incoming, &current);
+
+        assert!(incoming.cloud.telemetry_enabled);
+        assert!(incoming.cloud.backups_enabled);
+        assert!(incoming.cloud.notifications_enabled);
     }
 
     /// The stored value and the effective value must be the same number.

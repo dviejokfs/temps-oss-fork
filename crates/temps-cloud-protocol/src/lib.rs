@@ -63,6 +63,10 @@ pub enum Capability {
     /// Instance may submit an operator-approved, locally redacted manifest for
     /// credit-backed managed inference. Source telemetry never moves implicitly.
     ManagedAiInference,
+    /// A capability introduced by a newer peer. Older agents retain the
+    /// connection and simply decline to negotiate the unknown feature.
+    #[serde(other)]
+    Unknown,
 }
 
 /// First frame on every connection, sent by both sides.
@@ -91,6 +95,7 @@ impl Hello {
             .capabilities
             .iter()
             .copied()
+            .filter(|capability| *capability != Capability::Unknown)
             .filter(|c| peer.capabilities.contains(c))
             .collect())
     }
@@ -117,6 +122,10 @@ pub enum Unavailable {
         retry_after_secs: u32,
         detail: String,
     },
+    /// A reason introduced by a newer peer. The feature remains unavailable,
+    /// but version skew must not make the entire response unreadable.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -169,10 +178,27 @@ mod tests {
     }
 
     #[test]
-    fn unknown_message_kinds_do_not_break_deserialisation() {
-        // Additive-change guarantee: a peer sending a variant we do not know
-        // must not take down the connection.
-        let json = r#"{"reason":"not_enrolled"}"#;
-        assert!(serde_json::from_str::<Unavailable>(json).is_ok());
+    fn unknown_capabilities_are_tolerated_but_never_negotiated() {
+        let peer: Hello = serde_json::from_str(
+            r#"{"protocol_version":1,"agent_version":"future","capabilities":["telemetry_shipping","future_export"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            peer.capabilities,
+            vec![Capability::TelemetryShipping, Capability::Unknown]
+        );
+        assert_eq!(
+            hello(&[Capability::TelemetryShipping, Capability::Unknown])
+                .negotiate(&peer)
+                .unwrap(),
+            vec![Capability::TelemetryShipping]
+        );
+    }
+
+    #[test]
+    fn unknown_unavailable_reasons_are_tolerated() {
+        let unavailable: Unavailable =
+            serde_json::from_str(r#"{"reason":"future_maintenance","window":"soon"}"#).unwrap();
+        assert_eq!(unavailable, Unavailable::Unknown);
     }
 }

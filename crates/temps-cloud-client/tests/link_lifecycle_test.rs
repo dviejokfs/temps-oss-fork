@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use axum::{extract::State, routing::post, Json, Router};
 use temps_cloud_client::link::{CloudLink, FlushOutcome};
 use temps_cloud_client::status::{LinkStatus, MirrorHealth};
-use temps_cloud_client::BackendUrl;
-use temps_cloud_protocol::{SpanRecord, TelemetryBatch};
+use temps_cloud_client::{BackendUrl, CloudError, CloudFeatureSwitches};
+use temps_cloud_protocol::{SpanRecord, TelemetryBatch, WalGObjectTargetRequest};
 use uuid::Uuid;
 
 #[derive(Clone, Default)]
@@ -116,6 +116,13 @@ fn backend(url: &str) -> BackendUrl {
     BackendUrl::loopback_development(url).unwrap()
 }
 
+fn enable_telemetry(link: &CloudLink) {
+    link.set_feature_switches(CloudFeatureSwitches {
+        telemetry: true,
+        ..Default::default()
+    });
+}
+
 #[tokio::test]
 async fn a_fresh_instance_is_unconfigured_and_says_so() {
     let d = tempfile::tempdir().unwrap();
@@ -160,6 +167,7 @@ async fn the_full_lifecycle_configure_enroll_record_flush() {
 
     l.enroll("abcd-2345").await.expect("enroll");
     assert!(matches!(l.status(), LinkStatus::Linked { .. }));
+    enable_telemetry(&l);
 
     l.record(spans(3));
     assert_eq!(l.flush().await, FlushOutcome::Shipped { spans: 3 });
@@ -181,6 +189,7 @@ async fn a_saturated_ingest_queue_drops_only_the_mirror_and_reports_it() {
     let link = link(&d);
     link.configure(backend(&url)).unwrap();
     link.enroll("abcd-2345").await.unwrap();
+    enable_telemetry(&link);
 
     for _ in 0..9 {
         link.record(spans(1));
@@ -208,6 +217,7 @@ async fn concurrent_flushes_ship_each_submission_once() {
     let link = Arc::new(link(&d));
     link.configure(backend(&url)).unwrap();
     link.enroll("abcd-2345").await.unwrap();
+    enable_telemetry(&link);
     link.record(spans(3));
 
     let first = tokio::spawn({
@@ -277,6 +287,7 @@ async fn an_outage_buffers_and_a_recovery_drains_without_loss() {
     let l = link(&d);
     l.configure(backend(&url)).unwrap();
     l.enroll("abcd-2345").await.unwrap();
+    enable_telemetry(&l);
 
     // Backend goes down.
     stub.status.store(503, Ordering::SeqCst);
@@ -324,6 +335,7 @@ async fn changing_backend_origin_requires_remote_disconnect_first() {
     l.configure(backend(&first)).unwrap();
     l.enroll("abcd-2345").await.unwrap();
     assert!(matches!(l.status(), LinkStatus::Linked { .. }));
+    enable_telemetry(&l);
     l.record(spans(2));
     assert_eq!(l.spooled(), 2);
 
@@ -350,6 +362,7 @@ async fn a_rejected_credential_retains_the_batch_for_reenrollment() {
     let l = link(&d);
     l.configure(backend(&url)).unwrap();
     l.enroll("abcd-2345").await.unwrap();
+    enable_telemetry(&l);
     l.record(spans(2));
 
     match l.flush().await {
@@ -464,6 +477,7 @@ async fn flushing_an_empty_spool_is_idle_not_an_error() {
     let l = link(&d);
     l.configure(backend(&url)).unwrap();
     l.enroll("abcd-2345").await.unwrap();
+    enable_telemetry(&l);
 
     assert_eq!(l.flush().await, FlushOutcome::Idle);
     assert_eq!(l.health(), MirrorHealth::Healthy);
@@ -484,6 +498,7 @@ async fn a_refused_credential_becomes_a_visible_state_the_operator_must_act_on()
     l.configure(backend(&url)).unwrap();
     l.enroll("abcd-2345").await.unwrap();
     assert!(matches!(l.status(), LinkStatus::Linked { .. }));
+    enable_telemetry(&l);
 
     stub.status.store(401, Ordering::SeqCst);
     l.record(spans(1));
@@ -500,4 +515,42 @@ async fn a_refused_credential_becomes_a_visible_state_the_operator_must_act_on()
     stub.status.store(200, Ordering::SeqCst);
     l.enroll("abcd-2345").await.unwrap();
     assert!(matches!(l.status(), LinkStatus::Linked { .. }));
+}
+
+#[tokio::test]
+async fn linking_does_not_enable_any_export_without_explicit_consent() {
+    match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => drop(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("sandbox denied TCP bind; skipping Cloud consent lifecycle test");
+            return;
+        }
+        Err(error) => panic!("probe loopback listener: {error}"),
+    }
+    let d = tempfile::tempdir().unwrap();
+    let url = serve(Stub {
+        status: Arc::new(AtomicU16::new(200)),
+        ..Default::default()
+    })
+    .await;
+    let link = link(&d);
+    link.configure(backend(&url)).unwrap();
+    link.enroll("abcd-2345").await.unwrap();
+
+    assert_eq!(link.feature_switches(), CloudFeatureSwitches::default());
+    link.record(spans(2));
+    assert_eq!(link.spooled(), 0, "telemetry export defaults off");
+    let error = link
+        .native_object_target(&WalGObjectTargetRequest {
+            backup_id: Uuid::new_v4(),
+            instance_id: link.instance_id().expect("linked instance id"),
+            relative_key: "base/part-0001".into(),
+        })
+        .await
+        .expect_err("backup export defaults off");
+    assert!(matches!(
+        error,
+        CloudError::FeatureDisabled { feature: "backups" }
+    ));
+    assert!(!link.notifications_available());
 }

@@ -11,8 +11,21 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+const ENCRYPTED_STATE_VERSION: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct EncryptedEnrollmentState {
+    version: u8,
+    ciphertext: String,
+}
+
 #[derive(Debug, Error)]
 pub enum StateError {
+    #[error(
+        "Cloud link state at {path} is unreadable. Restore the encryption key used to create it, or back up and remove the state file before reconnecting"
+    )]
+    UnreadableStateBlocksMutation { path: String },
+
     #[error("Disconnect from {current} before changing the managed backend to {requested}")]
     BackendChangeRequiresDisconnect { current: String, requested: String },
 
@@ -24,6 +37,13 @@ pub enum StateError {
 
     #[error("Link state at {path} is corrupt: {reason}")]
     Corrupt { path: String, reason: String },
+
+    #[error("Failed to {operation} encrypted link state at {path}: {reason}")]
+    Encryption {
+        path: String,
+        operation: &'static str,
+        reason: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -118,6 +138,45 @@ impl EnrollmentState {
             })
     }
 
+    /// Load the versioned encrypted format, atomically migrating a legacy
+    /// plaintext state before returning it to the caller.
+    pub fn load_encrypted(
+        path: &Path,
+        encryption: &temps_core::EncryptionService,
+    ) -> Result<Option<Self>, StateError> {
+        let Some(raw) = read_state_file(path)? else {
+            return Ok(None);
+        };
+        if let Ok(envelope) = serde_json::from_str::<EncryptedEnrollmentState>(&raw) {
+            if envelope.version != ENCRYPTED_STATE_VERSION {
+                return Err(StateError::Corrupt {
+                    path: path.display().to_string(),
+                    reason: format!("unsupported encrypted state version {}", envelope.version),
+                });
+            }
+            let plaintext = encryption
+                .decrypt_string(&envelope.ciphertext)
+                .map_err(|error| StateError::Encryption {
+                    path: path.display().to_string(),
+                    operation: "decrypt",
+                    reason: error.to_string(),
+                })?;
+            return serde_json::from_str(&plaintext).map(Some).map_err(|error| {
+                StateError::Corrupt {
+                    path: path.display().to_string(),
+                    reason: format!("decrypted state is invalid: {error}"),
+                }
+            });
+        }
+
+        let legacy: Self = serde_json::from_str(&raw).map_err(|error| StateError::Corrupt {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })?;
+        legacy.save_encrypted(path, encryption)?;
+        Ok(Some(legacy))
+    }
+
     /// Persist atomically.
     pub fn save(&self, path: &Path) -> Result<(), StateError> {
         let write_err = |reason: String| StateError::Write {
@@ -172,6 +231,36 @@ impl EnrollmentState {
         Ok(())
     }
 
+    pub fn save_encrypted(
+        &self,
+        path: &Path,
+        encryption: &temps_core::EncryptionService,
+    ) -> Result<(), StateError> {
+        let plaintext = serde_json::to_string(self).map_err(|error| StateError::Corrupt {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })?;
+        let ciphertext =
+            encryption
+                .encrypt_string(&plaintext)
+                .map_err(|error| StateError::Encryption {
+                    path: path.display().to_string(),
+                    operation: "encrypt",
+                    reason: error.to_string(),
+                })?;
+        write_state_file(
+            path,
+            &serde_json::to_string_pretty(&EncryptedEnrollmentState {
+                version: ENCRYPTED_STATE_VERSION,
+                ciphertext,
+            })
+            .map_err(|error| StateError::Corrupt {
+                path: path.display().to_string(),
+                reason: error.to_string(),
+            })?,
+        )
+    }
+
     /// Forget the credential but keep the identity.
     ///
     /// Disconnecting must not mint a new `instance_id`: re-linking later should
@@ -181,6 +270,48 @@ impl EnrollmentState {
         self.tenant_id = None;
         self.account_email = None;
     }
+}
+
+fn read_state_file(path: &Path) -> Result<Option<String>, StateError> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(StateError::Read {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        }),
+    }
+}
+
+fn write_state_file(path: &Path, json: &str) -> Result<(), StateError> {
+    let write_err = |reason: String| StateError::Write {
+        path: path.display().to_string(),
+        reason,
+    };
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|error| write_err(error.to_string()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|error| write_err(format!("create secure temporary file: {error}")))?;
+    tmp.write_all(json.as_bytes())
+        .map_err(|error| write_err(format!("write secure temporary file: {error}")))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|error| write_err(format!("sync secure temporary file: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| write_err(format!("protect credential directory: {error}")))?;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| write_err(format!("protect secure temporary file: {error}")))?;
+    }
+    tmp.persist(path)
+        .map_err(|error| write_err(format!("atomically replace link state: {}", error.error)))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -210,6 +341,40 @@ mod tests {
 
         s.save(&p).unwrap();
         assert_eq!(EnrollmentState::load(&p).unwrap(), Some(s));
+    }
+
+    #[test]
+    fn encrypted_state_round_trips_without_plaintext_token() {
+        let (_directory, path) = temp();
+        let encryption = temps_core::EncryptionService::new_from_password("state-test-key");
+        let mut state = EnrollmentState::new("https://cloud.test");
+        state.token = Some("inst_secret_token".into());
+        state.save_encrypted(&path, &encryption).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("inst_secret_token"));
+        assert!(raw.contains("\"version\": 1"));
+        assert_eq!(
+            EnrollmentState::load_encrypted(&path, &encryption).unwrap(),
+            Some(state)
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_state_is_atomically_migrated_on_load() {
+        let (_directory, path) = temp();
+        let encryption = temps_core::EncryptionService::new_from_password("migration-test-key");
+        let mut state = EnrollmentState::new("https://cloud.test");
+        state.token = Some("inst_legacy_secret".into());
+        state.save(&path).unwrap();
+
+        assert_eq!(
+            EnrollmentState::load_encrypted(&path, &encryption).unwrap(),
+            Some(state)
+        );
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(!migrated.contains("inst_legacy_secret"));
+        assert!(serde_json::from_str::<EncryptedEnrollmentState>(&migrated).is_ok());
     }
 
     #[test]

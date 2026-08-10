@@ -1,5 +1,6 @@
 mod alerts;
 mod backup;
+mod capability;
 mod notifier;
 mod reconcile;
 mod restore;
@@ -14,6 +15,7 @@ pub use backup::{
     ScheduleRunListResponse, ScheduleRunOutcome, ScheduleRunResponse, ScheduleRunSummary,
     ScheduleRunSummaryList, ServiceBackupEntry, TriggerSource,
 };
+pub use capability::{BackupCapabilityError, ExternalServiceBackupCapability};
 pub use notifier::BackupNotificationAdapter;
 pub use reconcile::reconcile_orphan_backups;
 pub use restore::{

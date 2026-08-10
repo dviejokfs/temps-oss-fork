@@ -1,7 +1,10 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use serde::Serialize;
-use temps_cloud_client::{BackendUrl, CloudError, CloudLink};
+use temps_cloud_client::{BackendUrl, CloudError, CloudFeatureSwitches, CloudLink};
 use temps_cloud_protocol::{ManagedNotificationAccepted, ManagedNotificationRequest};
 use temps_config::{ConfigService, ConfigServiceError};
 use thiserror::Error;
@@ -10,6 +13,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 const SETUP_PATH: &str = "/settings/cloud";
+const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Error)]
 pub enum CloudServiceError {
@@ -31,6 +35,14 @@ pub struct CloudCapability {
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CloudAiCapability {
+    pub configured: bool,
+    pub reason: Option<String>,
+    pub setup_path: String,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CloudStatus {
     pub status: String,
     pub status_message: String,
@@ -41,6 +53,9 @@ pub struct CloudStatus {
     pub account_email: Option<String>,
     pub spooled_spans: usize,
     pub backend_url: String,
+    pub telemetry_enabled: bool,
+    pub backups_enabled: bool,
+    pub notifications_enabled: bool,
 }
 
 pub struct CloudService {
@@ -94,15 +109,37 @@ impl CloudService {
         self.link.clone()
     }
 
+    /// Apply explicit persisted operator consent. Enrollment does not call
+    /// this method and therefore cannot enable exports by itself.
+    pub fn set_feature_switches(&self, switches: CloudFeatureSwitches) {
+        self.link.set_feature_switches(switches);
+    }
+
+    pub fn feature_switches(&self) -> CloudFeatureSwitches {
+        self.link.feature_switches()
+    }
+
     pub async fn initialize(&self) -> Result<(), CloudServiceError> {
         let settings = self.config.get_settings().await?;
+        self.link.set_feature_switches(CloudFeatureSwitches {
+            telemetry: settings.cloud.telemetry_enabled,
+            backups: settings.cloud.backups_enabled,
+            notifications: settings.cloud.notifications_enabled,
+        });
         let backend = parse_backend(&settings.cloud.backend_url, self.allow_loopback_development)
             .map_err(|error| CloudServiceError::InvalidBackend {
             reason: error.to_string(),
         })?;
-        self.link
-            .configure(backend)
-            .map_err(CloudServiceError::State)?;
+        if let Err(error) = self.link.configure(backend) {
+            if matches!(
+                error,
+                temps_cloud_client::state::StateError::UnreadableStateBlocksMutation { .. }
+            ) {
+                tracing::error!(%error, "Cloud service started with unreadable link state");
+            } else {
+                return Err(CloudServiceError::State(error));
+            }
+        }
 
         let mut task = self
             .task
@@ -146,6 +183,7 @@ impl CloudService {
         let settings = self.config.get_settings().await?;
         let status = self.link.status();
         let health = self.link.health();
+        let switches = self.link.feature_switches();
         Ok(CloudStatus {
             status: status_name(&status).to_string(),
             status_message: status.message(),
@@ -155,7 +193,39 @@ impl CloudService {
             account_email: self.link.account_email(),
             spooled_spans: self.link.spooled(),
             backend_url: settings.cloud.backend_url,
+            telemetry_enabled: switches.telemetry,
+            backups_enabled: switches.backups,
+            notifications_enabled: switches.notifications,
         })
+    }
+
+    pub async fn ai_capability(&self) -> Result<CloudAiCapability, CloudServiceError> {
+        match self.link.managed_ai_capability().await {
+            Ok(capability) => Ok(CloudAiCapability {
+                configured: capability.configured,
+                reason: capability.reason,
+                setup_path: capability.setup_path,
+                model: capability.managed_model,
+            }),
+            Err(CloudError::NotEnrolled) => Ok(CloudAiCapability {
+                configured: false,
+                reason: Some("Link this instance to use managed AI.".to_string()),
+                setup_path: SETUP_PATH.to_string(),
+                model: None,
+            }),
+            Err(error) => Err(CloudServiceError::Client(error)),
+        }
+    }
+
+    pub async fn update_feature_switches(
+        &self,
+        switches: CloudFeatureSwitches,
+    ) -> Result<CloudStatus, CloudServiceError> {
+        self.config
+            .update_cloud_features(switches.telemetry, switches.backups, switches.notifications)
+            .await?;
+        self.link.set_feature_switches(switches);
+        self.status().await
     }
 
     pub async fn enroll(&self, code: &str) -> Result<CloudStatus, CloudServiceError> {
@@ -201,9 +271,7 @@ impl CloudService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(task) = task {
-            if let Err(error) = task.await {
-                tracing::warn!(%error, "managed telemetry mirror task did not shut down cleanly");
-            }
+            await_task_shutdown(task, "managed telemetry mirror", SHUTDOWN_TASK_TIMEOUT).await;
         }
         let backup_task = self
             .backup_task
@@ -211,6 +279,26 @@ impl CloudService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(task) = backup_task {
+            await_task_shutdown(task, "Cloud backup mirror", SHUTDOWN_TASK_TIMEOUT).await;
+        }
+    }
+}
+
+async fn await_task_shutdown(
+    mut task: tokio::task::JoinHandle<()>,
+    task_name: &'static str,
+    timeout: Duration,
+) {
+    match tokio::time::timeout(timeout, &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, task_name, "Cloud task did not shut down cleanly"),
+        Err(_) => {
+            tracing::warn!(
+                task_name,
+                timeout_ms = timeout.as_millis(),
+                "Cloud task exceeded shutdown deadline; cancelling in-flight network work"
+            );
+            task.abort();
             let _ = task.await;
         }
     }
@@ -226,6 +314,7 @@ fn parse_backend(value: &str, allow_loopback_development: bool) -> Result<Backen
 
 fn status_name(status: &temps_cloud_client::LinkStatus) -> &'static str {
     match status {
+        temps_cloud_client::LinkStatus::StateUnreadable { .. } => "state_unreadable",
         temps_cloud_client::LinkStatus::NotConfigured => "not_configured",
         temps_cloud_client::LinkStatus::AwaitingEnrollment { .. } => "awaiting_enrollment",
         temps_cloud_client::LinkStatus::Linked { .. } => "linked",
@@ -261,6 +350,12 @@ mod tests {
     #[test]
     fn status_names_are_stable_api_values() {
         assert_eq!(
+            status_name(&temps_cloud_client::LinkStatus::StateUnreadable {
+                state_path: "/data/cloud-link/state.json".to_string(),
+            }),
+            "state_unreadable"
+        );
+        assert_eq!(
             status_name(&temps_cloud_client::LinkStatus::Linked {
                 base_url: "https://cloud.test".to_string(),
             }),
@@ -273,5 +368,16 @@ mod tests {
             }),
             "buffering"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_in_flight_work_after_the_deadline() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            await_task_shutdown(task, "test mirror", Duration::from_millis(10)),
+        )
+        .await
+        .unwrap();
     }
 }

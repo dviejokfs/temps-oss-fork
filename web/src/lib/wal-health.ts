@@ -51,40 +51,6 @@ export interface WalHealthResponse {
   wal_health: PostgresWalHealth | null
 }
 
-export interface PostgresBackupCapability {
-  cloud_backup_compatible: boolean
-  wal_g_installed: boolean
-  engine: string
-  reason: string | null
-  remediation: string | null
-  recommended_image: string | null
-}
-
-export async function getPostgresBackupCapability(
-  id: number
-): Promise<PostgresBackupCapability> {
-  const response = await fetch(
-    `/api/backups/external-services/${id}/capability`,
-    {
-      credentials: 'include',
-    }
-  )
-  if (!response.ok) {
-    let detail = response.statusText
-    try {
-      const body = (await response.json()) as {
-        detail?: string
-        title?: string
-      }
-      detail = body.detail || body.title || detail
-    } catch {
-      // Preserve the HTTP diagnostic when the response is not JSON.
-    }
-    throw new Error(detail)
-  }
-  return (await response.json()) as PostgresBackupCapability
-}
-
 export async function getPostgresWalHealth(
   id: number
 ): Promise<WalHealthResponse> {

@@ -17,12 +17,23 @@ pub struct CloudPlugin {
 
 impl CloudPlugin {
     pub fn new(data_dir: PathBuf, agent_version: impl Into<String>) -> Self {
-        let allow_loopback_development = std::env::var("TEMPS_CLOUD_ALLOW_LOOPBACK")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"));
         Self {
             data_dir,
             agent_version: agent_version.into(),
-            allow_loopback_development,
+            allow_loopback_development: false,
+        }
+    }
+
+    /// Explicit CLI/development configuration. No ambient environment value
+    /// may weaken managed-backend URL validation.
+    pub fn new_for_loopback_development(
+        data_dir: PathBuf,
+        agent_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            data_dir,
+            agent_version: agent_version.into(),
+            allow_loopback_development: true,
         }
     }
 }
@@ -38,15 +49,18 @@ impl TempsPlugin for CloudPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let config = context.require_service::<ConfigService>();
+            let encryption = context.require_service::<temps_core::EncryptionService>();
             let link = if self.allow_loopback_development {
-                Arc::new(CloudLink::load_for_loopback_development(
+                Arc::new(CloudLink::load_encrypted_for_loopback_development(
                     self.data_dir.clone(),
                     self.agent_version.clone(),
+                    encryption,
                 ))
             } else {
-                Arc::new(CloudLink::load(
+                Arc::new(CloudLink::load_encrypted(
                     self.data_dir.clone(),
                     self.agent_version.clone(),
+                    encryption,
                 ))
             };
             let service = Arc::new(CloudService::new(

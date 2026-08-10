@@ -30,10 +30,21 @@ pub use link::{CloudLink, FlushOutcome};
 pub use state::EnrollmentState;
 pub use status::{LinkStatus, MirrorHealth};
 
+/// Operator-controlled export gates. Linking an account never enables data
+/// export; persisted settings must be applied explicitly after startup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CloudFeatureSwitches {
+    pub telemetry: bool,
+    pub backups: bool,
+    pub notifications: bool,
+}
+
 use std::{
     collections::BTreeMap,
     net::{IpAddr, SocketAddr},
     path::Path,
+    pin::Pin,
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -138,6 +149,7 @@ impl BackendUrl {
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const AI_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const UPLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Error)]
 pub enum CloudError {
@@ -153,6 +165,14 @@ pub enum CloudError {
     #[error("Not linked to an account. Paste an enrollment code to connect one.")]
     NotEnrolled,
 
+    #[error(
+        "Cloud link state at {path} is unreadable. Restore the original encryption key, or back up and remove the state file before reconnecting"
+    )]
+    LinkStateUnreadable { path: String },
+
+    #[error("Managed Cloud feature '{feature}' is disabled in local settings")]
+    FeatureDisabled { feature: &'static str },
+
     #[error("Enrollment was refused: {detail}")]
     EnrollmentRefused { detail: String },
 
@@ -162,6 +182,16 @@ pub enum CloudError {
     /// Transient. The caller keeps the batch spooled and tries again.
     #[error("Managed backend unreachable ({reason}); {spooled_bytes} bytes buffered locally")]
     Unreachable { reason: String, spooled_bytes: u64 },
+
+    /// Transient. The destination accepted the connection but neither upload
+    /// reads nor a response made progress within the bounded idle window.
+    #[error(
+        "Backup upload made no progress for {idle_timeout_ms}ms; {spooled_bytes} bytes remain buffered locally"
+    )]
+    BackupUploadIdleTimeout {
+        idle_timeout_ms: u64,
+        spooled_bytes: u64,
+    },
 
     #[error("Backend rejected the payload: {detail}")]
     Rejected { detail: String },
@@ -179,6 +209,7 @@ impl CloudError {
         matches!(
             self,
             CloudError::Unreachable { .. }
+                | CloudError::BackupUploadIdleTimeout { .. }
                 | CloudError::CredentialRejected
                 | CloudError::InvalidAcknowledgement { .. }
         )
@@ -188,6 +219,7 @@ impl CloudError {
 pub struct CloudClient {
     http: reqwest::Client,
     backend: BackendUrl,
+    upload_idle_timeout: Duration,
 }
 
 impl CloudClient {
@@ -199,7 +231,11 @@ impl CloudClient {
             .map_err(|e| CloudError::ClientConfiguration {
                 reason: e.to_string(),
             })?;
-        Ok(Self { http, backend })
+        Ok(Self {
+            http,
+            backend,
+            upload_idle_timeout: UPLOAD_IDLE_TIMEOUT,
+        })
     }
 
     /// Exchange an operator-pasted code for a long-lived instance token.
@@ -399,8 +435,10 @@ impl CloudClient {
                 .map_err(|error| CloudError::Rejected {
                     detail: format!("could not reopen backup artifact for upload: {error}"),
                 })?;
-            let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
-            match self.send_backup_upload(&validated, body, bytes).await {
+            match self
+                .send_backup_upload_reader(&validated, file, bytes)
+                .await
+            {
                 Ok(response) if response.status().is_success() => {
                     last_failure = None;
                     break;
@@ -449,12 +487,15 @@ impl CloudClient {
     /// This is deliberately shared with local-file uploads so repository
     /// mirroring cannot accidentally regain reqwest's redirect-following
     /// default or skip destination/header validation.
-    pub async fn upload_backup_object(
+    pub async fn upload_backup_object_reader<R>(
         &self,
         target: &WalGObjectTarget,
-        body: reqwest::Body,
+        reader: R,
         spooled_bytes: u64,
-    ) -> Result<reqwest::Response, CloudError> {
+    ) -> Result<reqwest::Response, CloudError>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
         if !target.upload_required {
             return Err(CloudError::InvalidBackupTarget {
                 reason: format!(
@@ -468,7 +509,7 @@ impl CloudClient {
             target.expires_at_millis,
             &target.headers,
         )?;
-        self.send_backup_upload(&validated, body, spooled_bytes)
+        self.send_backup_upload_reader(&validated, reader, spooled_bytes)
             .await
     }
 
@@ -486,23 +527,41 @@ impl CloudClient {
         )
     }
 
-    async fn send_backup_upload(
+    async fn send_backup_upload_reader<R>(
         &self,
         target: &ValidatedBackupUpload,
-        body: reqwest::Body,
+        reader: R,
         spooled_bytes: u64,
-    ) -> Result<reqwest::Response, CloudError> {
+    ) -> Result<reqwest::Response, CloudError>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
         let upload_http = build_pinned_upload_client(target, spooled_bytes).await?;
-        upload_http
+        let (progress_tx, progress_rx) = tokio::sync::watch::channel(());
+        let body =
+            reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(UploadProgressReader {
+                inner: reader,
+                progress: progress_tx,
+            }));
+        let request = upload_http
             .put(target.url.clone())
             .headers(target.headers.clone())
             .body(body)
-            .send()
-            .await
-            .map_err(|error| CloudError::Unreachable {
+            .send();
+        tokio::pin!(request);
+
+        tokio::select! {
+            response = &mut request => response.map_err(|error| CloudError::Unreachable {
                 reason: format!("backup object upload failed: {}", error.without_url()),
                 spooled_bytes,
-            })
+            }),
+            () = wait_for_upload_idle(progress_rx, self.upload_idle_timeout) => {
+                Err(CloudError::BackupUploadIdleTimeout {
+                    idle_timeout_ms: self.upload_idle_timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                    spooled_bytes,
+                })
+            }
+        }
     }
 
     async fn backup_target(
@@ -652,18 +711,8 @@ impl CloudClient {
         token: &str,
         request: &ManagedNotificationRequest,
     ) -> Result<ManagedNotificationAccepted, CloudError> {
-        let response = self
-            .http
-            .post(self.backend.endpoint("/v1/notifications"))
-            .bearer_auth(token)
-            .json(request)
-            .send()
+        self.retry_backup_json("/v1/notifications", token, request)
             .await
-            .map_err(|error| CloudError::Unreachable {
-                reason: error.to_string(),
-                spooled_bytes: 0,
-            })?;
-        decode_managed_response(response).await
     }
 
     /// Mirror a batch of spans. Never called on a request path.
@@ -728,6 +777,52 @@ impl CloudClient {
                     .and_then(|v| v["detail"].as_str().map(String::from))
                     .unwrap_or_else(|| format!("backend returned {status}"));
                 Err(CloudError::Rejected { detail })
+            }
+        }
+    }
+}
+
+struct UploadProgressReader<R> {
+    inner: R,
+    progress: tokio::sync::watch::Sender<()>,
+}
+
+impl<R> tokio::io::AsyncRead for UploadProgressReader<R>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled_before = buffer.filled().len();
+        match Pin::new(&mut self.inner).poll_read(context, buffer) {
+            Poll::Ready(Ok(())) => {
+                if buffer.filled().len() > filled_before {
+                    self.progress.send_replace(());
+                }
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
+
+async fn wait_for_upload_idle(
+    mut progress: tokio::sync::watch::Receiver<()>,
+    idle_timeout: Duration,
+) {
+    loop {
+        let idle = tokio::time::sleep(idle_timeout);
+        tokio::pin!(idle);
+        tokio::select! {
+            () = &mut idle => return,
+            changed = progress.changed() => {
+                if changed.is_err() {
+                    tokio::time::sleep(idle_timeout).await;
+                    return;
+                }
             }
         }
     }
@@ -845,8 +940,19 @@ async fn build_pinned_upload_client(
                 .ok_or_else(|| CloudError::InvalidBackupTarget {
                     reason: "the destination URL has no known port".into(),
                 })?;
-        let addresses = tokio::net::lookup_host((domain, port))
-            .await
+        let lookup = tokio::time::timeout(
+            UPLOAD_CONNECT_TIMEOUT,
+            tokio::net::lookup_host((domain, port)),
+        )
+        .await
+        .map_err(|_| CloudError::Unreachable {
+            reason: format!(
+                "backup destination {domain} DNS resolution timed out after {}ms",
+                UPLOAD_CONNECT_TIMEOUT.as_millis()
+            ),
+            spooled_bytes,
+        })?;
+        let addresses = lookup
             .map_err(|error| CloudError::Unreachable {
                 reason: format!("could not resolve backup destination {domain}: {error}"),
                 spooled_bytes,
@@ -1004,6 +1110,7 @@ mod tests {
     use chrono::Utc;
     use futures::StreamExt;
     use serde_json::json;
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
 
@@ -1072,6 +1179,91 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(response.request_id, request_id);
         assert_eq!(response.settled_credits, 1);
+    }
+
+    struct NotificationStub {
+        calls: AtomicUsize,
+        source_ids: Mutex<Vec<String>>,
+    }
+
+    async fn notification_stub(
+        State(state): State<Arc<NotificationStub>>,
+        Json(request): Json<ManagedNotificationRequest>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        state
+            .source_ids
+            .lock()
+            .expect("notification source id lock")
+            .push(request.source_notification_id);
+        if state.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"detail": "temporary outage"})),
+            );
+        }
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "event_id": Uuid::new_v4(),
+                "queued_deliveries": 1,
+                "duplicate": true
+            })),
+        )
+    }
+
+    #[tokio::test]
+    async fn managed_notification_retries_503_with_the_same_source_id() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping notification retry test: sandbox denied TCP bind");
+                return;
+            }
+            Err(error) => panic!("bind notification stub: {error}"),
+        };
+        let address = listener.local_addr().expect("notification stub address");
+        let state = Arc::new(NotificationStub {
+            calls: AtomicUsize::new(0),
+            source_ids: Mutex::new(Vec::new()),
+        });
+        let app = Router::new()
+            .route("/v1/notifications", post(notification_stub))
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve notification stub");
+        });
+        let client = CloudClient::new(
+            BackendUrl::loopback_development(&format!("http://{address}"))
+                .expect("loopback notification backend"),
+        )
+        .expect("cloud client");
+        let source_id = "stable-private-source-id".to_string();
+        let accepted = client
+            .send_notification(
+                "instance-token",
+                &ManagedNotificationRequest {
+                    source_notification_id: source_id.clone(),
+                    title: "Deployment failed".into(),
+                    message: "The deployment failed".into(),
+                    severity: temps_cloud_protocol::ManagedNotificationSeverity::Error,
+                    metadata: Default::default(),
+                },
+            )
+            .await
+            .expect("transient notification outage recovers");
+
+        assert!(accepted.duplicate);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state
+                .source_ids
+                .lock()
+                .expect("notification source ids lock")
+                .as_slice(),
+            [source_id, "stable-private-source-id".to_string()]
+        );
     }
 
     struct BackupStub {
@@ -1296,7 +1488,11 @@ mod tests {
         };
 
         let response = client
-            .upload_backup_object(&target, reqwest::Body::from("backup bytes"), 12)
+            .upload_backup_object_reader(
+                &target,
+                std::io::Cursor::new(b"backup bytes".to_vec()),
+                12,
+            )
             .await
             .expect("redirect response is returned without navigation");
 
@@ -1305,6 +1501,126 @@ mod tests {
             redirected_calls.load(Ordering::SeqCst),
             0,
             "backup bytes must never be replayed to a redirect destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_upload_times_out_when_target_stops_making_progress() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping stalled upload test: sandbox denied TCP bind");
+                return;
+            }
+            Err(error) => panic!("bind stalled upload stub: {error}"),
+        };
+        let address = listener.local_addr().expect("stalled upload address");
+        tokio::spawn(async move {
+            if let Ok((_socket, _peer)) = listener.accept().await {
+                // Keep the connection open without reading the request or
+                // returning a response. The upload watchdog must abort it.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+
+        let mut client = CloudClient::new(
+            BackendUrl::loopback_development(&format!("http://{address}"))
+                .expect("loopback stalled-upload backend"),
+        )
+        .expect("cloud client");
+        client.upload_idle_timeout = Duration::from_millis(100);
+        let target = WalGObjectTarget {
+            backup_id: Uuid::new_v4(),
+            relative_key: "basebackups_005/base.tar.lz4".into(),
+            upload_required: true,
+            upload_url: format!("http://{address}/stalled"),
+            expires_at_millis: Utc::now().timestamp_millis() + 60_000,
+            headers: BTreeMap::new(),
+        };
+        let started = tokio::time::Instant::now();
+
+        let error = client
+            .upload_backup_object_reader(
+                &target,
+                std::io::Cursor::new(vec![0x5a; 64 * 1024]),
+                64 * 1024,
+            )
+            .await
+            .expect_err("a target that never consumes or responds must time out");
+
+        assert!(matches!(
+            &error,
+            CloudError::BackupUploadIdleTimeout {
+                idle_timeout_ms: 100,
+                spooled_bytes: 65_536,
+            }
+        ));
+        assert!(error.is_retryable());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "idle upload cancellation must remain bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_upload_allows_slow_continuous_reader_progress() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping progressing upload test: sandbox denied TCP bind");
+                return;
+            }
+            Err(error) => panic!("bind progressing upload stub: {error}"),
+        };
+        let address = listener.local_addr().expect("progressing upload address");
+        let app = Router::new().route(
+            "/slow",
+            put(|body: axum::body::Bytes| async move {
+                assert_eq!(body.len(), 4 * 1024);
+                StatusCode::OK
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve progressing upload stub");
+        });
+
+        let mut client = CloudClient::new(
+            BackendUrl::loopback_development(&format!("http://{address}"))
+                .expect("loopback progressing-upload backend"),
+        )
+        .expect("cloud client");
+        client.upload_idle_timeout = Duration::from_millis(120);
+        let target = WalGObjectTarget {
+            backup_id: Uuid::new_v4(),
+            relative_key: "wal_005/segment".into(),
+            upload_required: true,
+            upload_url: format!("http://{address}/slow"),
+            expires_at_millis: Utc::now().timestamp_millis() + 60_000,
+            headers: BTreeMap::new(),
+        };
+        let (reader, mut writer) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                writer
+                    .write_all(&vec![0x5a; 1024])
+                    .await
+                    .expect("write progressing upload chunk");
+            }
+        });
+        let started = tokio::time::Instant::now();
+
+        let response = client
+            .upload_backup_object_reader(&target, reader, 4 * 1024)
+            .await
+            .expect("continuous progress must not hit the idle watchdog");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            started.elapsed() > client.upload_idle_timeout,
+            "test must run longer than one idle window"
         );
     }
 

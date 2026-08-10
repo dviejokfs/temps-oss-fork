@@ -29,7 +29,7 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use super::dispatch::container_has_walg;
+use super::dispatch::{container_has_walg, service_container_name};
 use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
 use super::postgres_walg::run_walg_exec;
 use super::v2_common;
@@ -37,7 +37,8 @@ use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, Bac
 
 const ENGINE_KEY: &str = "redis";
 const DUMP_FILE_SUFFIX: &str = "dump.rdb.gz";
-const REDIS_SIDECAR_IMAGE: &str = "redis:7-alpine";
+const REDIS_SIDECAR_IMAGE: &str =
+    "redis:7.4.10-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2";
 const WALG_STREAM_CREATE_COMMAND: &str = "bash -c 'error=$(mktemp); redis-cli --rdb - 2>$error; code=$?; cat $error >&2; if [ $code -ne 0 ] && grep -q \"Fail to fsync.*Invalid argument\" $error; then code=0; fi; rm -f $error; exit $code'";
 const WALG_STREAM_RESTORE_COMMAND: &str = "cat > /data/dump.rdb";
 
@@ -103,7 +104,7 @@ impl BackupEngine for RedisEngine {
             .to_string();
 
         let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
-        let target_container = format!("redis-{}", service.name);
+        let target_container = service_container_name(&service);
         if container_has_walg(&deps.docker, &target_container).await {
             return run_walg_backup(
                 &deps,
@@ -436,6 +437,13 @@ async fn list_total_s3_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redis_sidecar_image_is_release_and_digest_pinned() {
+        assert!(REDIS_SIDECAR_IMAGE.contains("redis:7.4.10-alpine@"));
+        assert!(REDIS_SIDECAR_IMAGE
+            .contains("sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2"));
+    }
 
     #[test]
     fn walg_stream_commands_match_cloud_restore_contract() {

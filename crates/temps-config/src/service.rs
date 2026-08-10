@@ -1179,6 +1179,55 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         self.update_settings(settings).await
     }
 
+    /// Atomically update only managed Cloud export consent. The settings row
+    /// is shared by many subsystems, so reading through the cache and writing
+    /// the whole document would lose concurrent unrelated changes.
+    pub async fn update_cloud_features(
+        &self,
+        telemetry_enabled: bool,
+        backups_enabled: bool,
+        notifications_enabled: bool,
+    ) -> Result<AppSettings, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        current.cloud.telemetry_enabled = telemetry_enabled;
+        current.cloud.backups_enabled = backups_enabled;
+        current.cloud.notifications_enabled = notifications_enabled;
+        let now = Utc::now();
+        if let Some(model) = existing {
+            let merged = current.to_json_merged(&model.data);
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(merged);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(current.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        // Invalidate instead of publishing this transaction's clone: another
+        // writer may commit later but update the cache earlier, and publishing
+        // here would then regress the cache out of commit order.
+        self.invalidate_settings_cache().await;
+        Ok(current)
+    }
+
     /// Initialize default settings if they don't exist
     pub async fn initialize_defaults(&self) -> Result<(), ConfigServiceError> {
         // Check if settings exist

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Extension, State},
     http::StatusCode,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,8 @@ use temps_core::{
 };
 use utoipa::{OpenApi, ToSchema};
 
-use crate::{CloudCapability, CloudService, CloudServiceError, CloudStatus};
+use crate::{CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus};
+use temps_cloud_client::CloudFeatureSwitches;
 
 #[derive(Clone)]
 pub struct CloudState {
@@ -28,10 +29,38 @@ pub struct EnrollCloudRequest {
     pub enrollment_code: String,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CloudFeatureSwitchesRequest {
+    pub telemetry_enabled: bool,
+    pub backups_enabled: bool,
+    pub notifications_enabled: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct CloudLinkAudit {
     context: AuditContext,
     action: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_features: Option<CloudFeatureAuditValues>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_features: Option<CloudFeatureAuditValues>,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudFeatureAuditValues {
+    telemetry_enabled: bool,
+    backups_enabled: bool,
+    notifications_enabled: bool,
+}
+
+impl From<CloudFeatureSwitches> for CloudFeatureAuditValues {
+    fn from(value: CloudFeatureSwitches) -> Self {
+        Self {
+            telemetry_enabled: value.telemetry,
+            backups_enabled: value.backups,
+            notifications_enabled: value.notifications,
+        }
+    }
 }
 
 impl AuditOperation for CloudLinkAudit {
@@ -57,13 +86,18 @@ fn problem(error: CloudServiceError) -> Problem {
         CloudServiceError::Client(temps_cloud_client::CloudError::EnrollmentRefused { .. }) => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
-        CloudServiceError::Client(temps_cloud_client::CloudError::Unreachable { .. }) => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        CloudServiceError::Client(
+            temps_cloud_client::CloudError::Unreachable { .. }
+            | temps_cloud_client::CloudError::BackupUploadIdleTimeout { .. },
+        ) => StatusCode::SERVICE_UNAVAILABLE,
         CloudServiceError::Client(temps_cloud_client::CloudError::CredentialRejected) => {
             StatusCode::UNAUTHORIZED
         }
-        CloudServiceError::Client(temps_cloud_client::CloudError::NotEnrolled) => {
+        CloudServiceError::Client(
+            temps_cloud_client::CloudError::NotEnrolled
+            | temps_cloud_client::CloudError::LinkStateUnreadable { .. },
+        ) => StatusCode::CONFLICT,
+        CloudServiceError::Client(temps_cloud_client::CloudError::FeatureDisabled { .. }) => {
             StatusCode::CONFLICT
         }
         CloudServiceError::Client(
@@ -79,10 +113,17 @@ fn problem(error: CloudServiceError) -> Problem {
             | temps_cloud_client::CloudError::ClientConfiguration { .. },
         ) => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    let detail = if status.is_server_error() {
+        tracing::error!(%error, http_status = status.as_u16(), "managed control-plane request failed");
+        "Managed control-plane operation could not be completed. Check the server logs for details."
+            .to_string()
+    } else {
+        error.to_string()
+    };
     ErrorBuilder::new(status)
         .type_("https://temps.sh/probs/cloud-link")
         .title("Managed control plane error")
-        .detail(error.to_string())
+        .detail(detail)
         .build()
 }
 
@@ -104,6 +145,58 @@ async fn get_cloud_status(
     state.service.status().await.map(Json).map_err(problem)
 }
 
+#[utoipa::path(get, path = "/cloud/ai/capability", tag = "Cloud", responses((status = 200, body = CloudAiCapability)), security(("bearer_auth" = [])))]
+async fn get_cloud_ai_capability(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<CloudState>,
+) -> Result<Json<CloudAiCapability>, Problem> {
+    permission_guard!(auth, SettingsRead);
+    state
+        .service
+        .ai_capability()
+        .await
+        .map(Json)
+        .map_err(problem)
+}
+
+#[utoipa::path(patch, path = "/cloud/features", tag = "Cloud", request_body = CloudFeatureSwitchesRequest, responses((status = 200, body = CloudStatus)), security(("bearer_auth" = [])))]
+async fn update_cloud_features(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<CloudState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<CloudFeatureSwitchesRequest>,
+) -> Result<Json<CloudStatus>, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    if request.backups_enabled {
+        permission_guard!(auth, BackupsWrite);
+    }
+    if request.notifications_enabled {
+        permission_guard!(auth, NotificationProvidersWrite);
+        permission_guard!(auth, NotificationProvidersCreate);
+    }
+    let previous = state.service.feature_switches();
+    let switches = CloudFeatureSwitches {
+        telemetry: request.telemetry_enabled,
+        backups: request.backups_enabled,
+        notifications: request.notifications_enabled,
+    };
+    let result = state
+        .service
+        .update_feature_switches(switches)
+        .await
+        .map_err(problem)?;
+    audit(
+        &state,
+        &auth,
+        &metadata,
+        "CLOUD_FEATURES_UPDATED",
+        Some(previous),
+        Some(switches),
+    )
+    .await;
+    Ok(Json(result))
+}
+
 #[utoipa::path(post, path = "/cloud/enroll", tag = "Cloud", request_body = EnrollCloudRequest, responses((status = 200, body = CloudStatus)), security(("bearer_auth" = [])))]
 async fn enroll_cloud(
     RequireAuth(auth): RequireAuth,
@@ -122,7 +215,7 @@ async fn enroll_cloud(
         .enroll(&request.enrollment_code)
         .await
         .map_err(problem)?;
-    audit(&state, &auth, &metadata, "CLOUD_LINK_CONNECTED").await;
+    audit(&state, &auth, &metadata, "CLOUD_LINK_CONNECTED", None, None).await;
     Ok(Json(result))
 }
 
@@ -134,7 +227,15 @@ async fn disconnect_cloud(
 ) -> Result<Json<CloudStatus>, Problem> {
     permission_guard!(auth, SettingsWrite);
     let result = state.service.disconnect().await.map_err(problem)?;
-    audit(&state, &auth, &metadata, "CLOUD_LINK_DISCONNECTED").await;
+    audit(
+        &state,
+        &auth,
+        &metadata,
+        "CLOUD_LINK_DISCONNECTED",
+        None,
+        None,
+    )
+    .await;
     Ok(Json(result))
 }
 
@@ -143,6 +244,8 @@ async fn audit(
     auth: &temps_auth::AuthContext,
     metadata: &RequestMetadata,
     action: &'static str,
+    previous_features: Option<CloudFeatureSwitches>,
+    new_features: Option<CloudFeatureSwitches>,
 ) {
     let event = CloudLinkAudit {
         context: AuditContext {
@@ -151,6 +254,8 @@ async fn audit(
             user_agent: metadata.user_agent.clone(),
         },
         action,
+        previous_features: previous_features.map(Into::into),
+        new_features: new_features.map(Into::into),
     };
     if let Err(error) = state.audit.create_audit_log(&event).await {
         tracing::error!(%error, action, "failed to record managed control-plane audit event");
@@ -161,6 +266,8 @@ pub fn cloud_routes(service: Arc<CloudService>, audit: Arc<dyn AuditLogger>) -> 
     Router::new()
         .route("/cloud/capability", get(get_cloud_capability))
         .route("/cloud/status", get(get_cloud_status))
+        .route("/cloud/ai/capability", get(get_cloud_ai_capability))
+        .route("/cloud/features", patch(update_cloud_features))
         .route("/cloud/enroll", post(enroll_cloud))
         .route("/cloud", delete(disconnect_cloud))
         .with_state(CloudState { service, audit })
@@ -168,7 +275,117 @@ pub fn cloud_routes(service: Arc<CloudService>, audit: Arc<dyn AuditLogger>) -> 
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(get_cloud_capability, get_cloud_status, enroll_cloud, disconnect_cloud),
-    components(schemas(CloudCapability, CloudStatus, EnrollCloudRequest))
+    paths(
+        get_cloud_capability,
+        get_cloud_status,
+        get_cloud_ai_capability,
+        update_cloud_features,
+        enroll_cloud,
+        disconnect_cloud
+    ),
+    components(schemas(
+        CloudAiCapability,
+        CloudCapability,
+        CloudStatus,
+        CloudFeatureSwitchesRequest,
+        EnrollCloudRequest
+    ))
 )]
 pub struct CloudApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feature_audit_contains_before_and_after_consent() {
+        let audit = CloudLinkAudit {
+            context: AuditContext {
+                user_id: 42,
+                ip_address: Some("127.0.0.1".to_string()),
+                user_agent: "test".to_string(),
+            },
+            action: "CLOUD_FEATURES_UPDATED",
+            previous_features: Some(
+                CloudFeatureSwitches {
+                    telemetry: false,
+                    backups: false,
+                    notifications: false,
+                }
+                .into(),
+            ),
+            new_features: Some(
+                CloudFeatureSwitches {
+                    telemetry: true,
+                    backups: true,
+                    notifications: false,
+                }
+                .into(),
+            ),
+        };
+        let serialized = AuditOperation::serialize(&audit).unwrap();
+        assert!(serialized.contains("\"previous_features\""));
+        assert!(serialized.contains("\"new_features\""));
+        assert!(serialized.contains("\"backups_enabled\":true"));
+    }
+
+    #[test]
+    fn test_cloud_internal_failure_problem_hides_configuration_details() {
+        let secret = "postgres://operator:do-not-leak@internal.example.invalid/cloud";
+
+        let response = problem(CloudServiceError::InvalidBackend {
+            reason: format!("could not connect to {secret}"),
+        });
+
+        assert_eq!(response.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = response
+            .body
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .expect("problem detail");
+        assert!(!detail.contains(secret));
+        assert!(!detail.contains("do-not-leak"));
+        assert!(detail.contains("server logs"));
+    }
+
+    #[test]
+    fn test_cloud_upstream_failure_problem_hides_provider_response() {
+        let provider_detail = "object storage signature included secret-token";
+
+        let response = problem(CloudServiceError::Client(
+            temps_cloud_client::CloudError::Rejected {
+                detail: provider_detail.into(),
+            },
+        ));
+
+        assert_eq!(response.status_code, StatusCode::BAD_GATEWAY);
+        let detail = response
+            .body
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .expect("problem detail");
+        assert!(!detail.contains(provider_detail));
+        assert!(!detail.contains("secret-token"));
+    }
+
+    #[test]
+    fn test_cloud_upload_idle_timeout_is_safe_and_retryable() {
+        let error = temps_cloud_client::CloudError::BackupUploadIdleTimeout {
+            idle_timeout_ms: 60_000,
+            spooled_bytes: 42,
+        };
+        assert!(error.is_retryable());
+
+        let response = problem(CloudServiceError::Client(error));
+
+        assert_eq!(response.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        let detail = response
+            .body
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .expect("problem detail");
+        assert!(!detail.contains("60000"));
+        assert!(!detail.contains("42"));
+        assert!(detail.contains("server logs"));
+    }
+}

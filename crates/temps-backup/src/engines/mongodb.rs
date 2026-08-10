@@ -35,7 +35,7 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use super::dispatch::container_has_walg;
+use super::dispatch::{container_has_walg, service_container_name};
 use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
 use super::postgres_walg::run_walg_exec;
 use super::v2_common;
@@ -43,7 +43,8 @@ use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, Bac
 
 const ENGINE_KEY: &str = "mongodb";
 const DUMP_FILE_SUFFIX: &str = "dump.archive";
-const MONGO_SIDECAR_IMAGE: &str = "mongo:7";
+const MONGO_SIDECAR_IMAGE: &str =
+    "mongo:7.0.39-jammy@sha256:04582c3a144d088f841c446abfc19f79adcefa8bd00ad4a7fb18e27b9585c5d6";
 const WALG_STREAM_CREATE_COMMAND: &str = "mongodump --archive --uri=\"$MONGODB_URI\"";
 const WALG_STREAM_RESTORE_COMMAND: &str = "mongorestore --archive --drop --uri=\"$MONGODB_URI\"";
 
@@ -114,7 +115,7 @@ impl BackupEngine for MongodbEngine {
             .unwrap_or("")
             .to_string();
 
-        let target_container = format!("temps-mongodb-{}", service.name);
+        let target_container = service_container_name(&service);
         match deps
             .docker
             .inspect_container(
@@ -487,6 +488,13 @@ async fn list_total_s3_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mongo_sidecar_image_is_release_and_digest_pinned() {
+        assert!(MONGO_SIDECAR_IMAGE.contains("mongo:7.0.39-jammy@"));
+        assert!(MONGO_SIDECAR_IMAGE
+            .contains("sha256:04582c3a144d088f841c446abfc19f79adcefa8bd00ad4a7fb18e27b9585c5d6"));
+    }
 
     #[test]
     fn walg_stream_commands_use_ephemeral_uri_environment() {

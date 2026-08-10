@@ -27,6 +27,7 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
+use super::dispatch::service_container_name;
 use super::ring_buffer::RingBuffer;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
@@ -134,7 +135,7 @@ impl BackupEngine for PostgresWalgEngine {
                 reason: format!("decrypt secret key: {}", e),
             })?;
 
-        let container_name = format!("postgres-{}", service.name);
+        let container_name = service_container_name(&service);
         let s3_credentials = temps_providers::externalsvc::S3Credentials {
             access_key_id: access_key.clone(),
             secret_key: secret_key.clone(),

@@ -28,6 +28,8 @@ pub mod backup_schedules;
 pub mod backups;
 pub mod challenge_sessions;
 pub mod cli_login_sessions;
+pub mod cloud_backup_mirror_cursors;
+pub mod cloud_backup_mirror_states;
 pub mod cron_executions;
 pub mod crons;
 pub mod custom_routes;

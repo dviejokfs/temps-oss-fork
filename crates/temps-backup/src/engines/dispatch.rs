@@ -53,7 +53,7 @@ pub async fn resolve_engine_key(
     docker: &bollard::Docker,
 ) -> Result<&'static str, ResolveEngineError> {
     match service.service_type.as_str() {
-        "postgres" => {
+        "postgres" | "postgresql" | "timescale" | "timescaledb" => {
             if service.topology.as_str() == "cluster" {
                 return Ok("postgres_cluster");
             }
@@ -63,7 +63,7 @@ pub async fn resolve_engine_key(
             // (see temps-providers/src/externalsvc/postgres.rs:269-271).
             // Using a different prefix here makes the probe miss every
             // container and silently fall back to pg_dump.
-            let container_name = format!("postgres-{}", service.name);
+            let container_name = service_container_name(service);
             if container_has_walg(docker, &container_name).await {
                 Ok("postgres_walg")
             } else {
@@ -71,7 +71,7 @@ pub async fn resolve_engine_key(
             }
         }
         "redis" => Ok("redis"),
-        "mongodb" => Ok("mongodb"),
+        "mongodb" | "mongo" => Ok("mongodb"),
         "mariadb" => {
             // Cloud-grade PITR needs WAL-G, mariadb-backup (physical base),
             // and mariadb-binlog (binary-log replay) inside the container.
@@ -80,19 +80,36 @@ pub async fn resolve_engine_key(
             // (see temps-providers/src/externalsvc/mariadb.rs:298-300).
             // Using a different prefix here makes the probe miss every
             // container and silently fall back to the logical dump.
-            let container_name = format!("mariadb-{}", service.name);
+            let container_name = service_container_name(service);
             if container_has_mariadb_pitr_tools(docker, &container_name).await {
                 Ok("mariadb_physical")
             } else {
                 Ok("mariadb_dump")
             }
         }
-        "s3" | "minio" | "blob" => Ok("s3_mirror"),
+        "rustfs" | "s3" | "minio" | "blob" => Ok("s3_mirror"),
         other => Err(ResolveEngineError::Unsupported {
             service_id: service.id,
             service_type: other.to_string(),
         }),
     }
+}
+
+/// Resolve the actual container targeted by backup execution and capability
+/// probes. Imported services persist their original Docker container name;
+/// synthesizing a Temps-managed name for them probes and backs up the wrong
+/// container.
+pub(crate) fn service_container_name(service: &temps_entities::external_services::Model) -> String {
+    service.container_name.clone().unwrap_or_else(|| {
+        let prefix = match service.service_type.as_str() {
+            "mongodb" | "mongo" => "temps-mongodb",
+            "postgres" | "postgresql" | "timescale" | "timescaledb" => "postgres",
+            "mariadb" => "mariadb",
+            "redis" => "redis",
+            _ => service.service_type.as_str(),
+        };
+        format!("{prefix}-{}", service.name)
+    })
 }
 
 /// Probe whether `wal-g` is available in `container_name`.
@@ -158,7 +175,10 @@ pub(crate) async fn container_has_walg(docker: &bollard::Docker, container_name:
 /// `mariadb-binlog`/`mysqlbinlog` for replay. Returns `false` on any error or
 /// if any tool is missing, so existing stock MariaDB containers keep the
 /// logical `mariadb_dump` fallback while new managed images use WAL-G.
-async fn container_has_mariadb_pitr_tools(docker: &bollard::Docker, container_name: &str) -> bool {
+pub(crate) async fn container_has_mariadb_pitr_tools(
+    docker: &bollard::Docker,
+    container_name: &str,
+) -> bool {
     use bollard::exec::{CreateExecOptions, StartExecOptions};
 
     // Single shell test: exit 0 only if ALL tools resolve. `mariadb-binlog`
@@ -376,5 +396,25 @@ mod tests {
                 let result = resolve_engine_key(&svc, &docker).await;
                 assert!(matches!(result, Err(ResolveEngineError::Unsupported { service_type, .. }) if service_type == "elasticsearch"));
             });
+    }
+
+    #[test]
+    fn imported_service_uses_persisted_container_name() {
+        let mut service = make_service("postgres", "standalone");
+        service.container_name = Some("imported-production-db".to_string());
+
+        assert_eq!(service_container_name(&service), "imported-production-db");
+    }
+
+    #[test]
+    fn managed_service_uses_engine_specific_container_name() {
+        assert_eq!(
+            service_container_name(&make_service("mongodb", "standalone")),
+            "temps-mongodb-test-svc"
+        );
+        assert_eq!(
+            service_container_name(&make_service("redis", "standalone")),
+            "redis-test-svc"
+        );
     }
 }

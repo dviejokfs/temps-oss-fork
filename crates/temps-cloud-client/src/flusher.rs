@@ -223,6 +223,10 @@ mod tests {
         link.enroll("shutdown-code")
             .await
             .expect("test link must enroll");
+        link.set_feature_switches(crate::CloudFeatureSwitches {
+            telemetry: true,
+            ..Default::default()
+        });
         Some((link, directory))
     }
 

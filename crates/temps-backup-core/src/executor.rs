@@ -682,7 +682,9 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+    use sea_orm::{
+        ActiveModelTrait, DatabaseBackend, EntityTrait, MockDatabase, MockExecResult, Set,
+    };
 
     use super::*;
 
@@ -880,5 +882,269 @@ mod tests {
         assert!(sql.contains("s3_location      = $1"));
         assert!(sql.contains("size_bytes       = $2"));
         assert!(sql.contains("compression_type = $3"));
+    }
+
+    async fn setup_real_backup_pair(
+        db: &DatabaseConnection,
+    ) -> (
+        temps_entities::backups::Model,
+        temps_entities::external_service_backups::Model,
+    ) {
+        use temps_entities::{
+            backups, external_service_backups, external_services, s3_sources, users,
+        };
+
+        let now = chrono::Utc::now();
+        let user = users::ActiveModel {
+            name: Set("Backup transition test".into()),
+            email: Set(format!(
+                "backup-transition-{}@example.invalid",
+                uuid::Uuid::new_v4()
+            )),
+            password_hash: Set(None),
+            email_verified: Set(true),
+            email_verification_token: Set(None),
+            email_verification_expires: Set(None),
+            password_reset_token: Set(None),
+            password_reset_expires: Set(None),
+            must_change_password: Set(false),
+            deleted_at: Set(None),
+            mfa_secret: Set(None),
+            mfa_enabled: Set(false),
+            mfa_recovery_codes: Set(None),
+            oidc_subject: Set(None),
+            oidc_provider_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert transition-test user");
+        let source = s3_sources::ActiveModel {
+            name: Set(format!("transition-source-{}", uuid::Uuid::new_v4())),
+            bucket_name: Set("backup-transition-tests".into()),
+            region: Set("test-region-1".into()),
+            endpoint: Set(None),
+            bucket_path: Set(String::new()),
+            access_key_id: Set("encrypted-test-key".into()),
+            secret_key: Set("encrypted-test-secret".into()),
+            force_path_style: Set(Some(true)),
+            is_default: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert transition-test S3 source");
+        let service = external_services::ActiveModel {
+            name: Set(format!("transition-db-{}", uuid::Uuid::new_v4())),
+            service_type: Set("postgres".into()),
+            version: Set(Some("17".into())),
+            status: Set("running".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            slug: Set(None),
+            config: Set(None),
+            node_id: Set(None),
+            topology: Set("standalone".into()),
+            error_message: Set(None),
+            health_status: Set(None),
+            last_health_check_at: Set(None),
+            last_health_error: Set(None),
+            consecutive_health_failures: Set(0),
+            health_metadata: Set(None),
+            metrics_enabled: Set(false),
+            default_backup_provisioned: Set(false),
+            container_name: Set(None),
+            ai_data_access: Set(false),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert transition-test external service");
+        let backup = backups::ActiveModel {
+            name: Set("atomic transition".into()),
+            backup_id: Set(uuid::Uuid::new_v4().to_string()),
+            schedule_id: Set(None),
+            backup_type: Set("full".into()),
+            state: Set("pending".into()),
+            started_at: Set(now),
+            finished_at: Set(None),
+            size_bytes: Set(None),
+            file_count: Set(None),
+            s3_source_id: Set(source.id),
+            s3_location: Set("s3://backup-transition-tests/source/walg".into()),
+            error_message: Set(None),
+            metadata: Set(r#"{"local":"preserved"}"#.into()),
+            checksum: Set(None),
+            compression_type: Set("none".into()),
+            created_by: Set(user.id),
+            expires_at: Set(None),
+            tags: Set("[]".into()),
+            schedule_run_id: Set(None),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert transition-test backup");
+        let child = external_service_backups::ActiveModel {
+            service_id: Set(service.id),
+            backup_id: Set(backup.id),
+            backup_type: Set("full".into()),
+            state: Set("pending".into()),
+            started_at: Set(now),
+            finished_at: Set(None),
+            size_bytes: Set(None),
+            s3_location: Set(String::new()),
+            error_message: Set(None),
+            metadata: Set(serde_json::json!({"engine": "postgres"})),
+            checksum: Set(None),
+            compression_type: Set("none".into()),
+            created_by: Set(user.id),
+            expires_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert transition-test child backup");
+        (backup, child)
+    }
+
+    #[tokio::test]
+    async fn test_backup_transition_concurrent_start_updates_parent_and_child_once() {
+        use temps_entities::{backups, external_service_backups};
+
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/TestDatabase unavailable; skipping atomic transition test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (backup, child) = setup_real_backup_pair(db.as_ref()).await;
+        let executor = BackupExecutorBuilder::new(db.clone()).build();
+
+        let (first, second) = tokio::join!(
+            executor.mark_backup_running(backup.id),
+            executor.mark_backup_running(backup.id)
+        );
+
+        first.expect("first running transition");
+        second.expect("duplicate running transition is an idempotent no-op");
+        let parent = backups::Entity::find_by_id(backup.id)
+            .one(db.as_ref())
+            .await
+            .expect("query parent")
+            .expect("parent exists");
+        let child = external_service_backups::Entity::find_by_id(child.id)
+            .one(db.as_ref())
+            .await
+            .expect("query child")
+            .expect("child exists");
+        assert_eq!(parent.state, "running");
+        assert_eq!(child.state, "running");
+    }
+
+    #[tokio::test]
+    async fn test_backup_transition_failure_recovery_keeps_parent_and_child_consistent() {
+        use temps_entities::{backups, external_service_backups};
+
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/TestDatabase unavailable; skipping failure transition test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (backup, child) = setup_real_backup_pair(db.as_ref()).await;
+        let executor = BackupExecutorBuilder::new(db.clone()).build();
+        executor
+            .mark_backup_running(backup.id)
+            .await
+            .expect("mark running");
+
+        executor
+            .mark_backup_failed(backup.id, "object store unavailable after retries")
+            .await
+            .expect("mark failed atomically");
+
+        let parent = backups::Entity::find_by_id(backup.id)
+            .one(db.as_ref())
+            .await
+            .expect("query parent")
+            .expect("parent exists");
+        let child = external_service_backups::Entity::find_by_id(child.id)
+            .one(db.as_ref())
+            .await
+            .expect("query child")
+            .expect("child exists");
+        assert_eq!(parent.state, "failed");
+        assert_eq!(child.state, "failed");
+        assert_eq!(
+            parent.error_message.as_deref(),
+            Some("object store unavailable after retries")
+        );
+        assert_eq!(child.error_message, parent.error_message);
+        assert!(parent.finished_at.is_some());
+        assert!(child.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_backup_transition_completion_propagates_restore_contract_atomically() {
+        use temps_entities::{backups, external_service_backups};
+
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/TestDatabase unavailable; skipping completion transition test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (backup, child) = setup_real_backup_pair(db.as_ref()).await;
+        let executor = BackupExecutorBuilder::new(db.clone()).build();
+
+        executor
+            .finalize_completed(
+                backup.id,
+                "postgres_walg",
+                BackupOutcome {
+                    location: "s3://backup-transition-tests/cloud/walg".into(),
+                    size_bytes: Some(5_242_881),
+                    compression: "wal-g-native".into(),
+                },
+            )
+            .await
+            .expect("complete parent and child atomically");
+
+        let parent = backups::Entity::find_by_id(backup.id)
+            .one(db.as_ref())
+            .await
+            .expect("query parent")
+            .expect("parent exists");
+        let child = external_service_backups::Entity::find_by_id(child.id)
+            .one(db.as_ref())
+            .await
+            .expect("query child")
+            .expect("child exists");
+        assert_eq!(parent.state, "completed");
+        assert_eq!(child.state, "completed");
+        assert_eq!(parent.s3_location, child.s3_location);
+        assert_eq!(parent.size_bytes, child.size_bytes);
+        assert_eq!(parent.compression_type, child.compression_type);
+        assert_eq!(parent.metadata, r#"{"local":"preserved"}"#);
+        assert_eq!(child.metadata["engine"], "postgres");
+        assert!(parent.finished_at.is_some());
+        assert!(child.finished_at.is_some());
     }
 }

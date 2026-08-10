@@ -7369,6 +7369,22 @@ ORDER BY esb.id ASC
             })
     }
 
+    /// Resolve the live backup artifact and Cloud mirror compatibility for an
+    /// external service. Database lookup and Docker probing stay in the
+    /// service layer so HTTP handlers only perform authorization and mapping.
+    pub async fn get_external_service_backup_capability(
+        &self,
+        service_id: i32,
+    ) -> Result<super::ExternalServiceBackupCapability, super::BackupCapabilityError> {
+        let service = temps_entities::external_services::Entity::find_by_id(service_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| super::BackupCapabilityError::LoadService { service_id, source })?
+            .ok_or(super::BackupCapabilityError::ServiceNotFound { service_id })?;
+
+        Ok(super::capability::probe_external_service_backup_capability(&service).await)
+    }
+
     pub async fn backup_external_service(
         &self,
         service: &temps_entities::external_services::Model,

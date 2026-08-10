@@ -27,7 +27,7 @@ use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 const ENGINE_KEY: &str = "s3_mirror";
-const MC_IMAGE: &str = "minio/mc:latest";
+const MC_IMAGE: &str = "minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
 
 pub struct S3MirrorDeps {
     pub db: Arc<DatabaseConnection>,
@@ -308,4 +308,16 @@ async fn list_total_s3_size(
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minio_client_image_is_release_and_digest_pinned() {
+        assert!(MC_IMAGE.contains("minio/mc:RELEASE.2025-08-13T08-35-41Z@"));
+        assert!(MC_IMAGE
+            .contains("sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"));
+    }
 }

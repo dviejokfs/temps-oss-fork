@@ -10,6 +10,7 @@ temps-cloud-protocol = { path = "../temps-cloud-protocol" }
 temps-core = { path = "../temps-core" }
 
 chrono.workspace = true
+hmac = "0.13"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

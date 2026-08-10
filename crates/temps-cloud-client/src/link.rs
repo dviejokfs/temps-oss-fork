@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 
 use temps_cloud_protocol::{
@@ -31,7 +31,7 @@ use uuid::Uuid;
 use crate::spool::Spool;
 use crate::state::EnrollmentState;
 use crate::status::{LinkStatus, MirrorHealth};
-use crate::{BackendUrl, CloudClient, CloudError};
+use crate::{BackendUrl, CloudClient, CloudError, CloudFeatureSwitches};
 
 /// Spans per shipment. Small enough that one failure loses little progress.
 const BATCH_SIZE: usize = 500;
@@ -74,6 +74,9 @@ struct IncomingBatch {
 
 pub struct CloudLink {
     state: RwLock<Option<EnrollmentState>>,
+    /// Present when a state file existed but could not be decoded. Mutations
+    /// stay blocked so recoverable credentials are never overwritten.
+    unreadable_state_path: Option<String>,
     incoming_tx: mpsc::Sender<IncomingBatch>,
     incoming_rx: Mutex<mpsc::Receiver<IncomingBatch>>,
     incoming_spans: AtomicUsize,
@@ -92,13 +95,25 @@ pub struct CloudLink {
     generation: AtomicU64,
     flush_lock: tokio::sync::Mutex<()>,
     allow_loopback_development: bool,
+    telemetry_enabled: AtomicBool,
+    backups_enabled: AtomicBool,
+    notifications_enabled: AtomicBool,
+    encryption: Option<Arc<temps_core::EncryptionService>>,
 }
 
 impl CloudLink {
     /// Load from disk. An unlinked or absent state is a normal outcome, not an
     /// error — most instances never connect anything.
     pub fn load(data_dir: PathBuf, agent_version: impl Into<String>) -> Self {
-        Self::load_inner(data_dir, agent_version, false)
+        Self::load_inner(data_dir, agent_version, false, None)
+    }
+
+    pub fn load_encrypted(
+        data_dir: PathBuf,
+        agent_version: impl Into<String>,
+        encryption: Arc<temps_core::EncryptionService>,
+    ) -> Self {
+        Self::load_inner(data_dir, agent_version, false, Some(encryption))
     }
 
     /// Local-test constructor. Production callers must use [`CloudLink::load`].
@@ -106,28 +121,45 @@ impl CloudLink {
         data_dir: PathBuf,
         agent_version: impl Into<String>,
     ) -> Self {
-        Self::load_inner(data_dir, agent_version, true)
+        Self::load_inner(data_dir, agent_version, true, None)
+    }
+
+    pub fn load_encrypted_for_loopback_development(
+        data_dir: PathBuf,
+        agent_version: impl Into<String>,
+        encryption: Arc<temps_core::EncryptionService>,
+    ) -> Self {
+        Self::load_inner(data_dir, agent_version, true, Some(encryption))
     }
 
     fn load_inner(
         data_dir: PathBuf,
         agent_version: impl Into<String>,
         allow_loopback_development: bool,
+        encryption: Option<Arc<temps_core::EncryptionService>>,
     ) -> Self {
         // Credentials live in their own directory; state hardening must never
         // chmod an operator's shared TEMPS_DATA_DIR.
         let state_path = data_dir.join("cloud-link").join("state.json");
-        let state = EnrollmentState::load(&state_path).unwrap_or_else(|e| {
-            // Corruption is reported, not silently reset: overwriting would
-            // destroy a token the operator may still be able to recover.
-            tracing::error!(error = %e, "link state unreadable; treating as unlinked");
-            None
-        });
+        let loaded = encryption.as_ref().map_or_else(
+            || EnrollmentState::load(&state_path),
+            |encryption| EnrollmentState::load_encrypted(&state_path, encryption),
+        );
+        let (state, unreadable_state_path) = match loaded {
+            Ok(state) => (state, None),
+            Err(error) => {
+                // Corruption is reported, not silently reset: overwriting would
+                // destroy a token the operator may still be able to recover.
+                tracing::error!(%error, "link state unreadable; Cloud link mutations are blocked");
+                (None, Some(state_path.display().to_string()))
+            }
+        };
         let linked = state.as_ref().is_some_and(EnrollmentState::is_linked);
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_BATCH_CAPACITY);
 
         Self {
             state: RwLock::new(state),
+            unreadable_state_path,
             incoming_tx,
             incoming_rx: Mutex::new(incoming_rx),
             incoming_spans: AtomicUsize::new(0),
@@ -142,7 +174,119 @@ impl CloudLink {
             generation: AtomicU64::new(0),
             flush_lock: tokio::sync::Mutex::new(()),
             allow_loopback_development,
+            telemetry_enabled: AtomicBool::new(false),
+            backups_enabled: AtomicBool::new(false),
+            notifications_enabled: AtomicBool::new(false),
+            encryption,
         }
+    }
+
+    fn save_state(&self, state: &EnrollmentState) -> Result<(), crate::state::StateError> {
+        match &self.encryption {
+            Some(encryption) => state.save_encrypted(&self.state_path, encryption),
+            None => state.save(&self.state_path),
+        }
+    }
+
+    fn ensure_state_readable(&self) -> Result<(), crate::state::StateError> {
+        match &self.unreadable_state_path {
+            Some(path) => {
+                Err(crate::state::StateError::UnreadableStateBlocksMutation { path: path.clone() })
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn unreadable_cloud_error(&self) -> Option<CloudError> {
+        self.unreadable_state_path
+            .as_ref()
+            .map(|path| CloudError::LinkStateUnreadable { path: path.clone() })
+    }
+
+    /// Apply persisted, operator-controlled export settings. This is lock-free
+    /// on telemetry producers and deliberately independent of enrollment.
+    pub fn set_feature_switches(&self, switches: CloudFeatureSwitches) {
+        self.telemetry_enabled
+            .store(switches.telemetry, Ordering::Release);
+        self.backups_enabled
+            .store(switches.backups, Ordering::Release);
+        self.notifications_enabled
+            .store(switches.notifications, Ordering::Release);
+    }
+
+    pub fn feature_switches(&self) -> CloudFeatureSwitches {
+        CloudFeatureSwitches {
+            telemetry: self.telemetry_enabled.load(Ordering::Acquire),
+            backups: self.backups_enabled.load(Ordering::Acquire),
+            notifications: self.notifications_enabled.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn backups_enabled(&self) -> bool {
+        self.backups_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn telemetry_enabled(&self) -> bool {
+        self.telemetry_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn notifications_enabled(&self) -> bool {
+        self.notifications_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn notifications_available(&self) -> bool {
+        self.notifications_enabled()
+            && self.linked.load(Ordering::Acquire)
+            && !self.credential_rejected.load(Ordering::Acquire)
+    }
+
+    /// Stable per-link pseudonym for identifiers that must remain joinable in
+    /// Cloud without disclosing the local trace/span identifiers.
+    pub fn pseudonymize_telemetry_id(
+        &self,
+        domain: &'static str,
+        value: &str,
+    ) -> Result<String, CloudError> {
+        if !self.telemetry_enabled() {
+            return Err(CloudError::FeatureDisabled {
+                feature: "telemetry",
+            });
+        }
+        self.pseudonymize_linked_id(domain, value)
+    }
+
+    pub fn pseudonymize_notification_id(&self, value: &str) -> Result<String, CloudError> {
+        if !self.notifications_enabled() {
+            return Err(CloudError::FeatureDisabled {
+                feature: "notifications",
+            });
+        }
+        self.pseudonymize_linked_id("notification", value)
+    }
+
+    fn pseudonymize_linked_id(
+        &self,
+        domain: &'static str,
+        value: &str,
+    ) -> Result<String, CloudError> {
+        use hmac::{Hmac, KeyInit, Mac};
+        let (_, token) = self.linked_credential()?;
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(token.as_bytes()).map_err(|error| {
+            CloudError::ClientConfiguration {
+                reason: format!("could not initialize telemetry identifier HMAC: {error}"),
+            }
+        })?;
+        mac.update(domain.as_bytes());
+        mac.update(&[0]);
+        mac.update(value.as_bytes());
+        Ok(mac.finalize().into_bytes().iter().fold(
+            String::with_capacity(64),
+            |mut output, byte| {
+                use std::fmt::Write;
+                let _ = write!(output, "{byte:02x}");
+                output
+            },
+        ))
     }
 
     fn parse_backend(&self, value: &str) -> Result<BackendUrl, CloudError> {
@@ -154,6 +298,11 @@ impl CloudLink {
     }
 
     pub fn status(&self) -> LinkStatus {
+        if let Some(state_path) = &self.unreadable_state_path {
+            return LinkStatus::StateUnreadable {
+                state_path: state_path.clone(),
+            };
+        }
         match &*self.state.read().unwrap_or_else(|p| p.into_inner()) {
             None => LinkStatus::NotConfigured,
             Some(s) if s.is_linked() => {
@@ -225,6 +374,7 @@ impl CloudLink {
 
     /// Point this instance at a backend without linking it yet.
     pub fn configure(&self, backend: BackendUrl) -> Result<(), crate::state::StateError> {
+        self.ensure_state_readable()?;
         let mut guard = self.state.write().unwrap_or_else(|p| p.into_inner());
         let next_url = backend.as_str().to_string();
         if let Some(existing) = guard.as_ref() {
@@ -251,7 +401,7 @@ impl CloudLink {
             }
             None => EnrollmentState::new(next_url),
         };
-        next.save(&self.state_path)?;
+        self.save_state(&next)?;
         if changed_origin {
             self.linked.store(false, Ordering::Release);
             self.spool
@@ -276,6 +426,9 @@ impl CloudLink {
 
     /// Redeem an operator-pasted code and persist the resulting credential.
     pub async fn enroll(&self, code: &str) -> Result<(), CloudError> {
+        if let Some(error) = self.unreadable_cloud_error() {
+            return Err(error);
+        }
         let (base_url, instance_id, generation) = {
             let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
             let s = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
@@ -311,7 +464,7 @@ impl CloudLink {
         next.account_email = res.account_email;
         // Clone → save → swap: a failed disk write cannot leave a credential
         // alive only in memory.
-        next.save(&self.state_path)
+        self.save_state(&next)
             .map_err(|e| CloudError::EnrollmentRefused {
                 detail: format!("enrolled, but the credential could not be saved: {e}"),
             })?;
@@ -329,6 +482,9 @@ impl CloudLink {
     /// remove the local credential after this succeeds, or after the backend
     /// confirms that the credential is already invalid.
     pub async fn revoke(&self) -> Result<(), CloudError> {
+        if let Some(error) = self.unreadable_cloud_error() {
+            return Err(error);
+        }
         let (base_url, token) = {
             let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
             let state = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
@@ -464,15 +620,18 @@ impl CloudLink {
     /// issued. Destination validation and redirect prevention live in
     /// [`CloudClient`] and are therefore identical for WAL-G, native snapshots
     /// and local backup files.
-    pub async fn upload_backup_object(
+    pub async fn upload_backup_object_reader<R>(
         &self,
         target: &WalGObjectTarget,
-        body: reqwest::Body,
+        reader: R,
         spooled_bytes: u64,
-    ) -> Result<reqwest::Response, CloudError> {
+    ) -> Result<reqwest::Response, CloudError>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
         let (client, _, _) = self.walg_client()?;
         client
-            .upload_backup_object(target, body, spooled_bytes)
+            .upload_backup_object_reader(target, reader, spooled_bytes)
             .await
     }
 
@@ -496,6 +655,11 @@ impl CloudLink {
         &self,
         request: &ManagedNotificationRequest,
     ) -> Result<ManagedNotificationAccepted, CloudError> {
+        if !self.notifications_enabled.load(Ordering::Acquire) {
+            return Err(CloudError::FeatureDisabled {
+                feature: "notifications",
+            });
+        }
         let (base_url, token) = self.linked_credential()?;
         let backend = self.parse_backend(&base_url)?;
         CloudClient::new(backend)?
@@ -504,6 +668,9 @@ impl CloudLink {
     }
 
     fn linked_credential(&self) -> Result<(String, String), CloudError> {
+        if let Some(error) = self.unreadable_cloud_error() {
+            return Err(error);
+        }
         let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
         let state = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
         let token = state.token.clone().ok_or(CloudError::NotEnrolled)?;
@@ -511,6 +678,12 @@ impl CloudLink {
     }
 
     fn linked_backup_credential(&self) -> Result<(String, String, Uuid), CloudError> {
+        if !self.backups_enabled.load(Ordering::Acquire) {
+            return Err(CloudError::FeatureDisabled { feature: "backups" });
+        }
+        if let Some(error) = self.unreadable_cloud_error() {
+            return Err(error);
+        }
         let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
         let state = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
         let token = state.token.clone().ok_or(CloudError::NotEnrolled)?;
@@ -520,12 +693,13 @@ impl CloudLink {
     /// Forget the credential. Keeps the instance identity so re-linking later
     /// reattaches to the same record.
     pub fn disconnect(&self) -> Result<(), crate::state::StateError> {
+        self.ensure_state_readable()?;
         self.linked.store(false, Ordering::Release);
         let mut guard = self.state.write().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = guard.as_mut() {
             let mut next = s.clone();
             next.unlink();
-            next.save(&self.state_path)?;
+            self.save_state(&next)?;
             *s = next;
         }
         self.spool
@@ -548,7 +722,10 @@ impl CloudLink {
     /// that does not exist would burn memory to no purpose. Telemetry is still
     /// stored locally by the instance itself — that path is untouched.
     pub fn record(&self, spans: Vec<SpanRecord>) {
-        if spans.is_empty() || !self.linked.load(Ordering::Acquire) {
+        if spans.is_empty()
+            || !self.telemetry_enabled.load(Ordering::Acquire)
+            || !self.linked.load(Ordering::Acquire)
+        {
             return;
         }
         let count = spans.len();
@@ -596,6 +773,9 @@ impl CloudLink {
     pub async fn flush(&self) -> FlushOutcome {
         let _flush = self.flush_lock.lock().await;
         self.drain_incoming();
+        if !self.telemetry_enabled.load(Ordering::Acquire) {
+            return FlushOutcome::NotLinked;
+        }
         let (base_url, token, generation) = {
             let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
             match guard.as_ref() {
@@ -715,5 +895,68 @@ impl CloudLink {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod unreadable_state_tests {
+    use super::*;
+    use crate::state::StateError;
+
+    #[tokio::test]
+    async fn corrupt_state_is_visible_and_cannot_be_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("cloud-link/state.json");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let corrupt = b"{recoverable-but-currently-corrupt";
+        std::fs::write(&state_path, corrupt).unwrap();
+
+        let link =
+            CloudLink::load_for_loopback_development(directory.path().to_path_buf(), "test-agent");
+        assert!(matches!(link.status(), LinkStatus::StateUnreadable { .. }));
+
+        let backend = BackendUrl::loopback_development("http://127.0.0.1:19200").unwrap();
+        assert!(matches!(
+            link.configure(backend),
+            Err(StateError::UnreadableStateBlocksMutation { .. })
+        ));
+        assert!(matches!(
+            link.disconnect(),
+            Err(StateError::UnreadableStateBlocksMutation { .. })
+        ));
+        assert!(matches!(
+            link.enroll("code").await,
+            Err(CloudError::LinkStateUnreadable { .. })
+        ));
+        assert_eq!(std::fs::read(&state_path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn encryption_key_mismatch_blocks_mutation_and_preserves_ciphertext() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("cloud-link/state.json");
+        let original_encryption =
+            temps_core::EncryptionService::new_from_password("original-cloud-link-key");
+        EnrollmentState::new("http://127.0.0.1:19200")
+            .save_encrypted(&state_path, &original_encryption)
+            .unwrap();
+        let ciphertext = std::fs::read(&state_path).unwrap();
+
+        let wrong_encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "different-cloud-link-key",
+        ));
+        let link = CloudLink::load_encrypted_for_loopback_development(
+            directory.path().to_path_buf(),
+            "test-agent",
+            wrong_encryption,
+        );
+
+        assert!(matches!(link.status(), LinkStatus::StateUnreadable { .. }));
+        let backend = BackendUrl::loopback_development("http://127.0.0.1:19201").unwrap();
+        assert!(matches!(
+            link.configure(backend),
+            Err(StateError::UnreadableStateBlocksMutation { .. })
+        ));
+        assert_eq!(std::fs::read(&state_path).unwrap(), ciphertext);
     }
 }

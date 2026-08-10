@@ -11,6 +11,11 @@ use temps_cloud_protocol::Unavailable;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum LinkStatus {
+    /// State exists but cannot be decoded with the current configuration. No
+    /// mutation is allowed because it could destroy recoverable credentials.
+    StateUnreadable {
+        state_path: String,
+    },
     /// No backend configured. The UI should offer to connect one rather than
     /// hiding the feature — an unconfigured capability must onboard, not vanish.
     NotConfigured,
@@ -31,6 +36,9 @@ impl LinkStatus {
     /// One line, written for a human with no support channel.
     pub fn message(&self) -> String {
         match self {
+            LinkStatus::StateUnreadable { state_path } => format!(
+                "Cloud link state at {state_path} cannot be read. Restore the encryption key used to create it, or back up and remove the state file before reconnecting."
+            ),
             LinkStatus::NotConfigured => {
                 "Not connected to a managed backend. Telemetry is stored locally only.".into()
             }
@@ -50,7 +58,9 @@ impl LinkStatus {
     pub fn needs_attention(&self) -> bool {
         matches!(
             self,
-            LinkStatus::AwaitingEnrollment { .. } | LinkStatus::CredentialRejected { .. }
+            LinkStatus::StateUnreadable { .. }
+                | LinkStatus::AwaitingEnrollment { .. }
+                | LinkStatus::CredentialRejected { .. }
         )
     }
 }
@@ -134,6 +144,21 @@ mod tests {
         };
         assert!(s.needs_attention());
         assert!(s.message().contains("enrollment code"));
+    }
+
+    #[test]
+    fn unreadable_state_is_actionable_and_has_a_stable_serialized_shape() {
+        let status = LinkStatus::StateUnreadable {
+            state_path: "/data/cloud-link/state.json".into(),
+        };
+        assert!(status.needs_attention());
+        let message = status.message();
+        assert!(message.contains("encryption key"));
+        assert!(message.contains("back up and remove"));
+
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["state"], "state_unreadable");
+        assert_eq!(value["state_path"], "/data/cloud-link/state.json");
     }
 
     #[test]

@@ -1,11 +1,14 @@
-import { getCloudStatus, listProviderKeys } from '@/api/client'
+import {
+  getCloudAiCapabilityOptions,
+  listProviderKeysOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { getErrorMessage } from '@/utils/errorHandling'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowRight,
   Cloud,
-  Coins,
   ShieldCheck,
   Sparkles,
   X,
@@ -21,27 +24,46 @@ export function AiAssistantGate({
   onClose: () => void
 }) {
   const providers = useQuery({
-    queryKey: ['providerKeys'],
-    queryFn: async () => (await listProviderKeys()).data ?? [],
+    ...listProviderKeysOptions(),
     staleTime: 60_000,
     retry: false,
   })
   const cloud = useQuery({
-    queryKey: ['cloudStatus', 'ai'],
-    queryFn: async () => (await getCloudStatus()).data,
+    ...getCloudAiCapabilityOptions(),
     staleTime: 15_000,
     retry: false,
   })
 
+  const hasLocalProvider = (providers.data ?? []).some((key) => key.is_active)
+  if (providers.isSuccess && hasLocalProvider) {
+    return children
+  }
   if (providers.isPending || cloud.isPending) {
     return <AiDockSkeleton onClose={onClose} />
   }
-  const hasLocalProvider = (providers.data ?? []).some((key) => key.is_active)
-  const hasManagedProvider = cloud.data?.status === 'linked'
-  if (!hasLocalProvider && !hasManagedProvider) {
-    return <CloudAiEmptyState onClose={onClose} />
+  if (cloud.data?.configured) {
+    return children
   }
-  return children
+  if (providers.isError || cloud.isError) {
+    return (
+      <AiCapabilityError
+        error={providers.error ?? cloud.error}
+        retry={() => {
+          if (providers.isError) void providers.refetch()
+          if (cloud.isError) void cloud.refetch()
+        }}
+        isRetrying={providers.isFetching || cloud.isFetching}
+        onClose={onClose}
+      />
+    )
+  }
+  return (
+    <CloudAiEmptyState
+      reason={cloud.data?.reason}
+      setupPath={cloud.data?.setup_path}
+      onClose={onClose}
+    />
+  )
 }
 
 function DockHeader({ onClose }: { onClose: () => void }) {
@@ -78,7 +100,54 @@ function AiDockSkeleton({ onClose }: { onClose: () => void }) {
   )
 }
 
-export function CloudAiEmptyState({ onClose }: { onClose: () => void }) {
+function AiCapabilityError({
+  error,
+  retry,
+  isRetrying,
+  onClose,
+}: {
+  error: unknown
+  retry: () => void
+  isRetrying: boolean
+  onClose: () => void
+}) {
+  return (
+    <div className="flex h-full flex-col">
+      <DockHeader onClose={onClose} />
+      <div className="mt-auto space-y-5 p-5">
+        <div className="space-y-2">
+          <h2 className="text-lg font-semibold">AI availability is unknown</h2>
+          <p className="text-sm leading-6 text-muted-foreground">
+            {getErrorMessage(
+              error,
+              'The server could not check local or managed AI providers.'
+            )}
+          </p>
+        </div>
+        <div className="grid gap-2">
+          <Button onClick={retry} disabled={isRetrying}>
+            Check again
+          </Button>
+          <Button asChild variant="outline">
+            <Link to="/settings/ai-providers" onClick={onClose}>
+              Configure my own provider
+            </Link>
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export function CloudAiEmptyState({
+  reason,
+  setupPath = '/settings/cloud',
+  onClose,
+}: {
+  reason?: string | null
+  setupPath?: string
+  onClose: () => void
+}) {
   return (
     <div className="flex h-full flex-col">
       <DockHeader onClose={onClose} />
@@ -97,12 +166,21 @@ export function CloudAiEmptyState({ onClose }: { onClose: () => void }) {
               traces, errors, analytics, and deploys. Local ingest and primary
               telemetry storage stay on this instance.
             </p>
+            {reason ? (
+              <p className="max-w-md text-sm font-medium text-foreground">
+                {reason}
+              </p>
+            ) : null}
           </div>
 
           <div className="divide-y divide-border border-y border-border">
-            <AiCloudBenefit icon={<Coins />} title="250 AI credits included monthly">
-              Credits reset each billing period. Extra usage stays off until
-              you set a hard cap.
+            <AiCloudBenefit
+              icon={<Sparkles />}
+              title="Managed AI when configured"
+            >
+              Connecting Cloud does not enable AI usage or sell credits. This
+              assistant opens only after Cloud reports an available managed
+              provider.
             </AiCloudBenefit>
             <AiCloudBenefit
               icon={<ShieldCheck />}
@@ -118,8 +196,8 @@ export function CloudAiEmptyState({ onClose }: { onClose: () => void }) {
 
           <div className="grid gap-2">
             <Button asChild className="w-full justify-between">
-              <Link to="/settings/cloud" onClick={onClose}>
-                Connect Temps Cloud <ArrowRight className="size-4" />
+              <Link to={setupPath} onClick={onClose}>
+                Review managed AI setup <ArrowRight className="size-4" />
               </Link>
             </Button>
             <Button

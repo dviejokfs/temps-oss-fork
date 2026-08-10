@@ -1,9 +1,14 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use aws_sdk_s3::{Client as S3Client, Config};
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    sea_query::OnConflict, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend,
+    DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use temps_cloud_client::CloudLink;
@@ -14,18 +19,49 @@ use temps_cloud_protocol::{
     WalGSnapshotCompleted, WalGSnapshotRequest,
 };
 use temps_core::EncryptionService;
-use temps_entities::{backups, external_service_backups, external_services, s3_sources};
+use temps_entities::{
+    backups, cloud_backup_mirror_cursors, cloud_backup_mirror_states, external_service_backups,
+    external_services, s3_sources,
+};
 use tokio::{io::AsyncReadExt, sync::watch};
-use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Healthy cadence for discovering completed local backups.
 const BASE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+const S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const S3_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const S3_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Outage ceiling. Cloud can be unavailable indefinitely without making the
 /// self-hosted instance hammer it or affecting local backup completion.
 const MAX_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const SWEEP_LIMIT: u64 = 50;
+const MIRROR_STATE_VERSION: u32 = 1;
+const DUE_BACKUPS_SQL: &str = r#"
+SELECT b.*
+FROM cloud_backup_mirror_states AS mirror
+JOIN backups AS b ON b.id = mirror.backup_id
+WHERE mirror.tenant_id = $1
+  AND mirror.outcome <> 'complete'
+  AND mirror.retry_after <= $3
+  AND b.state = 'completed'
+ORDER BY mirror.retry_after ASC, mirror.backup_id ASC
+LIMIT $2
+"#;
+const DISCOVER_BACKUPS_SQL: &str = r#"
+SELECT b.*
+FROM backups AS b
+WHERE b.state = 'completed'
+  AND (COALESCE(b.finished_at, b.started_at), b.id) > ($1, $2)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM cloud_backup_mirror_states AS mirror
+    WHERE mirror.backup_id = b.id
+      AND mirror.tenant_id = $3
+  )
+ORDER BY COALESCE(b.finished_at, b.started_at) ASC, b.id ASC
+LIMIT $4
+"#;
 
 enum StageError {
     Unsupported(String),
@@ -99,16 +135,14 @@ async fn sweep(
     if !link.is_linked() {
         return Ok(SweepOutcome::NotLinked);
     }
+    if !link.backups_enabled() {
+        return Ok(SweepOutcome::NotLinked);
+    }
     let (Some(tenant_id), Some(instance_id)) = (link.tenant_id(), link.instance_id()) else {
         return Ok(SweepOutcome::NotLinked);
     };
-    let candidates = backups::Entity::find()
-        .filter(backups::Column::State.eq("completed"))
-        .filter(Expr::col(backups::Column::Metadata).not_like(format!("%\"{tenant_id}\"%")))
-        .order_by_asc(backups::Column::FinishedAt)
-        .limit(SWEEP_LIMIT)
-        .all(db.as_ref())
-        .await?;
+    let selection = select_due_backups(db, tenant_id, SWEEP_LIMIT).await?;
+    let candidates = selection.backups;
 
     tracing::debug!(
         candidate_count = candidates.len(),
@@ -118,32 +152,65 @@ async fn sweep(
     );
 
     if candidates.is_empty() {
+        if let Some(watermark) = selection.watermark {
+            advance_discovery_cursor(db, tenant_id, watermark).await?;
+        }
         return Ok(SweepOutcome::Idle);
     }
 
+    let mut resources = SweepResources::load(db, encryption, &candidates).await?;
     let mut made_progress = false;
     let mut retry_required = false;
 
     for backup in candidates {
+        // Before the indexed state table existed, mirror state lived in a
+        // free-form metadata string. Materialize terminal or not-yet-due
+        // legacy states in bounded batches. Malformed metadata deliberately
+        // falls through and is treated as new work.
+        if let Some(legacy) = deferred_legacy_state(&backup.metadata, tenant_id) {
+            persist_state(
+                db,
+                backup.id,
+                tenant_id,
+                legacy.outcome,
+                legacy.classification,
+                legacy.reason.as_deref(),
+            )
+            .await?;
+            made_progress = true;
+            continue;
+        }
         info!(
             local_backup_id = %backup.backup_id,
             "Cloud backup mirror staging local backup"
         );
-        match mirror_backup(link, db, encryption, &backup, instance_id).await {
+        match mirror_backup(link, &mut resources, &backup, instance_id).await {
             Ok(()) => {
                 info!(local_backup_id = %backup.backup_id, "WAL-G repository mirrored to Cloud");
-                persist_state(db, backup, tenant_id, "complete", None).await?;
+                persist_state(db, backup.id, tenant_id, "complete", "mirrored", None).await?;
                 made_progress = true;
             }
             Err(StageError::Unsupported(reason)) => {
-                persist_state(db, backup, tenant_id, "unsupported", Some(&reason)).await?;
-                made_progress = true;
+                persist_state(
+                    db,
+                    backup.id,
+                    tenant_id,
+                    "retry",
+                    "unsupported",
+                    Some(&reason),
+                )
+                .await?;
+                retry_required = true;
             }
             Err(StageError::Retry(error)) => {
                 warn!(backup_id = %backup.backup_id, error = %error, "Cloud backup mirror unavailable; will retry without affecting the local backup");
+                persist_state(db, backup.id, tenant_id, "retry", "transient", Some(&error)).await?;
                 retry_required = true;
             }
         }
+    }
+    if let Some(watermark) = selection.watermark {
+        advance_discovery_cursor(db, tenant_id, watermark).await?;
     }
     Ok(if retry_required {
         SweepOutcome::Retry
@@ -154,41 +221,311 @@ async fn sweep(
     })
 }
 
+/// Select a bounded page of work using the durable mirror-state index.
+///
+/// Rows without a state are included so pre-migration backups are lazily
+/// classified. The query never casts `backups.metadata`; malformed legacy
+/// strings therefore cannot poison discovery.
+#[derive(Clone, Copy)]
+struct DiscoveryWatermark {
+    finished_at: chrono::DateTime<chrono::Utc>,
+    backup_id: i32,
+}
+
+struct SweepSelection {
+    backups: Vec<backups::Model>,
+    watermark: Option<DiscoveryWatermark>,
+}
+
+async fn select_due_backups(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    limit: u64,
+) -> Result<SweepSelection, sea_orm::DbErr> {
+    let retry_limit = (limit / 2).max(1);
+    let retry_limit = i64::try_from(retry_limit).unwrap_or(i64::MAX);
+    let due = backups::Model::find_by_statement(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        DUE_BACKUPS_SQL,
+        [
+            tenant_id.into(),
+            retry_limit.into(),
+            chrono::Utc::now().into(),
+        ],
+    ))
+    .all(db)
+    .await?;
+
+    let cursor = cloud_backup_mirror_cursors::Entity::find_by_id(tenant_id)
+        .one(db)
+        .await?;
+    let cursor_finished_at = cursor
+        .as_ref()
+        .map(|cursor| cursor.last_finished_at)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+    let cursor_backup_id = cursor.as_ref().map_or(0, |cursor| cursor.last_backup_id);
+    let remaining = limit.saturating_sub(due.len() as u64);
+    let newly_completed = if remaining == 0 {
+        Vec::new()
+    } else {
+        backups::Model::find_by_statement(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            DISCOVER_BACKUPS_SQL,
+            [
+                cursor_finished_at.into(),
+                cursor_backup_id.into(),
+                tenant_id.into(),
+                i64::try_from(remaining).unwrap_or(i64::MAX).into(),
+            ],
+        ))
+        .all(db)
+        .await?
+    };
+    let watermark = newly_completed.last().map(|backup| DiscoveryWatermark {
+        finished_at: backup.finished_at.unwrap_or(backup.started_at),
+        backup_id: backup.id,
+    });
+    let mut seen = due.iter().map(|backup| backup.id).collect::<HashSet<_>>();
+    let mut candidates = due;
+    candidates.extend(
+        newly_completed
+            .into_iter()
+            .filter(|backup| seen.insert(backup.id)),
+    );
+    Ok(SweepSelection {
+        backups: candidates,
+        watermark,
+    })
+}
+
+async fn advance_discovery_cursor(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    watermark: DiscoveryWatermark,
+) -> Result<(), sea_orm::DbErr> {
+    db.execute(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        r#"
+INSERT INTO cloud_backup_mirror_cursors
+    (tenant_id, last_finished_at, last_backup_id, updated_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (tenant_id) DO UPDATE SET
+    last_finished_at = EXCLUDED.last_finished_at,
+    last_backup_id = EXCLUDED.last_backup_id,
+    updated_at = EXCLUDED.updated_at
+WHERE (
+    cloud_backup_mirror_cursors.last_finished_at,
+    cloud_backup_mirror_cursors.last_backup_id
+) < (EXCLUDED.last_finished_at, EXCLUDED.last_backup_id)
+"#,
+        [
+            tenant_id.into(),
+            watermark.finished_at.into(),
+            watermark.backup_id.into(),
+            chrono::Utc::now().into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+struct SweepResources<'a> {
+    db: &'a DatabaseConnection,
+    encryption: &'a EncryptionService,
+    external_by_backup: HashMap<i32, external_service_backups::Model>,
+    services: HashMap<i32, external_services::Model>,
+    sources: HashMap<i32, s3_sources::Model>,
+    clients: HashMap<i32, S3Client>,
+    repository_objects: HashMap<(i32, String), Arc<Vec<SourceObject>>>,
+    json_objects: HashMap<(i32, String), serde_json::Value>,
+    object_inspections: HashMap<(i32, String, String), (u64, String)>,
+    control_plane_postgres_major: Option<u16>,
+}
+
+impl<'a> SweepResources<'a> {
+    async fn load(
+        db: &'a DatabaseConnection,
+        encryption: &'a EncryptionService,
+        candidates: &[backups::Model],
+    ) -> Result<Self, sea_orm::DbErr> {
+        let backup_ids = candidates
+            .iter()
+            .map(|backup| backup.id)
+            .collect::<Vec<_>>();
+        let source_ids = candidates
+            .iter()
+            .map(|backup| backup.s3_source_id)
+            .collect::<HashSet<_>>();
+
+        let external_rows = if backup_ids.is_empty() {
+            Vec::new()
+        } else {
+            external_service_backups::Entity::find()
+                .filter(external_service_backups::Column::BackupId.is_in(backup_ids))
+                .all(db)
+                .await?
+        };
+        let service_ids = external_rows
+            .iter()
+            .map(|external| external.service_id)
+            .collect::<HashSet<_>>();
+        let services = if service_ids.is_empty() {
+            Vec::new()
+        } else {
+            external_services::Entity::find()
+                .filter(external_services::Column::Id.is_in(service_ids))
+                .all(db)
+                .await?
+        };
+        let sources = if source_ids.is_empty() {
+            Vec::new()
+        } else {
+            s3_sources::Entity::find()
+                .filter(s3_sources::Column::Id.is_in(source_ids))
+                .all(db)
+                .await?
+        };
+
+        Ok(Self {
+            db,
+            encryption,
+            external_by_backup: external_rows
+                .into_iter()
+                .map(|external| (external.backup_id, external))
+                .collect(),
+            services: services
+                .into_iter()
+                .map(|service| (service.id, service))
+                .collect(),
+            sources: sources
+                .into_iter()
+                .map(|source| (source.id, source))
+                .collect(),
+            clients: HashMap::new(),
+            repository_objects: HashMap::new(),
+            json_objects: HashMap::new(),
+            object_inspections: HashMap::new(),
+            control_plane_postgres_major: None,
+        })
+    }
+
+    fn external(&self, backup_id: i32) -> Option<external_service_backups::Model> {
+        self.external_by_backup.get(&backup_id).cloned()
+    }
+
+    fn service(&self, service_id: i32) -> Result<external_services::Model, StageError> {
+        self.services
+            .get(&service_id)
+            .cloned()
+            .ok_or_else(|| StageError::Retry(format!("external service {service_id} is missing")))
+    }
+
+    fn source(&self, source_id: i32) -> Result<s3_sources::Model, StageError> {
+        self.sources
+            .get(&source_id)
+            .cloned()
+            .ok_or_else(|| StageError::Retry(format!("S3 source {source_id} is missing")))
+    }
+
+    fn client(&mut self, source_id: i32) -> Result<S3Client, StageError> {
+        if let Some(client) = self.clients.get(&source_id) {
+            return Ok(client.clone());
+        }
+        let source = self.source(source_id)?;
+        let client = s3_client(self.encryption, &source)?;
+        self.clients.insert(source_id, client.clone());
+        Ok(client)
+    }
+
+    async fn list_repository(
+        &mut self,
+        source_id: i32,
+        bucket: &str,
+        root: &str,
+    ) -> Result<Arc<Vec<SourceObject>>, StageError> {
+        let cache_key = (source_id, root.to_owned());
+        if let Some(objects) = self.repository_objects.get(&cache_key) {
+            return Ok(Arc::clone(objects));
+        }
+        let client = self.client(source_id)?;
+        let objects = Arc::new(list_repository_objects(&client, bucket, root).await?);
+        self.repository_objects
+            .insert(cache_key, Arc::clone(&objects));
+        Ok(objects)
+    }
+
+    async fn read_json(
+        &mut self,
+        source_id: i32,
+        bucket: &str,
+        key: &str,
+    ) -> Result<serde_json::Value, StageError> {
+        let cache_key = (source_id, key.to_owned());
+        if let Some(value) = self.json_objects.get(&cache_key) {
+            return Ok(value.clone());
+        }
+        let client = self.client(source_id)?;
+        let value = read_json_object(&client, bucket, key).await?;
+        self.json_objects.insert(cache_key, value.clone());
+        Ok(value)
+    }
+
+    async fn inspect_object(
+        &mut self,
+        source_id: i32,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(u64, String), StageError> {
+        let cache_key = (source_id, bucket.to_owned(), key.to_owned());
+        if let Some(inspection) = self.object_inspections.get(&cache_key) {
+            return Ok(inspection.clone());
+        }
+        let client = self.client(source_id)?;
+        let inspection = inspect_source_object(&client, bucket, key).await?;
+        self.object_inspections
+            .insert(cache_key, inspection.clone());
+        Ok(inspection)
+    }
+
+    async fn find_snapshot_sentinel(
+        &mut self,
+        source_id: i32,
+        bucket: &str,
+        objects: &[SourceObject],
+        backup_uuid: &str,
+    ) -> Result<(String, serde_json::Value), StageError> {
+        for object in objects
+            .iter()
+            .filter(|object| object.key.ends_with("_backup_stop_sentinel.json"))
+        {
+            let value = self.read_json(source_id, bucket, &object.key).await?;
+            if contains_backup_identity(&value, backup_uuid) {
+                return Ok((object.key.clone(), value));
+            }
+        }
+        Err(StageError::Unsupported(format!(
+            "WAL-G repository has no sentinel carrying temps_backup_id={backup_uuid}; rerun the backup with the current Temps image"
+        )))
+    }
+}
+
 async fn mirror_backup(
     link: &CloudLink,
-    db: &DatabaseConnection,
-    encryption: &EncryptionService,
+    resources: &mut SweepResources<'_>,
     backup: &backups::Model,
     instance_id: Uuid,
 ) -> Result<(), StageError> {
-    let external = external_service_backups::Entity::find()
-        .filter(external_service_backups::Column::BackupId.eq(backup.id))
-        .one(db)
-        .await
-        .map_err(|error| StageError::Retry(error.to_string()))?;
+    let external = resources.external(backup.id);
     let Some(external) = external else {
-        return mirror_walg_backup(link, db, encryption, backup, instance_id).await;
+        return mirror_walg_backup(link, resources, backup, None, instance_id).await;
     };
-    let service = external_services::Entity::find_by_id(external.service_id)
-        .one(db)
-        .await
-        .map_err(|error| StageError::Retry(error.to_string()))?
-        .ok_or_else(|| StageError::Retry(format!("service {} is missing", external.service_id)))?;
+    let service = resources.service(external.service_id)?;
     match service.service_type.to_ascii_lowercase().as_str() {
         "postgres" | "postgresql" | "timescale" | "timescaledb" => {
-            mirror_walg_backup(link, db, encryption, backup, instance_id).await
+            mirror_walg_backup(link, resources, backup, Some(external), instance_id).await
         }
         engine if supports_native_mirror(engine) => {
-            mirror_native_backup(
-                link,
-                db,
-                encryption,
-                backup,
-                &external,
-                &service,
-                instance_id,
-            )
-            .await
+            mirror_native_backup(link, resources, backup, &external, &service, instance_id).await
         }
         engine => Err(StageError::Unsupported(format!(
             "Cloud backup mirroring does not support engine {engine}"
@@ -205,21 +542,14 @@ fn supports_native_mirror(service_type: &str) -> bool {
 
 async fn mirror_native_backup(
     link: &CloudLink,
-    db: &DatabaseConnection,
-    encryption: &EncryptionService,
+    resources: &mut SweepResources<'_>,
     backup: &backups::Model,
     external: &external_service_backups::Model,
     service: &external_services::Model,
     instance_id: Uuid,
 ) -> Result<(), StageError> {
-    let source_config = s3_sources::Entity::find_by_id(backup.s3_source_id)
-        .one(db)
-        .await
-        .map_err(|error| StageError::Retry(error.to_string()))?
-        .ok_or_else(|| {
-            StageError::Retry(format!("S3 source {} is missing", backup.s3_source_id))
-        })?;
-    let client = s3_client(encryption, &source_config)?;
+    let source_config = resources.source(backup.s3_source_id)?;
+    let client = resources.client(backup.s3_source_id)?;
     let location = if external.s3_location.trim().is_empty() {
         backup.s3_location.as_str()
     } else {
@@ -227,7 +557,7 @@ async fn mirror_native_backup(
     };
     let location_key = s3_key(&source_config.bucket_name, location)?;
     let service_type = service.service_type.to_ascii_lowercase();
-    let version = service_engine_version(encryption, service);
+    let version = service_engine_version(resources.encryption, service);
 
     let (root, selected, engine, format, compression, identity) = match service_type.as_str() {
         "mongodb" | "mongo" | "redis" => {
@@ -237,14 +567,17 @@ async fn mirror_native_backup(
                     "{service_type} Cloud backups require the WAL-G stream path; got {location}"
                 )));
             }
-            let all = list_repository_objects(&client, &source_config.bucket_name, &root).await?;
-            let (sentinel_key, _) = find_snapshot_sentinel(
-                &client,
-                &source_config.bucket_name,
-                &all,
-                &backup.backup_id,
-            )
-            .await?;
+            let all = resources
+                .list_repository(backup.s3_source_id, &source_config.bucket_name, &root)
+                .await?;
+            let (sentinel_key, _) = resources
+                .find_snapshot_sentinel(
+                    backup.s3_source_id,
+                    &source_config.bucket_name,
+                    &all,
+                    &backup.backup_id,
+                )
+                .await?;
             let backup_name = sentinel_key
                 .rsplit('/')
                 .next()
@@ -254,8 +587,9 @@ async fn mirror_native_backup(
                 })?
                 .to_string();
             let selected = all
-                .into_iter()
+                .iter()
                 .filter(|object| object.key == sentinel_key || object.key.contains(&backup_name))
+                .cloned()
                 .collect::<Vec<_>>();
             if selected.len() < 2 {
                 return Err(StageError::Retry(format!(
@@ -295,14 +629,17 @@ async fn mirror_native_backup(
                     "MariaDB Cloud backups require the WAL-G repository path; got {location}"
                 )));
             }
-            let all = list_repository_objects(&client, &source_config.bucket_name, &root).await?;
-            let (sentinel_key, _) = find_snapshot_sentinel(
-                &client,
-                &source_config.bucket_name,
-                &all,
-                &backup.backup_id,
-            )
-            .await?;
+            let all = resources
+                .list_repository(backup.s3_source_id, &source_config.bucket_name, &root)
+                .await?;
+            let (sentinel_key, _) = resources
+                .find_snapshot_sentinel(
+                    backup.s3_source_id,
+                    &source_config.bucket_name,
+                    &all,
+                    &backup.backup_id,
+                )
+                .await?;
             let backup_name = sentinel_key
                 .rsplit('/')
                 .next()
@@ -313,20 +650,26 @@ async fn mirror_native_backup(
                 .to_string();
             let metadata_key = format!("{root}/{}.metadata.json", backup.backup_id);
             let selected = all
-                .into_iter()
+                .iter()
                 .filter(|object| {
                     object.key == sentinel_key
                         || object.key == metadata_key
                         || object.key.contains(&backup_name)
                 })
+                .cloned()
                 .collect::<Vec<_>>();
             if selected.len() < 3 || !selected.iter().any(|object| object.key == metadata_key) {
                 return Err(StageError::Retry(format!(
                     "MariaDB WAL-G snapshot {backup_name} is incomplete or lacks {metadata_key}"
                 )));
             }
-            let metadata =
-                read_json_object(&client, &source_config.bucket_name, &metadata_key).await?;
+            let metadata = resources
+                .read_json(
+                    backup.s3_source_id,
+                    &source_config.bucket_name,
+                    &metadata_key,
+                )
+                .await?;
             let binlog_file = metadata
                 .pointer("/extra/binlog_file")
                 .or_else(|| metadata.get("binlog_file"))
@@ -357,10 +700,12 @@ async fn mirror_native_backup(
         }
         "rustfs" | "s3" | "minio" | "blob" => {
             let root = location_key.trim_end_matches('/').to_string();
-            let selected = list_repository_objects(&client, &source_config.bucket_name, &root)
+            let selected = resources
+                .list_repository(backup.s3_source_id, &source_config.bucket_name, &root)
                 .await?
-                .into_iter()
+                .iter()
                 .filter(|object| !object.key.ends_with("/metadata.json"))
+                .cloned()
                 .collect::<Vec<_>>();
             if selected.is_empty() {
                 return Err(StageError::Retry(format!(
@@ -387,8 +732,9 @@ async fn mirror_native_backup(
 
     let mut declarations = Vec::with_capacity(selected.len());
     for object in &selected {
-        let (bytes, checksum_sha256) =
-            inspect_source_object(&client, &source_config.bucket_name, &object.key).await?;
+        let (bytes, checksum_sha256) = resources
+            .inspect_object(backup.s3_source_id, &source_config.bucket_name, &object.key)
+            .await?;
         if bytes != object.bytes {
             return Err(StageError::Retry(format!(
                 "native snapshot object {} changed while its manifest was built",
@@ -461,9 +807,9 @@ async fn mirror_native_backup(
 
 async fn mirror_walg_backup(
     link: &CloudLink,
-    db: &DatabaseConnection,
-    encryption: &EncryptionService,
+    resources: &mut SweepResources<'_>,
     backup: &backups::Model,
+    external: Option<external_service_backups::Model>,
     instance_id: Uuid,
 ) -> Result<(), StageError> {
     let root = walg_root_key(&backup.s3_location).ok_or_else(|| {
@@ -472,28 +818,20 @@ async fn mirror_walg_backup(
             backup.s3_location
         ))
     })?;
-    let external = external_service_backups::Entity::find()
-        .filter(external_service_backups::Column::BackupId.eq(backup.id))
-        .one(db)
-        .await
-        .map_err(|error| StageError::Retry(error.to_string()))?;
-    let (source, engine, postgres_major) = load_postgres_identity(db, external).await?;
-    let source_config = s3_sources::Entity::find_by_id(backup.s3_source_id)
-        .one(db)
-        .await
-        .map_err(|error| StageError::Retry(error.to_string()))?
-        .ok_or_else(|| {
-            StageError::Retry(format!("S3 source {} is missing", backup.s3_source_id))
-        })?;
-    let client = s3_client(encryption, &source_config)?;
-    let objects = list_repository_objects(&client, &source_config.bucket_name, &root).await?;
-    let (sentinel_key, sentinel) = find_snapshot_sentinel(
-        &client,
-        &source_config.bucket_name,
-        &objects,
-        &backup.backup_id,
-    )
-    .await?;
+    let (source, engine, postgres_major) = load_postgres_identity(resources, external).await?;
+    let source_config = resources.source(backup.s3_source_id)?;
+    let client = resources.client(backup.s3_source_id)?;
+    let objects = resources
+        .list_repository(backup.s3_source_id, &source_config.bucket_name, &root)
+        .await?;
+    let (sentinel_key, sentinel) = resources
+        .find_snapshot_sentinel(
+            backup.s3_source_id,
+            &source_config.bucket_name,
+            &objects,
+            &backup.backup_id,
+        )
+        .await?;
     let backup_name = sentinel_key
         .rsplit('/')
         .next()
@@ -516,7 +854,7 @@ async fn mirror_walg_backup(
     let base_prefix = format!("{root}/basebackups_005/{backup_name}/");
     let wal_prefix = format!("{root}/wal_005/");
     let selected = objects
-        .into_iter()
+        .iter()
         .filter(|object| {
             object.key == sentinel_key
                 || object.key.starts_with(&base_prefix)
@@ -525,6 +863,7 @@ async fn mirror_walg_backup(
                     segment >= first_wal.as_str() && segment <= last_wal.as_str()
                 })
         })
+        .cloned()
         .collect::<Vec<_>>();
     if selected.is_empty() {
         return Err(StageError::Retry(format!(
@@ -534,8 +873,9 @@ async fn mirror_walg_backup(
 
     let mut declarations = Vec::with_capacity(selected.len());
     for object in &selected {
-        let (bytes, checksum_sha256) =
-            inspect_source_object(&client, &source_config.bucket_name, &object.key).await?;
+        let (bytes, checksum_sha256) = resources
+            .inspect_object(backup.s3_source_id, &source_config.bucket_name, &object.key)
+            .await?;
         if bytes != object.bytes {
             return Err(StageError::Retry(format!(
                 "WAL-G object {} changed while its manifest was being built",
@@ -613,6 +953,7 @@ async fn mirror_walg_backup(
     .map_err(|error| StageError::Retry(error.to_string()))
 }
 
+#[derive(Clone, Debug)]
 struct SourceObject {
     key: String,
     bytes: u64,
@@ -633,9 +974,12 @@ async fn list_repository_objects(
         if let Some(token) = continuation.take() {
             request = request.continuation_token(token);
         }
-        let response = request.send().await.map_err(|error| {
-            StageError::Retry(format!("could not list WAL-G repository: {error}"))
-        })?;
+        let response = tokio::time::timeout(S3_CONTROL_REQUEST_TIMEOUT, request.send())
+            .await
+            .map_err(|_| StageError::Retry("listing the backup repository timed out".into()))?
+            .map_err(|error| {
+                StageError::Retry(format!("could not list WAL-G repository: {error}"))
+            })?;
         for object in response.contents() {
             if let (Some(key), Some(bytes)) = (
                 object.key(),
@@ -657,54 +1001,6 @@ async fn list_repository_objects(
         }
     }
     Ok(objects)
-}
-
-async fn find_snapshot_sentinel(
-    client: &S3Client,
-    bucket: &str,
-    objects: &[SourceObject],
-    backup_uuid: &str,
-) -> Result<(String, serde_json::Value), StageError> {
-    for object in objects
-        .iter()
-        .filter(|object| object.key.ends_with("_backup_stop_sentinel.json"))
-    {
-        let response = client
-            .get_object()
-            .bucket(bucket)
-            .key(&object.key)
-            .send()
-            .await
-            .map_err(|error| {
-                StageError::Retry(format!(
-                    "could not read WAL-G sentinel {}: {error}",
-                    object.key
-                ))
-            })?;
-        let bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|error| {
-                StageError::Retry(format!(
-                    "could not collect WAL-G sentinel {}: {error}",
-                    object.key
-                ))
-            })?
-            .into_bytes();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-            StageError::Retry(format!(
-                "WAL-G sentinel {} is invalid JSON: {error}",
-                object.key
-            ))
-        })?;
-        if contains_backup_identity(&value, backup_uuid) {
-            return Ok((object.key.clone(), value));
-        }
-    }
-    Err(StageError::Unsupported(format!(
-        "WAL-G repository has no sentinel carrying temps_backup_id={backup_uuid}; rerun the backup with the current Temps image"
-    )))
 }
 
 fn contains_backup_identity(value: &serde_json::Value, backup_uuid: &str) -> bool {
@@ -824,9 +1120,17 @@ async fn inspect_source_object(
     let mut bytes = 0_u64;
     let mut digest = Sha256::new();
     loop {
-        let read = reader.read(&mut buffer).await.map_err(|error| {
-            StageError::Retry(format!("could not stream WAL-G object {key}: {error}"))
-        })?;
+        let read = tokio::time::timeout(S3_STREAM_IDLE_TIMEOUT, reader.read(&mut buffer))
+            .await
+            .map_err(|_| {
+                StageError::Retry(format!(
+                    "source object {key} made no progress for {} seconds",
+                    S3_STREAM_IDLE_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|error| {
+                StageError::Retry(format!("could not stream WAL-G object {key}: {error}"))
+            })?;
         if read == 0 {
             break;
         }
@@ -869,21 +1173,40 @@ async fn upload_repository_object(
         for attempt in 0..3 {
             // Reopen the S3 source on every attempt. The stream is not
             // rewindable, but retrying never allocates a local staging file.
-            let response = source_client
-                .get_object()
-                .bucket(bucket)
-                .key(&source_key)
-                .send()
-                .await
-                .map_err(|error| {
-                    StageError::Retry(format!(
+            let response = match tokio::time::timeout(
+                S3_CONTROL_REQUEST_TIMEOUT,
+                source_client
+                    .get_object()
+                    .bucket(bucket)
+                    .key(&source_key)
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    last_failure = Some(format!(
                         "could not reopen WAL-G object {source_key}: {error}"
-                    ))
-                })?;
-            let body =
-                reqwest::Body::wrap_stream(ReaderStream::new(response.body.into_async_read()));
+                    ));
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    last_failure = Some(format!("opening WAL-G object {source_key} timed out"));
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                    }
+                    continue;
+                }
+            };
             match link
-                .upload_backup_object(&target, body, declaration.bytes)
+                .upload_backup_object_reader(
+                    &target,
+                    response.body.into_async_read(),
+                    declaration.bytes,
+                )
                 .await
             {
                 Ok(response) if response.status().is_success() => {
@@ -894,6 +1217,13 @@ async fn upload_repository_object(
                     if matches!(response.status().as_u16(), 408 | 425 | 429 | 500..=599) =>
                 {
                     last_failure = Some(format!("object storage returned {}", response.status()));
+                }
+                Ok(response) if matches!(response.status().as_u16(), 409 | 412) => {
+                    // The previous PUT may have committed before its response
+                    // was lost. Completion verifies the immutable object's
+                    // declared size and checksum and is the safe arbiter.
+                    last_failure = None;
+                    break;
                 }
                 Ok(response) => {
                     return Err(StageError::Unsupported(format!(
@@ -954,21 +1284,42 @@ async fn upload_native_object(
         let source_key = format!("{root}/{}", declaration.relative_key);
         let mut last_failure = None;
         for attempt in 0..3 {
-            let response = source_client
-                .get_object()
-                .bucket(bucket)
-                .key(&source_key)
-                .send()
-                .await
-                .map_err(|error| {
-                    StageError::Retry(format!(
+            let response = match tokio::time::timeout(
+                S3_CONTROL_REQUEST_TIMEOUT,
+                source_client
+                    .get_object()
+                    .bucket(bucket)
+                    .key(&source_key)
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    last_failure = Some(format!(
                         "could not reopen native snapshot object {source_key}: {error}"
-                    ))
-                })?;
-            let body =
-                reqwest::Body::wrap_stream(ReaderStream::new(response.body.into_async_read()));
+                    ));
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    last_failure = Some(format!(
+                        "opening native snapshot object {source_key} timed out"
+                    ));
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                    }
+                    continue;
+                }
+            };
             match link
-                .upload_backup_object(&target, body, declaration.bytes)
+                .upload_backup_object_reader(
+                    &target,
+                    response.body.into_async_read(),
+                    declaration.bytes,
+                )
                 .await
             {
                 Ok(response) if response.status().is_success() => {
@@ -979,6 +1330,10 @@ async fn upload_native_object(
                     if matches!(response.status().as_u16(), 408 | 425 | 429 | 500..=599) =>
                 {
                     last_failure = Some(format!("object storage returned {}", response.status()));
+                }
+                Ok(response) if matches!(response.status().as_u16(), 409 | 412) => {
+                    last_failure = None;
+                    break;
                 }
                 Ok(response) => {
                     return Err(StageError::Unsupported(format!(
@@ -1044,17 +1399,16 @@ async fn read_json_object(
     bucket: &str,
     key: &str,
 ) -> Result<serde_json::Value, StageError> {
-    let response = client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
+    let response = tokio::time::timeout(
+        S3_CONTROL_REQUEST_TIMEOUT,
+        client.get_object().bucket(bucket).key(key).send(),
+    )
+    .await
+    .map_err(|_| StageError::Retry(format!("reading {key} timed out")))?
+    .map_err(|error| StageError::Retry(format!("could not read {key}: {error}")))?;
+    let bytes = tokio::time::timeout(S3_CONTROL_REQUEST_TIMEOUT, response.body.collect())
         .await
-        .map_err(|error| StageError::Retry(format!("could not read {key}: {error}")))?;
-    let bytes = response
-        .body
-        .collect()
-        .await
+        .map_err(|_| StageError::Retry(format!("collecting {key} timed out")))?
         .map_err(|error| StageError::Retry(format!("could not collect {key}: {error}")))?
         .into_bytes();
     serde_json::from_slice(&bytes)
@@ -1069,17 +1423,11 @@ fn walg_root_key(location: &str) -> Option<String> {
 }
 
 async fn load_postgres_identity(
-    db: &DatabaseConnection,
+    resources: &mut SweepResources<'_>,
     external: Option<external_service_backups::Model>,
 ) -> Result<(String, BackupEngine, u16), StageError> {
     if let Some(external) = external {
-        let service = external_services::Entity::find_by_id(external.service_id)
-            .one(db)
-            .await
-            .map_err(|error| StageError::Retry(error.to_string()))?
-            .ok_or_else(|| {
-                StageError::Retry(format!("service {} is missing", external.service_id))
-            })?;
+        let service = resources.service(external.service_id)?;
         let engine = match service.service_type.to_ascii_lowercase().as_str() {
             "postgres" | "postgresql" => BackupEngine::Postgres,
             "timescale" | "timescaledb" => BackupEngine::TimescaleDb,
@@ -1101,20 +1449,29 @@ async fn load_postgres_identity(
             major,
         ))
     } else {
-        let row = db
-            .query_one(Statement::from_string(
-                db.get_database_backend(),
-                "SELECT current_setting('server_version') AS server_version".to_string(),
-            ))
-            .await
-            .map_err(|error| StageError::Retry(error.to_string()))?
-            .ok_or_else(|| StageError::Retry("PostgreSQL did not return server_version".into()))?;
-        let version: String = row
-            .try_get("", "server_version")
-            .map_err(|error| StageError::Retry(error.to_string()))?;
-        let major = parse_postgres_major(Some(&version)).ok_or_else(|| {
-            StageError::Unsupported(format!("unsupported PostgreSQL version {version}"))
-        })?;
+        let major = if let Some(major) = resources.control_plane_postgres_major {
+            major
+        } else {
+            let row = resources
+                .db
+                .query_one(Statement::from_string(
+                    resources.db.get_database_backend(),
+                    "SELECT current_setting('server_version') AS server_version".to_string(),
+                ))
+                .await
+                .map_err(|error| StageError::Retry(error.to_string()))?
+                .ok_or_else(|| {
+                    StageError::Retry("PostgreSQL did not return server_version".into())
+                })?;
+            let version: String = row
+                .try_get("", "server_version")
+                .map_err(|error| StageError::Retry(error.to_string()))?;
+            let major = parse_postgres_major(Some(&version)).ok_or_else(|| {
+                StageError::Unsupported(format!("unsupported PostgreSQL version {version}"))
+            })?;
+            resources.control_plane_postgres_major = Some(major);
+            major
+        };
         Ok((
             "postgres/control-plane".into(),
             BackupEngine::Postgres,
@@ -1144,7 +1501,15 @@ fn s3_client(
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new(source.region.clone()))
         .force_path_style(source.force_path_style.unwrap_or(true))
-        .credentials_provider(credentials);
+        .credentials_provider(credentials)
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(3))
+        // Connect attempts are bounded, but no whole-operation timeout is set:
+        // a valid multi-gigabyte streaming GET must not be killed by its size.
+        .timeout_config(
+            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                .connect_timeout(S3_CONNECT_TIMEOUT)
+                .build(),
+        );
     if let Some(endpoint) = &source.endpoint {
         builder = builder.endpoint_url(if endpoint.starts_with("http") {
             endpoint.clone()
@@ -1200,50 +1565,708 @@ fn image_tag_version(image: &str) -> Option<&str> {
 
 async fn persist_state(
     db: &DatabaseConnection,
-    backup: backups::Model,
+    backup_id: i32,
     tenant_id: Uuid,
-    state: &str,
+    outcome: &str,
+    classification: &str,
     reason: Option<&str>,
 ) -> Result<(), sea_orm::DbErr> {
-    let mut metadata = serde_json::from_str::<serde_json::Value>(&backup.metadata)
-        .unwrap_or_else(|_| serde_json::json!({}));
-    if !metadata.is_object() {
-        metadata = serde_json::json!({});
+    // Re-read under a row lock. The sweep model may be minutes old by the time
+    // S3 work completes; writing it back would erase metadata concurrently
+    // added by the local backup workflow.
+    let transaction = db.begin().await?;
+    let query = backups::Entity::find_by_id(backup_id);
+    let backup = if db.get_database_backend() == DatabaseBackend::Postgres {
+        query.lock_exclusive().one(&transaction).await?
+    } else {
+        // SQLite serializes the write transaction itself and does not support
+        // SELECT ... FOR UPDATE.
+        query.one(&transaction).await?
     }
-    let Some(root) = metadata.as_object_mut() else {
-        return Ok(());
+    .ok_or_else(|| {
+        sea_orm::DbErr::RecordNotFound(format!(
+            "backup {backup_id} disappeared while persisting Cloud mirror state"
+        ))
+    })?;
+    let previous_attempt_count =
+        cloud_backup_mirror_states::Entity::find_by_id((backup_id, tenant_id))
+            .one(&transaction)
+            .await?
+            .map_or(0, |state| state.attempt_count);
+    let attempt_count = if outcome == "retry" {
+        previous_attempt_count.saturating_add(1)
+    } else {
+        0
     };
+    let retry_after = (outcome == "retry")
+        .then(|| chrono::Utc::now() + mirror_retry_delay(classification, attempt_count));
+    let metadata = merge_mirror_state(
+        &backup.metadata,
+        tenant_id,
+        outcome,
+        classification,
+        reason,
+        retry_after,
+    );
+    if let Some(metadata) = metadata {
+        let mut active: backups::ActiveModel = backup.into();
+        active.metadata = Set(metadata.to_string());
+        active.update(&transaction).await?;
+    }
+    cloud_backup_mirror_states::Entity::insert(cloud_backup_mirror_states::ActiveModel {
+        backup_id: Set(backup_id),
+        tenant_id: Set(tenant_id),
+        schema_version: Set(i32::try_from(MIRROR_STATE_VERSION).unwrap_or(i32::MAX)),
+        outcome: Set(outcome.to_owned()),
+        classification: Set(classification.to_owned()),
+        reason: Set(reason.map(str::to_owned)),
+        attempt_count: Set(attempt_count),
+        retry_after: Set(retry_after),
+        updated_at: Set(chrono::Utc::now()),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            cloud_backup_mirror_states::Column::BackupId,
+            cloud_backup_mirror_states::Column::TenantId,
+        ])
+        .update_columns([
+            cloud_backup_mirror_states::Column::SchemaVersion,
+            cloud_backup_mirror_states::Column::Outcome,
+            cloud_backup_mirror_states::Column::Classification,
+            cloud_backup_mirror_states::Column::Reason,
+            cloud_backup_mirror_states::Column::AttemptCount,
+            cloud_backup_mirror_states::Column::RetryAfter,
+            cloud_backup_mirror_states::Column::UpdatedAt,
+        ])
+        .to_owned(),
+    )
+    .exec(&transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+fn mirror_retry_delay(classification: &str, attempt_count: i32) -> chrono::Duration {
+    if classification == "unsupported" {
+        return chrono::Duration::from_std(MAX_SWEEP_INTERVAL)
+            .unwrap_or_else(|_| chrono::Duration::minutes(15));
+    }
+    let exponent = u32::try_from(attempt_count.saturating_sub(1))
+        .unwrap_or_default()
+        .min(5);
+    let seconds = 30_u64.saturating_mul(1_u64 << exponent);
+    chrono::Duration::seconds(
+        i64::try_from(seconds.min(MAX_SWEEP_INTERVAL.as_secs())).unwrap_or(900),
+    )
+}
+
+fn merge_mirror_state(
+    current_metadata: &str,
+    tenant_id: Uuid,
+    outcome: &str,
+    classification: &str,
+    reason: Option<&str>,
+    retry_after: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<serde_json::Value> {
+    let mut metadata = serde_json::from_str::<serde_json::Value>(current_metadata).ok()?;
+    if !metadata.is_object() {
+        return None;
+    }
+    let root = metadata.as_object_mut()?;
     let cloud = root
         .entry("cloud_mirror")
         .or_insert_with(|| serde_json::json!({}));
     if !cloud.is_object() {
         *cloud = serde_json::json!({});
     }
-    let Some(cloud) = cloud.as_object_mut() else {
-        return Ok(());
-    };
+    let cloud = cloud.as_object_mut()?;
     cloud.insert(
         tenant_id.to_string(),
         serde_json::json!({
-            "state": state,
+            "schema_version": MIRROR_STATE_VERSION,
+            "outcome": outcome,
+            "classification": classification,
             "reason": reason,
+            "retry_after": retry_after.map(|value| value.to_rfc3339()),
             "updated_at": chrono::Utc::now().to_rfc3339(),
         }),
     );
-    let mut active: backups::ActiveModel = backup.into();
-    active.metadata = Set(metadata.to_string());
-    active.update(db).await?;
-    Ok(())
+    Some(metadata)
+}
+
+struct LegacyMirrorState {
+    outcome: &'static str,
+    classification: &'static str,
+    reason: Option<String>,
+}
+
+fn deferred_legacy_state(metadata: &str, tenant_id: Uuid) -> Option<LegacyMirrorState> {
+    let metadata = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
+    let state = metadata.get("cloud_mirror")?.get(tenant_id.to_string())?;
+    if state.get("outcome").and_then(serde_json::Value::as_str) == Some("complete")
+        || state.get("state").and_then(serde_json::Value::as_str) == Some("complete")
+    {
+        return Some(LegacyMirrorState {
+            outcome: "complete",
+            classification: "legacy",
+            reason: state
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        });
+    }
+    if state
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(u64::from(MIRROR_STATE_VERSION))
+    {
+        return None;
+    }
+    let retry_after = state
+        .get("retry_after")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())?;
+    (retry_after > chrono::Utc::now()).then(|| LegacyMirrorState {
+        outcome: "retry",
+        classification: "legacy",
+        reason: state
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_backup_identity, image_tag_version, next_sweep_interval, parse_postgres_major,
-        s3_key, sentinel_lsn, supports_native_mirror, timeline_from_backup_name, wal_segment_name,
-        walg_root_key, SweepOutcome, BASE_SWEEP_INTERVAL, MAX_SWEEP_INTERVAL,
+        contains_backup_identity, deferred_legacy_state, image_tag_version, merge_mirror_state,
+        next_sweep_interval, parse_postgres_major, s3_key, select_due_backups, sentinel_lsn,
+        supports_native_mirror, timeline_from_backup_name, upload_native_object, wal_segment_name,
+        walg_root_key, StageError, SweepOutcome, BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL,
+        DUE_BACKUPS_SQL, MAX_SWEEP_INTERVAL, MIRROR_STATE_VERSION,
     };
-    use std::time::Duration;
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+
+    use aws_sdk_s3::{Client as S3Client, Config};
+    use axum::{
+        body::{to_bytes, Body},
+        extract::{Path, State},
+        http::{header, HeaderMap, StatusCode},
+        routing::{get, post, put},
+        Json, Router,
+    };
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait,
+        IntoActiveModel, MockDatabase, QueryFilter, QueryOrder, Schema, Set, Statement,
+        TransactionTrait,
+    };
+    use sha2::{Digest, Sha256};
+    use temps_cloud_client::{BackendUrl, CloudFeatureSwitches, CloudLink};
+    use temps_cloud_protocol::{
+        NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind, WalGObjectCompleted,
+        WalGObjectTargetRequest,
+    };
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn sqlite_select_and_persist_support_retry_state_without_for_update() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let backend = db.get_database_backend();
+        let schema = Schema::new(backend);
+        for statement in [
+            schema.create_table_from_entity(temps_entities::backups::Entity),
+            schema.create_table_from_entity(temps_entities::cloud_backup_mirror_states::Entity),
+            schema.create_table_from_entity(temps_entities::cloud_backup_mirror_cursors::Entity),
+        ] {
+            db.execute(backend.build(&statement))
+                .await
+                .expect("SQLite mirror table creates");
+        }
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("SQLite fixture disables unrelated backup foreign keys");
+        let now = chrono::Utc::now();
+        temps_entities::backups::ActiveModel {
+            id: Set(1),
+            name: Set("sqlite-backup".to_owned()),
+            backup_id: Set(Uuid::new_v4().to_string()),
+            schedule_id: Set(None),
+            backup_type: Set("full".to_owned()),
+            state: Set("completed".to_owned()),
+            started_at: Set(now),
+            finished_at: Set(Some(now)),
+            size_bytes: Set(Some(1)),
+            file_count: Set(Some(1)),
+            s3_source_id: Set(1),
+            s3_location: Set("s3://sqlite/backup".to_owned()),
+            error_message: Set(None),
+            metadata: Set("malformed legacy metadata".to_owned()),
+            checksum: Set(None),
+            compression_type: Set("none".to_owned()),
+            created_by: Set(1),
+            expires_at: Set(None),
+            tags: Set("[]".to_owned()),
+            schedule_run_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("SQLite backup inserts");
+        super::persist_state(
+            &db,
+            1,
+            Uuid::nil(),
+            "retry",
+            "transient",
+            Some("temporary outage"),
+        )
+        .await
+        .expect("SQLite mirror state persists without row locking");
+        let first_retry =
+            temps_entities::cloud_backup_mirror_states::Entity::find_by_id((1, Uuid::nil()))
+                .one(&db)
+                .await
+                .expect("first SQLite retry reads")
+                .expect("first SQLite retry exists");
+        assert_eq!(first_retry.attempt_count, 1);
+        let first_delay =
+            first_retry.retry_after.expect("first retry is scheduled") - first_retry.updated_at;
+        assert!(first_delay >= chrono::Duration::seconds(29));
+        assert!(first_delay <= chrono::Duration::seconds(31));
+        super::persist_state(
+            &db,
+            1,
+            Uuid::nil(),
+            "retry",
+            "transient",
+            Some("still unavailable"),
+        )
+        .await
+        .expect("SQLite retry attempt survives and increments");
+        let second_retry =
+            temps_entities::cloud_backup_mirror_states::Entity::find_by_id((1, Uuid::nil()))
+                .one(&db)
+                .await
+                .expect("second SQLite retry reads")
+                .expect("second SQLite retry exists");
+        assert_eq!(second_retry.attempt_count, 2);
+        let second_delay =
+            second_retry.retry_after.expect("second retry is scheduled") - second_retry.updated_at;
+        assert!(second_delay >= chrono::Duration::seconds(59));
+        assert!(second_delay <= chrono::Duration::seconds(61));
+        let stored = temps_entities::backups::Entity::find_by_id(1)
+            .one(&db)
+            .await
+            .expect("SQLite backup reads")
+            .expect("SQLite backup exists");
+        assert_eq!(stored.metadata, "malformed legacy metadata");
+        let deferred = select_due_backups(&db, Uuid::nil(), 50)
+            .await
+            .expect("SQLite due query runs");
+        assert!(deferred.backups.is_empty());
+
+        let state =
+            temps_entities::cloud_backup_mirror_states::Entity::find_by_id((1, Uuid::nil()))
+                .one(&db)
+                .await
+                .expect("SQLite state reads")
+                .expect("SQLite state exists");
+        let mut due = state.into_active_model();
+        due.retry_after = Set(Some(now - chrono::Duration::seconds(1)));
+        due.update(&db).await.expect("SQLite retry becomes due");
+        let selected = select_due_backups(&db, Uuid::nil(), 50)
+            .await
+            .expect("SQLite due retry selects");
+        assert_eq!(selected.backups.len(), 1);
+        assert_eq!(selected.backups[0].id, 1);
+
+        super::persist_state(&db, 1, Uuid::nil(), "complete", "mirrored", None)
+            .await
+            .expect("successful mirror resets retry state");
+        let completed =
+            temps_entities::cloud_backup_mirror_states::Entity::find_by_id((1, Uuid::nil()))
+                .one(&db)
+                .await
+                .expect("completed SQLite state reads")
+                .expect("completed SQLite state exists");
+        assert_eq!(completed.attempt_count, 0);
+        assert!(completed.retry_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn indexed_state_selects_only_bounded_due_work_after_thousands_of_rows() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Docker unavailable; skipping indexed mirror-state query test: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to create mirror-state test database: {error}"),
+        };
+        let db = test_db.connection();
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::ActiveModel {
+            name: Set("Mirror Test".to_owned()),
+            email: Set(format!("mirror-{}@example.invalid", Uuid::new_v4())),
+            email_verified: Set(true),
+            must_change_password: Set(false),
+            mfa_enabled: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("test user inserts");
+        let source = temps_entities::s3_sources::ActiveModel {
+            name: Set("mirror-source".to_owned()),
+            bucket_name: Set("mirror-test".to_owned()),
+            region: Set("test-1".to_owned()),
+            endpoint: Set(Some("http://127.0.0.1:1".to_owned())),
+            bucket_path: Set(String::new()),
+            access_key_id: Set("encrypted-test-key".to_owned()),
+            secret_key: Set("encrypted-test-secret".to_owned()),
+            force_path_style: Set(Some(true)),
+            is_default: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("test S3 source inserts");
+
+        let backup_rows = (0..2_005)
+            .map(|index| temps_entities::backups::ActiveModel {
+                name: Set(format!("backup-{index}")),
+                backup_id: Set(Uuid::new_v4().to_string()),
+                schedule_id: Set(None),
+                backup_type: Set("full".to_owned()),
+                state: Set("completed".to_owned()),
+                started_at: Set(now),
+                finished_at: Set(Some(now + chrono::Duration::seconds(i64::from(index)))),
+                size_bytes: Set(Some(1)),
+                file_count: Set(Some(1)),
+                s3_source_id: Set(source.id),
+                s3_location: Set(format!("s3://mirror-test/backup-{index}")),
+                error_message: Set(None),
+                metadata: Set(if index == 2_002 {
+                    "malformed legacy metadata".to_owned()
+                } else {
+                    "{}".to_owned()
+                }),
+                checksum: Set(None),
+                compression_type: Set("none".to_owned()),
+                created_by: Set(user.id),
+                expires_at: Set(None),
+                tags: Set("[]".to_owned()),
+                schedule_run_id: Set(None),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        temps_entities::backups::Entity::insert_many(backup_rows)
+            .exec(db)
+            .await
+            .expect("bulk backups insert");
+
+        let stored = temps_entities::backups::Entity::find()
+            .order_by_asc(temps_entities::backups::Column::Id)
+            .all(db)
+            .await
+            .expect("backups list");
+        let tenant_id = Uuid::new_v4();
+        let terminal = stored
+            .iter()
+            .take(2_000)
+            .map(
+                |backup| temps_entities::cloud_backup_mirror_states::ActiveModel {
+                    backup_id: Set(backup.id),
+                    tenant_id: Set(tenant_id),
+                    schema_version: Set(i32::try_from(MIRROR_STATE_VERSION).unwrap_or(i32::MAX)),
+                    outcome: Set("complete".to_owned()),
+                    classification: Set("mirrored".to_owned()),
+                    reason: Set(None),
+                    attempt_count: Set(0),
+                    retry_after: Set(None),
+                    updated_at: Set(now),
+                },
+            )
+            .collect::<Vec<_>>();
+        temps_entities::cloud_backup_mirror_states::Entity::insert_many(terminal)
+            .exec(db)
+            .await
+            .expect("terminal mirror states insert");
+
+        temps_entities::cloud_backup_mirror_states::Entity::insert_many([
+            temps_entities::cloud_backup_mirror_states::ActiveModel {
+                backup_id: Set(stored[2_000].id),
+                tenant_id: Set(tenant_id),
+                schema_version: Set(i32::try_from(MIRROR_STATE_VERSION).unwrap_or(i32::MAX)),
+                outcome: Set("retry".to_owned()),
+                classification: Set("network".to_owned()),
+                reason: Set(Some("temporary outage".to_owned())),
+                attempt_count: Set(2),
+                retry_after: Set(Some(now + chrono::Duration::hours(1))),
+                updated_at: Set(now),
+            },
+            temps_entities::cloud_backup_mirror_states::ActiveModel {
+                backup_id: Set(stored[2_001].id),
+                tenant_id: Set(tenant_id),
+                schema_version: Set(i32::try_from(MIRROR_STATE_VERSION).unwrap_or(i32::MAX)),
+                outcome: Set("retry".to_owned()),
+                classification: Set("network".to_owned()),
+                reason: Set(Some("outage recovered".to_owned())),
+                attempt_count: Set(2),
+                retry_after: Set(Some(now - chrono::Duration::minutes(1))),
+                updated_at: Set(now),
+            },
+            temps_entities::cloud_backup_mirror_states::ActiveModel {
+                backup_id: Set(stored[2_003].id),
+                tenant_id: Set(tenant_id),
+                schema_version: Set(i32::try_from(MIRROR_STATE_VERSION).unwrap_or(i32::MAX)),
+                outcome: Set("complete".to_owned()),
+                classification: Set("mirrored".to_owned()),
+                reason: Set(None),
+                attempt_count: Set(0),
+                retry_after: Set(None),
+                updated_at: Set(now),
+            },
+        ])
+        .exec(db)
+        .await
+        .expect("deferred and stale states insert");
+        temps_entities::cloud_backup_mirror_cursors::ActiveModel {
+            tenant_id: Set(tenant_id),
+            last_finished_at: Set(stored[2_000]
+                .finished_at
+                .unwrap_or(stored[2_000].started_at)),
+            last_backup_id: Set(stored[2_000].id),
+            updated_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("discovery cursor inserts");
+
+        let first_page = select_due_backups(db, tenant_id, 3)
+            .await
+            .expect("bounded due query");
+        assert_eq!(first_page.backups.len(), 3);
+        assert_eq!(first_page.backups[0].id, stored[2_001].id);
+        let all_due = select_due_backups(db, tenant_id, 50)
+            .await
+            .expect("all due query");
+        assert_eq!(all_due.backups.len(), 3);
+        assert!(all_due
+            .backups
+            .iter()
+            .any(|backup| backup.metadata == "malformed legacy metadata"));
+
+        // A backup may be created long before it completes. Its lower ID must
+        // not fall behind a newer cursor; completion time is the leading key.
+        temps_entities::cloud_backup_mirror_states::Entity::delete_many()
+            .filter(temps_entities::cloud_backup_mirror_states::Column::BackupId.eq(stored[100].id))
+            .filter(temps_entities::cloud_backup_mirror_states::Column::TenantId.eq(tenant_id))
+            .exec(db)
+            .await
+            .expect("old terminal state deletes for late-completion simulation");
+        let mut late_completion = stored[100].clone().into_active_model();
+        late_completion.finished_at = Set(Some(now + chrono::Duration::hours(2)));
+        late_completion
+            .update(db)
+            .await
+            .expect("old backup finishes after cursor advancement");
+        let after_late_completion = select_due_backups(db, tenant_id, 50)
+            .await
+            .expect("late completion query");
+        assert!(after_late_completion
+            .backups
+            .iter()
+            .any(|backup| backup.id == stored[100].id));
+
+        let transaction = db.begin().await.expect("query-plan transaction starts");
+        transaction
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SET LOCAL enable_seqscan = off".to_owned(),
+            ))
+            .await
+            .expect("sequential scans disabled for index-shape assertion");
+        let due_plan = explain_query_plan(
+            &transaction,
+            DUE_BACKUPS_SQL,
+            [tenant_id.into(), 25_i64.into(), chrono::Utc::now().into()],
+        )
+        .await;
+        assert!(
+            due_plan.contains("idx_cloud_backup_mirror_states_due"),
+            "due work must start from the partial retry index: {due_plan}"
+        );
+        assert!(!due_plan.contains("\"Node Type\":\"Seq Scan\""));
+        let discovery_plan = explain_query_plan(
+            &transaction,
+            DISCOVER_BACKUPS_SQL,
+            [
+                stored[2_000]
+                    .finished_at
+                    .unwrap_or(stored[2_000].started_at)
+                    .into(),
+                stored[2_000].id.into(),
+                tenant_id.into(),
+                25_i64.into(),
+            ],
+        )
+        .await;
+        assert!(
+            discovery_plan.contains("idx_backups_cloud_mirror_discovery"),
+            "discovery must seek from the completion watermark: {discovery_plan}"
+        );
+        assert!(!discovery_plan.contains("\"Node Type\":\"Seq Scan\""));
+        transaction
+            .rollback()
+            .await
+            .expect("query-plan transaction rolls back");
+    }
+
+    async fn explain_query_plan<I>(
+        connection: &impl ConnectionTrait,
+        sql: &str,
+        values: I,
+    ) -> String
+    where
+        I: IntoIterator<Item = sea_orm::Value>,
+    {
+        let row = connection
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}"),
+                values,
+            ))
+            .await
+            .expect("EXPLAIN query succeeds")
+            .expect("EXPLAIN returns a plan");
+        let plan: serde_json::Value = row
+            .try_get("", "QUERY PLAN")
+            .expect("PostgreSQL JSON plan decodes");
+        serde_json::to_string(&plan).expect("query plan serializes")
+    }
+
+    #[tokio::test]
+    async fn sweep_resources_batch_relational_lookups_for_many_candidates() {
+        let now = chrono::Utc::now();
+        let candidates = (1..=50)
+            .map(|id| temps_entities::backups::Model {
+                id,
+                name: format!("backup-{id}"),
+                backup_id: Uuid::new_v4().to_string(),
+                schedule_id: None,
+                backup_type: "full".to_owned(),
+                state: "completed".to_owned(),
+                started_at: now,
+                finished_at: Some(now),
+                size_bytes: Some(1),
+                file_count: Some(1),
+                s3_source_id: 7,
+                s3_location: format!("s3://mirror/backup-{id}"),
+                error_message: None,
+                metadata: "{}".to_owned(),
+                checksum: None,
+                compression_type: "none".to_owned(),
+                created_by: 1,
+                expires_at: None,
+                tags: "[]".to_owned(),
+                schedule_run_id: None,
+            })
+            .collect::<Vec<_>>();
+        let external_rows = candidates
+            .iter()
+            .map(|backup| temps_entities::external_service_backups::Model {
+                id: backup.id,
+                service_id: 9,
+                backup_id: backup.id,
+                backup_type: "full".to_owned(),
+                state: "completed".to_owned(),
+                started_at: now,
+                finished_at: Some(now),
+                size_bytes: Some(1),
+                s3_location: backup.s3_location.clone(),
+                error_message: None,
+                metadata: serde_json::json!({}),
+                checksum: None,
+                compression_type: "none".to_owned(),
+                created_by: 1,
+                expires_at: None,
+            })
+            .collect::<Vec<_>>();
+        let service = temps_entities::external_services::Model {
+            id: 9,
+            name: "postgres".to_owned(),
+            service_type: "postgres".to_owned(),
+            version: Some("17".to_owned()),
+            status: "running".to_owned(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: None,
+            node_id: None,
+            topology: "standalone".to_owned(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            ai_data_access: false,
+        };
+        let source = temps_entities::s3_sources::Model {
+            id: 7,
+            name: "mirror".to_owned(),
+            bucket_name: "mirror".to_owned(),
+            region: "test-1".to_owned(),
+            endpoint: None,
+            bucket_path: String::new(),
+            access_key_id: "encrypted".to_owned(),
+            secret_key: "encrypted".to_owned(),
+            force_path_style: Some(true),
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([external_rows])
+            .append_query_results([[service]])
+            .append_query_results([[source]])
+            .into_connection();
+        let encryption = temps_core::EncryptionService::new_from_password("mirror-test");
+
+        let resources = super::SweepResources::load(&db, &encryption, &candidates)
+            .await
+            .expect("batched resources load");
+        assert_eq!(resources.external_by_backup.len(), 50);
+        assert_eq!(resources.services.len(), 1);
+        assert_eq!(resources.sources.len(), 1);
+        drop(resources);
+        let log = db.into_transaction_log();
+        assert_eq!(
+            log.len(),
+            3,
+            "candidate count must not increase relational query count"
+        );
+    }
 
     #[test]
     fn cloud_outages_use_bounded_exponential_backoff() {
@@ -1260,6 +2283,27 @@ mod tests {
             interval = next_sweep_interval(interval, SweepOutcome::Retry);
         }
         assert_eq!(interval, MAX_SWEEP_INTERVAL);
+
+        assert_eq!(
+            super::mirror_retry_delay("transient", 1),
+            chrono::Duration::seconds(30)
+        );
+        assert_eq!(
+            super::mirror_retry_delay("transient", 2),
+            chrono::Duration::seconds(60)
+        );
+        assert_eq!(
+            super::mirror_retry_delay("transient", 6),
+            chrono::Duration::minutes(15)
+        );
+        assert_eq!(
+            super::mirror_retry_delay("transient", 100),
+            chrono::Duration::minutes(15)
+        );
+        assert_eq!(
+            super::mirror_retry_delay("unsupported", 1),
+            chrono::Duration::minutes(15)
+        );
     }
 
     #[test]
@@ -1367,5 +2411,510 @@ mod tests {
             timeline_from_backup_name("base_000000030000000000000002"),
             Some(3)
         );
+    }
+
+    #[test]
+    fn mirror_state_merge_preserves_concurrently_added_metadata() {
+        let tenant_id = uuid::Uuid::new_v4();
+        let current = serde_json::json!({
+            "cloud_mirror": {"another-tenant": {"outcome": "complete"}},
+            "local_completion": {"checksum": "newer-value"},
+            "note": tenant_id.to_string()
+        });
+        let merged = merge_mirror_state(
+            &current.to_string(),
+            tenant_id,
+            "retry",
+            "unsupported",
+            Some("future engine"),
+            Some(chrono::Utc::now() + chrono::Duration::minutes(15)),
+        )
+        .expect("valid object metadata merges");
+
+        assert_eq!(merged["local_completion"]["checksum"], "newer-value");
+        assert_eq!(merged["note"], tenant_id.to_string());
+        assert_eq!(
+            merged["cloud_mirror"][tenant_id.to_string()]["schema_version"],
+            MIRROR_STATE_VERSION
+        );
+        assert_eq!(
+            merged["cloud_mirror"][tenant_id.to_string()]["outcome"],
+            "retry"
+        );
+        assert!(merge_mirror_state(
+            "malformed legacy metadata",
+            tenant_id,
+            "complete",
+            "mirrored",
+            None,
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn exact_mirror_state_handles_invalid_json_and_uuid_text_without_false_exclusion() {
+        let tenant_id = uuid::Uuid::new_v4();
+        assert!(deferred_legacy_state("not-json", tenant_id).is_none());
+        assert!(deferred_legacy_state(
+            &serde_json::json!({"note": tenant_id.to_string()}).to_string(),
+            tenant_id
+        )
+        .is_none());
+        assert!(deferred_legacy_state(
+            &serde_json::json!({"cloud_mirror": {tenant_id.to_string(): {"outcome": "complete"}}})
+                .to_string(),
+            tenant_id
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn unsupported_retry_is_versioned_and_bounded() {
+        let tenant_id = uuid::Uuid::new_v4();
+        let delayed = merge_mirror_state(
+            "{}",
+            tenant_id,
+            "retry",
+            "unsupported",
+            Some("future engine"),
+            Some(chrono::Utc::now() + chrono::Duration::minutes(15)),
+        )
+        .expect("valid object metadata merges");
+        assert!(deferred_legacy_state(&delayed.to_string(), tenant_id).is_some());
+        let mut old = delayed;
+        old["cloud_mirror"][tenant_id.to_string()]["schema_version"] = serde_json::json!(0);
+        assert!(deferred_legacy_state(&old.to_string(), tenant_id).is_none());
+    }
+
+    struct MirrorFlowStub {
+        origin: String,
+        source_body: Vec<u8>,
+        source_gets: AtomicUsize,
+        source_failures_remaining: AtomicUsize,
+        upload_attempts: AtomicUsize,
+        simulate_commit_response_loss: bool,
+        upload_committed: AtomicBool,
+        completion_calls: AtomicUsize,
+        completed: AtomicBool,
+        expected_backup_id: Mutex<Option<Uuid>>,
+        expected_instance_id: Mutex<Option<Uuid>>,
+        expected_checksum: String,
+    }
+
+    async fn enroll_stub(
+        State(state): State<Arc<MirrorFlowStub>>,
+        Json(request): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let instance_id = request["instance_id"]
+            .as_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("enrollment carries instance id");
+        *state.expected_instance_id.lock().expect("instance id lock") = Some(instance_id);
+        Json(serde_json::json!({
+            "tenant_id": Uuid::new_v4(),
+            "instance_token": "instance-test-token",
+            "account_email": "backup-owner@example.invalid"
+        }))
+    }
+
+    async fn source_object_stub(
+        State(state): State<Arc<MirrorFlowStub>>,
+        Path((bucket, key)): Path<(String, String)>,
+    ) -> (StatusCode, HeaderMap, Body) {
+        assert_eq!(bucket, "source-bucket");
+        assert_eq!(key, "snapshots/object-0001.bin");
+        state.source_gets.fetch_add(1, Ordering::SeqCst);
+        if state
+            .source_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                HeaderMap::new(),
+                Body::empty(),
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_LENGTH,
+            state.source_body.len().to_string().parse().expect("length"),
+        );
+        (
+            StatusCode::OK,
+            headers,
+            Body::from(state.source_body.clone()),
+        )
+    }
+
+    async fn native_target_stub(
+        State(state): State<Arc<MirrorFlowStub>>,
+        Json(request): Json<WalGObjectTargetRequest>,
+    ) -> Json<serde_json::Value> {
+        assert_eq!(
+            Some(request.instance_id),
+            *state.expected_instance_id.lock().expect("instance id lock")
+        );
+        let mut backup_id = state.expected_backup_id.lock().expect("backup id lock");
+        if let Some(expected) = *backup_id {
+            assert_eq!(
+                request.backup_id, expected,
+                "resume changed backup identity"
+            );
+        } else {
+            *backup_id = Some(request.backup_id);
+        }
+        let upload_required = !state.completed.load(Ordering::SeqCst);
+        Json(serde_json::json!({
+            "backup_id": request.backup_id,
+            "relative_key": request.relative_key,
+            "upload_required": upload_required,
+            "upload_url": format!("{}/object-upload", state.origin),
+            "expires_at_millis": chrono::Utc::now().timestamp_millis() + 60_000,
+            "headers": if upload_required {
+                serde_json::json!({"content-length": state.source_body.len().to_string()})
+            } else {
+                serde_json::json!({})
+            }
+        }))
+    }
+
+    async fn object_upload_stub(
+        State(state): State<Arc<MirrorFlowStub>>,
+        body: Body,
+    ) -> StatusCode {
+        let attempt = state.upload_attempts.fetch_add(1, Ordering::SeqCst);
+        if state.simulate_commit_response_loss {
+            if state.upload_committed.load(Ordering::SeqCst) {
+                return StatusCode::PRECONDITION_FAILED;
+            }
+            let body = match to_bytes(body, state.source_body.len() + 1).await {
+                Ok(body) => body,
+                Err(_) => return StatusCode::BAD_REQUEST,
+            };
+            if body.as_ref() != state.source_body.as_slice() {
+                return StatusCode::UNPROCESSABLE_ENTITY;
+            }
+            state.upload_committed.store(true, Ordering::SeqCst);
+            // The object is durable, but the client observes an uncertain
+            // response and retries with its original immutable target.
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+        if attempt == 0 {
+            // Fail before buffering the body. The production mirror must reopen
+            // the S3 object for its retry; it cannot rewind or stage this stream.
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+        let body = match to_bytes(body, state.source_body.len() + 1).await {
+            Ok(body) => body,
+            Err(_) => return StatusCode::BAD_REQUEST,
+        };
+        if body.as_ref() == state.source_body.as_slice() {
+            StatusCode::OK
+        } else {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+    }
+
+    async fn native_complete_stub(
+        State(state): State<Arc<MirrorFlowStub>>,
+        Json(completion): Json<WalGObjectCompleted>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        assert_eq!(
+            Some(completion.backup_id),
+            *state.expected_backup_id.lock().expect("backup id lock")
+        );
+        assert_eq!(completion.relative_key, "object-0001.bin");
+        assert_eq!(completion.bytes, state.source_body.len() as u64);
+        assert_eq!(completion.checksum_sha256, state.expected_checksum);
+        state.completion_calls.fetch_add(1, Ordering::SeqCst);
+        state.completed.store(true, Ordering::SeqCst);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"state": "complete"})),
+        )
+    }
+
+    fn source_client(origin: &str) -> S3Client {
+        let credentials = aws_sdk_s3::config::Credentials::new(
+            "test-access-key",
+            "test-secret-key",
+            None,
+            None,
+            "mirror-flow-test",
+        );
+        S3Client::from_conf(
+            Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("test-region-1"))
+                .force_path_style(true)
+                .credentials_provider(credentials)
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+                .endpoint_url(origin)
+                .build(),
+        )
+    }
+
+    fn expect_stage_ok<T>(result: Result<T, StageError>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(StageError::Unsupported(reason)) => {
+                panic!("{context}: unexpectedly unsupported: {reason}")
+            }
+            Err(StageError::Retry(reason)) => panic!("{context}: retryable failure: {reason}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_backup_mirror_streams_s3_source_and_resumes_at_object_boundary() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping production mirror flow test");
+                return;
+            }
+            Err(error) => panic!("bind mirror flow stub: {error}"),
+        };
+        let address = listener.local_addr().expect("mirror flow stub address");
+        // Larger than inspect_source_object's 1 MiB buffer. The checksum pass
+        // therefore exercises bounded reads, while upload retries reopen the
+        // source instead of retaining or rewinding an in-memory body.
+        let source_body = vec![0x5a; 3 * 1024 * 1024 + 17];
+        let expected_checksum = Sha256::digest(&source_body).iter().fold(
+            String::with_capacity(64),
+            |mut output, byte| {
+                use std::fmt::Write;
+                write!(output, "{byte:02x}").expect("write checksum");
+                output
+            },
+        );
+        let state = Arc::new(MirrorFlowStub {
+            origin: format!("http://{address}"),
+            source_body,
+            source_gets: AtomicUsize::new(0),
+            source_failures_remaining: AtomicUsize::new(0),
+            upload_attempts: AtomicUsize::new(0),
+            simulate_commit_response_loss: false,
+            upload_committed: AtomicBool::new(false),
+            completion_calls: AtomicUsize::new(0),
+            completed: AtomicBool::new(false),
+            expected_backup_id: Mutex::new(None),
+            expected_instance_id: Mutex::new(None),
+            expected_checksum,
+        });
+        let app = Router::new()
+            .route("/v1/enroll", post(enroll_stub))
+            .route(
+                "/v1/backups/native/objects/target",
+                post(native_target_stub),
+            )
+            .route(
+                "/v1/backups/native/objects/complete",
+                post(native_complete_stub),
+            )
+            .route("/object-upload", put(object_upload_stub))
+            .route("/{bucket}/{*key}", get(source_object_stub))
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mirror flow stub");
+        });
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link =
+            CloudLink::load_for_loopback_development(temp.path().to_path_buf(), "test-agent");
+        link.configure(
+            BackendUrl::loopback_development(&state.origin).expect("loopback Cloud URL"),
+        )
+        .expect("configure Cloud link");
+        link.set_feature_switches(CloudFeatureSwitches {
+            telemetry: false,
+            backups: true,
+            notifications: false,
+        });
+        link.enroll("TEST-CODE").await.expect("enroll Cloud link");
+        let instance_id = link.instance_id().expect("linked instance id");
+        let backup_id = Uuid::new_v4();
+        let s3 = source_client(&state.origin);
+        let source_key = "snapshots/object-0001.bin";
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("checksum-cache SQLite connects");
+        let encryption = temps_core::EncryptionService::new_from_password("mirror-cache-test");
+        let mut clients = HashMap::new();
+        clients.insert(7, s3.clone());
+        let mut resources = super::SweepResources {
+            db: &db,
+            encryption: &encryption,
+            external_by_backup: HashMap::new(),
+            services: HashMap::new(),
+            sources: HashMap::new(),
+            clients,
+            repository_objects: HashMap::new(),
+            json_objects: HashMap::new(),
+            object_inspections: HashMap::new(),
+            control_plane_postgres_major: None,
+        };
+        let (bytes, checksum_sha256) = expect_stage_ok(
+            resources
+                .inspect_object(7, "source-bucket", source_key)
+                .await,
+            "stream source checksum",
+        );
+        let cached_inspection = expect_stage_ok(
+            resources
+                .inspect_object(7, "source-bucket", source_key)
+                .await,
+            "reuse source checksum",
+        );
+        assert_eq!(cached_inspection, (bytes, checksum_sha256.clone()));
+        assert_eq!(state.source_gets.load(Ordering::SeqCst), 1);
+        let declaration = NativeSnapshotObjectDeclaration {
+            relative_key: "object-0001.bin".into(),
+            kind: NativeSnapshotObjectKind::Object,
+            bytes,
+            checksum_sha256,
+        };
+
+        expect_stage_ok(
+            upload_native_object(
+                &link,
+                &s3,
+                "source-bucket",
+                "snapshots",
+                instance_id,
+                backup_id,
+                declaration.clone(),
+            )
+            .await,
+            "mirror recovers from interrupted object upload",
+        );
+        expect_stage_ok(
+            upload_native_object(
+                &link,
+                &s3,
+                "source-bucket",
+                "snapshots",
+                instance_id,
+                backup_id,
+                declaration,
+            )
+            .await,
+            "completed object resumes idempotently without another upload",
+        );
+
+        assert_eq!(bytes, state.source_body.len() as u64);
+        assert_eq!(state.upload_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state.source_gets.load(Ordering::SeqCst),
+            3,
+            "one bounded checksum pass plus two upload streams; resumed object is not reopened"
+        );
+        assert_eq!(
+            state.completion_calls.load(Ordering::SeqCst),
+            2,
+            "completion is idempotently replayed after Cloud reports the object already present"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_upload_retries_source_get_and_accepts_precondition_after_lost_response() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping upload idempotency test");
+                return;
+            }
+            Err(error) => panic!("bind mirror idempotency stub: {error}"),
+        };
+        let address = listener.local_addr().expect("mirror stub address");
+        let source_body = b"immutable backup object".to_vec();
+        let expected_checksum = Sha256::digest(&source_body).iter().fold(
+            String::with_capacity(64),
+            |mut output, byte| {
+                use std::fmt::Write;
+                write!(output, "{byte:02x}").expect("write checksum");
+                output
+            },
+        );
+        let state = Arc::new(MirrorFlowStub {
+            origin: format!("http://{address}"),
+            source_body: source_body.clone(),
+            source_gets: AtomicUsize::new(0),
+            source_failures_remaining: AtomicUsize::new(0),
+            upload_attempts: AtomicUsize::new(0),
+            simulate_commit_response_loss: true,
+            upload_committed: AtomicBool::new(false),
+            completion_calls: AtomicUsize::new(0),
+            completed: AtomicBool::new(false),
+            expected_backup_id: Mutex::new(None),
+            expected_instance_id: Mutex::new(None),
+            expected_checksum: expected_checksum.clone(),
+        });
+        let app = Router::new()
+            .route("/v1/enroll", post(enroll_stub))
+            .route(
+                "/v1/backups/native/objects/target",
+                post(native_target_stub),
+            )
+            .route(
+                "/v1/backups/native/objects/complete",
+                post(native_complete_stub),
+            )
+            .route("/object-upload", put(object_upload_stub))
+            .route("/{bucket}/{*key}", get(source_object_stub))
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mirror idempotency stub");
+        });
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link =
+            CloudLink::load_for_loopback_development(temp.path().to_path_buf(), "test-agent");
+        link.configure(
+            BackendUrl::loopback_development(&state.origin).expect("loopback Cloud URL"),
+        )
+        .expect("configure Cloud link");
+        link.set_feature_switches(CloudFeatureSwitches {
+            telemetry: false,
+            backups: true,
+            notifications: false,
+        });
+        link.enroll("TEST-CODE").await.expect("enroll Cloud link");
+        let instance_id = link.instance_id().expect("linked instance id");
+        let backup_id = Uuid::new_v4();
+        let s3 = source_client(&state.origin);
+
+        // Exercise the outer source-GET retry independently of SDK retries.
+        state.source_failures_remaining.store(1, Ordering::SeqCst);
+        expect_stage_ok(
+            upload_native_object(
+                &link,
+                &s3,
+                "source-bucket",
+                "snapshots",
+                instance_id,
+                backup_id,
+                NativeSnapshotObjectDeclaration {
+                    relative_key: "object-0001.bin".into(),
+                    kind: NativeSnapshotObjectKind::Object,
+                    bytes: source_body.len() as u64,
+                    checksum_sha256: expected_checksum,
+                },
+            )
+            .await,
+            "lost upload response resolves through completion verification",
+        );
+
+        assert_eq!(state.source_gets.load(Ordering::SeqCst), 3);
+        assert_eq!(state.upload_attempts.load(Ordering::SeqCst), 2);
+        assert!(state.upload_committed.load(Ordering::SeqCst));
+        assert_eq!(state.completion_calls.load(Ordering::SeqCst), 1);
     }
 }

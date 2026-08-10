@@ -34,6 +34,7 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use super::dispatch::service_container_name;
 use super::mariadb_exec::parse_binlog_position;
 use super::postgres_walg::run_walg_exec;
 use super::v2_common;
@@ -112,13 +113,14 @@ impl BackupEngine for MariadbPhysicalEngine {
             "MariadbPhysicalEngine: starting direct WAL-G physical base backup",
         );
 
-        let config_json = deps
-            .encryption_service
-            .decrypt_string(service.config.as_deref().unwrap_or("{}"))
-            .unwrap_or_else(|_| "{}".to_string());
-        let root_password = root_password_from_config(&config_json);
+        let config_json = decrypt_service_config(
+            &deps.encryption_service,
+            service_id,
+            service.config.as_deref(),
+        )?;
+        let root_password = root_password_from_config(service_id, &config_json)?;
 
-        let container_name = format!("mariadb-{}", service.name);
+        let container_name = service_container_name(&service);
         let access_key = deps
             .encryption_service
             .decrypt_string(&s3_source.access_key_id)
@@ -259,13 +261,38 @@ fn stderr_tail(stderr: &str) -> String {
     format!("…{}", &trimmed[start..])
 }
 
-fn root_password_from_config(config_json: &str) -> String {
-    let params: Value = serde_json::from_str(config_json).unwrap_or_else(|_| json!({}));
+fn decrypt_service_config(
+    encryption: &temps_core::EncryptionService,
+    service_id: i32,
+    encrypted_config: Option<&str>,
+) -> Result<String, BackupError> {
+    let encrypted_config = encrypted_config.ok_or_else(|| BackupError::PermanentFailure {
+        reason: format!("MariaDB service {service_id} has no encrypted configuration"),
+    })?;
+    encryption
+        .decrypt_string(encrypted_config)
+        .map_err(|error| BackupError::PermanentFailure {
+            reason: format!("decrypt configuration for MariaDB service {service_id}: {error}"),
+        })
+}
+
+fn root_password_from_config(service_id: i32, config_json: &str) -> Result<String, BackupError> {
+    let params: Value =
+        serde_json::from_str(config_json).map_err(|error| BackupError::PermanentFailure {
+            reason: format!(
+                "parse decrypted configuration for MariaDB service {service_id}: {error}"
+            ),
+        })?;
     params
         .get("root_password")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+        .filter(|password| !password.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| BackupError::PermanentFailure {
+            reason: format!(
+                "decrypted configuration for MariaDB service {service_id} has no root_password"
+            ),
+        })
 }
 
 fn build_walg_env(
@@ -375,5 +402,32 @@ mod tests {
         let tail = stderr_tail(&long);
         assert!(tail.starts_with('…'));
         assert!(tail.len() < 5000);
+    }
+
+    #[test]
+    fn wrong_encryption_key_is_a_contextual_permanent_failure() {
+        let original =
+            temps_core::EncryptionService::new_from_password("original-mariadb-config-key");
+        let wrong =
+            temps_core::EncryptionService::new_from_password("different-mariadb-config-key");
+        let encrypted = original
+            .encrypt_string(r#"{"root_password":"secret"}"#)
+            .unwrap();
+
+        let error = decrypt_service_config(&wrong, 42, Some(&encrypted)).unwrap_err();
+        match error {
+            BackupError::PermanentFailure { reason } => {
+                assert!(reason.contains("MariaDB service 42"));
+                assert!(reason.contains("decrypt configuration"));
+            }
+            other => panic!("expected permanent failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_decrypted_config_is_not_treated_as_an_empty_object() {
+        let error = root_password_from_config(73, "not-json").unwrap_err();
+        assert!(matches!(error, BackupError::PermanentFailure { .. }));
+        assert!(error.to_string().contains("MariaDB service 73"));
     }
 }

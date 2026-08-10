@@ -8,15 +8,16 @@
  */
 import {
   formatBytes,
-  getPostgresBackupCapability,
   getPostgresWalHealth,
   severityOf,
   type WalWarning,
 } from '@/lib/wal-health'
+import { getExternalServiceBackupCapabilityOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { getErrorMessage } from '@/utils/errorHandling'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ShieldAlert } from 'lucide-react'
 
@@ -38,17 +39,21 @@ export function WalHealthPanel({ serviceId, serviceType, onUpgrade }: Props) {
     refetchInterval: 60_000,
     staleTime: 55_000,
   })
-  const { data: backupCapability } = useQuery({
-    queryKey: ['postgres-backup-capability', serviceId],
-    queryFn: () => getPostgresBackupCapability(serviceId),
+  const backupCapability = useQuery({
+    ...getExternalServiceBackupCapabilityOptions({ path: { id: serviceId } }),
     enabled,
     refetchInterval: 60_000,
     staleTime: 55_000,
+    retry: false,
   })
 
   const snapshot = data?.wal_health ?? null
-  const incompatible = backupCapability?.cloud_backup_compatible === false
-  if ((!snapshot || snapshot.warnings.length === 0) && !incompatible) {
+  const incompatible = backupCapability.data?.cloud_backup_compatible === false
+  if (
+    (!snapshot || snapshot.warnings.length === 0) &&
+    !incompatible &&
+    !backupCapability.isError
+  ) {
     return null
   }
 
@@ -57,6 +62,30 @@ export function WalHealthPanel({ serviceId, serviceType, onUpgrade }: Props) {
 
   return (
     <div className="space-y-3">
+      {backupCapability.isError ? (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription className="space-y-3">
+            <div>
+              <p className="font-medium">Backup compatibility unavailable</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {getErrorMessage(
+                  backupCapability.error,
+                  'The server could not check whether this service supports Cloud backups.'
+                )}
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void backupCapability.refetch()}
+              disabled={backupCapability.isFetching}
+            >
+              Check again
+            </Button>
+          </AlertDescription>
+        </Alert>
+      ) : null}
       {incompatible ? (
         <Alert>
           <AlertTriangle className="h-4 w-4" />
@@ -64,11 +93,11 @@ export function WalHealthPanel({ serviceId, serviceType, onUpgrade }: Props) {
             <div>
               <p className="font-medium">Cloud backups need WAL-G</p>
               <p className="mt-1 text-xs text-muted-foreground">
-                {backupCapability?.reason}
+                {backupCapability.data?.reason}
               </p>
-              {backupCapability?.remediation ? (
+              {backupCapability.data?.remediation ? (
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {backupCapability.remediation}
+                  {backupCapability.data.remediation}
                 </p>
               ) : null}
             </div>

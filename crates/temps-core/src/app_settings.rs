@@ -162,12 +162,21 @@ pub struct AppSettings {
 pub struct CloudSettings {
     /// HTTPS origin used for enrollment and telemetry mirroring.
     pub backend_url: String,
+    /// Explicit consent to mirror locally stored telemetry.
+    pub telemetry_enabled: bool,
+    /// Explicit consent to export completed backup objects.
+    pub backups_enabled: bool,
+    /// Explicit consent to send notifications through managed providers.
+    pub notifications_enabled: bool,
 }
 
 impl Default for CloudSettings {
     fn default() -> Self {
         Self {
             backend_url: "https://app.temps.sh".to_string(),
+            telemetry_enabled: false,
+            backups_enabled: false,
+            notifications_enabled: false,
         }
     }
 }
@@ -1486,6 +1495,21 @@ mod tests {
         let compression = ObservabilityCompressionSettings::default();
         assert_eq!(compression.proxy_logs_after_hours, 24);
         assert_eq!(compression.otel_spans_after_hours, 24);
+    }
+
+    #[test]
+    fn cloud_exports_default_off_for_legacy_and_new_settings() {
+        let defaults = CloudSettings::default();
+        assert!(!defaults.telemetry_enabled);
+        assert!(!defaults.backups_enabled);
+        assert!(!defaults.notifications_enabled);
+
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "cloud": {"backend_url": "https://cloud.example.com"}
+        }));
+        assert!(!parsed.cloud.telemetry_enabled);
+        assert!(!parsed.cloud.backups_enabled);
+        assert!(!parsed.cloud.notifications_enabled);
     }
 
     #[test]

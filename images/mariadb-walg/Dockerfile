@@ -1,31 +1,53 @@
 # MariaDB + WAL-G image for direct-to-S3 physical backups and restore proof.
 #
 # Build:
-#   docker build --build-arg MARIADB_VERSION=11.4 -t gotempsh/mariadb-walg:11.4 .
+#   docker build -t gotempsh/mariadb-walg:11.4 .
 #
 # The MySQL WAL-G binary invokes mariadb-backup through
 # WALG_STREAM_CREATE_COMMAND. The resulting mbstream never lands on the Temps
 # host filesystem.
 
-ARG MARIADB_VERSION=11.4
-FROM mariadb:${MARIADB_VERSION}
+# Update the version and multi-arch digest together. Resolve the digest with:
+#   docker buildx imagetools inspect mariadb:<version> --format '{{json .Manifest}}'
+# Refresh WALG_DOWNLOADER_IMAGE with the same command for debian:bookworm-slim.
+ARG MARIADB_IMAGE=mariadb:11.4.12-noble@sha256:67873d30a17f6a9c331f06363b2fa15f38abca415529966d67c84f87f82439fe
+ARG WALG_DOWNLOADER_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 
 ARG WALG_VERSION=v3.0.8
 ARG TARGETARCH
 
+FROM ${WALG_DOWNLOADER_IMAGE} AS walg-downloader
+
+ARG WALG_VERSION
+ARG TARGETARCH
+
+# SHA-256 digests below are from the official WAL-G v3.0.8 GitHub release assets.
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends curl ca-certificates mariadb-backup; \
+    apt-get install -y --no-install-recommends ca-certificates curl; \
     WALG_ARCH="${TARGETARCH}"; \
-    if [ "$WALG_ARCH" = "arm64" ]; then WALG_ARCH="aarch64"; fi; \
-    curl -fSL "https://github.com/wal-g/wal-g/releases/download/${WALG_VERSION}/wal-g-mysql-24.04-${WALG_ARCH}.tar.gz" \
+    case "$WALG_ARCH" in \
+      amd64) WALG_SHA256="3f1b234e9d252c968c9698e73b276b8c79de46462c873494e474e7486684bd52" ;; \
+      arm64) WALG_ARCH="aarch64"; WALG_SHA256="2d009d991281254361725d449749e37df179ba0ebd8bde878876cc98d2028ed4" ;; \
+      *) echo "Unsupported WAL-G architecture: $WALG_ARCH" >&2; exit 1 ;; \
+    esac; \
+    curl --fail --show-error --location --proto '=https' --tlsv1.2 --retry 3 \
+      "https://github.com/wal-g/wal-g/releases/download/${WALG_VERSION}/wal-g-mysql-24.04-${WALG_ARCH}.tar.gz" \
       -o /tmp/wal-g.tar.gz; \
-    tar -xzf /tmp/wal-g.tar.gz -C /usr/local/bin/; \
-    mv /usr/local/bin/wal-g-mysql-* /usr/local/bin/wal-g; \
-    chmod +x /usr/local/bin/wal-g; \
-    rm -f /tmp/wal-g.tar.gz; \
-    apt-get purge -y curl; \
-    apt-get autoremove -y; \
-    rm -rf /var/lib/apt/lists/*; \
+    echo "${WALG_SHA256}  /tmp/wal-g.tar.gz" | sha256sum --check --strict; \
+    tar -xzf /tmp/wal-g.tar.gz -C /tmp "wal-g-mysql-24.04-${WALG_ARCH}"; \
+    install -m 0755 "/tmp/wal-g-mysql-24.04-${WALG_ARCH}" /wal-g
+
+FROM ${MARIADB_IMAGE}
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends mariadb-backup; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=walg-downloader /wal-g /usr/local/bin/wal-g
+
+RUN set -eux; \
+    test -x /bin/bash; \
     wal-g --version; \
     mariadb-backup --version

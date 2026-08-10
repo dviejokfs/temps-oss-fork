@@ -63,10 +63,15 @@ const SERVICE_INGEST_MAX_REQUESTS: u32 = 600;
 /// Sliding window for the service ingest limiter.
 const SERVICE_INGEST_WINDOW: Duration = Duration::from_secs(60);
 
-fn cloud_span(span: &SpanRecord) -> temps_cloud_protocol::SpanRecord {
-    temps_cloud_protocol::SpanRecord {
-        trace_id: span.trace_id.clone(),
-        span_id: span.span_id.clone(),
+fn cloud_span(
+    link: &temps_cloud_client::CloudLink,
+    span: &SpanRecord,
+) -> Option<temps_cloud_protocol::SpanRecord> {
+    Some(temps_cloud_protocol::SpanRecord {
+        trace_id: link
+            .pseudonymize_telemetry_id("trace", &span.trace_id)
+            .ok()?,
+        span_id: link.pseudonymize_telemetry_id("span", &span.span_id).ok()?,
         // Span names are application-controlled too. Instrumentation may put
         // raw URLs, SQL, email addresses or identifiers here, so the safe
         // continuous projection uses a neutral operation label.
@@ -77,7 +82,7 @@ fn cloud_span(span: &SpanRecord) -> temps_cloud_protocol::SpanRecord {
         // routinely contain headers, SQL, user identifiers and other
         // application data.
         attributes: Default::default(),
-    }
+    })
 }
 
 /// Atomic counters for pipeline observability.
@@ -273,8 +278,12 @@ impl OtelService {
         }
 
         let mirror = self.cloud_link.as_ref().and_then(|link| {
-            link.is_linked()
-                .then(|| spans.iter().map(cloud_span).collect::<Vec<_>>())
+            (link.is_linked() && link.telemetry_enabled()).then(|| {
+                spans
+                    .iter()
+                    .filter_map(|span| cloud_span(link, span))
+                    .collect::<Vec<_>>()
+            })
         });
 
         match self.storage.store_spans(spans).await {
@@ -596,6 +605,11 @@ mod tests {
             directory.path().to_path_buf(),
             "test",
         ));
+        link.set_feature_switches(temps_cloud_client::CloudFeatureSwitches {
+            telemetry: true,
+            backups: false,
+            notifications: false,
+        });
         (directory, link)
     }
 
@@ -652,6 +666,21 @@ mod tests {
         assert_eq!(link.spooled(), 4);
     }
 
+    #[tokio::test]
+    async fn linking_alone_does_not_offer_spans_to_cloud() {
+        let mock = MockOtelStorage::new();
+        let (svc, _) = make_service(mock);
+        let (_directory, link) = linked_cloud();
+        link.set_feature_switches(temps_cloud_client::CloudFeatureSwitches::default());
+        let svc = svc.with_cloud_link(link.clone());
+        let (_, encoded) = test_support::build_sample_trace_tree();
+        let spans = decode::decode_traces_request(&encoded, 1, None).unwrap();
+
+        svc.ingest_spans(spans).await.unwrap();
+
+        assert_eq!(link.spooled(), 0);
+    }
+
     #[test]
     fn cloud_mirror_strips_application_controlled_names_and_attributes() {
         let (_, encoded) = test_support::build_sample_trace_tree();
@@ -662,11 +691,14 @@ mod tests {
         );
         spans[0].name = "SELECT * FROM users WHERE email='secret@example.com'".into();
 
-        let mirrored = cloud_span(&spans[0]);
+        let (_directory, link) = linked_cloud();
+        let mirrored = cloud_span(&link, &spans[0]).unwrap();
 
         assert!(mirrored.attributes.is_empty());
-        assert_eq!(mirrored.trace_id, spans[0].trace_id);
-        assert_eq!(mirrored.span_id, spans[0].span_id);
+        assert_ne!(mirrored.trace_id, spans[0].trace_id);
+        assert_ne!(mirrored.span_id, spans[0].span_id);
+        assert_eq!(mirrored.trace_id.len(), 64);
+        assert_eq!(mirrored.span_id.len(), 64);
         assert_eq!(mirrored.name, "span");
         let serialized = serde_json::to_string(&mirrored).unwrap();
         assert!(!serialized.contains("secret@example.com"));

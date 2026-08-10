@@ -28,6 +28,13 @@ const MARIADB_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MARIADB_BINLOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MARIADB_BINLOG_REPLAY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MARIADB_RESTORE_HELPER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MAX_BINLOG_POSITION: u64 = u32::MAX as u64;
+const MAX_BINLOG_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_BINLOG_SEGMENTS: usize = 4096;
+const MAX_BINLOG_COMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_BINLOG_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_RESTORE_COMPRESSED_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const MAX_RESTORE_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 
 fn walg_target_user_data(backup: &temps_entities::backups::Model) -> Result<Option<String>> {
     let metadata: serde_json::Value = serde_json::from_str(&backup.metadata).map_err(|error| {
@@ -271,8 +278,31 @@ pub struct BinlogManifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MariaDbBinlogCoordinate {
     file: String,
-    position: String,
+    position: u64,
     gtid: String,
+}
+
+struct BoundedChunkReader {
+    receiver: tokio::sync::mpsc::Receiver<std::result::Result<bytes::Bytes, String>>,
+    current: std::io::Cursor<bytes::Bytes>,
+}
+
+impl std::io::Read for BoundedChunkReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let read = std::io::Read::read(&mut self.current, buffer)?;
+            if read > 0 {
+                return Ok(read);
+            }
+            match self.receiver.blocking_recv() {
+                Some(Ok(chunk)) => self.current = std::io::Cursor::new(chunk),
+                Some(Err(reason)) => {
+                    return Err(std::io::Error::other(reason));
+                }
+                None => return Ok(0),
+            }
+        }
+    }
 }
 
 /// Input configuration for creating a MariaDB service.
@@ -500,6 +530,211 @@ impl MariaDbService {
             .container_name
             .clone()
             .unwrap_or_else(|| self.get_container_name())
+    }
+
+    fn normalize_binlog_filename(raw: &str) -> Result<String> {
+        let filename = raw.trim().trim_matches(['\'', '"']);
+        let filename = filename.strip_prefix("./").unwrap_or(filename);
+        Self::validate_binlog_filename(filename)?;
+        Ok(filename.to_string())
+    }
+
+    fn validate_binlog_filename(filename: &str) -> Result<()> {
+        let valid = filename.len() <= 255
+            && filename.rsplit_once('.').is_some_and(|(prefix, sequence)| {
+                !prefix.is_empty()
+                    && prefix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                    && !sequence.is_empty()
+                    && sequence.len() <= 20
+                    && sequence.bytes().all(|byte| byte.is_ascii_digit())
+                    && sequence.parse::<u64>().is_ok_and(|value| value > 0)
+            });
+
+        if !valid {
+            return Err(anyhow::anyhow!(
+                "Invalid MariaDB binlog filename '{}': expected a safe basename like mysql-bin.000001",
+                filename
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse_binlog_position(raw: &str, context: &str) -> Result<u64> {
+        let position = raw.parse::<u64>().map_err(|error| {
+            anyhow::anyhow!(
+                "Invalid MariaDB binlog position '{}' in {}: {}",
+                raw,
+                context,
+                error
+            )
+        })?;
+        if !(4..=MAX_BINLOG_POSITION).contains(&position) {
+            return Err(anyhow::anyhow!(
+                "Invalid MariaDB binlog position {} in {}: expected 4..={}",
+                position,
+                context,
+                MAX_BINLOG_POSITION
+            ));
+        }
+        Ok(position)
+    }
+
+    fn validate_binlog_manifest(manifest: &BinlogManifest) -> Result<()> {
+        if manifest.shipped_files.len() > MAX_BINLOG_SEGMENTS {
+            return Err(anyhow::anyhow!(
+                "MariaDB binlog manifest contains {} segments; limit is {}",
+                manifest.shipped_files.len(),
+                MAX_BINLOG_SEGMENTS
+            ));
+        }
+        if let Some(file) = &manifest.last_shipped_file {
+            Self::validate_binlog_filename(file)?;
+        }
+        for file in &manifest.shipped_files {
+            Self::validate_binlog_filename(file)?;
+        }
+        Ok(())
+    }
+
+    async fn stream_gzip_body_to_file_bounded(
+        mut body: aws_sdk_s3::primitives::ByteStream,
+        output_path: &std::path::Path,
+        label: &str,
+        max_compressed_bytes: u64,
+        max_uncompressed_bytes: u64,
+    ) -> Result<u64> {
+        use std::io::Read;
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let output = output_path.to_path_buf();
+        let decode_label = label.to_string();
+        let decoder = tokio::task::spawn_blocking(move || {
+            let reader = BoundedChunkReader {
+                receiver,
+                current: std::io::Cursor::new(bytes::Bytes::new()),
+            };
+            let mut decoder = flate2::read::GzDecoder::new(reader).take(max_uncompressed_bytes + 1);
+            let mut file = std::fs::File::create(&output).map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to create decompressed MariaDB {} at {}: {}",
+                    decode_label,
+                    output.display(),
+                    error
+                )
+            })?;
+            let written = std::io::copy(&mut decoder, &mut file).map_err(|error| {
+                anyhow::anyhow!("Failed to gunzip MariaDB {}: {}", decode_label, error)
+            })?;
+            if written == 0 || written > max_uncompressed_bytes {
+                drop(file);
+                let _ = std::fs::remove_file(&output);
+                return Err(anyhow::anyhow!(
+                    "MariaDB {} decompressed to {} bytes; expected 1..={} bytes",
+                    decode_label,
+                    written,
+                    max_uncompressed_bytes
+                ));
+            }
+            Ok(written)
+        });
+
+        let mut compressed_bytes = 0_u64;
+        let producer_result = async {
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.map_err(|error| {
+                    anyhow::anyhow!("Failed to stream compressed MariaDB {}: {}", label, error)
+                })?;
+                compressed_bytes = compressed_bytes
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| anyhow::anyhow!("MariaDB {} compressed size overflow", label))?;
+                if compressed_bytes > max_compressed_bytes {
+                    return Err(anyhow::anyhow!(
+                        "Compressed MariaDB {} exceeds the {} byte limit",
+                        label,
+                        max_compressed_bytes
+                    ));
+                }
+                sender.send(Ok(chunk)).await.map_err(|_| {
+                    anyhow::anyhow!(
+                        "MariaDB {} gzip decoder stopped before input completed",
+                        label
+                    )
+                })?;
+            }
+            if compressed_bytes == 0 {
+                return Err(anyhow::anyhow!("Compressed MariaDB {} is empty", label));
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        drop(sender);
+
+        let decoder_result = decoder.await.map_err(|error| {
+            anyhow::anyhow!("MariaDB {} decompression task failed: {}", label, error)
+        })?;
+        match (producer_result, decoder_result) {
+            (_, Err(error)) => {
+                let _ = tokio::fs::remove_file(output_path).await;
+                Err(error)
+            }
+            (Err(error), Ok(_)) => {
+                let _ = tokio::fs::remove_file(output_path).await;
+                Err(error)
+            }
+            (Ok(()), Ok(written)) => Ok(written),
+        }
+    }
+
+    async fn stream_body_to_file_bounded(
+        mut body: aws_sdk_s3::primitives::ByteStream,
+        output_path: &std::path::Path,
+        label: &str,
+        max_bytes: u64,
+    ) -> Result<u64> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut output = tokio::fs::File::create(output_path)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to create MariaDB {} staging file at {}: {}",
+                    label,
+                    output_path.display(),
+                    error
+                )
+            })?;
+        let mut written = 0_u64;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|error| {
+                anyhow::anyhow!("Failed to stream MariaDB {}: {}", label, error)
+            })?;
+            written = written
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("MariaDB {} compressed size overflow", label))?;
+            if written > max_bytes {
+                drop(output);
+                let _ = tokio::fs::remove_file(output_path).await;
+                return Err(anyhow::anyhow!(
+                    "MariaDB {} exceeds the {} byte limit",
+                    label,
+                    max_bytes
+                ));
+            }
+            output.write_all(&chunk).await.map_err(|error| {
+                anyhow::anyhow!("Failed to write MariaDB {} staging file: {}", label, error)
+            })?;
+        }
+        output.flush().await.map_err(|error| {
+            anyhow::anyhow!("Failed to flush MariaDB {} staging file: {}", label, error)
+        })?;
+        if written == 0 {
+            drop(output);
+            let _ = tokio::fs::remove_file(output_path).await;
+            return Err(anyhow::anyhow!("MariaDB {} is empty", label));
+        }
+        Ok(written)
     }
 
     fn get_mariadb_config(&self, service_config: ServiceConfig) -> Result<MariaDbConfig> {
@@ -1266,7 +1501,7 @@ impl MariaDbService {
 
         // 2. Enumerate segments. The last entry is the new active segment.
         let raw = self.show_binary_logs(config).await?;
-        let all_files = Self::parse_show_binary_logs(&raw);
+        let all_files = Self::parse_show_binary_logs(&raw)?;
         let closed = Self::closed_binlog_files(&all_files);
         if closed.is_empty() {
             debug!(
@@ -1279,8 +1514,7 @@ impl MariaDbService {
         // 3. Read the manifest to learn what we have already shipped.
         let mut manifest = self
             .read_binlog_manifest(s3_client, bucket, prefix, &self.name)
-            .await
-            .unwrap_or_default();
+            .await?;
 
         // 4. Compute the to-ship set: closed segments lexicographically
         //    greater than last_shipped_file (excludes the active file and
@@ -1299,7 +1533,7 @@ impl MariaDbService {
 
         let mut shipped = 0usize;
         for file in &to_ship {
-            let key = Self::binlog_object_key(prefix, &self.name, file);
+            let key = Self::binlog_object_key(prefix, &self.name, file)?;
             match self
                 .ship_one_binlog(s3_client, bucket, &container_name, file, &key)
                 .await
@@ -1487,15 +1721,28 @@ impl MariaDbService {
             Err(_) => return Ok(BinlogManifest::default()),
         };
 
-        let bytes = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read binlog manifest body: {}", e))?
-            .into_bytes();
+        let mut body = resp.body;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|error| {
+                anyhow::anyhow!("Failed to read binlog manifest body: {}", error)
+            })?;
+            let new_len = (bytes.len() as u64)
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("MariaDB binlog manifest size overflow"))?;
+            if new_len > MAX_BINLOG_MANIFEST_BYTES {
+                return Err(anyhow::anyhow!(
+                    "MariaDB binlog manifest exceeds the {} byte limit",
+                    MAX_BINLOG_MANIFEST_BYTES
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
 
-        serde_json::from_slice::<BinlogManifest>(&bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to parse binlog manifest: {}", e))
+        let manifest = serde_json::from_slice::<BinlogManifest>(&bytes)
+            .map_err(|error| anyhow::anyhow!("Failed to parse binlog manifest: {}", error))?;
+        Self::validate_binlog_manifest(&manifest)?;
+        Ok(manifest)
     }
 
     /// Serialize + PUT the manifest to S3.
@@ -1531,14 +1778,14 @@ impl MariaDbService {
     /// Parse `SHOW BINARY LOGS` output into segment filenames, in order.
     /// Each row is tab-separated (`filename\tsize[\t...]`); blank lines and
     /// the `Log_name` header (when present) are ignored.
-    pub(crate) fn parse_show_binary_logs(raw: &str) -> Vec<String> {
+    pub(crate) fn parse_show_binary_logs(raw: &str) -> Result<Vec<String>> {
         raw.lines()
             .filter_map(|line| {
                 let name = line.split('\t').next()?.trim();
                 if name.is_empty() || name == "Log_name" {
                     return None;
                 }
-                Some(name.to_string())
+                Some(Self::normalize_binlog_filename(name))
             })
             .collect()
     }
@@ -1570,16 +1817,21 @@ impl MariaDbService {
     /// S3 object key for a single gzipped binlog segment.
     /// `{prefix}/external_services/mariadb/{service}/binlog/{file}.gz`
     /// (the leading `{prefix}/` is dropped when `prefix` is empty).
-    pub(crate) fn binlog_object_key(prefix: &str, service_name: &str, file: &str) -> String {
+    pub(crate) fn binlog_object_key(
+        prefix: &str,
+        service_name: &str,
+        file: &str,
+    ) -> Result<String> {
+        Self::validate_binlog_filename(file)?;
         let tail = format!(
             "external_services/mariadb/{}/binlog/{}.gz",
             service_name, file
         );
-        if prefix.is_empty() {
+        Ok(if prefix.is_empty() {
             tail
         } else {
             format!("{}/{}", prefix, tail)
-        }
+        })
     }
 
     /// S3 object key for the binlog manifest.
@@ -1853,8 +2105,6 @@ impl MariaDbService {
         base_key: &str,
         dest: &std::path::Path,
     ) -> Result<()> {
-        use std::io::Read;
-
         let resp = s3_client
             .get_object()
             .bucket(bucket)
@@ -1869,26 +2119,15 @@ impl MariaDbService {
                     e
                 )
             })?;
-        let gz = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read physical base body: {}", e))?
-            .into_bytes();
 
-        let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(gz));
-        let mut stream = Vec::new();
-        decoder
-            .read_to_end(&mut stream)
-            .map_err(|e| anyhow::anyhow!("Failed to gunzip physical base: {}", e))?;
-        if stream.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Physical base mbstream is empty after gunzip"
-            ));
-        }
-        tokio::fs::write(dest, &stream).await.map_err(|e| {
-            anyhow::anyhow!("Failed to write mbstream to {}: {}", dest.display(), e)
-        })?;
+        Self::stream_gzip_body_to_file_bounded(
+            resp.body,
+            dest,
+            "physical base backup",
+            MAX_RESTORE_COMPRESSED_BYTES,
+            MAX_RESTORE_UNCOMPRESSED_BYTES,
+        )
+        .await?;
         Ok(())
     }
 
@@ -2261,8 +2500,8 @@ impl MariaDbService {
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("xtrabackup_binlog_info has no position"))?;
             return Ok(MariaDbBinlogCoordinate {
-                file: file.trim_start_matches("./").to_string(),
-                position: position.to_string(),
+                file: Self::normalize_binlog_filename(file)?,
+                position: Self::parse_binlog_position(position, "xtrabackup_binlog_info")?,
                 gtid: fields.next().unwrap_or_default().to_string(),
             });
         }
@@ -2274,19 +2513,11 @@ impl MariaDbService {
             let Some((file, position)) = coordinate.split_once(", position ") else {
                 continue;
             };
-            let position = position
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .trim_matches(|character: char| !character.is_ascii_digit());
+            let position = position.split_whitespace().next().unwrap_or_default();
             if !file.is_empty() && !position.is_empty() {
                 return Ok(MariaDbBinlogCoordinate {
-                    file: file
-                        .trim()
-                        .trim_matches(['\'', '"'])
-                        .trim_start_matches("./")
-                        .to_string(),
-                    position: position.to_string(),
+                    file: Self::normalize_binlog_filename(file)?,
+                    position: Self::parse_binlog_position(position, "WAL-G prepare log")?,
                     gtid: String::new(),
                 });
             }
@@ -2572,21 +2803,16 @@ impl MariaDbService {
                 Self::format_stop_datetime(*time),
             ))),
             RecoveryTarget::Lsn { lsn } => {
-                // Accept "binlog_file:position"; reject a bare position.
-                match lsn.rsplit_once(':') {
-                    Some((file, pos))
-                        if !file.is_empty()
-                            && pos.chars().all(|c| c.is_ascii_digit())
-                            && !pos.is_empty() =>
-                    {
-                        Ok(Some(("--stop-position".to_string(), pos.to_string())))
-                    }
-                    _ => Err(anyhow::anyhow!(
+                let (file, raw_position) = lsn.rsplit_once(':').ok_or_else(|| {
+                    anyhow::anyhow!(
                         "PITR Lsn target must be 'binlog_file:position' (a bare position is \
                          ambiguous across binlog segments); got '{}'",
                         lsn
-                    )),
-                }
+                    )
+                })?;
+                Self::validate_binlog_filename(file)?;
+                let position = Self::parse_binlog_position(raw_position, "PITR Lsn target")?;
+                Ok(Some(("--stop-position".to_string(), position.to_string())))
             }
             RecoveryTarget::Xid { xid } => Err(anyhow::anyhow!(
                 "PITR Xid/GTID target ('{}') is not yet supported for MariaDB physical \
@@ -2602,13 +2828,16 @@ impl MariaDbService {
 
     /// For an `Lsn` target, the binlog file the `--stop-position` applies to
     /// (the final segment to replay). `None` for non-Lsn targets.
-    fn lsn_target_file(target: &RecoveryTarget) -> Option<String> {
+    fn lsn_target_file(target: &RecoveryTarget) -> Result<Option<String>> {
         match target {
-            RecoveryTarget::Lsn { lsn } => lsn
-                .rsplit_once(':')
-                .map(|(file, _)| file.to_string())
-                .filter(|f| !f.is_empty()),
-            _ => None,
+            RecoveryTarget::Lsn { lsn } => {
+                let (file, _) = lsn.rsplit_once(':').ok_or_else(|| {
+                    anyhow::anyhow!("PITR Lsn target '{}' has no binlog filename", lsn)
+                })?;
+                Self::validate_binlog_filename(file)?;
+                Ok(Some(file.to_string()))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -2627,12 +2856,11 @@ impl MariaDbService {
         start_file: &str,
         dest_dir: &std::path::Path,
     ) -> Result<Vec<(std::path::PathBuf, String)>> {
-        use std::io::Read;
+        Self::validate_binlog_filename(start_file)?;
 
         let manifest = self
             .read_binlog_manifest(s3_client, bucket, prefix, source_name)
-            .await
-            .unwrap_or_default();
+            .await?;
 
         // Contiguous segment set: every shipped file >= the base's start file,
         // in lexicographic (== chronological for fixed-width names) order.
@@ -2644,6 +2872,13 @@ impl MariaDbService {
             .collect();
         files.sort();
         files.dedup();
+        if files.len() > MAX_BINLOG_SEGMENTS {
+            return Err(anyhow::anyhow!(
+                "MariaDB PITR requires {} binlog segments; limit is {}",
+                files.len(),
+                MAX_BINLOG_SEGMENTS
+            ));
+        }
 
         if files.is_empty() {
             warn!(
@@ -2656,7 +2891,8 @@ impl MariaDbService {
 
         let mut result = Vec::with_capacity(files.len());
         for file in files {
-            let key = Self::binlog_object_key(prefix, source_name, &file);
+            Self::validate_binlog_filename(&file)?;
+            let key = Self::binlog_object_key(prefix, source_name, &file)?;
             let resp = s3_client
                 .get_object()
                 .bucket(bucket)
@@ -2671,21 +2907,22 @@ impl MariaDbService {
                         e
                     )
                 })?;
-            let gz = resp
-                .body
-                .collect()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to read binlog segment {}: {}", file, e))?
-                .into_bytes();
-            let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(gz));
-            let mut raw = Vec::new();
-            decoder
-                .read_to_end(&mut raw)
-                .map_err(|e| anyhow::anyhow!("Failed to gunzip binlog segment {}: {}", file, e))?;
+
             let host_path = dest_dir.join(&file);
-            tokio::fs::write(&host_path, &raw)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to write binlog {} to host: {}", file, e))?;
+            let uncompressed_bytes = Self::stream_gzip_body_to_file_bounded(
+                resp.body,
+                &host_path,
+                &format!("compressed binlog segment {}", file),
+                MAX_BINLOG_COMPRESSED_BYTES,
+                MAX_BINLOG_UNCOMPRESSED_BYTES,
+            )
+            .await?;
+            debug!(
+                service = %self.name,
+                binlog = %file,
+                uncompressed_bytes,
+                "Staged bounded MariaDB binlog segment"
+            );
             result.push((host_path, file));
         }
         Ok(result)
@@ -2704,7 +2941,7 @@ impl MariaDbService {
         &self,
         config: &MariaDbConfig,
         segments: &[(std::path::PathBuf, String)],
-        start_position: &str,
+        start_position: u64,
         target: &RecoveryTarget,
     ) -> Result<()> {
         if segments.is_empty() {
@@ -2755,7 +2992,7 @@ impl MariaDbService {
         // For an Lsn target, --stop-position is only sound when the target file
         // is the LAST segment replayed; otherwise the same numeric position
         // exists in multiple files and we'd stop in the wrong one.
-        if let Some(target_file) = Self::lsn_target_file(target) {
+        if let Some(target_file) = Self::lsn_target_file(target)? {
             let last = container_files
                 .last()
                 .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
@@ -2783,33 +3020,28 @@ impl MariaDbService {
             binlog_args.push_str(&Self::shell_single_quote(f));
         }
 
-        // Resolve tool names at run time: mariadb:lts ships `mariadb-binlog`
-        // and `mariadb` (NOT `mysqlbinlog`/`mysql`); fall back to the mysql
-        // names for non-MariaDB images. dash has no pipefail, so we decode to
-        // an intermediate file FIRST (under `set -e`, a failed decode aborts
-        // before the client runs) and only then feed it to the client — this
-        // surfaces a broken replay as an error rather than a silent
-        // half-apply masked by the client's exit code in a pipe.
-        let replay_file = "/var/tmp/temps-pitr-replay.sql";
+        // The pinned managed image guarantees bash. `pipefail` makes either a
+        // decoder failure or a client failure fail the replay without staging
+        // decoded SQL, which can be much larger than the binlog segments.
+        let pipeline = format!(
+            "{} | \"$CLIENT\" --protocol=TCP -h127.0.0.1 -P3306 --connect-timeout=10 -uroot --binary-mode=1",
+            binlog_args
+        );
+        let pipefail_command = Self::shell_pipeline_with_pipefail(&pipeline);
         let replay_cmd = format!(
             "set -ex; \
              if command -v mariadb-binlog >/dev/null 2>&1; then BINLOG=mariadb-binlog; else BINLOG=mysqlbinlog; fi; \
              if command -v mariadb >/dev/null 2>&1; then CLIENT=mariadb; else CLIENT=mysql; fi; \
-             echo temps-mariadb-pitr-replay: decode-binlogs; \
-             timeout 120s {binlog} > {file}; \
-             ls -lh {file}; \
-             echo temps-mariadb-pitr-replay: apply-sql; \
-             timeout 120s \"$CLIENT\" --protocol=TCP -h127.0.0.1 -P3306 --connect-timeout=10 -uroot --password=\"$MARIADB_ROOT_PASSWORD\" --binary-mode=1 < {file}; \
-             rm -f {file}; \
+             export BINLOG CLIENT; \
+             echo temps-mariadb-pitr-replay: stream-binlogs; \
+             timeout 120s {pipeline}; \
              echo temps-mariadb-pitr-replay: complete",
-            binlog = binlog_args,
-            file = replay_file,
+            pipeline = pipefail_command,
         );
 
         let env = vec![
             format!("MYSQL_PWD={}", config.root_password),
             format!("MARIADB_PWD={}", config.root_password),
-            format!("MARIADB_ROOT_PASSWORD={}", config.root_password),
         ];
 
         info!(
@@ -2953,8 +3185,6 @@ impl MariaDbService {
         backup_location: &str,
         config: &MariaDbConfig,
     ) -> Result<()> {
-        use std::io::Read;
-
         let backup_key = Self::backup_key_from_location(backup_location, bucket);
         let response = s3_client
             .get_object()
@@ -2964,23 +3194,26 @@ impl MariaDbService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to download MariaDB backup from S3: {}", e))?;
 
-        let backup_data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read MariaDB backup data: {}", e))?
-            .into_bytes();
-
         let temp_dir = tempfile::tempdir()?;
         let sql_path = temp_dir.path().join("restore.sql");
 
         if backup_key.ends_with(".gz") {
-            let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(backup_data));
-            let mut sql = Vec::new();
-            decoder.read_to_end(&mut sql)?;
-            tokio::fs::write(&sql_path, sql).await?;
+            Self::stream_gzip_body_to_file_bounded(
+                response.body,
+                &sql_path,
+                "logical backup",
+                MAX_RESTORE_COMPRESSED_BYTES,
+                MAX_RESTORE_UNCOMPRESSED_BYTES,
+            )
+            .await?;
         } else {
-            tokio::fs::write(&sql_path, backup_data).await?;
+            Self::stream_body_to_file_bounded(
+                response.body,
+                &sql_path,
+                "logical backup",
+                MAX_RESTORE_UNCOMPRESSED_BYTES,
+            )
+            .await?;
         }
 
         self.restore_sql_file(config, &sql_path).await
@@ -2989,6 +3222,10 @@ impl MariaDbService {
     /// POSIX single-quote escape for embedding a value in an `sh -c` string.
     pub(crate) fn shell_single_quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', "'\\''"))
+    }
+
+    fn shell_pipeline_with_pipefail(pipeline: &str) -> String {
+        format!("bash -o pipefail -c {}", Self::shell_single_quote(pipeline))
     }
 }
 
@@ -3703,12 +3940,14 @@ impl ExternalService for MariaDbService {
                 ));
             }
             Some(MariaDbBinlogCoordinate {
-                file: file.to_string(),
-                position: metadata
-                    .get("binlog_position")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("4")
-                    .to_string(),
+                file: Self::normalize_binlog_filename(file)?,
+                position: Self::parse_binlog_position(
+                    metadata
+                        .get("binlog_position")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("4"),
+                    "physical base metadata",
+                )?,
                 gtid: metadata
                     .get("gtid")
                     .and_then(|value| value.as_str())
@@ -3778,11 +4017,7 @@ impl ExternalService for MariaDbService {
                 anyhow::anyhow!("Legacy physical MariaDB backup has no binlog coordinate")
             })?
         };
-        let start_position = if coordinate.position.is_empty() {
-            "4".to_string()
-        } else {
-            coordinate.position.clone()
-        };
+        let start_position = coordinate.position;
         info!(
             target_service = %target_service.name,
             binlog_file = %coordinate.file,
@@ -3816,7 +4051,7 @@ impl ExternalService for MariaDbService {
             "Fetched MariaDB PITR binlog segments"
         );
         target_service
-            .replay_binlogs(&target_config, &segments, &start_position, &target)
+            .replay_binlogs(&target_config, &segments, start_position, &target)
             .await?;
 
         info!("MariaDB PITR completed successfully");
@@ -4156,7 +4391,7 @@ mod tests {
         // Typical `mariadb -N -B` output: tab-separated, no header.
         let raw = "mysql-bin.000001\t1234\nmysql-bin.000002\t5678\nmysql-bin.000003\t90\n";
         assert_eq!(
-            MariaDbService::parse_show_binary_logs(raw),
+            MariaDbService::parse_show_binary_logs(raw).expect("valid binlog listing"),
             vec![
                 "mysql-bin.000001".to_string(),
                 "mysql-bin.000002".to_string(),
@@ -4170,9 +4405,49 @@ mod tests {
         // Some clients (non -N) emit a header row and trailing blank lines.
         let raw = "Log_name\tFile_size\nmysql-bin.000007\t100\n\n";
         assert_eq!(
-            MariaDbService::parse_show_binary_logs(raw),
+            MariaDbService::parse_show_binary_logs(raw).expect("valid binlog listing"),
             vec!["mysql-bin.000007".to_string()]
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_binlog_filenames_from_server_and_manifest() {
+        for filename in [
+            "../mysql-bin.000001",
+            "nested/mysql-bin.000001",
+            "mysql-bin.000001.gz",
+            "mysql-bin.$(id)",
+            "mysql-bin.000000",
+        ] {
+            let listing = format!("{filename}\t100\nmysql-bin.000002\t100\n");
+            assert!(
+                MariaDbService::parse_show_binary_logs(&listing).is_err(),
+                "server filename {filename:?} must be rejected"
+            );
+
+            let manifest = BinlogManifest {
+                last_shipped_file: Some(filename.to_string()),
+                updated_at: String::new(),
+                shipped_files: vec![filename.to_string()],
+            };
+            assert!(
+                MariaDbService::validate_binlog_manifest(&manifest).is_err(),
+                "manifest filename {filename:?} must be rejected"
+            );
+            assert!(MariaDbService::binlog_object_key("backups", "service", filename).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_binlog_manifest_with_too_many_segments() {
+        let manifest = BinlogManifest {
+            last_shipped_file: None,
+            updated_at: String::new(),
+            shipped_files: vec!["mysql-bin.000001".to_string(); MAX_BINLOG_SEGMENTS + 1],
+        };
+        let error = MariaDbService::validate_binlog_manifest(&manifest)
+            .expect_err("oversized manifest must fail");
+        assert!(error.to_string().contains("limit"));
     }
 
     #[test]
@@ -4244,12 +4519,14 @@ mod tests {
     fn binlog_object_key_handles_empty_and_nonempty_prefix() {
         // Non-empty bucket_path prefix.
         assert_eq!(
-            MariaDbService::binlog_object_key("backups/prod", "orders-db", "mysql-bin.000007"),
+            MariaDbService::binlog_object_key("backups/prod", "orders-db", "mysql-bin.000007")
+                .expect("valid binlog filename"),
             "backups/prod/external_services/mariadb/orders-db/binlog/mysql-bin.000007.gz"
         );
         // Empty prefix drops the leading segment.
         assert_eq!(
-            MariaDbService::binlog_object_key("", "orders-db", "mysql-bin.000007"),
+            MariaDbService::binlog_object_key("", "orders-db", "mysql-bin.000007")
+                .expect("valid binlog filename"),
             "external_services/mariadb/orders-db/binlog/mysql-bin.000007.gz"
         );
     }
@@ -4383,7 +4660,7 @@ mod tests {
         .expect("coordinate");
 
         assert_eq!(coordinate.file, "mysql-bin.000007");
-        assert_eq!(coordinate.position, "421");
+        assert_eq!(coordinate.position, 421);
         assert_eq!(coordinate.gtid, "0-1-99");
     }
 
@@ -4398,6 +4675,70 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malicious_walg_restore_coordinates() {
+        for coordinate in [
+            "../mysql-bin.000007 421",
+            "mysql-bin.000007 421;touch_/tmp/pwn",
+            "mysql-bin.000007 3",
+            "mysql-bin.000007 4294967296",
+        ] {
+            let logs = format!("TEMPS_BINLOG_COORD={coordinate}\n");
+            assert!(
+                MariaDbService::parse_walg_restore_coordinate(&logs).is_err(),
+                "coordinate {coordinate:?} must be rejected"
+            );
+        }
+        for logs in [
+            "[00] Last binlog file '../../mysql-bin.000007', position 421\n",
+            "[00] Last binlog file './mysql-bin.000007', position 421;id\n",
+        ] {
+            assert!(MariaDbService::parse_walg_restore_coordinate(logs).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_gzip_decompression_rejects_bombs_and_removes_partial_output() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let output_path = temp.path().join("bomb.out");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(&vec![0_u8; 128 * 1024])
+            .expect("write compressible payload");
+        let compressed = encoder.finish().expect("finish gzip");
+
+        let error = MariaDbService::stream_gzip_body_to_file_bounded(
+            aws_sdk_s3::primitives::ByteStream::from(compressed),
+            &output_path,
+            "test bomb",
+            1024 * 1024,
+            1024,
+        )
+        .await
+        .expect_err("gzip bomb must exceed decompressed limit");
+        assert!(error.to_string().contains("expected 1..=1024 bytes"));
+        assert!(!output_path.exists(), "partial output must be removed");
+    }
+
+    #[tokio::test]
+    async fn streaming_gzip_surfaces_decoder_failure() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let output_path = temp.path().join("invalid.out");
+        let error = MariaDbService::stream_gzip_body_to_file_bounded(
+            aws_sdk_s3::primitives::ByteStream::from_static(b"not gzip"),
+            &output_path,
+            "invalid segment",
+            1024,
+            1024,
+        )
+        .await
+        .expect_err("invalid gzip must fail");
+        assert!(error.to_string().contains("gunzip"));
+        assert!(!output_path.exists(), "partial output must be removed");
+    }
+
+    #[test]
     fn parses_walg_prepare_log_binlog_coordinate() {
         let coordinate = MariaDbService::parse_walg_restore_coordinate(
             "[00] recovery\n[00] Last binlog file './mysql-bin.000002', position 1969\n",
@@ -4405,7 +4746,7 @@ mod tests {
         .expect("prepare-log coordinate");
 
         assert_eq!(coordinate.file, "mysql-bin.000002");
-        assert_eq!(coordinate.position, "1969");
+        assert_eq!(coordinate.position, 1969);
         assert!(coordinate.gtid.is_empty());
     }
 
@@ -4460,6 +4801,20 @@ mod tests {
             })
             .is_err()
         );
+        for lsn in [
+            "../mysql-bin.000007:1234",
+            "mysql-bin.000007:1234;id",
+            "mysql-bin.000007:3",
+            "mysql-bin.000007:4294967296",
+        ] {
+            assert!(
+                MariaDbService::recovery_target_to_stop_flag(&RecoveryTarget::Lsn {
+                    lsn: lsn.to_string(),
+                })
+                .is_err(),
+                "LSN {lsn:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -4529,6 +4884,18 @@ mod tests {
             MariaDbService::shell_single_quote("2026-06-23 14:30:15"),
             "'2026-06-23 14:30:15'"
         );
+    }
+
+    #[test]
+    fn replay_pipefail_surfaces_decoder_and_client_failures() {
+        for pipeline in ["false | cat", "printf ok | false"] {
+            let command = MariaDbService::shell_pipeline_with_pipefail(pipeline);
+            let status = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .status()
+                .expect("bash pipefail command should run");
+            assert!(!status.success(), "pipeline {pipeline:?} must fail");
+        }
     }
 
     #[test]

@@ -9,4 +9,6 @@ mod service;
 
 pub use handler::{cloud_routes, CloudApiDoc};
 pub use plugin::CloudPlugin;
-pub use service::{CloudCapability, CloudService, CloudServiceError, CloudStatus};
+pub use service::{
+    CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus,
+};
