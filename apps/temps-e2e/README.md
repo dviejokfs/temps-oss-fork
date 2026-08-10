@@ -7,7 +7,9 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `error-tracking-scenario`, `logs-scenario`, `analytics-scenario`,
 `session-replay-scenario`, `backup-restore-scenario`, `pitr-scenario`,
 `git-deploy-scenario`, `otel-quota-scenario`, `deploy-lifecycle-scenario`,
-`db-ha-failover-scenario`, `examples`) drive the real
+`db-ha-failover-scenario`, `pg-upgrade-scenario`, `redis-restore-scenario`,
+`mongodb-restore-scenario`, `s3-restore-scenario`, `mariadb-restore-scenario`,
+`env-vars-scenario`, `api-key-scenario`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -163,6 +165,14 @@ bun run src/index.ts backup-restore-scenario --registry localhost:5111
 # wait time so a WAL segment actually archives -- see the steps section below.
 bun run src/index.ts pitr-scenario --registry localhost:5111
 
+# pg-upgrade: Postgres major-version upgrade (16 → 17) -- provision a service
+# pinned to postgres:16-bookworm, write 5 marker rows, trigger the upgrade
+# (pre_backup → snapshot → dump → new_container → restore → swap → analyze),
+# and prove via the read-only data-browser API that the marker rows survived
+# the pg_dumpall → psql restore cycle. Needs MinIO (docker-compose.e2e.yml).
+bun run src/index.ts pg-upgrade-scenario --registry localhost:5111
+bun run src/index.ts pg-upgrade-scenario --registry localhost:5111 --upgrade-timeout 900000  # generous timeout for slow hosts
+
 # git-deploy: real clone + build of a public GitHub repo
 # (github.com/gotempsh/temps-examples) via trigger-pipeline -- proves the
 # actual git pipeline, not an image pull or a synthesized Dockerfile. Hits
@@ -193,6 +203,32 @@ bun run src/index.ts deploy-lifecycle-scenario --keep --json    # inspect afterw
 # value) for the quota half to mean anything -- see its section below.
 bun run src/index.ts otel-quota-scenario
 bun run src/index.ts otel-quota-scenario --max-quota-batches 400 --json
+
+# redis-restore / mongodb-restore / s3-restore: backup + in-place restore of
+# each managed service via MinIO, proven by verifying pre-backup data
+# survives and post-backup-only data is erased. Needs MinIO (docker-compose.e2e.yml).
+bun run src/index.ts redis-restore-scenario --registry localhost:5111
+bun run src/index.ts mongodb-restore-scenario
+bun run src/index.ts s3-restore-scenario
+
+# mariadb-restore: backup + in-place restore of a real MariaDB service --
+# insert pre-backup rows via docker exec, real backup (physical or logical,
+# engine-selected) to MinIO, insert post-backup rows, restore in place, and
+# verify via the data-browser API that only the pre-backup rows survive.
+# Needs MinIO (docker-compose.e2e.yml).
+bun run src/index.ts mariadb-restore-scenario
+
+# env-vars: create/update/delete a project env var and redeploy after each
+# change, asserting the RUNNING CONTAINER (an echo-server app, not just the
+# API response) reflects the new/updated/removed value, plus an
+# environment-scoping check.
+bun run src/index.ts env-vars-scenario --registry localhost:5111
+
+# api-key: a second low-privilege user creates a scoped API key over real
+# HTTP, the key gets 200 on an in-scope request and 403 on an out-of-scope
+# one, then revocation makes an immediate retry fail. Needs DB-direct access
+# to mint the second user's initial session, same as rbac-scenario.
+bun run src/index.ts api-key-scenario --temps-root /path/to/temps --database-url postgres://...
 ```
 
 ### `examples`
@@ -791,6 +827,168 @@ platform/Postgres behavior that this scenario's first draft got wrong:
   count and the restored ids' exact identity instead of the new row's
   specific id.
 
+### `pg-upgrade-scenario` steps
+
+Closes the real coverage gap noted in the former "Known gaps" section: the
+`PostgresUpgradeOrchestrator`
+(`crates/temps-providers/src/externalsvc/postgres_upgrade.rs`) and its
+`POST /external-services/{service_id}/upgrades` HTTP surface were fully wired
+and real, but zero e2e coverage existed for the actual dump+restore data
+path -- the only honest proof that a major-version upgrade preserves data is
+reading the rows back after it finishes, not just watching a status field flip.
+
+1. build + push the db-probe Go app (`lib/probe-app.ts`) -- the same app
+   `backup-restore-scenario` and `pitr-scenario` use. On every `/probe` hit
+   it inserts a row into `e2e_probe` and returns the total count
+2. provision a real standalone Postgres service pinned to `postgres:16-bookworm`
+   via `parameters.docker_image` at creation time. Standard official postgres
+   images are used; `extract_postgres_version("postgres:16-bookworm")` returns
+   `"16"` and PGDATA is set to `/var/lib/postgresql/16/docker`. The explicit
+   pin is required because the upgrade API validates that `to_version > from_version`
+   and both images are on the same OS family (Alpine ↔ Alpine, Debian ↔ Debian)
+   -- using the platform default 18-bookworm image would leave nowhere to
+   upgrade to in an e2e test
+3. create a **default** S3 source (`is_default: true`) pointed at the local
+   MinIO. `phase_pre_backup` in the orchestrator calls
+   `BackupService::default_s3_source_id` (`WHERE is_default = true`) to find
+   the backup target; the upgrade API returns 412 immediately if no default
+   source is configured -- this is a hard precondition, not an optional step
+4. link the service to a project, deploy the db-probe app, wait for it to be
+   healthy, and confirm `/health` succeeds (real DB ping)
+5. write 5 real rows through `/probe` (the T1 marker set). These land in the
+   per-project auto-provisioned database (NOT the service's own `database`
+   parameter -- see `PostgresService::get_runtime_env_vars`), named
+   `normalize_database_name("{project_slug}_{env_slug}")` as computed by
+   `normalizePostgresDatabaseName` in `flows.ts`
+6. `POST /external-services/{service_id}/upgrades` with
+   from_version="16" / to_version="17" / from_image="postgres:16-bookworm" /
+   to_image="postgres:17-bookworm". The orchestrator spawns a
+   tokio task and returns immediately with status="pending". It then runs
+   seven real phases synchronously:
+     - `pre_backup`: wal-g backup to the default MinIO S3 source (safety net)
+     - `snapshot`: stop old container, `docker cp`-style volume copy to a
+       rollback volume, remove the original volume
+     - `dump`: boot throwaway old-version container with rollback volume
+       mounted, run `pg_dumpall`, write dump to a separate volume
+     - `new_container`: `lifecycle.create_and_start(service_id, to_image)` --
+       boots a fresh 17-bookworm container (empty data volume → initdb)
+     - `restore`: boot a psql container with the dump volume, run
+       `psql < data.sql` against the new container
+     - `swap`: persist `to_image` onto the service's `parameters.docker_image`
+       column via `lifecycle.set_docker_image`, restart the container
+     - `analyze`: run `ANALYZE` so the planner sees the new-version stats
+7. poll `GET /external-services/{service_id}/upgrades/{id}` every 5s until
+   `status === "completed"` or `status === "failed"`, up to `--upgrade-timeout`
+   (default 600s). On failure, the error includes the last-seen phase and
+   `error_message` from the upgrade row so the cause is always visible
+8. assert the 5 T1 marker rows survived: read them via the read-only
+   data-browser API (`GET /external-services/{id}/query/containers/{path}/entities/{entity}/data`
+   -- same endpoint `pitr-scenario` uses) and assert `total_count=5` and
+   `ids=[1,2,3,4,5]` exactly. This is the only honest proof: the dump captured
+   those rows and psql restored them. A status=completed without this
+   check would pass even if the restore loaded into the wrong database or no
+   database at all
+9. assert the service is fully writable on the new version: hit `/probe` once
+   more and confirm a 6th row landed, read back via data-browser and assert
+   `total_count=6`, first 5 ids exactly `[1,2,3,4,5]`, new id > 5. The
+   sequence jumps past the pre-dump high-water mark for the same reason
+   PITR does (WAL-logged `SEQ_LOG_VALS` advance), so we assert count and
+   monotonicity, not the exact new id
+10. assert `GET /external-services/{id}`'s `current_parameters.docker_image`
+    now equals `postgres:17-bookworm`. `phase_swap` calls
+    `lifecycle.set_docker_image` which persists the new image into
+    `external_services.parameters`; this checks the API-visible result
+11. teardown (deployment, project, service, S3 source)
+
+### `mariadb-restore-scenario` steps
+
+Closes the last remaining gap in the backup/restore engine parity story:
+Postgres (`backup-restore-scenario`, `pitr-scenario`, `pg-upgrade-scenario`),
+Redis, MongoDB, and S3 all have restore e2e coverage; MariaDB had the engine
+code (`crates/temps-providers/src/externalsvc/mariadb.rs`'s
+`restore_capabilities`/`restore_to_new_service`/`restore_pitr`, all fully
+wired to the trait) but no live-server proof until now.
+
+1. provision a real MariaDB service and read its root password directly off
+   the container via `docker inspect` (`MARIADB_ROOT_PASSWORD`, per
+   `MariaDbService::get_container_name`)
+2. insert 3 pre-backup rows into a real table via `docker exec mariadb -uroot
+   -p... -e ...` -- no synthetic DB rows, the same discipline every other
+   restore scenario holds itself to
+3. create a MinIO S3 source and trigger a real backup; the backup engine
+   auto-selects physical or logical (`crates/temps-backup/src/engines/dispatch.rs`)
+4. insert 2 more rows post-backup, to prove restore reverts state rather than
+   just leaving current state alone
+5. start an in-place restore and poll until it completes
+6. verify via the read-only data-browser API (not a direct DB read) that the
+   3 pre-backup rows are present with correct values, the 2 post-backup rows
+   are absent, and exactly 3 rows remain
+7. teardown (S3 source, service)
+
+### `env-vars-scenario` steps
+
+Proves environment-variable changes actually propagate into the running
+container -- not just that the API round-trips the value. App env vars have
+**no hot-reload**: a changed value only takes effect after a redeploy, so
+the scenario redeploys after every change and asserts on the live
+container's own response, never the database row.
+
+1. create a project, deploy `examples/echo-server` (its response body
+   includes `env: process.env`, so it directly surfaces the real container's
+   environment)
+2. create an env var scoped to production with a distinct marker value;
+   assert the create response round-trips it in plaintext (list responses
+   mask non-secret values as `"***"` -- only create/update return plaintext)
+3. redeploy, then poll the live container's own response until
+   `env["E2E_ENV_VAR_MARKER"]` actually equals the new value
+4. update the var to a second marker value, redeploy again, assert the
+   response reflects the NEW value (not the stale one) -- proves updates,
+   not just creates
+5. delete the var, redeploy, assert the key is genuinely absent from the
+   running container's environment
+6. lightweight, deploy-free check: a var scoped only to production must not
+   appear when `GET .../env-vars` is filtered by a second (staging)
+   environment's id, but must appear when filtered by production
+7. teardown (env vars, deployments, project)
+
+### `api-key-scenario` steps
+
+Promotes `web/e2e/authenticated/api-key-create.spec.ts` (UI-only: open
+dialog, fill name, submit, see the key once) to a real API round trip,
+covering what only an API-level test can prove: scope enforcement and
+revocation actually cutting off access, not just that api-key CRUD returns
+2xx.
+
+A real constraint shaped this scenario: `POST /api-keys` is gated by
+`SensitiveAction::CreateApiKey`, and `DefaultSensitiveActionAuthorizer`
+denies every machine (API-key-authenticated) principal outright
+(`machine_principals_are_denied_by_default`,
+`crates/temps-auth/src/sensitive_action.rs`) -- so this suite's own primary
+bearer-key identity can never call it. Same wall `rbac-scenario` already
+documented. The fix here: mint a second, low-privilege user via DB-direct
+`temps api-key` (needs `--temps-root`/`--database-url`, same as
+`rbac-scenario`), log it in for real via `POST /auth/login`, and drive key
+creation/revocation with the resulting `session` cookie via raw `fetch` --
+the SDK client always attaches a Bearer header, so it can't be used for this
+leg.
+
+1. create a project (primary bearer identity)
+2. create + log in a second, low-privilege user; capture its `session` cookie
+3. `POST /api-keys` (session-cookie authenticated) with a custom key scoped
+   to `projects:read` only; capture the plaintext key (returned only once)
+4. use the scoped key (`Authorization: Bearer tk_...`) against `GET
+   /projects/{id}` -- assert 200
+5. use the same key against `PATCH /projects/{id}` -- assert 403 with
+   `required_permission: "projects:write"`
+6. revoke the key (`POST /api-keys/{id}/deactivate`, session-cookie
+   authenticated)
+7. immediately retry the previously-200 request with the revoked key --
+   assert it now fails. Revocation is instant (`ApiKeyService::validate_api_key`
+   queries `IsActive.eq(true)` directly on every call; the only cache
+   throttles `last_used_at` write-back, never the pass/fail read), so this
+   is a single request, not a poll
+8. teardown (key, second user, project)
+
 ### `git-deploy-scenario` steps
 
 1. create a project pointed at a real public repo
@@ -1282,36 +1480,6 @@ request actually reaches the host.
 
 ## Known gaps (not covered end-to-end)
 
-**Postgres major-version upgrade** — deliberately scoped out of
-`pitr-scenario` (and not covered by any other scenario), unlike PITR which
-IS fully covered. `POST /external-services/{id}/upgrades`
-(`crates/temps-backup/src/handlers/pg_upgrade_handler.rs`,
-`PostgresUpgradeOrchestrator` in
-`crates/temps-providers/src/externalsvc/postgres_upgrade.rs`) is real and
-reachable — a multi-phase `pre_backup -> snapshot -> dump -> new_container
--> restore -> swap -> analyze` workflow that dumps the live cluster,
-provisions a fresh container on the target major version, restores into it,
-and swaps traffic over — but exercising it live needs meaningfully more
-setup than PITR: (1) the source service must be pinned to an explicit older
-major version at creation time (`version: "16"` or similar) compatible with
-`validate_os_family`'s from/to image check, not the platform default; (2)
-`phase_pre_backup` requires a **default** S3 source
-(`ExternalService::default_s3_source_id`, `is_default: true`) rather than
-the ad-hoc, non-default source `pitr-scenario`'s S3 setup uses; (3) the
-workflow pulls TWO postgres major-version images and does a real
-dump+restore, meaningfully longer and higher-blast-radius than PITR's
-WAL-replay. Given the severe background-process instability hit while
-building `pitr-scenario` on this shared dev host (the target `temps serve`
-instance died unpredictably — no panic, no OOM, no crash report — multiple
-times across an otherwise-successful run, requiring repeated restarts to
-get 3 clean end-to-end passes), there wasn't a reliable enough window left
-to also stand up and live-verify the upgrade path in the same session. A
-future pass should build `pg-upgrade-scenario` as its own command following
-this same pattern (base backup via a **default** S3 source, provision on an
-explicit older `version`, write a marker row, trigger the upgrade, poll to
-`completed`, assert the marker row survived via the data-browser API, and
-assert the service is reachable on the new major version).
-
 **Slack notifications** — deliberately not covered by any scenario command,
 and not expected to be: two independent guards stand between a real
 `POST /notification-providers/slack` → `.../test` flow and any local target,
@@ -1329,6 +1497,32 @@ HTTP-driven e2e run. `vercel-labs/emulate` (used elsewhere in this repo for
 mocking third-party APIs test-harness-side) can't help here either, for the
 same reason — see `web/e2e/README.md`'s "Mocking third-party services"
 section, which documents the identical constraint for the console UI tests.
+
+**Generic outbound webhooks** — same guard, same conclusion, no
+`webhook-scenario` command. `POST /projects/{project_id}/webhooks` runs every
+URL (create *and* update) through
+`WebhookService::validate_webhook_url` (`crates/temps-webhooks/src/service.rs`),
+which calls the exact same `temps_core::url_validation::validate_external_url`
+Slack goes through, then `validate_domain_async` for the DNS-resolved case.
+Unlike the DNS-01/Pebble guard in `crates/temps-dns/src/providers/pebble.rs`
+(which has an explicit `TEMPS_ALLOW_PEBBLE_PROVIDER=1` opt-in for exactly this
+kind of test), there is no dev/test bypass anywhere in the webhooks path —
+grepped `crates/temps-webhooks/` and `crates/temps-core/src/url_validation.rs`
+for `TEMPS_ALLOW*`, `debug_assertions`, `is_dev`/`dev_mode`/`test_mode`, and
+found nothing. A local receiver is also unreachable via the DNS-rebinding
+route: actual delivery in `deliver_webhook` re-resolves and pins the HTTP
+client to the validated IPs (`delivery_client_for`), so a domain that
+resolves publicly at create-time and privately at delivery-time is rejected
+too. Net effect: no loopback, RFC1918, or link-local target — including
+anything inside `docker-compose.e2e.yml`'s bridge network — can ever be a
+legal webhook URL against a real instance, create or update. The signing math
+(`sha256=` HMAC over `{timestamp}.{payload}`) is covered by
+`test_signature_generation` in `crates/temps-webhooks/src/service.rs`, which
+is the right layer for that piece, same as Slack's `wiremock` unit test one
+section up. Proving actual delivery end-to-end would need a real public receiver (e.g. a
+tunnel or hosted catcher) wired into the harness, which does not exist in
+this repo today. It was deliberately not added, and the SSRF guard was not
+weakened, for test convenience — the same call made for Slack above.
 
 ## Notes
 
