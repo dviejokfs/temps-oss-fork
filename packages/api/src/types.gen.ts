@@ -1020,6 +1020,11 @@ export type AppSettings = {
    */
   build_limits?: BuildLimitsSettings;
   /**
+   * Managed control-plane connection. Credentials are deliberately not
+   * stored here; they live in the owner-only cloud-link state file.
+   */
+  cloud?: CloudSettings;
+  /**
    * Cluster-DNS resolver settings (ADR-024, experimental beta). Off by
    * default — see `ClusterDnsSettings` for the incident background and
    * trade-offs. Must be explicitly enabled by operators who need
@@ -1130,6 +1135,10 @@ export type AppSettingsResponse = {
    * passed through as-is.
    */
   build_limits: BuildLimitsSettings;
+  /**
+   * Managed control-plane destination and explicit export consent flags.
+   */
+  cloud: CloudSettings;
   /**
    * Cluster-DNS resolver settings (ADR-024, experimental beta). No masking
    * needed — `enabled` is a plain bool with no sensitive content. Passed
@@ -2150,11 +2159,66 @@ export type CliLoginRequest = {
   username: string;
 };
 
+export type CloudAiCapability = {
+  configured: boolean;
+  model?: string | null;
+  reason?: string | null;
+  setup_path: string;
+};
+
+export type CloudCapability = {
+  configured: boolean;
+  reason?: string | null;
+  setup_path: string;
+};
+
+export type CloudFeatureSwitchesRequest = {
+  backups_enabled: boolean;
+  notifications_enabled: boolean;
+  telemetry_enabled: boolean;
+};
+
 /**
  * Cloud provider detected from node metadata
  */
 export type CloudProvider =
   "aws" | "gcp" | "azure" | "hetzner" | "digitalocean" | "other";
+
+/**
+ * Non-secret managed control-plane settings stored with application settings.
+ */
+export type CloudSettings = {
+  /**
+   * HTTPS origin used for enrollment and telemetry mirroring.
+   */
+  backend_url?: string;
+  /**
+   * Explicit consent to export completed backup objects.
+   */
+  backups_enabled?: boolean;
+  /**
+   * Explicit consent to send notifications through managed providers.
+   */
+  notifications_enabled?: boolean;
+  /**
+   * Explicit consent to mirror locally stored telemetry.
+   */
+  telemetry_enabled?: boolean;
+};
+
+export type CloudStatus = {
+  account_email?: string | null;
+  backend_url: string;
+  backups_enabled: boolean;
+  health: string;
+  health_message: string;
+  instance_id?: string | null;
+  notifications_enabled: boolean;
+  spooled_spans: number;
+  status: string;
+  status_message: string;
+  telemetry_enabled: boolean;
+};
 
 /**
  * Configuration for a Cloudflare Email Sending notification provider.
@@ -3747,7 +3811,14 @@ export type CreateProjectRequest = {
   build_command?: string | null;
   custom_domain?: string | null;
   directory: string;
-  environment_variables?: Array<[string, string]> | null;
+  /**
+   * Environment variables to seed the default (production) environment with.
+   *
+   * Accepts objects — `{"key": "API_KEY", "value": "sk-...", "is_secret": true}`
+   * — or the legacy two-element form `["API_KEY", "sk-..."]`, which implies
+   * `is_secret: false`.
+   */
+  environment_variables?: Array<ProjectEnvVarInput> | null;
   /**
    * Port exposed by the container (fallback when image has no EXPOSE directive)
    *
@@ -6088,6 +6159,10 @@ export type EnrichVisitorResponse = {
   visitor_id: string;
 };
 
+export type EnrollCloudRequest = {
+  enrollment_code: string;
+};
+
 export type EnrollmentTokenInfo = {
   bound_node_name?: string | null;
   created_at: string;
@@ -6159,6 +6234,12 @@ export type EntityResponse = {
  * Input for environment variable
  */
 export type EnvVarInput = {
+  /**
+   * Mark the variable as a write-only secret. Secret values are encrypted at
+   * rest and never returned in plaintext by the API — they can only be
+   * replaced, not read back. Defaults to `false`.
+   */
+  is_secret?: boolean;
   /**
    * Variable name
    */
@@ -7099,6 +7180,30 @@ export type ExternalImageResponse = {
   pushed_at: string;
   size_bytes?: number | null;
   tag?: string | null;
+};
+
+export type ExternalServiceBackupCapabilityResponse = {
+  /**
+   * Concrete artifact Cloud would mirror, such as `walg_repository`,
+   * `redis_walg_stream`, or `object_set`.
+   */
+  artifact: string;
+  /**
+   * Whether this running service can produce the physical WAL-G repository
+   * required by Temps Cloud. Logical dump fallback is intentionally not
+   * considered compatible.
+   */
+  cloud_backup_compatible: boolean;
+  engine: string;
+  reason?: string | null;
+  recommended_image?: string | null;
+  remediation?: string | null;
+  /**
+   * False when Docker or the target container was unavailable, meaning the
+   * endpoint intentionally did not guess whether required tools exist.
+   */
+  verified: boolean;
+  wal_g_installed: boolean;
 };
 
 /**
@@ -12211,6 +12316,31 @@ export type ProjectDashboardAnalytics = {
    * Unique visitor count in the current time range
    */
   unique_visitors: number;
+};
+
+/**
+ * Documentation-only schema for a project-creation environment variable.
+ *
+ * The wire format is deserialized by [`CreateProjectEnvVar`], which also
+ * accepts the legacy `["KEY", "value"]` tuple form. This struct exists so the
+ * OpenAPI spec (and the generated clients) describe the preferred object form
+ * with its `is_secret` flag.
+ */
+export type ProjectEnvVarInput = {
+  /**
+   * Mark the variable as a write-only secret. Secret values are encrypted at
+   * rest and never returned in plaintext by the API — they can only be
+   * replaced, not read back. Defaults to `false`.
+   */
+  is_secret?: boolean;
+  /**
+   * Variable name, e.g. `DATABASE_URL`
+   */
+  key: string;
+  /**
+   * Variable value
+   */
+  value: string;
 };
 
 /**
@@ -23345,6 +23475,43 @@ export type CleanupExpiredBackupsResponses = {
 export type CleanupExpiredBackupsResponse =
   CleanupExpiredBackupsResponses[keyof CleanupExpiredBackupsResponses];
 
+export type GetExternalServiceBackupCapabilityData = {
+  body?: never;
+  path: {
+    id: number;
+  };
+  query?: never;
+  url: "/backups/external-services/{id}/capability";
+};
+
+export type GetExternalServiceBackupCapabilityErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * External service not found
+   */
+  404: ProblemDetails;
+  /**
+   * Capability could not be loaded
+   */
+  500: ProblemDetails;
+};
+
+export type GetExternalServiceBackupCapabilityError =
+  GetExternalServiceBackupCapabilityErrors[keyof GetExternalServiceBackupCapabilityErrors];
+
+export type GetExternalServiceBackupCapabilityResponses = {
+  /**
+   * Cloud backup compatibility
+   */
+  200: ExternalServiceBackupCapabilityResponse;
+};
+
+export type GetExternalServiceBackupCapabilityResponse =
+  GetExternalServiceBackupCapabilityResponses[keyof GetExternalServiceBackupCapabilityResponses];
+
 export type RunExternalServiceBackupData = {
   body: RunExternalServiceBackupRequest;
   path: {
@@ -24913,6 +25080,90 @@ export type BlobHeadResponses = {
    */
   200: unknown;
 };
+
+export type DisconnectCloudData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/cloud";
+};
+
+export type DisconnectCloudResponses = {
+  200: CloudStatus;
+};
+
+export type DisconnectCloudResponse =
+  DisconnectCloudResponses[keyof DisconnectCloudResponses];
+
+export type GetCloudAiCapabilityData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/cloud/ai/capability";
+};
+
+export type GetCloudAiCapabilityResponses = {
+  200: CloudAiCapability;
+};
+
+export type GetCloudAiCapabilityResponse =
+  GetCloudAiCapabilityResponses[keyof GetCloudAiCapabilityResponses];
+
+export type GetCloudCapabilityData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/cloud/capability";
+};
+
+export type GetCloudCapabilityResponses = {
+  200: CloudCapability;
+};
+
+export type GetCloudCapabilityResponse =
+  GetCloudCapabilityResponses[keyof GetCloudCapabilityResponses];
+
+export type EnrollCloudData = {
+  body: EnrollCloudRequest;
+  path?: never;
+  query?: never;
+  url: "/cloud/enroll";
+};
+
+export type EnrollCloudResponses = {
+  200: CloudStatus;
+};
+
+export type EnrollCloudResponse =
+  EnrollCloudResponses[keyof EnrollCloudResponses];
+
+export type UpdateCloudFeaturesData = {
+  body: CloudFeatureSwitchesRequest;
+  path?: never;
+  query?: never;
+  url: "/cloud/features";
+};
+
+export type UpdateCloudFeaturesResponses = {
+  200: CloudStatus;
+};
+
+export type UpdateCloudFeaturesResponse =
+  UpdateCloudFeaturesResponses[keyof UpdateCloudFeaturesResponses];
+
+export type GetCloudStatusData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/cloud/status";
+};
+
+export type GetCloudStatusResponses = {
+  200: CloudStatus;
+};
+
+export type GetCloudStatusResponse =
+  GetCloudStatusResponses[keyof GetCloudStatusResponses];
 
 export type GetDashboardProjectsAnalyticsData = {
   body?: never;
@@ -35524,6 +35775,14 @@ export type QueryTracesData = {
      */
     deployment_id?: number;
     /**
+     * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+     */
+    attributes?: string;
+    /**
+     * Filter by span name pattern (ILIKE)
+     */
+    name_pattern?: string;
+    /**
      * Max spans to return (default: 100, max: 1000)
      */
     limit?: number;
@@ -44081,8 +44340,11 @@ export type ObservabilityListEventsData = {
   };
   query?: {
     /**
-     * Comma-separated kinds: `log,request,span,error,revenue`. Empty or
-     * missing returns every kind.
+     * Comma-separated kinds: `request,span,error,revenue`. Empty or
+     * missing returns every kind. There is no `log` kind — runtime logs
+     * intentionally never appear in this feed (see `ObservabilityEvent`'s
+     * "No `Log` variant" doc); passing `kinds=log` is rejected with 400
+     * `InvalidKindsFilter`, not silently ignored.
      */
     kinds?: string;
     /**

@@ -556,6 +556,8 @@ import type {
   DisableMfaData,
   DisableMfaErrors,
   DisableMfaResponses,
+  DisconnectCloudData,
+  DisconnectCloudResponses,
   DiscoverWorkloadsData,
   DiscoverWorkloadsErrors,
   DiscoverWorkloadsResponses,
@@ -583,6 +585,8 @@ import type {
   EnrichVisitorData,
   EnrichVisitorErrors,
   EnrichVisitorResponses,
+  EnrollCloudData,
+  EnrollCloudResponses,
   ExecData,
   ExecDetachedData,
   ExecDetachedErrors,
@@ -736,6 +740,12 @@ import type {
   GetCliStatusData,
   GetCliStatusErrors,
   GetCliStatusResponses,
+  GetCloudAiCapabilityData,
+  GetCloudAiCapabilityResponses,
+  GetCloudCapabilityData,
+  GetCloudCapabilityResponses,
+  GetCloudStatusData,
+  GetCloudStatusResponses,
   GetClusterHealthData,
   GetClusterHealthErrors,
   GetClusterHealthResponses,
@@ -920,6 +930,9 @@ import type {
   GetExternalImageData,
   GetExternalImageErrors,
   GetExternalImageResponses,
+  GetExternalServiceBackupCapabilityData,
+  GetExternalServiceBackupCapabilityErrors,
+  GetExternalServiceBackupCapabilityResponses,
   GetFileData,
   GetFileErrors,
   GetFileResponses,
@@ -2228,6 +2241,8 @@ import type {
   UpdateBackupScheduleData,
   UpdateBackupScheduleErrors,
   UpdateBackupScheduleResponses,
+  UpdateCloudFeaturesData,
+  UpdateCloudFeaturesResponses,
   UpdateCloudflareProviderData,
   UpdateCloudflareProviderErrors,
   UpdateCloudflareProviderResponses,
@@ -4176,6 +4191,32 @@ export const cleanupExpiredBackups = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Report whether an existing service can produce a Cloud-restorable backup.
+ *
+ * This probes the running container instead of trusting its configured image
+ * name: operators can build their own WAL-G image, and an image label alone
+ * cannot prove that the binary is actually executable.
+ */
+export const getExternalServiceBackupCapability = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetExternalServiceBackupCapabilityData, ThrowOnError>,
+): RequestResult<
+  GetExternalServiceBackupCapabilityResponses,
+  GetExternalServiceBackupCapabilityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetExternalServiceBackupCapabilityResponses,
+    GetExternalServiceBackupCapabilityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/backups/external-services/{id}/capability",
+    ...options,
+  });
+
+/**
  * Run a backup for an external service manually.
  *
  * Enqueues the backup for asynchronous execution via the `BackupRunner`
@@ -5057,6 +5098,88 @@ export const blobHead = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/blob/{project_id}/{path}",
+    ...options,
+  });
+
+export const disconnectCloud = <ThrowOnError extends boolean = false>(
+  options?: Options<DisconnectCloudData, ThrowOnError>,
+): RequestResult<DisconnectCloudResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).delete<
+    DisconnectCloudResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud",
+    ...options,
+  });
+
+export const getCloudAiCapability = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudAiCapabilityData, ThrowOnError>,
+): RequestResult<GetCloudAiCapabilityResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudAiCapabilityResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/ai/capability",
+    ...options,
+  });
+
+export const getCloudCapability = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudCapabilityData, ThrowOnError>,
+): RequestResult<GetCloudCapabilityResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudCapabilityResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/capability",
+    ...options,
+  });
+
+export const enrollCloud = <ThrowOnError extends boolean = false>(
+  options: Options<EnrollCloudData, ThrowOnError>,
+): RequestResult<EnrollCloudResponses, unknown, ThrowOnError> =>
+  (options.client ?? client).post<EnrollCloudResponses, unknown, ThrowOnError>({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/enroll",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const updateCloudFeatures = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateCloudFeaturesData, ThrowOnError>,
+): RequestResult<UpdateCloudFeaturesResponses, unknown, ThrowOnError> =>
+  (options.client ?? client).patch<
+    UpdateCloudFeaturesResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/features",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getCloudStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudStatusData, ThrowOnError>,
+): RequestResult<GetCloudStatusResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudStatusResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/status",
     ...options,
   });
 

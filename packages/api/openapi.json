@@ -2173,6 +2173,20 @@
               }
             ]
           },
+          "cloud": {
+            "default": {
+              "backend_url": "https://app.temps.sh",
+              "backups_enabled": false,
+              "notifications_enabled": false,
+              "telemetry_enabled": false
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CloudSettings",
+                "description": "Managed control-plane connection. Credentials are deliberately not\nstored here; they live in the owner-only cloud-link state file."
+              }
+            ]
+          },
           "cluster_dns": {
             "default": {
               "enabled": false
@@ -2460,6 +2474,10 @@
             "$ref": "#/components/schemas/BuildLimitsSettings",
             "description": "Build-time resource limits (control-plane only). No sensitive content,\npassed through as-is."
           },
+          "cloud": {
+            "$ref": "#/components/schemas/CloudSettings",
+            "description": "Managed control-plane destination and explicit export consent flags."
+          },
           "cluster_dns": {
             "$ref": "#/components/schemas/ClusterDnsSettings",
             "description": "Cluster-DNS resolver settings (ADR-024, experimental beta). No masking\nneeded — `enabled` is a plain bool with no sensitive content. Passed\nthrough as-is so the settings UI can read and toggle the flag."
@@ -2562,6 +2580,7 @@
         },
         "required": [
           "preview_domain",
+          "cloud",
           "screenshots",
           "letsencrypt",
           "dns_provider",
@@ -4605,6 +4624,73 @@
         ],
         "type": "object"
       },
+      "CloudAiCapability": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "setup_path"
+        ],
+        "type": "object"
+      },
+      "CloudCapability": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "setup_path"
+        ],
+        "type": "object"
+      },
+      "CloudFeatureSwitchesRequest": {
+        "properties": {
+          "backups_enabled": {
+            "type": "boolean"
+          },
+          "notifications_enabled": {
+            "type": "boolean"
+          },
+          "telemetry_enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "telemetry_enabled",
+          "backups_enabled",
+          "notifications_enabled"
+        ],
+        "type": "object"
+      },
       "CloudProvider": {
         "description": "Cloud provider detected from node metadata",
         "enum": [
@@ -4616,6 +4702,88 @@
           "other"
         ],
         "type": "string"
+      },
+      "CloudSettings": {
+        "description": "Non-secret managed control-plane settings stored with application settings.",
+        "properties": {
+          "backend_url": {
+            "default": "https://app.temps.sh",
+            "description": "HTTPS origin used for enrollment and telemetry mirroring.",
+            "type": "string"
+          },
+          "backups_enabled": {
+            "default": false,
+            "description": "Explicit consent to export completed backup objects.",
+            "type": "boolean"
+          },
+          "notifications_enabled": {
+            "default": false,
+            "description": "Explicit consent to send notifications through managed providers.",
+            "type": "boolean"
+          },
+          "telemetry_enabled": {
+            "default": false,
+            "description": "Explicit consent to mirror locally stored telemetry.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "CloudStatus": {
+        "properties": {
+          "account_email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "backend_url": {
+            "type": "string"
+          },
+          "backups_enabled": {
+            "type": "boolean"
+          },
+          "health": {
+            "type": "string"
+          },
+          "health_message": {
+            "type": "string"
+          },
+          "instance_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "notifications_enabled": {
+            "type": "boolean"
+          },
+          "spooled_spans": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "status_message": {
+            "type": "string"
+          },
+          "telemetry_enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "status_message",
+          "health",
+          "health_message",
+          "spooled_spans",
+          "backend_url",
+          "telemetry_enabled",
+          "backups_enabled",
+          "notifications_enabled"
+        ],
+        "type": "object"
       },
       "CloudflareConfig": {
         "description": "Configuration for a Cloudflare Email Sending notification provider.\n\nNotifications are delivered through Cloudflare's transactional Email Sending\nAPI. Only the account, token, sender and recipients are configured here —\nsubject and body are derived from each notification.",
@@ -7770,17 +7938,9 @@
             "type": "string"
           },
           "environment_variables": {
+            "description": "Environment variables to seed the default (production) environment with.\n\nAccepts objects — `{\"key\": \"API_KEY\", \"value\": \"sk-...\", \"is_secret\": true}`\n— or the legacy two-element form `[\"API_KEY\", \"sk-...\"]`, which implies\n`is_secret: false`.",
             "items": {
-              "items": false,
-              "prefixItems": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "string"
-                }
-              ],
-              "type": "array"
+              "$ref": "#/components/schemas/ProjectEnvVarInput"
             },
             "type": [
               "array",
@@ -13029,6 +13189,19 @@
         ],
         "type": "object"
       },
+      "EnrollCloudRequest": {
+        "properties": {
+          "enrollment_code": {
+            "example": "ABCD-EFGH",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "enrollment_code"
+        ],
+        "type": "object"
+      },
       "EnrollmentTokenInfo": {
         "properties": {
           "bound_node_name": {
@@ -13184,6 +13357,10 @@
       "EnvVarInput": {
         "description": "Input for environment variable",
         "properties": {
+          "is_secret": {
+            "description": "Mark the variable as a write-only secret. Secret values are encrypted at\nrest and never returned in plaintext by the API — they can only be\nreplaced, not read back. Defaults to `false`.",
+            "type": "boolean"
+          },
           "name": {
             "description": "Variable name",
             "type": "string"
@@ -15255,6 +15432,54 @@
           "image_ref",
           "pushed_at",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "ExternalServiceBackupCapabilityResponse": {
+        "properties": {
+          "artifact": {
+            "description": "Concrete artifact Cloud would mirror, such as `walg_repository`,\n`redis_walg_stream`, or `object_set`.",
+            "type": "string"
+          },
+          "cloud_backup_compatible": {
+            "description": "Whether this running service can produce the physical WAL-G repository\nrequired by Temps Cloud. Logical dump fallback is intentionally not\nconsidered compatible.",
+            "type": "boolean"
+          },
+          "engine": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recommended_image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remediation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "description": "False when Docker or the target container was unavailable, meaning the\nendpoint intentionally did not guess whether required tools exist.",
+            "type": "boolean"
+          },
+          "wal_g_installed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cloud_backup_compatible",
+          "verified",
+          "wal_g_installed",
+          "engine",
+          "artifact"
         ],
         "type": "object"
       },
@@ -26906,6 +27131,28 @@
           "unique_visitors",
           "previous_unique_visitors",
           "hourly_visits"
+        ],
+        "type": "object"
+      },
+      "ProjectEnvVarInput": {
+        "description": "Documentation-only schema for a project-creation environment variable.\n\nThe wire format is deserialized by [`CreateProjectEnvVar`], which also\naccepts the legacy `[\"KEY\", \"value\"]` tuple form. This struct exists so the\nOpenAPI spec (and the generated clients) describe the preferred object form\nwith its `is_secret` flag.",
+        "properties": {
+          "is_secret": {
+            "description": "Mark the variable as a write-only secret. Secret values are encrypted at\nrest and never returned in plaintext by the API — they can only be\nreplaced, not read back. Defaults to `false`.",
+            "type": "boolean"
+          },
+          "key": {
+            "description": "Variable name, e.g. `DATABASE_URL`",
+            "type": "string"
+          },
+          "value": {
+            "description": "Variable value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value"
         ],
         "type": "object"
       },
@@ -49342,6 +49589,74 @@
         ]
       }
     },
+    "/backups/external-services/{id}/capability": {
+      "get": {
+        "description": "This probes the running container instead of trusting its configured image\nname: operators can build their own WAL-G image, and an image label alone\ncannot prove that the binary is actually executable.",
+        "operationId": "get_external_service_backup_capability",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalServiceBackupCapabilityResponse"
+                }
+              }
+            },
+            "description": "Cloud backup compatibility"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "External service not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Capability could not be loaded"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Report whether an existing service can produce a Cloud-restorable backup.",
+        "tags": [
+          "Backups"
+        ]
+      }
+    },
     "/backups/external-services/{id}/run": {
       "post": {
         "description": "Enqueues the backup for asynchronous execution via the `BackupRunner`\n(ADR-014). Returns `202 Accepted` immediately: pending parent and child\nrows are inserted, and a `backup_jobs` row is enqueued for the resolved\nengine. Poll `GET /backups/{id}` to observe `pending → running → completed`.",
@@ -52098,6 +52413,176 @@
         "summary": "Get blob metadata",
         "tags": [
           "Blob"
+        ]
+      }
+    },
+    "/cloud": {
+      "delete": {
+        "operationId": "disconnect_cloud",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudStatus"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
+    "/cloud/ai/capability": {
+      "get": {
+        "operationId": "get_cloud_ai_capability",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudAiCapability"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
+    "/cloud/capability": {
+      "get": {
+        "operationId": "get_cloud_capability",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudCapability"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
+    "/cloud/enroll": {
+      "post": {
+        "operationId": "enroll_cloud",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnrollCloudRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudStatus"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
+    "/cloud/features": {
+      "patch": {
+        "operationId": "update_cloud_features",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloudFeatureSwitchesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudStatus"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
+    "/cloud/status": {
+      "get": {
+        "operationId": "get_cloud_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudStatus"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cloud"
         ]
       }
     },
@@ -55329,7 +55814,7 @@
           }
         ],
         "responses": {
-          "302": {
+          "307": {
             "description": "Redirect to original URL"
           },
           "404": {
@@ -67755,6 +68240,24 @@
             "schema": {
               "format": "int32",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by span attributes as comma-separated key=value pairs, e.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\"",
+            "in": "query",
+            "name": "attributes",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by span name pattern (ILIKE)",
+            "in": "query",
+            "name": "name_pattern",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -80864,7 +81367,7 @@
             }
           },
           {
-            "description": "Comma-separated kinds: `log,request,span,error,revenue`. Empty or\nmissing returns every kind.",
+            "description": "Comma-separated kinds: `request,span,error,revenue`. Empty or\nmissing returns every kind. There is no `log` kind — runtime logs\nintentionally never appear in this feed (see `ObservabilityEvent`'s\n\"No `Log` variant\" doc); passing `kinds=log` is rejected with 400\n`InvalidKindsFilter`, not silently ignored.",
             "in": "query",
             "name": "kinds",
             "required": false,

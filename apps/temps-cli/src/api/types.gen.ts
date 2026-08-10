@@ -1136,6 +1136,10 @@ export type AppSettingsResponse = {
      */
     build_limits: BuildLimitsSettings;
     /**
+     * Managed control-plane destination and explicit export consent flags.
+     */
+    cloud: CloudSettings;
+    /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). No masking
      * needed — `enabled` is a plain bool with no sensitive content. Passed
      * through as-is so the settings UI can read and toggle the flag.
@@ -2148,10 +2152,23 @@ export type CliLoginRequest = {
     username: string;
 };
 
+export type CloudAiCapability = {
+    configured: boolean;
+    model?: string | null;
+    reason?: string | null;
+    setup_path: string;
+};
+
 export type CloudCapability = {
     configured: boolean;
     reason?: string | null;
     setup_path: string;
+};
+
+export type CloudFeatureSwitchesRequest = {
+    backups_enabled: boolean;
+    notifications_enabled: boolean;
+    telemetry_enabled: boolean;
 };
 
 /**
@@ -2167,17 +2184,32 @@ export type CloudSettings = {
      * HTTPS origin used for enrollment and telemetry mirroring.
      */
     backend_url?: string;
+    /**
+     * Explicit consent to export completed backup objects.
+     */
+    backups_enabled?: boolean;
+    /**
+     * Explicit consent to send notifications through managed providers.
+     */
+    notifications_enabled?: boolean;
+    /**
+     * Explicit consent to mirror locally stored telemetry.
+     */
+    telemetry_enabled?: boolean;
 };
 
 export type CloudStatus = {
     account_email?: string | null;
     backend_url: string;
+    backups_enabled: boolean;
     health: string;
     health_message: string;
     instance_id?: string | null;
+    notifications_enabled: boolean;
     spooled_spans: number;
     status: string;
     status_message: string;
+    telemetry_enabled: boolean;
 };
 
 /**
@@ -7117,6 +7149,30 @@ export type ExternalImageResponse = {
     tag?: string | null;
 };
 
+export type ExternalServiceBackupCapabilityResponse = {
+    /**
+     * Concrete artifact Cloud would mirror, such as `walg_repository`,
+     * `redis_walg_stream`, or `object_set`.
+     */
+    artifact: string;
+    /**
+     * Whether this running service can produce the physical WAL-G repository
+     * required by Temps Cloud. Logical dump fallback is intentionally not
+     * considered compatible.
+     */
+    cloud_backup_compatible: boolean;
+    engine: string;
+    reason?: string | null;
+    recommended_image?: string | null;
+    remediation?: string | null;
+    /**
+     * False when Docker or the target container was unavailable, meaning the
+     * endpoint intentionally did not guess whether required tools exist.
+     */
+    verified: boolean;
+    wal_g_installed: boolean;
+};
+
 /**
  * Response type for external service backup
  */
@@ -9169,7 +9225,7 @@ export type ListApiKeysQuery = {
  */
 export type ListAuditLogsQuery = {
     /**
-     * Start timestamp (milliseconds since epoch)
+     * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
      */
     from?: string | null;
     /**
@@ -9185,7 +9241,7 @@ export type ListAuditLogsQuery = {
      */
     operation_type?: string | null;
     /**
-     * End timestamp (milliseconds since epoch)
+     * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
      */
     to?: string | null;
     /**
@@ -23116,6 +23172,41 @@ export type CleanupExpiredBackupsResponses = {
 
 export type CleanupExpiredBackupsResponse = CleanupExpiredBackupsResponses[keyof CleanupExpiredBackupsResponses];
 
+export type GetExternalServiceBackupCapabilityData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/backups/external-services/{id}/capability';
+};
+
+export type GetExternalServiceBackupCapabilityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * External service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Capability could not be loaded
+     */
+    500: ProblemDetails;
+};
+
+export type GetExternalServiceBackupCapabilityError = GetExternalServiceBackupCapabilityErrors[keyof GetExternalServiceBackupCapabilityErrors];
+
+export type GetExternalServiceBackupCapabilityResponses = {
+    /**
+     * Cloud backup compatibility
+     */
+    200: ExternalServiceBackupCapabilityResponse;
+};
+
+export type GetExternalServiceBackupCapabilityResponse = GetExternalServiceBackupCapabilityResponses[keyof GetExternalServiceBackupCapabilityResponses];
+
 export type RunExternalServiceBackupData = {
     body: RunExternalServiceBackupRequest;
     path: {
@@ -24321,6 +24412,10 @@ export type BlobListData = {
          * Continuation token for pagination
          */
         cursor?: string;
+        /**
+         * Project ID (required for API key/session auth, optional for deployment tokens)
+         */
+        project_id?: number;
     };
     url: '/blob';
 };
@@ -24353,7 +24448,24 @@ export type BlobPutData = {
      */
     body: string;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Path where the blob will be stored
+         */
+        pathname?: string;
+        /**
+         * Content type of the blob (optional, will be guessed from extension)
+         */
+        content_type?: string;
+        /**
+         * Add random suffix to pathname to prevent collisions
+         */
+        add_random_suffix?: boolean;
+        /**
+         * Project ID (required for API key/session auth, optional for deployment tokens)
+         */
+        project_id?: number;
+    };
     url: '/blob';
 };
 
@@ -24621,6 +24733,19 @@ export type DisconnectCloudResponses = {
 
 export type DisconnectCloudResponse = DisconnectCloudResponses[keyof DisconnectCloudResponses];
 
+export type GetCloudAiCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/ai/capability';
+};
+
+export type GetCloudAiCapabilityResponses = {
+    200: CloudAiCapability;
+};
+
+export type GetCloudAiCapabilityResponse = GetCloudAiCapabilityResponses[keyof GetCloudAiCapabilityResponses];
+
 export type GetCloudCapabilityData = {
     body?: never;
     path?: never;
@@ -24646,6 +24771,19 @@ export type EnrollCloudResponses = {
 };
 
 export type EnrollCloudResponse = EnrollCloudResponses[keyof EnrollCloudResponses];
+
+export type UpdateCloudFeaturesData = {
+    body: CloudFeatureSwitchesRequest;
+    path?: never;
+    query?: never;
+    url: '/cloud/features';
+};
+
+export type UpdateCloudFeaturesResponses = {
+    200: CloudStatus;
+};
+
+export type UpdateCloudFeaturesResponse = UpdateCloudFeaturesResponses[keyof UpdateCloudFeaturesResponses];
 
 export type GetCloudStatusData = {
     body?: never;
@@ -32974,7 +33112,7 @@ export type GetUptimeHistoryData = {
          */
         monitor_id: number;
     };
-    query: {
+    query?: {
         /**
          * Number of days of history (default: 60) - ignored if start_time/end_time provided
          */
@@ -32982,11 +33120,11 @@ export type GetUptimeHistoryData = {
         /**
          * Start time (ISO 8601) - overrides days parameter
          */
-        start_time: string;
+        start_time?: string;
         /**
          * End time (ISO 8601) - defaults to now
          */
-        end_time: string;
+        end_time?: string;
     };
     url: '/monitors/{monitor_id}/uptime';
 };
@@ -35019,6 +35157,14 @@ export type QueryTracesData = {
          * Filter by deployment ID
          */
         deployment_id?: number;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string;
+        /**
+         * Filter by span name pattern (ILIKE)
+         */
+        name_pattern?: string;
         /**
          * Max spans to return (default: 100, max: 1000)
          */
@@ -43406,8 +43552,11 @@ export type ObservabilityListEventsData = {
     };
     query?: {
         /**
-         * Comma-separated kinds: `log,request,span,error,revenue`. Empty or
-         * missing returns every kind.
+         * Comma-separated kinds: `request,span,error,revenue`. Empty or
+         * missing returns every kind. There is no `log` kind — runtime logs
+         * intentionally never appear in this feed (see `ObservabilityEvent`'s
+         * "No `Log` variant" doc); passing `kinds=log` is rejected with 400
+         * `InvalidKindsFilter`, not silently ignored.
          */
         kinds?: string;
         /**
@@ -50478,11 +50627,11 @@ export type ListAuditLogsData = {
          */
         user_id?: number;
         /**
-         * Start timestamp (milliseconds since epoch)
+         * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
          */
         from?: string;
         /**
-         * End timestamp (milliseconds since epoch)
+         * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
          */
         to?: string;
         /**

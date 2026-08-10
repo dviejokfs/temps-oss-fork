@@ -8,8 +8,7 @@ export default defineConfig({
   input: 'openapi.json',
   output: {
     path: 'src',
-    format: 'prettier',
+    postProcess: ['prettier'],
   },
-  client: '@hey-api/client-fetch',
-  plugins: ['@hey-api/sdk', '@hey-api/typescript'],
+  plugins: ['@hey-api/client-fetch', '@hey-api/sdk', '@hey-api/typescript'],
 })

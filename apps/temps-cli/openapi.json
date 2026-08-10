@@ -2175,7 +2175,10 @@
           },
           "cloud": {
             "default": {
-              "backend_url": "https://app.temps.sh"
+              "backend_url": "https://app.temps.sh",
+              "backups_enabled": false,
+              "notifications_enabled": false,
+              "telemetry_enabled": false
             },
             "oneOf": [
               {
@@ -2471,6 +2474,10 @@
             "$ref": "#/components/schemas/BuildLimitsSettings",
             "description": "Build-time resource limits (control-plane only). No sensitive content,\npassed through as-is."
           },
+          "cloud": {
+            "$ref": "#/components/schemas/CloudSettings",
+            "description": "Managed control-plane destination and explicit export consent flags."
+          },
           "cluster_dns": {
             "$ref": "#/components/schemas/ClusterDnsSettings",
             "description": "Cluster-DNS resolver settings (ADR-024, experimental beta). No masking\nneeded — `enabled` is a plain bool with no sensitive content. Passed\nthrough as-is so the settings UI can read and toggle the flag."
@@ -2573,6 +2580,7 @@
         },
         "required": [
           "preview_domain",
+          "cloud",
           "screenshots",
           "letsencrypt",
           "dns_provider",
@@ -4616,6 +4624,33 @@
         ],
         "type": "object"
       },
+      "CloudAiCapability": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "setup_path"
+        ],
+        "type": "object"
+      },
       "CloudCapability": {
         "properties": {
           "configured": {
@@ -4634,6 +4669,25 @@
         "required": [
           "configured",
           "setup_path"
+        ],
+        "type": "object"
+      },
+      "CloudFeatureSwitchesRequest": {
+        "properties": {
+          "backups_enabled": {
+            "type": "boolean"
+          },
+          "notifications_enabled": {
+            "type": "boolean"
+          },
+          "telemetry_enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "telemetry_enabled",
+          "backups_enabled",
+          "notifications_enabled"
         ],
         "type": "object"
       },
@@ -4656,6 +4710,21 @@
             "default": "https://app.temps.sh",
             "description": "HTTPS origin used for enrollment and telemetry mirroring.",
             "type": "string"
+          },
+          "backups_enabled": {
+            "default": false,
+            "description": "Explicit consent to export completed backup objects.",
+            "type": "boolean"
+          },
+          "notifications_enabled": {
+            "default": false,
+            "description": "Explicit consent to send notifications through managed providers.",
+            "type": "boolean"
+          },
+          "telemetry_enabled": {
+            "default": false,
+            "description": "Explicit consent to mirror locally stored telemetry.",
+            "type": "boolean"
           }
         },
         "type": "object"
@@ -4671,6 +4740,9 @@
           "backend_url": {
             "type": "string"
           },
+          "backups_enabled": {
+            "type": "boolean"
+          },
           "health": {
             "type": "string"
           },
@@ -4683,6 +4755,9 @@
               "null"
             ]
           },
+          "notifications_enabled": {
+            "type": "boolean"
+          },
           "spooled_spans": {
             "minimum": 0,
             "type": "integer"
@@ -4692,6 +4767,9 @@
           },
           "status_message": {
             "type": "string"
+          },
+          "telemetry_enabled": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -4700,7 +4778,10 @@
           "health",
           "health_message",
           "spooled_spans",
-          "backend_url"
+          "backend_url",
+          "telemetry_enabled",
+          "backups_enabled",
+          "notifications_enabled"
         ],
         "type": "object"
       },
@@ -15354,6 +15435,54 @@
         ],
         "type": "object"
       },
+      "ExternalServiceBackupCapabilityResponse": {
+        "properties": {
+          "artifact": {
+            "description": "Concrete artifact Cloud would mirror, such as `walg_repository`,\n`redis_walg_stream`, or `object_set`.",
+            "type": "string"
+          },
+          "cloud_backup_compatible": {
+            "description": "Whether this running service can produce the physical WAL-G repository\nrequired by Temps Cloud. Logical dump fallback is intentionally not\nconsidered compatible.",
+            "type": "boolean"
+          },
+          "engine": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recommended_image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remediation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "description": "False when Docker or the target container was unavailable, meaning the\nendpoint intentionally did not guess whether required tools exist.",
+            "type": "boolean"
+          },
+          "wal_g_installed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cloud_backup_compatible",
+          "verified",
+          "wal_g_installed",
+          "engine",
+          "artifact"
+        ],
+        "type": "object"
+      },
       "ExternalServiceBackupResponse": {
         "description": "Response type for external service backup",
         "properties": {
@@ -19985,7 +20114,7 @@
         "description": "Query parameters for listing audit logs.\n\nEvery field is optional — omitting one means \"don't filter on it\". Deriving\n`IntoParams` makes utoipa render them as optional query params with the\ncorrect types; the previous hand-written `params((\"operation_type\", Query,\n…))` tuples defaulted every param to `required: true, type: string`, which\nmisled both API clients and the AI `describe_api`/`call_api` tools into\nthinking all filters were mandatory.",
         "properties": {
           "from": {
-            "description": "Start timestamp (milliseconds since epoch)",
+            "description": "Start timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
             "format": "date-time",
             "type": [
               "string",
@@ -20016,7 +20145,7 @@
             ]
           },
           "to": {
-            "description": "End timestamp (milliseconds since epoch)",
+            "description": "End timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
             "format": "date-time",
             "type": [
               "string",
@@ -49460,6 +49589,74 @@
         ]
       }
     },
+    "/backups/external-services/{id}/capability": {
+      "get": {
+        "description": "This probes the running container instead of trusting its configured image\nname: operators can build their own WAL-G image, and an image label alone\ncannot prove that the binary is actually executable.",
+        "operationId": "get_external_service_backup_capability",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalServiceBackupCapabilityResponse"
+                }
+              }
+            },
+            "description": "Cloud backup compatibility"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "External service not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Capability could not be loaded"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Report whether an existing service can produce a Cloud-restorable backup.",
+        "tags": [
+          "Backups"
+        ]
+      }
+    },
     "/backups/external-services/{id}/run": {
       "post": {
         "description": "Enqueues the backup for asynchronous execution via the `BackupRunner`\n(ADR-014). Returns `202 Accepted` immediately: pending parent and child\nrows are inserted, and a `backup_jobs` row is enqueued for the resolved\nengine. Poll `GET /backups/{id}` to observe `pending → running → completed`.",
@@ -51712,6 +51909,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Project ID (required for API key/session auth, optional for deployment tokens)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -51758,6 +51965,45 @@
       },
       "post": {
         "operationId": "blob_put",
+        "parameters": [
+          {
+            "description": "Path where the blob will be stored",
+            "in": "query",
+            "name": "pathname",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Content type of the blob (optional, will be guessed from extension)",
+            "in": "query",
+            "name": "content_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Add random suffix to pathname to prevent collisions",
+            "in": "query",
+            "name": "add_random_suffix",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Project ID (required for API key/session auth, optional for deployment tokens)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/octet-stream": {
@@ -52195,6 +52441,31 @@
         ]
       }
     },
+    "/cloud/ai/capability": {
+      "get": {
+        "operationId": "get_cloud_ai_capability",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudAiCapability"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
     "/cloud/capability": {
       "get": {
         "operationId": "get_cloud_capability",
@@ -52228,6 +52499,41 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/EnrollCloudRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudStatus"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
+    "/cloud/features": {
+      "patch": {
+        "operationId": "update_cloud_features",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloudFeatureSwitchesRequest"
               }
             }
           },
@@ -55508,7 +55814,7 @@
           }
         ],
         "responses": {
-          "302": {
+          "307": {
             "description": "Redirect to original URL"
           },
           "404": {
@@ -64205,7 +64511,7 @@
             "description": "Start time (ISO 8601) - overrides days parameter",
             "in": "query",
             "name": "start_time",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -64214,7 +64520,7 @@
             "description": "End time (ISO 8601) - defaults to now",
             "in": "query",
             "name": "end_time",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -67934,6 +68240,24 @@
             "schema": {
               "format": "int32",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by span attributes as comma-separated key=value pairs, e.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\"",
+            "in": "query",
+            "name": "attributes",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by span name pattern (ILIKE)",
+            "in": "query",
+            "name": "name_pattern",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -81043,7 +81367,7 @@
             }
           },
           {
-            "description": "Comma-separated kinds: `log,request,span,error,revenue`. Empty or\nmissing returns every kind.",
+            "description": "Comma-separated kinds: `request,span,error,revenue`. Empty or\nmissing returns every kind. There is no `log` kind — runtime logs\nintentionally never appear in this feed (see `ObservabilityEvent`'s\n\"No `Log` variant\" doc); passing `kinds=log` is rejected with 400\n`InvalidKindsFilter`, not silently ignored.",
             "in": "query",
             "name": "kinds",
             "required": false,
@@ -92684,8 +93008,8 @@
             }
           },
           {
-            "description": "Start timestamp (milliseconds since epoch)",
-            "example": 1,
+            "description": "Start timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
+            "example": "2024-01-15T14:30:00Z",
             "in": "query",
             "name": "from",
             "required": false,
@@ -92695,8 +93019,8 @@
             }
           },
           {
-            "description": "End timestamp (milliseconds since epoch)",
-            "example": 1,
+            "description": "End timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
+            "example": "2024-01-15T14:30:00Z",
             "in": "query",
             "name": "to",
             "required": false,
