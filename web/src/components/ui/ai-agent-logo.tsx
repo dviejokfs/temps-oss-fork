@@ -42,6 +42,7 @@ const AGENT_TO_LOGO: Record<string, string> = {
   PerplexityBot: 'perplexity.svg',
   'Perplexity-User': 'perplexity.svg',
   GoogleOther: 'google.svg',
+  Googlebot: 'google.svg',
   Applebot: 'apple.svg',
   'Applebot-Extended': 'apple.svg',
   'Meta-ExternalAgent': 'meta.svg',
