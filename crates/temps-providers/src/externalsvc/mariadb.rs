@@ -29,6 +29,49 @@ const MARIADB_BINLOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MARIADB_BINLOG_REPLAY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MARIADB_RESTORE_HELPER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+fn walg_target_user_data(backup: &temps_entities::backups::Model) -> Result<Option<String>> {
+    let metadata: serde_json::Value = serde_json::from_str(&backup.metadata).map_err(|error| {
+        anyhow::anyhow!(
+            "Backup {} has invalid metadata JSON: {}",
+            backup.backup_id,
+            error
+        )
+    })?;
+    let Some(version) = metadata.get("walg_identity_version") else {
+        return Ok(None);
+    };
+    if version.as_u64() != Some(1) {
+        return Err(anyhow::anyhow!(
+            "Backup {} uses unsupported WAL-G identity version {}",
+            backup.backup_id,
+            version
+        ));
+    }
+    let value = metadata.get("walg_target_user_data").ok_or_else(|| {
+        anyhow::anyhow!(
+            "Backup {} is missing its WAL-G target user data",
+            backup.backup_id
+        )
+    })?;
+    if value
+        .get("temps_backup_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(backup.backup_id.as_str())
+    {
+        return Err(anyhow::anyhow!(
+            "Backup {} has WAL-G target user data for a different backup",
+            backup.backup_id
+        ));
+    }
+    serde_json::to_string(value).map(Some).map_err(|error| {
+        anyhow::anyhow!(
+            "Failed to serialize WAL-G target user data for backup {}: {}",
+            backup.backup_id,
+            error
+        )
+    })
+}
+
 /// Resource/tuning profile for Temps-managed MariaDB containers.
 ///
 /// A MariaDB service is a shared database server: linked projects receive
@@ -223,6 +266,13 @@ pub struct BinlogManifest {
     /// Every segment shipped to S3, in ship order.
     #[serde(default)]
     pub shipped_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MariaDbBinlogCoordinate {
+    file: String,
+    position: String,
+    gtid: String,
 }
 
 /// Input configuration for creating a MariaDB service.
@@ -1746,6 +1796,12 @@ impl MariaDbService {
         location.ends_with("base.mbstream.gz")
     }
 
+    /// True when the backup location points at a WAL-G repository rather than
+    /// a single legacy mbstream object.
+    pub(crate) fn is_walg_repository_location(location: &str) -> bool {
+        location.trim_end_matches('/').ends_with("/walg")
+    }
+
     /// Derive the `metadata.json` companion key from a base backup key by
     /// replacing the last path segment. Mirrors
     /// `temps_backup::engines::v2_common::derive_metadata_key`.
@@ -1924,6 +1980,321 @@ impl MariaDbService {
 
         info!("MariaDB physical restore completed for {}", container_name);
         Ok(())
+    }
+
+    /// Restore a WAL-G repository directly into a MariaDB data volume.
+    ///
+    /// The helper shares the stopped service's volume and downloads from S3
+    /// itself, so a database-sized archive never lands on the Temps host.
+    /// `xtrabackup_binlog_info` is emitted after fetch/prepare and becomes the
+    /// exact replay anchor for PITR.
+    async fn restore_walg_repository_into_container(
+        &self,
+        config: &MariaDbConfig,
+        s3_credentials: &super::S3Credentials,
+        repository: &str,
+        target_user_data: Option<&str>,
+    ) -> Result<MariaDbBinlogCoordinate> {
+        use bollard::models::{ContainerCreateBody, HostConfig};
+
+        let container_name = self.get_live_container_name(config);
+        let container_info = self
+            .docker
+            .inspect_container(&container_name, None::<InspectContainerOptions>)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to inspect MariaDB container '{}' before WAL-G restore: {}",
+                    container_name,
+                    error
+                )
+            })?;
+        let image = container_info
+            .config
+            .and_then(|container_config| container_config.image)
+            .unwrap_or_else(|| DEFAULT_MARIADB_IMAGE.to_string());
+
+        let mut env = vec![
+            format!("WALG_S3_PREFIX={repository}"),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+            format!(
+                "WALG_MYSQL_DATASOURCE_NAME=root:{}@tcp(127.0.0.1:3306)/mysql",
+                config.root_password
+            ),
+            "WALG_STREAM_CREATE_COMMAND=echo noop".to_string(),
+            "WALG_STREAM_RESTORE_COMMAND=mbstream -x -C /var/lib/mysql".to_string(),
+            "WALG_MYSQL_BACKUP_PREPARE_COMMAND=mariadb-backup --prepare --target-dir=/var/lib/mysql".to_string(),
+        ];
+        if let Some(endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .await
+        {
+            env.push(format!("AWS_ENDPOINT={endpoint}"));
+        }
+        if s3_credentials.force_path_style {
+            env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+        if let Some(target_user_data) = target_user_data {
+            env.push(format!("WALG_FETCH_TARGET_USER_DATA={target_user_data}"));
+        }
+
+        self.docker
+            .update_container(
+                &container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::NO),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to disable restart policy for MariaDB WAL-G restore '{}': {}",
+                    container_name,
+                    error
+                )
+            })?;
+        let _ = self
+            .docker
+            .stop_container(
+                &container_name,
+                Some(StopContainerOptions {
+                    t: Some(30),
+                    signal: None,
+                }),
+            )
+            .await;
+
+        ensure_network_exists(&self.docker)
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to ensure restore network: {error:?}"))?;
+        let helper_name = format!("{}-walg-restore-{}", container_name, uuid::Uuid::new_v4());
+        let fetch_target = if target_user_data.is_some() {
+            "--target-user-data \"$WALG_FETCH_TARGET_USER_DATA\""
+        } else {
+            "LATEST"
+        };
+        let restore_script = format!(
+            concat!(
+                "set -eu; ",
+                "find /var/lib/mysql -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +; ",
+                "wal-g backup-fetch {}; ",
+                "if test -s /var/lib/mysql/xtrabackup_binlog_info; then ",
+                "printf 'TEMPS_BINLOG_COORD='; cat /var/lib/mysql/xtrabackup_binlog_info; fi; ",
+                "chown -R mysql:mysql /var/lib/mysql"
+            ),
+            fetch_target
+        );
+        let helper = self
+            .docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&helper_name)
+                        .build(),
+                ),
+                ContainerCreateBody {
+                    image: Some(image),
+                    cmd: Some(vec!["sh".to_string(), "-c".to_string(), restore_script]),
+                    env: Some(env),
+                    host_config: Some(HostConfig {
+                        volumes_from: Some(vec![container_name.clone()]),
+                        ..Default::default()
+                    }),
+                    networking_config: Some(bollard::models::NetworkingConfig {
+                        endpoints_config: Some(HashMap::from([(
+                            temps_core::NETWORK_NAME.to_string(),
+                            bollard::models::EndpointSettings::default(),
+                        )])),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to create MariaDB WAL-G restore helper for '{}': {}",
+                    container_name,
+                    error
+                )
+            })?;
+
+        let helper_result = async {
+            self.docker
+                .start_container(
+                    &helper.id,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Failed to start MariaDB WAL-G restore helper for '{}': {}",
+                        container_name,
+                        error
+                    )
+                })?;
+            let wait = tokio::time::timeout(
+                MARIADB_RESTORE_HELPER_TIMEOUT,
+                self.docker
+                    .wait_container(
+                        &helper.id,
+                        None::<bollard::query_parameters::WaitContainerOptions>,
+                    )
+                    .next(),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "MariaDB WAL-G restore helper for '{}' timed out after {:?}",
+                    container_name,
+                    MARIADB_RESTORE_HELPER_TIMEOUT
+                )
+            })?;
+
+            let mut log_stream = self.docker.logs(
+                &helper.id,
+                Some(bollard::query_parameters::LogsOptions {
+                    stdout: true,
+                    stderr: true,
+                    follow: false,
+                    ..Default::default()
+                }),
+            );
+            let mut logs = String::new();
+            while let Some(chunk) = log_stream.next().await {
+                match chunk {
+                    Ok(output) => logs.push_str(&output.to_string()),
+                    Err(error) => {
+                        logs.push_str(&format!("\nunable to read helper logs: {error}"));
+                        break;
+                    }
+                }
+            }
+            match wait {
+                Some(Ok(response)) if response.status_code == 0 => {
+                    Self::parse_walg_restore_coordinate(&logs)
+                }
+                Some(Ok(response)) => Err(anyhow::anyhow!(
+                    "MariaDB WAL-G restore helper for '{}' exited with code {}: {}",
+                    container_name,
+                    response.status_code,
+                    logs
+                )),
+                Some(Err(error)) => Err(anyhow::anyhow!(
+                    "Failed waiting for MariaDB WAL-G restore helper for '{}': {}. Logs: {}",
+                    container_name,
+                    error,
+                    logs
+                )),
+                None => Err(anyhow::anyhow!(
+                    "MariaDB WAL-G restore helper for '{}' ended without a status",
+                    container_name
+                )),
+            }
+        }
+        .await;
+
+        let _ = self
+            .docker
+            .remove_container(
+                &helper.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        if let Err(error) = self
+            .docker
+            .update_container(
+                &container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            warn!(container = %container_name, %error, "Failed to restore MariaDB restart policy");
+        }
+
+        let coordinate = helper_result?;
+        self.docker
+            .start_container(
+                &container_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to start MariaDB '{}' after WAL-G restore: {}",
+                    container_name,
+                    error
+                )
+            })?;
+        self.wait_for_container_health(&self.docker, &container_name)
+            .await?;
+        Ok(coordinate)
+    }
+
+    fn parse_walg_restore_coordinate(logs: &str) -> Result<MariaDbBinlogCoordinate> {
+        if let Some(line) = logs.lines().find_map(|line| {
+            line.split_once("TEMPS_BINLOG_COORD=")
+                .map(|(_, value)| value)
+        }) {
+            let mut fields = line.split_whitespace();
+            let file = fields
+                .next()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("xtrabackup_binlog_info has no binlog filename"))?;
+            let position = fields
+                .next()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("xtrabackup_binlog_info has no position"))?;
+            return Ok(MariaDbBinlogCoordinate {
+                file: file.trim_start_matches("./").to_string(),
+                position: position.to_string(),
+                gtid: fields.next().unwrap_or_default().to_string(),
+            });
+        }
+
+        for line in logs.lines() {
+            let Some((_, coordinate)) = line.split_once("Last binlog file ") else {
+                continue;
+            };
+            let Some((file, position)) = coordinate.split_once(", position ") else {
+                continue;
+            };
+            let position = position
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches(|character: char| !character.is_ascii_digit());
+            if !file.is_empty() && !position.is_empty() {
+                return Ok(MariaDbBinlogCoordinate {
+                    file: file
+                        .trim()
+                        .trim_matches(['\'', '"'])
+                        .trim_start_matches("./")
+                        .to_string(),
+                    position: position.to_string(),
+                    gtid: String::new(),
+                });
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "WAL-G restore did not emit a MariaDB binlog coordinate"
+        ))
     }
 
     /// Create (don't start) the helper, upload the mbstream onto its writable
@@ -3295,54 +3666,56 @@ impl ExternalService for MariaDbService {
         // ── Guard: PITR requires a physical base with binlog coordinates ─────
         // Mirrors postgres' WAL-G guard. Logical (`mariadb_dump`) backups carry
         // no binlog start position and cannot anchor a replay.
-        if !Self::is_physical_base_location(&base_key) {
+        let is_walg_repository = Self::is_walg_repository_location(&base_key);
+        if !is_walg_repository && !Self::is_physical_base_location(&base_key) {
             return Err(anyhow::anyhow!(
                 "PITR requires a physical (mariadb-backup) base backup; '{}' is a \
                  logical dump and cannot be used for point-in-time recovery",
                 ctx.backup_location
             ));
         }
-        let metadata = self
-            .fetch_base_metadata(ctx.s3_client, bucket, &base_key)
-            .await?;
-        let engine = metadata
-            .get("engine")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let pitr_enabled = metadata
-            .get("pitr")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let binlog_file = metadata
-            .get("binlog_file")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let binlog_position = metadata
-            .get("binlog_position")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if engine != "mariadb_physical" || !pitr_enabled || binlog_file.is_empty() {
-            return Err(anyhow::anyhow!(
-                "PITR requires a physical (mariadb-backup) base with binlog coordinates; \
-                 base metadata has engine='{}', pitr={}, binlog_file='{}' — not usable for \
-                 point-in-time recovery",
-                engine,
-                pitr_enabled,
-                binlog_file
-            ));
-        }
-        let start_position = if binlog_position.is_empty() {
-            "4".to_string() // binlog header size; replay the whole first segment
+        let legacy_coordinate = if is_walg_repository {
+            None
         } else {
-            binlog_position
+            let metadata = self
+                .fetch_base_metadata(ctx.s3_client, bucket, &base_key)
+                .await?;
+            let engine = metadata
+                .get("engine")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let pitr_enabled = metadata
+                .get("pitr")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let file = metadata
+                .get("binlog_file")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if engine != "mariadb_physical" || !pitr_enabled || file.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "PITR requires a physical (mariadb-backup) base with binlog coordinates; \
+                     base metadata has engine='{}', pitr={}, binlog_file='{}' — not usable for \
+                     point-in-time recovery",
+                    engine,
+                    pitr_enabled,
+                    file
+                ));
+            }
+            Some(MariaDbBinlogCoordinate {
+                file: file.to_string(),
+                position: metadata
+                    .get("binlog_position")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("4")
+                    .to_string(),
+                gtid: metadata
+                    .get("gtid")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            })
         };
-
-        info!(
-            "Running MariaDB PITR to target {:?} (to_new_service={}) from base {} (binlog {}:{})",
-            target, to_new_service, ctx.backup_location, binlog_file, start_position
-        );
 
         // Validate the recovery target maps to something we can honor BEFORE
         // we destroy any data — fail fast on Name/Xid/bad-Lsn targets.
@@ -3380,24 +3753,43 @@ impl ExternalService for MariaDbService {
             (svc, config, None)
         };
 
-        // Physical base restore into the target container.
-        let temp_dir = tempfile::tempdir()?;
-        let mbstream_path = temp_dir.path().join("base.mbstream");
+        // Physical base restore into the target container. WAL-G repositories
+        // are fetched by a volume-sharing helper and never touch host disk.
+        let coordinate = if is_walg_repository {
+            let target_user_data = walg_target_user_data(ctx.backup)?;
+            target_service
+                .restore_walg_repository_into_container(
+                    &target_config,
+                    ctx.s3_credentials,
+                    ctx.backup_location,
+                    target_user_data.as_deref(),
+                )
+                .await?
+        } else {
+            let temp_dir = tempfile::tempdir()?;
+            let mbstream_path = temp_dir.path().join("base.mbstream");
+            target_service
+                .download_and_gunzip_base(ctx.s3_client, bucket, &base_key, &mbstream_path)
+                .await?;
+            target_service
+                .physical_restore_into_container(&target_config, &mbstream_path)
+                .await?;
+            legacy_coordinate.ok_or_else(|| {
+                anyhow::anyhow!("Legacy physical MariaDB backup has no binlog coordinate")
+            })?
+        };
+        let start_position = if coordinate.position.is_empty() {
+            "4".to_string()
+        } else {
+            coordinate.position.clone()
+        };
         info!(
             target_service = %target_service.name,
-            base_key = %base_key,
-            "Downloading MariaDB PITR physical base"
+            binlog_file = %coordinate.file,
+            binlog_position = %start_position,
+            gtid = %coordinate.gtid,
+            "Restored MariaDB PITR physical base"
         );
-        target_service
-            .download_and_gunzip_base(ctx.s3_client, bucket, &base_key, &mbstream_path)
-            .await?;
-        info!(
-            target_service = %target_service.name,
-            "Restoring MariaDB PITR physical base"
-        );
-        target_service
-            .physical_restore_into_container(&target_config, &mbstream_path)
-            .await?;
         info!(
             target_service = %target_service.name,
             "Restored MariaDB PITR physical base"
@@ -3414,7 +3806,7 @@ impl ExternalService for MariaDbService {
                 bucket,
                 prefix,
                 &ctx.source_config.name,
-                &binlog_file,
+                &coordinate.file,
                 binlog_temp.path(),
             )
             .await?;
@@ -3942,6 +4334,79 @@ mod tests {
             "backups/prod/mariadb_backup_20260623_010101.sql.gz"
         ));
         assert!(!MariaDbService::is_physical_base_location("dump.sql.gz"));
+        assert!(MariaDbService::is_walg_repository_location(
+            "external_services/mariadb/orders/walg"
+        ));
+        assert!(MariaDbService::is_walg_repository_location(
+            "s3://backups/external_services/mariadb/orders/walg/"
+        ));
+        assert!(!MariaDbService::is_walg_repository_location(
+            "backups/mariadb/orders.sql.gz"
+        ));
+    }
+
+    #[test]
+    fn selects_the_exact_walg_backup_from_metadata() {
+        let mut backup = crate::externalsvc::test_utils::create_mock_backup("repository/walg");
+        backup.backup_id = "selected-backup".to_string();
+        backup.metadata = serde_json::json!({
+            "walg_identity_version": 1,
+            "walg_target_user_data": { "temps_backup_id": "selected-backup" }
+        })
+        .to_string();
+
+        assert_eq!(
+            walg_target_user_data(&backup).expect("valid selector"),
+            Some(r#"{"temps_backup_id":"selected-backup"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_walg_metadata_for_a_different_backup() {
+        let mut backup = crate::externalsvc::test_utils::create_mock_backup("repository/walg");
+        backup.backup_id = "selected-backup".to_string();
+        backup.metadata = serde_json::json!({
+            "walg_identity_version": 1,
+            "walg_target_user_data": { "temps_backup_id": "another-backup" }
+        })
+        .to_string();
+
+        let error = walg_target_user_data(&backup).expect_err("mismatch must fail");
+        assert!(error.to_string().contains("different backup"));
+    }
+
+    #[test]
+    fn parses_walg_restore_binlog_coordinate() {
+        let coordinate = MariaDbService::parse_walg_restore_coordinate(
+            "restore complete\nTEMPS_BINLOG_COORD=mysql-bin.000007 421 0-1-99\n",
+        )
+        .expect("coordinate");
+
+        assert_eq!(coordinate.file, "mysql-bin.000007");
+        assert_eq!(coordinate.position, "421");
+        assert_eq!(coordinate.gtid, "0-1-99");
+    }
+
+    #[test]
+    fn rejects_walg_restore_without_binlog_coordinate() {
+        let error = MariaDbService::parse_walg_restore_coordinate("restore complete")
+            .expect_err("missing coordinate must fail");
+
+        assert!(error
+            .to_string()
+            .contains("did not emit a MariaDB binlog coordinate"));
+    }
+
+    #[test]
+    fn parses_walg_prepare_log_binlog_coordinate() {
+        let coordinate = MariaDbService::parse_walg_restore_coordinate(
+            "[00] recovery\n[00] Last binlog file './mysql-bin.000002', position 1969\n",
+        )
+        .expect("prepare-log coordinate");
+
+        assert_eq!(coordinate.file, "mysql-bin.000002");
+        assert_eq!(coordinate.position, "1969");
+        assert!(coordinate.gtid.is_empty());
     }
 
     #[test]

@@ -189,10 +189,7 @@ impl S3Credentials {
                 for container in &containers {
                     // Skip the target container itself
                     let names = container.names.as_deref().unwrap_or(&[]);
-                    let container_name_clean = names
-                        .first()
-                        .map(|n| n.trim_start_matches('/'))
-                        .unwrap_or("");
+                    let container_name_clean = canonical_container_name(names).unwrap_or("");
                     if container_name_clean == container_name {
                         continue;
                     }
@@ -258,6 +255,48 @@ impl S3Credentials {
             resolved
         );
         Some(resolved)
+    }
+}
+
+/// Select the canonical Docker container name from `ContainerSummary::names`.
+///
+/// Docker's legacy `--link` support prepends aliases such as
+/// `/source-container/object-store` before the canonical `/object-store`
+/// entry. Using the first value turns the alias into a URL path and makes
+/// direct-to-S3 backup clients connect to the wrong host.
+fn canonical_container_name(names: &[String]) -> Option<&str> {
+    names
+        .iter()
+        .map(|name| name.trim_start_matches('/'))
+        .find(|name| !name.is_empty() && !name.contains('/'))
+}
+
+#[cfg(test)]
+mod s3_endpoint_tests {
+    use super::canonical_container_name;
+
+    #[test]
+    fn canonical_container_name_ignores_link_aliases() {
+        let names = vec![
+            "/mariadb-source/minio-store".to_string(),
+            "/minio-store".to_string(),
+        ];
+
+        assert_eq!(canonical_container_name(&names), Some("minio-store"));
+    }
+
+    #[test]
+    fn canonical_container_name_accepts_an_unprefixed_name() {
+        let names = vec!["minio-store".to_string()];
+
+        assert_eq!(canonical_container_name(&names), Some("minio-store"));
+    }
+
+    #[test]
+    fn canonical_container_name_rejects_empty_or_alias_only_lists() {
+        let names = vec![String::new(), "/source/minio-store".to_string()];
+
+        assert_eq!(canonical_container_name(&names), None);
     }
 }
 
