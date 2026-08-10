@@ -137,6 +137,28 @@ const AGENT_PATTERNS: &[(&str, AiAgentMatch)] = &[
             purpose: AiAgentPurpose::Mixed,
         },
     ),
+    // Plain Googlebot. Google's own AI-features documentation says AI
+    // Overviews and Gemini's Search-grounded answers are "rooted in our
+    // core Search ranking and quality systems" — there is no separate
+    // crawler for AI answers, they're built from the same index Googlebot
+    // already crawls for regular Search. So this traffic is genuinely
+    // dual-purpose (Search ranking + AI answer citation), not exclusively
+    // a non-AI "Search / SEO crawler" the way Bingbot or YandexBot are.
+    //
+    // Caution: this is by far the highest-volume pattern in this table.
+    // Ordinary Googlebot indexing crawls every page constantly, so this
+    // will typically dominate the AI-agents view by orders of magnitude
+    // over agents like GPTBot or ClaudeBot — expected, not a bug, but
+    // worth knowing before reading the dashboard as "how much AI traffic
+    // do I get."
+    (
+        r"(?i)\bGooglebot\b",
+        AiAgentMatch {
+            provider: "Google",
+            agent: "Googlebot",
+            purpose: AiAgentPurpose::Mixed,
+        },
+    ),
     // Apple
     (
         r"(?i)\bApplebot-Extended\b",
@@ -396,6 +418,23 @@ mod tests {
         let m = detect(Some("meta-externalagent/1.1")).expect("should detect Meta-ExternalAgent");
         assert_eq!(m.provider, "Meta");
         assert_eq!(m.agent, "Meta-ExternalAgent");
+    }
+
+    #[test]
+    fn detects_googlebot_as_mixed() {
+        let m = detect(Some(
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        ))
+        .expect("should detect Googlebot");
+        assert_eq!(m.provider, "Google");
+        assert_eq!(m.agent, "Googlebot");
+        assert_eq!(m.purpose, AiAgentPurpose::Mixed);
+    }
+
+    #[test]
+    fn detects_googleother_distinct_from_googlebot() {
+        let m = detect(Some("Mozilla/5.0 GoogleOther")).expect("should detect GoogleOther");
+        assert_eq!(m.agent, "GoogleOther");
     }
 
     #[test]

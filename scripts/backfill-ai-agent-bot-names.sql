@@ -33,7 +33,7 @@
 --     a compressed hypertable.
 --
 -- The CASE mirrors temps_proxy::ai_agent_detector::AGENT_PATTERNS exactly
--- (32 agents / 21 providers) in the same specificity order (e.g.
+-- (33 agents / 21 providers) in the same specificity order (e.g.
 -- Applebot-Extended before Applebot, OAI-SearchBot before openai/). Postgres
 -- `~*` is case-insensitive POSIX regex; `\y` is the word boundary (Rust `\b`).
 
@@ -57,6 +57,7 @@
 --         WHEN user_agent ~* '\yPerplexityBot\y'                THEN 'PerplexityBot'
 --         WHEN user_agent ~* '\yPerplexity-User\y'              THEN 'Perplexity-User'
 --         WHEN user_agent ~* '\yGoogleOther\y'                  THEN 'GoogleOther'
+        WHEN user_agent ~* '\yGooglebot\y'                    THEN 'Googlebot'
 --         WHEN user_agent ~* '\yApplebot-Extended\y'            THEN 'Applebot-Extended'
 --         WHEN user_agent ~* '\yApplebot\y'                     THEN 'Applebot'
 --         WHEN user_agent ~* '\yMeta-ExternalAgent\y'           THEN 'Meta-ExternalAgent'
@@ -104,6 +105,7 @@ SET bot_name = (
         WHEN user_agent ~* '\yPerplexityBot\y'                THEN 'PerplexityBot'
         WHEN user_agent ~* '\yPerplexity-User\y'              THEN 'Perplexity-User'
         WHEN user_agent ~* '\yGoogleOther\y'                  THEN 'GoogleOther'
+        WHEN user_agent ~* '\yGooglebot\y'                    THEN 'Googlebot'
         WHEN user_agent ~* '\yApplebot-Extended\y'            THEN 'Applebot-Extended'
         WHEN user_agent ~* '\yApplebot\y'                     THEN 'Applebot'
         WHEN user_agent ~* '\yMeta-ExternalAgent\y'           THEN 'Meta-ExternalAgent'
@@ -131,7 +133,7 @@ SET bot_name = (
     is_bot = true
 WHERE timestamp >= now() - interval '7 days'
   AND user_agent IS NOT NULL
-  AND user_agent ~* '\y(GPTBot|OAI-SearchBot|ChatGPT-User|ClaudeBot|Claude-SearchBot|Claude-User|anthropic-ai|PerplexityBot|Perplexity-User|GoogleOther|Applebot-Extended|Applebot|Meta-ExternalAgent|Meta-ExternalFetcher|Amazonbot|Bytespider|CCBot|cohere-training-data-crawler|cohere-ai|Diffbot|YouBot|DuckAssistBot|Bravebot|Andibot|Omgilibot|omgili|ImagesiftBot|Timpibot|Kangaroo Bot|MistralAI-User|GrokBot)\y|openai/'
+  AND user_agent ~* '\y(GPTBot|OAI-SearchBot|ChatGPT-User|ClaudeBot|Claude-SearchBot|Claude-User|anthropic-ai|PerplexityBot|Perplexity-User|GoogleOther|Googlebot|Applebot-Extended|Applebot|Meta-ExternalAgent|Meta-ExternalFetcher|Amazonbot|Bytespider|CCBot|cohere-training-data-crawler|cohere-ai|Diffbot|YouBot|DuckAssistBot|Bravebot|Andibot|Omgilibot|omgili|ImagesiftBot|Timpibot|Kangaroo Bot|MistralAI-User|GrokBot)\y|openai/'
   AND bot_name IS DISTINCT FROM (
     CASE
         WHEN user_agent ~* '\yGPTBot\y'                       THEN 'GPTBot'
@@ -145,6 +147,7 @@ WHERE timestamp >= now() - interval '7 days'
         WHEN user_agent ~* '\yPerplexityBot\y'                THEN 'PerplexityBot'
         WHEN user_agent ~* '\yPerplexity-User\y'              THEN 'Perplexity-User'
         WHEN user_agent ~* '\yGoogleOther\y'                  THEN 'GoogleOther'
+        WHEN user_agent ~* '\yGooglebot\y'                    THEN 'Googlebot'
         WHEN user_agent ~* '\yApplebot-Extended\y'            THEN 'Applebot-Extended'
         WHEN user_agent ~* '\yApplebot\y'                     THEN 'Applebot'
         WHEN user_agent ~* '\yMeta-ExternalAgent\y'           THEN 'Meta-ExternalAgent'
