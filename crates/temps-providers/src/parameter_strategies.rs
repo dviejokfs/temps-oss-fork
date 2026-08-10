@@ -447,7 +447,7 @@ impl ParameterStrategy for MariaDbParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("gotempsh/mariadb-walg:11.4".to_string()),
+                JsonValue::String("ghcr.io/gotempsh/mariadb-walg:11.4".to_string()),
             );
         }
 
@@ -563,7 +563,7 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                 "docker_image": {
                     "type": "string",
                     "description": "Docker image (updateable; the managed default includes WAL-G and mariadb-backup)",
-                    "default": "gotempsh/mariadb-walg:11.4"
+                    "default": "ghcr.io/gotempsh/mariadb-walg:11.4"
                 },
                 "size_profile": {
                     "type": "string",
@@ -1438,7 +1438,9 @@ mod tests {
         );
         assert_eq!(
             params.get("docker_image"),
-            Some(&JsonValue::String("gotempsh/mariadb-walg:11.4".to_string()))
+            Some(&JsonValue::String(
+                "ghcr.io/gotempsh/mariadb-walg:11.4".to_string()
+            ))
         );
         assert_eq!(
             params.get("size_profile"),

@@ -1215,7 +1215,7 @@ impl ExternalServiceManager {
                 let image = parameters
                     .get("docker_image")
                     .cloned()
-                    .unwrap_or_else(|| "gotempsh/mariadb-walg:11.4".to_string());
+                    .unwrap_or_else(|| "ghcr.io/gotempsh/mariadb-walg:11.4".to_string());
                 let size_profile = parameters
                     .get("size_profile")
                     .and_then(|value| MariaDbSizeProfile::parse(value))

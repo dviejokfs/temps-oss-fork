@@ -21,7 +21,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 const MARIADB_INTERNAL_PORT: &str = "3306";
-const DEFAULT_MARIADB_IMAGE: &str = "gotempsh/mariadb-walg:11.4";
+const DEFAULT_MARIADB_IMAGE: &str = "ghcr.io/gotempsh/mariadb-walg:11.4";
 const MIN_PASSWORD_LENGTH: usize = 8;
 const MARIADB_BACKUP_EXEC_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 const MARIADB_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -461,6 +461,15 @@ fn default_docker_image() -> String {
     DEFAULT_MARIADB_IMAGE.to_string()
 }
 
+fn mariadb_image_pull_failure_message(image: &str, error: &str) -> String {
+    if image == DEFAULT_MARIADB_IMAGE {
+        return format!(
+            "Failed to pull the default MariaDB image {image}: {error}. The GHCR package must be public for unauthenticated Temps installations. An organization owner can set it to Public at https://github.com/orgs/gotempsh/packages/container/package/mariadb-walg/settings; until then, authenticate the Docker daemon to ghcr.io or configure a reachable MariaDB image"
+        );
+    }
+    format!("Failed to pull MariaDB image {image}: {error}")
+}
+
 fn example_host() -> &'static str {
     "localhost"
 }
@@ -793,7 +802,12 @@ impl MariaDbService {
                     MARIADB_IMAGE_PULL_TIMEOUT.as_secs()
                 )
             })?
-            .map_err(|e| anyhow::anyhow!("Failed to pull MariaDB image: {}", e))?;
+            .map_err(|error| {
+                anyhow::anyhow!(mariadb_image_pull_failure_message(
+                    &config.docker_image,
+                    &error.to_string()
+                ))
+            })?;
         }
 
         let containers = docker
@@ -5157,8 +5171,26 @@ mod tests {
     #[test]
     fn test_default_docker_image_constant() {
         // The default image tag the service provisions with.
-        assert_eq!(default_docker_image(), "gotempsh/mariadb-walg:11.4");
-        assert_eq!(DEFAULT_MARIADB_IMAGE, "gotempsh/mariadb-walg:11.4");
+        assert_eq!(default_docker_image(), "ghcr.io/gotempsh/mariadb-walg:11.4");
+        assert_eq!(DEFAULT_MARIADB_IMAGE, "ghcr.io/gotempsh/mariadb-walg:11.4");
+    }
+
+    #[test]
+    fn default_image_pull_error_explains_public_ghcr_requirement() {
+        let message = mariadb_image_pull_failure_message(
+            DEFAULT_MARIADB_IMAGE,
+            "manifest unknown or authorization failed",
+        );
+        assert!(message.contains(DEFAULT_MARIADB_IMAGE));
+        assert!(message.contains("must be public"));
+        assert!(message.contains("authenticate the Docker daemon to ghcr.io"));
+        assert!(message.contains("configure a reachable MariaDB image"));
+
+        let custom = mariadb_image_pull_failure_message("registry.test/mariadb:custom", "denied");
+        assert_eq!(
+            custom,
+            "Failed to pull MariaDB image registry.test/mariadb:custom: denied"
+        );
     }
 
     // ── Address / env-var routing (parity with Postgres) ────────────────────

@@ -1,7 +1,7 @@
 # MariaDB + WAL-G image for direct-to-S3 physical backups and restore proof.
 #
 # Build:
-#   docker build -t gotempsh/mariadb-walg:11.4 .
+#   docker build -t ghcr.io/gotempsh/mariadb-walg:11.4 .
 #
 # The MySQL WAL-G binary invokes mariadb-backup through
 # WALG_STREAM_CREATE_COMMAND. The resulting mbstream never lands on the Temps

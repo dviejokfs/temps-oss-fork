@@ -194,7 +194,7 @@ fn classify_capability(
                 "logical_mariadb_dump",
                 "MariaDB physical WAL-G PITR tools are not installed; logical mariadb-dump backups remain local-only.",
                 "Upgrade to the MariaDB WAL-G image, restart the service, and run a new physical backup.",
-                "gotempsh/mariadb-walg:11.4",
+                "ghcr.io/gotempsh/mariadb-walg:11.4",
             ),
         },
         "mongodb" | "mongo" => match probe {
@@ -316,7 +316,7 @@ fn recommended_image(service_type: &str) -> Option<&'static str> {
         "postgres" | "postgresql" | "timescale" | "timescaledb" => {
             Some("gotempsh/postgres-walg:18-bookworm")
         }
-        "mariadb" => Some("gotempsh/mariadb-walg:11.4"),
+        "mariadb" => Some("ghcr.io/gotempsh/mariadb-walg:11.4"),
         "mongodb" | "mongo" => Some("gotempsh/mongodb-walg:8.0"),
         "redis" => Some("gotempsh/redis-walg:8-bookworm"),
         _ => None,

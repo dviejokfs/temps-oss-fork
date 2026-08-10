@@ -895,9 +895,9 @@ jobs:
           timeout 10m docker pull minio/minio:latest
           timeout 10m docker build --pull \
             --build-arg MARIADB_VERSION=11.4 \
-            --tag gotempsh/mariadb-walg:11.4 \
+            --tag ghcr.io/gotempsh/mariadb-walg:11.4 \
             images/mariadb-walg
-          docker image ls | grep -E '^(minio/minio|gotempsh/mariadb-walg)\s' || true
+          docker image ls | grep -E '^(minio/minio|ghcr.io/gotempsh/mariadb-walg)\s' || true
 
       - name: Run MariaDB PITR E2E
         env:

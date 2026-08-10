@@ -2328,7 +2328,7 @@ mod tests {
     #[test]
     fn derives_engine_version_from_managed_image_tags() {
         assert_eq!(
-            image_tag_version("gotempsh/mariadb-walg:11.4"),
+            image_tag_version("ghcr.io/gotempsh/mariadb-walg:11.4"),
             Some("11.4")
         );
         assert_eq!(

@@ -187,7 +187,7 @@ export function useServiceTypePreset(
 // MariaDB preset — managed WAL-G image + custom.
 // -----------------------------------------------------------------------------
 
-const MARIADB_MANAGED_IMAGE = 'gotempsh/mariadb-walg:11.4'
+const MARIADB_MANAGED_IMAGE = 'ghcr.io/gotempsh/mariadb-walg:11.4'
 
 const MARIADB_OPTIONS: PresetOption[] = [
   {

@@ -44,7 +44,7 @@ use temps_providers::externalsvc::{
 };
 use tokio_util::sync::CancellationToken;
 
-const MARIADB_WALG_IMAGE: &str = "gotempsh/mariadb-walg:11.4";
+const MARIADB_WALG_IMAGE: &str = "ghcr.io/gotempsh/mariadb-walg:11.4";
 // A fixed 64-hex-char master key (== 32 bytes) shared by the test and every
 // EncryptionService instance, so encrypt-here / decrypt-in-engine round-trips.
 const MASTER_KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
