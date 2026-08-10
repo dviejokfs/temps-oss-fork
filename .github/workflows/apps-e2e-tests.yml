@@ -72,7 +72,7 @@ jobs:
           sudo docker image prune --all --force
 
       - name: Checkout code
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
 
       - name: Download temps binary
         uses: actions/download-artifact@v8
@@ -226,7 +226,7 @@ jobs:
           sudo docker image prune --all --force
 
       - name: Checkout code
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
 
       - name: Download temps binary
         uses: actions/download-artifact@v8
