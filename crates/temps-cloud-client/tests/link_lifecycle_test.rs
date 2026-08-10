@@ -405,6 +405,48 @@ async fn the_credential_survives_a_restart() {
 }
 
 #[tokio::test]
+async fn an_in_flight_submission_survives_restart_with_the_same_identity() {
+    let d = tempfile::tempdir().unwrap();
+    let stub = Stub {
+        status: Arc::new(AtomicU16::new(503)),
+        ..Default::default()
+    };
+    let url = serve(stub.clone()).await;
+
+    {
+        let link = link(&d);
+        link.configure(backend(&url)).unwrap();
+        link.enroll("abcd-2345").await.unwrap();
+        enable_telemetry(&link);
+        link.record(spans(3));
+        assert!(matches!(
+            link.flush().await,
+            FlushOutcome::Retained { spans: 3, .. }
+        ));
+        assert_eq!(link.spooled(), 3);
+    }
+
+    let restarted = link(&d);
+    enable_telemetry(&restarted);
+    assert_eq!(
+        restarted.spooled(),
+        3,
+        "a process restart must retain an in-flight shipment"
+    );
+
+    stub.status.store(200, Ordering::SeqCst);
+    assert_eq!(restarted.flush().await, FlushOutcome::Shipped { spans: 3 });
+    assert_eq!(restarted.spooled(), 0);
+    assert_eq!(stub.received.load(Ordering::SeqCst), 3);
+    let submissions = stub.submissions.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(submissions.len(), 2);
+    assert_eq!(
+        submissions[0], submissions[1],
+        "restart changed the id of an already-reserved submission"
+    );
+}
+
+#[tokio::test]
 async fn disconnecting_clears_the_credential_but_keeps_the_identity() {
     let d = tempfile::tempdir().unwrap();
     let stub = Stub {

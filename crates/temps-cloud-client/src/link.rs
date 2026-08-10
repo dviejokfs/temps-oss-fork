@@ -29,7 +29,7 @@ use temps_cloud_protocol::{
 use uuid::Uuid;
 
 use crate::spool::Spool;
-use crate::state::EnrollmentState;
+use crate::state::{EnrollmentState, PendingSubmission};
 use crate::status::{LinkStatus, MirrorHealth};
 use crate::{BackendUrl, CloudClient, CloudError, CloudFeatureSwitches};
 
@@ -59,12 +59,6 @@ pub enum FlushOutcome {
         spans: usize,
         reason: String,
     },
-}
-
-#[derive(Clone)]
-struct PendingSubmission {
-    submission_id: Uuid,
-    spans: Vec<SpanRecord>,
 }
 
 struct IncomingBatch {
@@ -156,6 +150,9 @@ impl CloudLink {
             }
         };
         let linked = state.as_ref().is_some_and(EnrollmentState::is_linked);
+        let pending_submission = state
+            .as_ref()
+            .and_then(|state| state.pending_submission.clone());
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_BATCH_CAPACITY);
 
         Self {
@@ -168,7 +165,7 @@ impl CloudLink {
             incoming_dropped: AtomicU64::new(0),
             linked: AtomicBool::new(linked),
             spool: Mutex::new(Spool::with_default_capacity()),
-            pending: Mutex::new(None),
+            pending: Mutex::new(pending_submission),
             health: RwLock::new(MirrorHealth::Healthy),
             state_path,
             agent_version: agent_version.into(),
@@ -188,6 +185,24 @@ impl CloudLink {
             Some(encryption) => state.save_encrypted(&self.state_path, encryption),
             None => state.save(&self.state_path),
         }
+    }
+
+    fn persist_pending(
+        &self,
+        pending_submission: Option<PendingSubmission>,
+    ) -> Result<(), crate::state::StateError> {
+        let mut guard = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| crate::state::StateError::Corrupt {
+                path: self.state_path.display().to_string(),
+                reason: "cannot persist a telemetry retry without link state".into(),
+            })?;
+        let mut next = state.clone();
+        next.pending_submission = pending_submission;
+        self.save_state(&next)?;
+        *guard = Some(next);
+        Ok(())
     }
 
     fn ensure_state_readable(&self) -> Result<(), crate::state::StateError> {
@@ -843,22 +858,53 @@ impl CloudLink {
             }
         };
 
-        let pending = {
-            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-            if pending.is_none() {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let pending = match pending {
+            Some(pending) => Some(pending),
+            None => {
+                // Lock order is state -> spool -> pending everywhere. Keeping
+                // that order prevents a concurrent disconnect from restoring
+                // an origin-bound batch after it has cleared the link.
+                let mut state_guard = self.state.write().unwrap_or_else(|p| p.into_inner());
+                let Some(state) = state_guard.as_ref() else {
+                    return FlushOutcome::NotLinked;
+                };
+                if !state.is_linked() || self.generation.load(Ordering::SeqCst) != generation {
+                    return FlushOutcome::NotLinked;
+                }
                 let spans = self
                     .spool
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .take(BATCH_SIZE);
-                if !spans.is_empty() {
-                    *pending = Some(PendingSubmission {
+                if spans.is_empty() {
+                    None
+                } else {
+                    let next = PendingSubmission {
                         submission_id: Uuid::new_v4(),
                         spans,
-                    });
+                    };
+                    let mut persisted = state.clone();
+                    persisted.pending_submission = Some(next.clone());
+                    if let Err(error) = self.save_state(&persisted) {
+                        self.spool
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .requeue(next.spans);
+                        return FlushOutcome::Blocked {
+                            spans: 0,
+                            reason: format!("persist telemetry retry before upload: {error}"),
+                        };
+                    }
+                    *state_guard = Some(persisted);
+                    *self.pending.lock().unwrap_or_else(|p| p.into_inner()) = Some(next.clone());
+                    Some(next)
                 }
             }
-            pending.clone()
         };
         let Some(pending) = pending else {
             *self.health.write().unwrap_or_else(|p| p.into_inner()) = MirrorHealth::Healthy;
@@ -897,6 +943,19 @@ impl CloudLink {
 
         match result {
             Ok(ack) => {
+                if let Err(error) = self.persist_pending(None) {
+                    *self.health.write().unwrap_or_else(|p| p.into_inner()) =
+                        MirrorHealth::Buffering {
+                            spooled: self.spooled(),
+                            reason: format!(
+                                "Cloud accepted the submission but its durable acknowledgement could not be saved: {error}"
+                            ),
+                        };
+                    return FlushOutcome::Retained {
+                        spans: count,
+                        reason: format!("persist Cloud acknowledgement: {error}"),
+                    };
+                }
                 let mut current = self.pending.lock().unwrap_or_else(|p| p.into_inner());
                 if current
                     .as_ref()

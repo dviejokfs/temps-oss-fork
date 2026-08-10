@@ -8,10 +8,24 @@ use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use temps_cloud_protocol::SpanRecord;
 use thiserror::Error;
 use uuid::Uuid;
 
 const ENCRYPTED_STATE_VERSION: u8 = 1;
+
+/// A telemetry shipment that has left the in-memory spool but has not yet
+/// received a durable acknowledgement from Cloud.
+///
+/// Persisting both the id and payload is what makes an OSS process restart
+/// safe after Cloud has reserved the submission but before it has stored the
+/// spans. Retrying with a new id would strand the original money reservation;
+/// dropping the payload would silently lose the managed projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PendingSubmission {
+    pub submission_id: Uuid,
+    pub spans: Vec<SpanRecord>,
+}
 
 #[derive(Serialize, Deserialize)]
 struct EncryptedEnrollmentState {
@@ -71,6 +85,11 @@ pub struct EnrollmentState {
     /// not contain it and can refresh it by reconnecting.
     #[serde(default)]
     pub account_email: Option<String>,
+
+    /// Active telemetry retry, encrypted together with the link credential.
+    /// Older state files predate durable retries and therefore load as `None`.
+    #[serde(default)]
+    pub(crate) pending_submission: Option<PendingSubmission>,
 }
 
 impl std::fmt::Debug for EnrollmentState {
@@ -81,6 +100,13 @@ impl std::fmt::Debug for EnrollmentState {
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .field("tenant_id", &self.tenant_id)
             .field("account_email", &self.account_email)
+            .field(
+                "pending_submission",
+                &self
+                    .pending_submission
+                    .as_ref()
+                    .map(|pending| (pending.submission_id, pending.spans.len())),
+            )
             .finish()
     }
 }
@@ -95,6 +121,7 @@ impl EnrollmentState {
             token: None,
             tenant_id: None,
             account_email: None,
+            pending_submission: None,
         }
     }
 
@@ -303,6 +330,7 @@ impl EnrollmentState {
         self.token = None;
         self.tenant_id = None;
         self.account_email = None;
+        self.pending_submission = None;
     }
 }
 

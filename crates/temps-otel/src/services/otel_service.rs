@@ -592,16 +592,11 @@ mod tests {
     fn linked_cloud() -> (tempfile::TempDir, Arc<temps_cloud_client::CloudLink>) {
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("cloud-link/state.json");
-        temps_cloud_client::EnrollmentState {
-            instance_id: uuid::Uuid::new_v4(),
-            base_url: "https://cloud.test/".to_string(),
-            allow_loopback_development: false,
-            token: Some("instance-token".to_string()),
-            tenant_id: Some(uuid::Uuid::new_v4()),
-            account_email: Some("owner@example.com".to_string()),
-        }
-        .save(&state_path)
-        .unwrap();
+        let mut state = temps_cloud_client::EnrollmentState::new("https://cloud.test/");
+        state.token = Some("instance-token".to_string());
+        state.tenant_id = Some(uuid::Uuid::new_v4());
+        state.account_email = Some("owner@example.com".to_string());
+        state.save(&state_path).unwrap();
         let link = Arc::new(temps_cloud_client::CloudLink::load(
             directory.path().to_path_buf(),
             "test",
