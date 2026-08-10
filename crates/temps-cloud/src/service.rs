@@ -141,8 +141,13 @@ impl CloudService {
 
     /// Apply explicit persisted operator consent. Enrollment does not call
     /// this method and therefore cannot enable exports by itself.
-    pub fn set_feature_switches(&self, switches: CloudFeatureSwitches) {
-        self.link.set_feature_switches(switches);
+    pub fn set_feature_switches(
+        &self,
+        switches: CloudFeatureSwitches,
+    ) -> Result<(), CloudServiceError> {
+        self.link
+            .set_feature_switches(switches)
+            .map_err(CloudServiceError::State)
     }
 
     pub fn feature_switches(&self) -> CloudFeatureSwitches {
@@ -154,8 +159,12 @@ impl CloudService {
             Ok(settings) => settings,
             Err(error) => {
                 tracing::error!(%error, "Cloud settings unavailable; Cloud integration disabled");
-                self.link
-                    .set_feature_switches(CloudFeatureSwitches::default());
+                if let Err(state_error) = self
+                    .link
+                    .set_feature_switches(CloudFeatureSwitches::default())
+                {
+                    tracing::error!(%state_error, "could not purge Cloud telemetry while disabling integration");
+                }
                 self.link
                     .block_outbound("Cloud settings are unavailable; fix local settings and retry");
                 self.set_configuration_issue(Some(
@@ -166,11 +175,22 @@ impl CloudService {
                 return Ok(());
             }
         };
-        self.link.set_feature_switches(CloudFeatureSwitches {
+        if let Err(state_error) = self.link.set_feature_switches(CloudFeatureSwitches {
             telemetry: settings.cloud.telemetry_enabled,
             backups: settings.cloud.backups_enabled,
             notifications: settings.cloud.notifications_enabled,
-        });
+        }) {
+            tracing::error!(%state_error, "Cloud consent state could not be applied; outbound operations blocked");
+            self.link.block_outbound(
+                "telemetry consent state could not be persisted; repair the Cloud link state",
+            );
+            self.set_configuration_issue(Some(
+                "Cloud telemetry consent could not be persisted. Check the server logs before reconnecting."
+                    .to_string(),
+            ));
+            self.start_flusher();
+            return Ok(());
+        }
         let backend = match parse_backend(
             &settings.cloud.backend_url,
             self.allow_loopback_development || self.link.allows_loopback_development(),
@@ -178,8 +198,12 @@ impl CloudService {
             Ok(backend) => backend,
             Err(error) => {
                 tracing::error!(%error, "Cloud backend configuration invalid; Cloud integration disabled");
-                self.link
-                    .set_feature_switches(CloudFeatureSwitches::default());
+                if let Err(state_error) = self
+                    .link
+                    .set_feature_switches(CloudFeatureSwitches::default())
+                {
+                    tracing::error!(%state_error, "could not purge Cloud telemetry while disabling invalid integration");
+                }
                 self.link
                     .block_outbound("the configured backend URL is invalid; update Cloud settings");
                 self.set_configuration_issue(Some(format!(
@@ -197,8 +221,12 @@ impl CloudService {
                 tracing::error!(%error, "Cloud service started with unreadable link state");
             } else {
                 tracing::error!(%error, "Cloud link configuration could not be applied; Cloud integration disabled");
-                self.link
-                    .set_feature_switches(CloudFeatureSwitches::default());
+                if let Err(state_error) = self
+                    .link
+                    .set_feature_switches(CloudFeatureSwitches::default())
+                {
+                    tracing::error!(%state_error, "could not purge Cloud telemetry after configuration failure");
+                }
                 self.link.block_outbound(
                     "the configured Cloud link could not be applied; check server logs",
                 );
@@ -309,7 +337,12 @@ impl CloudService {
         self.config
             .update_cloud_features(switches.telemetry, switches.backups, switches.notifications)
             .await?;
-        self.link.set_feature_switches(switches);
+        if let Err(error) = self.link.set_feature_switches(switches) {
+            self.link.block_outbound(
+                "telemetry consent state could not be persisted; repair the Cloud link state",
+            );
+            return Err(CloudServiceError::State(error));
+        }
         self.status().await
     }
 
@@ -326,11 +359,13 @@ impl CloudService {
             .configure(backend)
             .map_err(CloudServiceError::State)?;
         self.set_configuration_issue(None);
-        self.link.set_feature_switches(CloudFeatureSwitches {
-            telemetry: settings.cloud.telemetry_enabled,
-            backups: settings.cloud.backups_enabled,
-            notifications: settings.cloud.notifications_enabled,
-        });
+        self.link
+            .set_feature_switches(CloudFeatureSwitches {
+                telemetry: settings.cloud.telemetry_enabled,
+                backups: settings.cloud.backups_enabled,
+                notifications: settings.cloud.notifications_enabled,
+            })
+            .map_err(CloudServiceError::State)?;
         self.link
             .enroll(code)
             .await

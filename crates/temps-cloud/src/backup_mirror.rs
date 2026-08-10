@@ -36,6 +36,13 @@ const S3_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// self-hosted instance hammer it or affecting local backup completion.
 const MAX_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const SWEEP_LIMIT: u64 = 50;
+/// A corrupt or hostile repository must not turn discovery into an unbounded
+/// allocation. This still permits years of WAL segments for ordinary fleets.
+const MAX_REPOSITORY_OBJECTS: usize = 100_000;
+const MAX_REPOSITORY_KEY_BYTES: usize = 16 * 1024 * 1024;
+/// WAL-G sentinels and Temps metadata are small JSON control objects. A larger
+/// object is malformed for this protocol and is rejected before allocation.
+const MAX_JSON_OBJECT_BYTES: usize = 1024 * 1024;
 const MIRROR_STATE_VERSION: u32 = 1;
 const DUE_BACKUPS_SQL: &str = r#"
 SELECT b.*
@@ -163,6 +170,9 @@ async fn sweep(
     let mut retry_required = false;
 
     for backup in candidates {
+        // Inspection results are useful only while constructing one backup's
+        // manifest. Never accumulate object-derived metadata across a sweep.
+        resources.object_inspections.clear();
         // Before the indexed state table existed, mirror state lived in a
         // free-form metadata string. Materialize terminal or not-yet-due
         // legacy states in bounded batches. Malformed metadata deliberately
@@ -336,8 +346,6 @@ struct SweepResources<'a> {
     services: HashMap<i32, external_services::Model>,
     sources: HashMap<i32, s3_sources::Model>,
     clients: HashMap<i32, S3Client>,
-    repository_objects: HashMap<(i32, String), Arc<Vec<SourceObject>>>,
-    json_objects: HashMap<(i32, String), serde_json::Value>,
     object_inspections: HashMap<(i32, String, String), (u64, String)>,
     control_plane_postgres_major: Option<u16>,
 }
@@ -402,8 +410,6 @@ impl<'a> SweepResources<'a> {
                 .map(|source| (source.id, source))
                 .collect(),
             clients: HashMap::new(),
-            repository_objects: HashMap::new(),
-            json_objects: HashMap::new(),
             object_inspections: HashMap::new(),
             control_plane_postgres_major: None,
         })
@@ -442,16 +448,13 @@ impl<'a> SweepResources<'a> {
         source_id: i32,
         bucket: &str,
         root: &str,
-    ) -> Result<Arc<Vec<SourceObject>>, StageError> {
-        let cache_key = (source_id, root.to_owned());
-        if let Some(objects) = self.repository_objects.get(&cache_key) {
-            return Ok(Arc::clone(objects));
-        }
+    ) -> Result<Vec<SourceObject>, StageError> {
         let client = self.client(source_id)?;
-        let objects = Arc::new(list_repository_objects(&client, bucket, root).await?);
-        self.repository_objects
-            .insert(cache_key, Arc::clone(&objects));
-        Ok(objects)
+        // Deliberately do not retain repository listings across the sweep.
+        // A sweep may cover 50 backups; caching every key for all of them would
+        // multiply the bounded per-repository allocation into process-wide
+        // memory pressure.
+        list_repository_objects(&client, bucket, root).await
     }
 
     async fn read_json(
@@ -460,14 +463,11 @@ impl<'a> SweepResources<'a> {
         bucket: &str,
         key: &str,
     ) -> Result<serde_json::Value, StageError> {
-        let cache_key = (source_id, key.to_owned());
-        if let Some(value) = self.json_objects.get(&cache_key) {
-            return Ok(value.clone());
-        }
         let client = self.client(source_id)?;
-        let value = read_json_object(&client, bucket, key).await?;
-        self.json_objects.insert(cache_key, value.clone());
-        Ok(value)
+        // Sentinel candidates are normally read once. Retaining parsed values
+        // lets storage-controlled JSON allocation accumulate across a sweep,
+        // so bounded bodies are parsed and immediately consumed instead.
+        read_json_object(&client, bucket, key).await
     }
 
     async fn inspect_object(
@@ -965,6 +965,7 @@ async fn list_repository_objects(
     root: &str,
 ) -> Result<Vec<SourceObject>, StageError> {
     let mut objects = Vec::new();
+    let mut key_bytes = 0usize;
     let mut continuation = None;
     loop {
         let mut request = client
@@ -985,10 +986,14 @@ async fn list_repository_objects(
                 object.key(),
                 object.size().and_then(|value| u64::try_from(value).ok()),
             ) {
-                objects.push(SourceObject {
-                    key: key.to_string(),
+                append_source_object(
+                    &mut objects,
+                    &mut key_bytes,
+                    key,
                     bytes,
-                });
+                    MAX_REPOSITORY_OBJECTS,
+                    MAX_REPOSITORY_KEY_BYTES,
+                )?;
             }
         }
         if response.is_truncated().unwrap_or(false) {
@@ -1001,6 +1006,35 @@ async fn list_repository_objects(
         }
     }
     Ok(objects)
+}
+
+fn append_source_object(
+    objects: &mut Vec<SourceObject>,
+    key_bytes: &mut usize,
+    key: &str,
+    bytes: u64,
+    max_objects: usize,
+    max_key_bytes: usize,
+) -> Result<(), StageError> {
+    if objects.len() >= max_objects {
+        return Err(StageError::Unsupported(format!(
+            "backup repository exceeds the {max_objects} object safety limit"
+        )));
+    }
+    let next_key_bytes = key_bytes.checked_add(key.len()).ok_or_else(|| {
+        StageError::Unsupported("backup repository key metadata size overflowed".into())
+    })?;
+    if next_key_bytes > max_key_bytes {
+        return Err(StageError::Unsupported(format!(
+            "backup repository key metadata exceeds the {max_key_bytes} byte safety limit"
+        )));
+    }
+    *key_bytes = next_key_bytes;
+    objects.push(SourceObject {
+        key: key.to_owned(),
+        bytes,
+    });
+    Ok(())
 }
 
 fn contains_backup_identity(value: &serde_json::Value, backup_uuid: &str) -> bool {
@@ -1406,13 +1440,39 @@ async fn read_json_object(
     .await
     .map_err(|_| StageError::Retry(format!("reading {key} timed out")))?
     .map_err(|error| StageError::Retry(format!("could not read {key}: {error}")))?;
-    let bytes = tokio::time::timeout(S3_CONTROL_REQUEST_TIMEOUT, response.body.collect())
+    if let Some(length) = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+    {
+        ensure_json_object_size(key, length, MAX_JSON_OBJECT_BYTES)?;
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(MAX_JSON_OBJECT_BYTES),
+    );
+    let mut body = response
+        .body
+        .into_async_read()
+        .take((MAX_JSON_OBJECT_BYTES + 1) as u64);
+    tokio::time::timeout(S3_CONTROL_REQUEST_TIMEOUT, body.read_to_end(&mut bytes))
         .await
-        .map_err(|_| StageError::Retry(format!("collecting {key} timed out")))?
-        .map_err(|error| StageError::Retry(format!("could not collect {key}: {error}")))?
-        .into_bytes();
+        .map_err(|_| StageError::Retry(format!("reading the body of {key} timed out")))?
+        .map_err(|error| StageError::Retry(format!("could not stream {key}: {error}")))?;
+    ensure_json_object_size(key, bytes.len(), MAX_JSON_OBJECT_BYTES)?;
     serde_json::from_slice(&bytes)
         .map_err(|error| StageError::Retry(format!("object {key} is invalid JSON: {error}")))
+}
+
+fn ensure_json_object_size(key: &str, bytes: usize, limit: usize) -> Result<(), StageError> {
+    if bytes > limit {
+        return Err(StageError::Unsupported(format!(
+            "JSON control object {key} exceeds the {limit} byte safety limit"
+        )));
+    }
+    Ok(())
 }
 
 fn walg_root_key(location: &str) -> Option<String> {
@@ -1739,10 +1799,11 @@ fn deferred_legacy_state(metadata: &str, tenant_id: Uuid) -> Option<LegacyMirror
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_backup_identity, deferred_legacy_state, image_tag_version, merge_mirror_state,
-        next_sweep_interval, parse_postgres_major, s3_key, select_due_backups, sentinel_lsn,
-        supports_native_mirror, timeline_from_backup_name, upload_native_object, wal_segment_name,
-        walg_root_key, StageError, SweepOutcome, BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL,
+        append_source_object, contains_backup_identity, deferred_legacy_state,
+        ensure_json_object_size, image_tag_version, merge_mirror_state, next_sweep_interval,
+        parse_postgres_major, s3_key, select_due_backups, sentinel_lsn, supports_native_mirror,
+        timeline_from_backup_name, upload_native_object, wal_segment_name, walg_root_key,
+        SourceObject, StageError, SweepOutcome, BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL,
         DUE_BACKUPS_SQL, MAX_SWEEP_INTERVAL, MIRROR_STATE_VERSION,
     };
     use std::{
@@ -1774,6 +1835,48 @@ mod tests {
         WalGObjectTargetRequest,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn repository_discovery_rejects_excess_object_count() {
+        let mut objects = Vec::<SourceObject>::new();
+        let mut key_bytes = 0;
+        assert!(
+            append_source_object(&mut objects, &mut key_bytes, "first", 1, 1, 100).is_ok(),
+            "first object is within the limit"
+        );
+
+        let error = append_source_object(&mut objects, &mut key_bytes, "second", 1, 1, 100)
+            .expect_err("second object must exceed the count limit");
+        assert!(
+            matches!(error, StageError::Unsupported(reason) if reason.contains("object safety limit"))
+        );
+    }
+
+    #[test]
+    fn repository_discovery_rejects_excess_key_metadata() {
+        let mut objects = Vec::<SourceObject>::new();
+        let mut key_bytes = 0;
+        let error = append_source_object(&mut objects, &mut key_bytes, "too-long", 1, 10, 3)
+            .expect_err("key metadata must be bounded");
+
+        assert!(
+            matches!(error, StageError::Unsupported(reason) if reason.contains("key metadata"))
+        );
+        assert!(objects.is_empty());
+    }
+
+    #[test]
+    fn json_control_objects_are_bounded_before_parsing() {
+        assert!(
+            ensure_json_object_size("sentinel.json", 1024, 1024).is_ok(),
+            "object at the exact limit is accepted"
+        );
+        let error = ensure_json_object_size("sentinel.json", 1025, 1024)
+            .expect_err("oversized sentinel must be rejected");
+        assert!(
+            matches!(error, StageError::Unsupported(reason) if reason.contains("sentinel.json") && reason.contains("1024"))
+        );
+    }
 
     #[tokio::test]
     async fn sqlite_select_and_persist_support_retry_state_without_for_update() {
@@ -2735,7 +2838,8 @@ mod tests {
             telemetry: false,
             backups: true,
             notifications: false,
-        });
+        })
+        .expect("enable backup mirroring");
         link.enroll("TEST-CODE").await.expect("enroll Cloud link");
         let instance_id = link.instance_id().expect("linked instance id");
         let backup_id = Uuid::new_v4();
@@ -2754,8 +2858,6 @@ mod tests {
             services: HashMap::new(),
             sources: HashMap::new(),
             clients,
-            repository_objects: HashMap::new(),
-            json_objects: HashMap::new(),
             object_inspections: HashMap::new(),
             control_plane_postgres_major: None,
         };
@@ -2885,7 +2987,8 @@ mod tests {
             telemetry: false,
             backups: true,
             notifications: false,
-        });
+        })
+        .expect("enable backup mirroring");
         link.enroll("TEST-CODE").await.expect("enroll Cloud link");
         let instance_id = link.instance_id().expect("linked instance id");
         let backup_id = Uuid::new_v4();

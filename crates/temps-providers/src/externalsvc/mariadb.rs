@@ -21,7 +21,8 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 const MARIADB_INTERNAL_PORT: &str = "3306";
-const DEFAULT_MARIADB_IMAGE: &str = "ghcr.io/gotempsh/mariadb-walg:11.4";
+const MARIADB_IMAGE_REFERENCE_EXAMPLE: &str =
+    "ghcr.io/gotempsh/mariadb-walg@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const MIN_PASSWORD_LENGTH: usize = 8;
 const MARIADB_BACKUP_EXEC_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 const MARIADB_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -350,8 +351,7 @@ pub struct MariaDbInputConfig {
     pub root_password: Option<String>,
 
     /// Full Docker image reference.
-    #[serde(default = "default_docker_image")]
-    #[schemars(example = "example_docker_image", default = "default_docker_image")]
+    #[schemars(example = "example_docker_image")]
     pub docker_image: String,
 
     /// Managed service size/tuning profile.
@@ -457,17 +457,32 @@ fn default_username() -> String {
     "app".to_string()
 }
 
-fn default_docker_image() -> String {
-    DEFAULT_MARIADB_IMAGE.to_string()
+fn mariadb_image_pull_failure_message(image: &str, error: &str) -> String {
+    format!("Failed to pull MariaDB image {image}: {error}")
 }
 
-fn mariadb_image_pull_failure_message(image: &str, error: &str) -> String {
-    if image == DEFAULT_MARIADB_IMAGE {
-        return format!(
-            "Failed to pull the default MariaDB image {image}: {error}. The GHCR package must be public for unauthenticated Temps installations. An organization owner can set it to Public at https://github.com/orgs/gotempsh/packages/container/package/mariadb-walg/settings; until then, authenticate the Docker daemon to ghcr.io or configure a reachable MariaDB image"
+pub(crate) fn validate_immutable_mariadb_image(image: &str) -> std::result::Result<(), String> {
+    let digest = image
+        .strip_prefix("sha256:")
+        .or_else(|| image.rsplit_once("@sha256:").map(|(_, digest)| digest));
+    let Some(digest) = digest else {
+        return Err(format!(
+            "MariaDB WAL-G image must be immutable; configure repository@sha256:<64-hex-digest> (for example {MARIADB_IMAGE_REFERENCE_EXAMPLE}) or a local sha256:<64-hex-image-id>"
+        ));
+    };
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(
+            "MariaDB WAL-G image digest must contain exactly 64 hexadecimal characters".into(),
         );
     }
-    format!("Failed to pull MariaDB image {image}: {error}")
+    if image.contains('@')
+        && image
+            .split_once('@')
+            .is_some_and(|(repository, _)| repository.is_empty())
+    {
+        return Err("MariaDB WAL-G image digest is missing its repository name".into());
+    }
+    Ok(())
 }
 
 fn example_host() -> &'static str {
@@ -495,7 +510,7 @@ fn example_root_password() -> &'static str {
 }
 
 fn example_docker_image() -> &'static str {
-    DEFAULT_MARIADB_IMAGE
+    MARIADB_IMAGE_REFERENCE_EXAMPLE
 }
 
 fn generate_password() -> String {
@@ -755,6 +770,13 @@ impl MariaDbService {
         Self::validate_identifier("username", &config.username)?;
         Self::validate_password("password", &config.password)?;
         Self::validate_password("root_password", &config.root_password)?;
+        validate_immutable_mariadb_image(&config.docker_image).map_err(|reason| {
+            anyhow::anyhow!(
+                "Invalid MariaDB docker_image '{}': {}",
+                config.docker_image,
+                reason
+            )
+        })?;
 
         Ok(config)
     }
@@ -765,6 +787,13 @@ impl MariaDbService {
         config: &MariaDbConfig,
         resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
+        validate_immutable_mariadb_image(&config.docker_image).map_err(|reason| {
+            anyhow::anyhow!(
+                "Refusing to execute MariaDB image '{}': {}",
+                config.docker_image,
+                reason
+            )
+        })?;
         let container_name = self.get_container_name();
 
         if docker.inspect_image(&config.docker_image).await.is_ok() {
@@ -774,10 +803,17 @@ impl MariaDbService {
             );
         } else {
             info!("Pulling MariaDB image {}", config.docker_image);
-            let (image_name, tag) = if let Some((name, tag)) = config.docker_image.split_once(':') {
-                (name.to_string(), tag.to_string())
+            let (image_name, tag) = if config.docker_image.starts_with("sha256:") {
+                return Err(anyhow::anyhow!(
+                    "Local MariaDB image {} is not present; local image IDs cannot be pulled",
+                    config.docker_image
+                ));
+            } else if config.docker_image.contains("@sha256:") {
+                (config.docker_image.clone(), None)
+            } else if let Some((name, tag)) = config.docker_image.rsplit_once(':') {
+                (name.to_string(), Some(tag.to_string()))
             } else {
-                (config.docker_image.clone(), "latest".to_string())
+                (config.docker_image.clone(), None)
             };
 
             tokio::time::timeout(MARIADB_IMAGE_PULL_TIMEOUT, async {
@@ -785,7 +821,7 @@ impl MariaDbService {
                     .create_image(
                         Some(bollard::query_parameters::CreateImageOptions {
                             from_image: Some(image_name),
-                            tag: Some(tag),
+                            tag,
                             ..Default::default()
                         }),
                         None,
@@ -2265,7 +2301,12 @@ impl MariaDbService {
         let image = container_info
             .config
             .and_then(|container_config| container_config.image)
-            .unwrap_or_else(|| DEFAULT_MARIADB_IMAGE.to_string());
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MariaDB container '{}' does not report the immutable image used for restore",
+                    container_name
+                )
+            })?;
 
         let mut env = vec![
             format!("WALG_S3_PREFIX={repository}"),
@@ -4307,7 +4348,7 @@ mod tests {
             username: "app".to_string(),
             password: Some("secretpass".to_string()),
             root_password: Some("rootpass1".to_string()),
-            docker_image: DEFAULT_MARIADB_IMAGE.to_string(),
+            docker_image: MARIADB_IMAGE_REFERENCE_EXAMPLE.to_string(),
             container_name: None,
             size_profile: MariaDbSizeProfile::Standard,
             binlog_archive_interval: BinlogArchiveInterval::Min15,
@@ -4353,9 +4394,11 @@ mod tests {
 
     #[test]
     fn binlog_interval_serde_round_trips_wire_format() {
-        let cfg: MariaDbInputConfig =
-            serde_json::from_value(serde_json::json!({ "binlog_archive_interval": "1m" }))
-                .expect("parse");
+        let cfg: MariaDbInputConfig = serde_json::from_value(serde_json::json!({
+            "binlog_archive_interval": "1m",
+            "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
+        }))
+        .expect("parse");
         assert_eq!(cfg.binlog_archive_interval, BinlogArchiveInterval::Min1);
     }
 
@@ -4604,7 +4647,7 @@ mod tests {
                 "username": "app",
                 "password": "secretpass",
                 "root_password": "rootpass1",
-                "docker_image": DEFAULT_MARIADB_IMAGE,
+                "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
             }),
         };
         let caps = service
@@ -5050,7 +5093,7 @@ mod tests {
             username: default_username(),
             password: None,
             root_password: None,
-            docker_image: default_docker_image(),
+            docker_image: MARIADB_IMAGE_REFERENCE_EXAMPLE.to_string(),
             container_name: None,
             size_profile: MariaDbSizeProfile::default(),
             binlog_archive_interval: BinlogArchiveInterval::default(),
@@ -5061,7 +5104,7 @@ mod tests {
         assert_eq!(config.host, "localhost");
         assert_eq!(config.database, "app");
         assert_eq!(config.username, "app");
-        assert_eq!(config.docker_image, DEFAULT_MARIADB_IMAGE);
+        assert_eq!(config.docker_image, MARIADB_IMAGE_REFERENCE_EXAMPLE);
         assert_eq!(config.size_profile, MariaDbSizeProfile::Small);
         assert_eq!(config.binlog_archive_interval, BinlogArchiveInterval::Min5);
         // Auto-generated credentials: 24 alphanumeric chars, distinct.
@@ -5113,7 +5156,7 @@ mod tests {
             "database": "app",
             "username": "app",
             "password": "short",
-            "docker_image": DEFAULT_MARIADB_IMAGE,
+            "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
         }))
         .expect("parse input config");
         assert!(
@@ -5169,27 +5212,48 @@ mod tests {
     }
 
     #[test]
-    fn test_default_docker_image_constant() {
-        // The default image tag the service provisions with.
-        assert_eq!(default_docker_image(), "ghcr.io/gotempsh/mariadb-walg:11.4");
-        assert_eq!(DEFAULT_MARIADB_IMAGE, "ghcr.io/gotempsh/mariadb-walg:11.4");
+    fn immutable_image_validation_rejects_tags_and_accepts_digests() {
+        assert!(validate_immutable_mariadb_image(MARIADB_IMAGE_REFERENCE_EXAMPLE).is_ok());
+        assert!(validate_immutable_mariadb_image(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        .is_ok());
+        let error = validate_immutable_mariadb_image("ghcr.io/gotempsh/mariadb-walg:11.4")
+            .expect_err("mutable tag must be rejected");
+        assert!(error.contains("must be immutable"));
+    }
+
+    #[tokio::test]
+    async fn container_execution_rejects_mutable_restore_override_before_docker_io() {
+        let service = mariadb_service_for_tests();
+        let config = MariaDbConfig {
+            host: "localhost".into(),
+            port: "3306".into(),
+            database: "app".into(),
+            username: "app".into(),
+            password: "secretpass".into(),
+            root_password: "rootpass1".into(),
+            docker_image: "registry.example/mariadb-walg:latest".into(),
+            container_name: None,
+            size_profile: MariaDbSizeProfile::Small,
+            binlog_archive_interval: BinlogArchiveInterval::Min5,
+        };
+
+        let error = service
+            .create_container(&service.docker, &config, &ServiceResourceLimits::default())
+            .await
+            .expect_err("mutable restore override must fail before Docker access");
+        let message = error.to_string();
+        assert!(message.contains("Refusing to execute MariaDB image"));
+        assert!(message.contains("must be immutable"));
     }
 
     #[test]
-    fn default_image_pull_error_explains_public_ghcr_requirement() {
-        let message = mariadb_image_pull_failure_message(
-            DEFAULT_MARIADB_IMAGE,
-            "manifest unknown or authorization failed",
-        );
-        assert!(message.contains(DEFAULT_MARIADB_IMAGE));
-        assert!(message.contains("must be public"));
-        assert!(message.contains("authenticate the Docker daemon to ghcr.io"));
-        assert!(message.contains("configure a reachable MariaDB image"));
-
-        let custom = mariadb_image_pull_failure_message("registry.test/mariadb:custom", "denied");
+    fn image_pull_error_names_the_immutable_reference() {
+        let custom = mariadb_image_pull_failure_message(MARIADB_IMAGE_REFERENCE_EXAMPLE, "denied");
         assert_eq!(
             custom,
-            "Failed to pull MariaDB image registry.test/mariadb:custom: denied"
+            format!("Failed to pull MariaDB image {MARIADB_IMAGE_REFERENCE_EXAMPLE}: denied")
         );
     }
 
@@ -5216,7 +5280,7 @@ mod tests {
                 "username": "app",
                 "password": "secretpass",
                 "root_password": "rootpass1",
-                "docker_image": DEFAULT_MARIADB_IMAGE,
+                "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
             }),
         };
 
@@ -5246,7 +5310,7 @@ mod tests {
                 "username": "app",
                 "password": "secretpass",
                 "root_password": "rootpass1",
-                "docker_image": DEFAULT_MARIADB_IMAGE,
+                "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
             }),
         };
 
@@ -5278,7 +5342,7 @@ mod tests {
                 "username": "app",
                 "password": "secretpass",
                 "root_password": "rootpass1",
-                "docker_image": DEFAULT_MARIADB_IMAGE,
+                "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
                 "container_name": "legacy-mariadb",
             }),
         };

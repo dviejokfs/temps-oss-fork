@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use temps_cloud_protocol::{
     BackupArtifact, BackupTarget, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
@@ -88,6 +88,9 @@ pub struct CloudLink {
     /// this one needs the operator, not time.
     credential_rejected: AtomicBool,
     generation: AtomicU64,
+    /// Every telemetry revocation advances this channel. Flushes subscribe
+    /// before starting I/O so disabling export drops the active HTTP future.
+    telemetry_revocations: watch::Sender<u64>,
     flush_lock: tokio::sync::Mutex<()>,
     allow_loopback_development: bool,
     telemetry_enabled: AtomicBool,
@@ -154,6 +157,7 @@ impl CloudLink {
             .as_ref()
             .and_then(|state| state.pending_submission.clone());
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_BATCH_CAPACITY);
+        let (telemetry_revocations, _) = watch::channel(0);
 
         Self {
             state: RwLock::new(state),
@@ -171,6 +175,7 @@ impl CloudLink {
             agent_version: agent_version.into(),
             credential_rejected: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            telemetry_revocations,
             flush_lock: tokio::sync::Mutex::new(()),
             allow_loopback_development,
             telemetry_enabled: AtomicBool::new(false),
@@ -246,13 +251,60 @@ impl CloudLink {
 
     /// Apply persisted, operator-controlled export settings. This is lock-free
     /// on telemetry producers and deliberately independent of enrollment.
-    pub fn set_feature_switches(&self, switches: CloudFeatureSwitches) {
-        self.telemetry_enabled
-            .store(switches.telemetry, Ordering::Release);
+    pub fn set_feature_switches(
+        &self,
+        switches: CloudFeatureSwitches,
+    ) -> Result<(), crate::state::StateError> {
+        // Disable first, before taking any locks, so producers stop accepting
+        // new export work immediately.
+        let telemetry_was_enabled = self
+            .telemetry_enabled
+            .swap(switches.telemetry, Ordering::AcqRel);
         self.backups_enabled
             .store(switches.backups, Ordering::Release);
         self.notifications_enabled
             .store(switches.notifications, Ordering::Release);
+        if switches.telemetry {
+            return Ok(());
+        }
+
+        if telemetry_was_enabled {
+            let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            self.telemetry_revocations.send_replace(generation);
+        }
+
+        // Persist the deletion before returning success. If persistence fails,
+        // callers block outbound Cloud operations and surface the state error.
+        let persistence = {
+            let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+            match state.as_ref() {
+                Some(current) if current.pending_submission.is_some() => {
+                    let mut next = current.clone();
+                    next.pending_submission = None;
+                    let result = self.save_state(&next);
+                    // Even on a disk failure, do not keep the revoked payload
+                    // live in this process.
+                    *state = Some(next);
+                    result
+                }
+                _ => Ok(()),
+            }
+        };
+
+        {
+            let mut receiver = self.incoming_rx.lock().unwrap_or_else(|p| p.into_inner());
+            while let Ok(batch) = receiver.try_recv() {
+                self.incoming_spans
+                    .fetch_sub(batch.spans.len(), Ordering::Relaxed);
+            }
+        }
+        self.spool.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        *self.health.write().unwrap_or_else(|p| p.into_inner()) = MirrorHealth::Healthy;
+        persistence
     }
 
     pub fn feature_switches(&self) -> CloudFeatureSwitches {
@@ -842,6 +894,7 @@ impl CloudLink {
     /// Ship one batch. Called on an interval by a background task.
     pub async fn flush(&self) -> FlushOutcome {
         let _flush = self.flush_lock.lock().await;
+        let mut telemetry_revocations = self.telemetry_revocations.subscribe();
         self.drain_incoming();
         if !self.telemetry_enabled.load(Ordering::Acquire) {
             return FlushOutcome::NotLinked;
@@ -931,14 +984,18 @@ impl CloudLink {
             }
         };
 
-        let result = client
-            .ship(&token, pending.submission_id, pending.spans.clone())
-            .await;
-        if self.generation.load(Ordering::SeqCst) != generation {
-            return FlushOutcome::Blocked {
-                spans: count,
-                reason: "link state changed while this shipment was in progress".into(),
-            };
+        let result = tokio::select! {
+            biased;
+            changed = telemetry_revocations.changed() => {
+                let _ = changed;
+                return FlushOutcome::NotLinked;
+            }
+            result = client.ship(&token, pending.submission_id, pending.spans.clone()) => result,
+        };
+        if !self.telemetry_enabled.load(Ordering::Acquire)
+            || self.generation.load(Ordering::SeqCst) != generation
+        {
+            return FlushOutcome::NotLinked;
         }
 
         match result {

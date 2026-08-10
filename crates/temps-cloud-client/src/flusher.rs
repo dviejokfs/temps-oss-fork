@@ -226,7 +226,8 @@ mod tests {
         link.set_feature_switches(crate::CloudFeatureSwitches {
             telemetry: true,
             ..Default::default()
-        });
+        })
+        .expect("enable telemetry export");
         Some((link, directory))
     }
 

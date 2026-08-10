@@ -605,7 +605,8 @@ mod tests {
             telemetry: true,
             backups: false,
             notifications: false,
-        });
+        })
+        .expect("enable telemetry export");
         (directory, link)
     }
 
@@ -667,7 +668,8 @@ mod tests {
         let mock = MockOtelStorage::new();
         let (svc, _) = make_service(mock);
         let (_directory, link) = linked_cloud();
-        link.set_feature_switches(temps_cloud_client::CloudFeatureSwitches::default());
+        link.set_feature_switches(temps_cloud_client::CloudFeatureSwitches::default())
+            .expect("disable telemetry export");
         let svc = svc.with_cloud_link(link.clone());
         let (_, encoded) = test_support::build_sample_trace_tree();
         let spans = decode::decode_traces_request(&encoded, 1, None).unwrap();

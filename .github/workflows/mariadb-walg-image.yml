@@ -47,13 +47,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and publish multi-architecture image
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: images/mariadb-walg
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.IMAGE_REPOSITORY }}:11.4
             ${{ env.IMAGE_REPOSITORY }}:${{ env.IMAGE_VERSION }}-${{ github.sha }}
             ${{ env.IMAGE_REPOSITORY }}:sha-${{ github.sha }}
           labels: |
@@ -66,3 +66,11 @@ jobs:
           cache-to: type=gha,scope=mariadb-walg,mode=max
           provenance: true
           sbom: true
+
+      - name: Record immutable runtime reference
+        run: |
+          echo '### MariaDB WAL-G immutable image' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Use this reviewed manifest reference in the Temps MariaDB default:' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '`${{ env.IMAGE_REPOSITORY }}@${{ steps.build.outputs.digest }}`' >> "$GITHUB_STEP_SUMMARY"

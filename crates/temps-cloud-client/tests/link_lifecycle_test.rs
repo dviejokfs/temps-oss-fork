@@ -23,6 +23,8 @@ struct Stub {
     received: Arc<AtomicUsize>,
     submissions: Arc<Mutex<Vec<Uuid>>>,
     enroll_delay_ms: Arc<AtomicU64>,
+    telemetry_delay_ms: Arc<AtomicU64>,
+    telemetry_started: Arc<AtomicUsize>,
     revoked: Arc<AtomicUsize>,
 }
 
@@ -45,6 +47,11 @@ async fn serve(stub: Stub) -> String {
             "/v1/telemetry",
             post(
                 |State(s): State<Stub>, Json(batch): Json<TelemetryBatch>| async move {
+                    s.telemetry_started.fetch_add(1, Ordering::SeqCst);
+                    let delay = s.telemetry_delay_ms.load(Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
                     s.submissions
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -120,7 +127,8 @@ fn enable_telemetry(link: &CloudLink) {
     link.set_feature_switches(CloudFeatureSwitches {
         telemetry: true,
         ..Default::default()
-    });
+    })
+    .expect("enable telemetry export");
 }
 
 #[tokio::test]
@@ -447,6 +455,84 @@ async fn an_in_flight_submission_survives_restart_with_the_same_identity() {
 }
 
 #[tokio::test]
+async fn disabling_telemetry_purges_durable_retry_before_reenable_or_restart() {
+    let d = tempfile::tempdir().unwrap();
+    let stub = Stub {
+        status: Arc::new(AtomicU16::new(503)),
+        ..Default::default()
+    };
+    let url = serve(stub.clone()).await;
+
+    {
+        let link = link(&d);
+        link.configure(backend(&url)).unwrap();
+        link.enroll("abcd-2345").await.unwrap();
+        enable_telemetry(&link);
+        link.record(spans(3));
+        assert!(matches!(
+            link.flush().await,
+            FlushOutcome::Retained { spans: 3, .. }
+        ));
+
+        link.set_feature_switches(CloudFeatureSwitches::default())
+            .expect("revoke telemetry export");
+        assert_eq!(link.spooled(), 0, "revocation must purge queued data");
+    }
+
+    stub.status.store(200, Ordering::SeqCst);
+    let restarted = link(&d);
+    enable_telemetry(&restarted);
+    assert_eq!(restarted.spooled(), 0, "durable retry survived revocation");
+    assert_eq!(restarted.flush().await, FlushOutcome::Idle);
+    assert_eq!(
+        stub.submissions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len(),
+        1,
+        "revoked telemetry was retried after restart"
+    );
+}
+
+#[tokio::test]
+async fn disabling_telemetry_cancels_a_waiting_flush() {
+    let d = tempfile::tempdir().unwrap();
+    let stub = Stub {
+        status: Arc::new(AtomicU16::new(200)),
+        telemetry_delay_ms: Arc::new(AtomicU64::new(30_000)),
+        ..Default::default()
+    };
+    let url = serve(stub.clone()).await;
+    let link = Arc::new(link(&d));
+    link.configure(backend(&url)).unwrap();
+    link.enroll("abcd-2345").await.unwrap();
+    enable_telemetry(&link);
+    link.record(spans(2));
+
+    let flush = tokio::spawn({
+        let link = Arc::clone(&link);
+        async move { link.flush().await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while stub.telemetry_started.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("telemetry request starts");
+
+    link.set_feature_switches(CloudFeatureSwitches::default())
+        .expect("revoke telemetry export");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), flush)
+        .await
+        .expect("revocation cancels the waiting request")
+        .expect("flush task joins");
+    assert_eq!(outcome, FlushOutcome::NotLinked);
+    assert_eq!(link.spooled(), 0);
+    assert_eq!(stub.received.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn disconnecting_clears_the_credential_but_keeps_the_identity() {
     let d = tempfile::tempdir().unwrap();
     let stub = Stub {
@@ -502,7 +588,11 @@ async fn a_corrupt_state_file_leaves_the_instance_working_and_unlinked() {
     std::fs::write(state_dir.join("state.json"), "{ truncated").unwrap();
 
     let l = link(&d);
-    assert_eq!(l.status(), LinkStatus::NotConfigured);
+    assert!(matches!(l.status(), LinkStatus::StateUnreadable { .. }));
+    assert!(
+        l.status().needs_attention(),
+        "the operator must be told that credentials could not be read"
+    );
     l.record(spans(10)); // must not panic
     assert_eq!(l.flush().await, FlushOutcome::NotLinked);
 }

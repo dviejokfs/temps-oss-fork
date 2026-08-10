@@ -59,6 +59,16 @@ impl Spool {
         self.buffer.is_empty()
     }
 
+    /// Remove every buffered span after the operator revokes telemetry export.
+    /// This is intentionally distinct from capacity drops: consent revocation
+    /// must not leave exportable customer data resident for a later re-enable.
+    pub fn clear(&mut self) -> usize {
+        let removed = self.buffer.len();
+        self.buffer.clear();
+        self.buffered_bytes = 0;
+        removed
+    }
+
     /// Spans discarded because the spool was full. Never resets — it is a
     /// lifetime counter the operator can watch.
     pub fn dropped(&self) -> u64 {
@@ -232,6 +242,16 @@ mod tests {
     #[test]
     fn taking_from_an_empty_spool_is_not_an_error() {
         assert!(Spool::new(10).take(5).is_empty());
+    }
+
+    #[test]
+    fn clearing_removes_payloads_without_counting_capacity_drops() {
+        let mut spool = Spool::new(10);
+        spool.push(spans(0..3));
+
+        assert_eq!(spool.clear(), 3);
+        assert!(spool.is_empty());
+        assert_eq!(spool.dropped(), 0);
     }
 
     #[test]

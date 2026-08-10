@@ -448,7 +448,13 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let persisted: EncryptedEnrollmentState = serde_json::from_str(&raw).unwrap();
         let migrated_plaintext = encryption.decrypt_string(&persisted.ciphertext).unwrap();
-        assert!(migrated_plaintext.contains("\"allow_loopback_development\": true"));
+        let migrated_json: serde_json::Value = serde_json::from_str(&migrated_plaintext).unwrap();
+        assert_eq!(
+            migrated_json
+                .get("allow_loopback_development")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
