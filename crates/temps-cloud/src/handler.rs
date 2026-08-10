@@ -95,7 +95,8 @@ fn problem(error: CloudServiceError) -> Problem {
         }
         CloudServiceError::Client(
             temps_cloud_client::CloudError::NotEnrolled
-            | temps_cloud_client::CloudError::LinkStateUnreadable { .. },
+            | temps_cloud_client::CloudError::LinkStateUnreadable { .. }
+            | temps_cloud_client::CloudError::ConfigurationBlocked { .. },
         ) => StatusCode::CONFLICT,
         CloudServiceError::Client(temps_cloud_client::CloudError::FeatureDisabled { .. }) => {
             StatusCode::CONFLICT

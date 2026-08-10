@@ -77,6 +77,7 @@ pub struct CloudLink {
     /// Present when a state file existed but could not be decoded. Mutations
     /// stay blocked so recoverable credentials are never overwritten.
     unreadable_state_path: Option<String>,
+    outbound_blocked_reason: RwLock<Option<String>>,
     incoming_tx: mpsc::Sender<IncomingBatch>,
     incoming_rx: Mutex<mpsc::Receiver<IncomingBatch>>,
     incoming_spans: AtomicUsize,
@@ -160,6 +161,7 @@ impl CloudLink {
         Self {
             state: RwLock::new(state),
             unreadable_state_path,
+            outbound_blocked_reason: RwLock::new(None),
             incoming_tx,
             incoming_rx: Mutex::new(incoming_rx),
             incoming_spans: AtomicUsize::new(0),
@@ -201,6 +203,30 @@ impl CloudLink {
         self.unreadable_state_path
             .as_ref()
             .map(|path| CloudError::LinkStateUnreadable { path: path.clone() })
+    }
+
+    fn outbound_blocked_error(&self) -> Option<CloudError> {
+        self.outbound_blocked_reason
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|reason| CloudError::ConfigurationBlocked {
+                reason: reason.clone(),
+            })
+    }
+
+    pub fn block_outbound(&self, reason: impl Into<String>) {
+        *self
+            .outbound_blocked_reason
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason.into());
+    }
+
+    fn clear_outbound_block(&self) {
+        *self
+            .outbound_blocked_reason
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Apply persisted, operator-controlled export settings. This is lock-free
@@ -290,11 +316,21 @@ impl CloudLink {
     }
 
     fn parse_backend(&self, value: &str) -> Result<BackendUrl, CloudError> {
-        if self.allow_loopback_development {
+        if self.allows_loopback_development() {
             BackendUrl::loopback_development(value)
         } else {
             BackendUrl::production(value)
         }
+    }
+
+    pub fn allows_loopback_development(&self) -> bool {
+        self.allow_loopback_development
+            || self
+                .state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .is_some_and(|state| state.allow_loopback_development)
     }
 
     pub fn status(&self) -> LinkStatus {
@@ -377,6 +413,7 @@ impl CloudLink {
         self.ensure_state_readable()?;
         let mut guard = self.state.write().unwrap_or_else(|p| p.into_inner());
         let next_url = backend.as_str().to_string();
+        let next_allows_loopback = backend.allows_loopback_development();
         if let Some(existing) = guard.as_ref() {
             if existing.is_linked() && existing.base_url != next_url {
                 return Err(crate::state::StateError::BackendChangeRequiresDisconnect {
@@ -397,9 +434,14 @@ impl CloudLink {
                     existing.unlink();
                 }
                 existing.base_url = next_url;
+                existing.allow_loopback_development = next_allows_loopback;
                 existing
             }
-            None => EnrollmentState::new(next_url),
+            None => {
+                let mut state = EnrollmentState::new(next_url);
+                state.allow_loopback_development = next_allows_loopback;
+                state
+            }
         };
         self.save_state(&next)?;
         if changed_origin {
@@ -421,12 +463,16 @@ impl CloudLink {
             guard.as_ref().is_some_and(EnrollmentState::is_linked),
             Ordering::Release,
         );
+        self.clear_outbound_block();
         Ok(())
     }
 
     /// Redeem an operator-pasted code and persist the resulting credential.
     pub async fn enroll(&self, code: &str) -> Result<(), CloudError> {
         if let Some(error) = self.unreadable_cloud_error() {
+            return Err(error);
+        }
+        if let Some(error) = self.outbound_blocked_error() {
             return Err(error);
         }
         let (base_url, instance_id, generation) = {
@@ -483,6 +529,9 @@ impl CloudLink {
     /// confirms that the credential is already invalid.
     pub async fn revoke(&self) -> Result<(), CloudError> {
         if let Some(error) = self.unreadable_cloud_error() {
+            return Err(error);
+        }
+        if let Some(error) = self.outbound_blocked_error() {
             return Err(error);
         }
         let (base_url, token) = {
@@ -671,6 +720,9 @@ impl CloudLink {
         if let Some(error) = self.unreadable_cloud_error() {
             return Err(error);
         }
+        if let Some(error) = self.outbound_blocked_error() {
+            return Err(error);
+        }
         let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
         let state = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
         let token = state.token.clone().ok_or(CloudError::NotEnrolled)?;
@@ -682,6 +734,9 @@ impl CloudLink {
             return Err(CloudError::FeatureDisabled { feature: "backups" });
         }
         if let Some(error) = self.unreadable_cloud_error() {
+            return Err(error);
+        }
+        if let Some(error) = self.outbound_blocked_error() {
             return Err(error);
         }
         let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
@@ -902,6 +957,33 @@ impl CloudLink {
 mod unreadable_state_tests {
     use super::*;
     use crate::state::StateError;
+
+    #[test]
+    fn explicit_loopback_policy_survives_encrypted_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "restart-loopback-policy-key",
+        ));
+        let first = CloudLink::load_encrypted_for_loopback_development(
+            directory.path().to_path_buf(),
+            "test-agent",
+            encryption.clone(),
+        );
+        first
+            .configure(BackendUrl::loopback_development("http://127.0.0.1:19202").unwrap())
+            .unwrap();
+        drop(first);
+
+        let restarted =
+            CloudLink::load_encrypted(directory.path().to_path_buf(), "test-agent", encryption);
+        assert!(restarted.allows_loopback_development());
+        assert!(restarted.parse_backend("http://127.0.0.1:19202").is_ok());
+        assert!(matches!(
+            restarted.status(),
+            LinkStatus::AwaitingEnrollment { base_url }
+                if base_url == "http://127.0.0.1:19202/"
+        ));
+    }
 
     #[tokio::test]
     async fn corrupt_state_is_visible_and_cannot_be_overwritten() {

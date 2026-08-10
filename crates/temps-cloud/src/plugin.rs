@@ -80,14 +80,12 @@ impl TempsPlugin for CloudPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let service = context.require_service::<CloudService>();
-            service
-                .initialize()
-                .await
-                .map_err(|error| PluginError::InitializationFailed(error.to_string()))?;
-            service.start_backup_mirror(
-                context.require_service::<sea_orm::DatabaseConnection>(),
-                context.require_service::<temps_core::EncryptionService>(),
-            );
+            if cloud_initialization_succeeded(service.initialize().await) {
+                service.start_backup_mirror(
+                    context.require_service::<sea_orm::DatabaseConnection>(),
+                    context.require_service::<temps_core::EncryptionService>(),
+                );
+            }
             Ok(())
         })
     }
@@ -101,5 +99,30 @@ impl TempsPlugin for CloudPlugin {
 
     fn openapi_schema(&self) -> Option<OpenApi> {
         Some(CloudApiDoc::openapi())
+    }
+}
+
+fn cloud_initialization_succeeded(result: Result<(), crate::CloudServiceError>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, "Optional Cloud integration failed to initialize; console startup will continue");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_initialization_failure_does_not_become_a_plugin_failure() {
+        let initialized =
+            cloud_initialization_succeeded(Err(crate::CloudServiceError::InvalidBackend {
+                reason: "invalid test backend".to_string(),
+            }));
+
+        assert!(!initialized);
     }
 }

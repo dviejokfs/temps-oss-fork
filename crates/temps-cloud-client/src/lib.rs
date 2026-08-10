@@ -64,7 +64,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendUrl(url::Url);
+pub struct BackendUrl {
+    url: url::Url,
+    allow_loopback_development: bool,
+}
 
 impl BackendUrl {
     /// Parse a production managed-backend origin.
@@ -124,21 +127,30 @@ impl BackendUrl {
             }
         }
 
-        Ok(Self(parsed))
+        let allow_loopback_development =
+            allow_loopback_http && parsed.scheme() == "http" && loopback;
+        Ok(Self {
+            url: parsed,
+            allow_loopback_development,
+        })
     }
 
     fn endpoint(&self, path: &str) -> url::Url {
-        let mut endpoint = self.0.clone();
+        let mut endpoint = self.url.clone();
         endpoint.set_path(path);
         endpoint
     }
 
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        self.url.as_str()
+    }
+
+    pub fn allows_loopback_development(&self) -> bool {
+        self.allow_loopback_development
     }
 
     fn permits_loopback_uploads(&self) -> bool {
-        self.0.scheme() == "http" && is_loopback_host(&self.0)
+        self.url.scheme() == "http" && is_loopback_host(&self.url)
     }
 }
 
@@ -169,6 +181,9 @@ pub enum CloudError {
         "Cloud link state at {path} is unreadable. Restore the original encryption key, or back up and remove the state file before reconnecting"
     )]
     LinkStateUnreadable { path: String },
+
+    #[error("Managed Cloud outbound operations are blocked: {reason}")]
+    ConfigurationBlocked { reason: String },
 
     #[error("Managed Cloud feature '{feature}' is disabled in local settings")]
     FeatureDisabled { feature: &'static str },

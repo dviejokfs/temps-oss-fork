@@ -595,6 +595,7 @@ mod tests {
         temps_cloud_client::EnrollmentState {
             instance_id: uuid::Uuid::new_v4(),
             base_url: "https://cloud.test/".to_string(),
+            allow_loopback_development: false,
             token: Some("instance-token".to_string()),
             tenant_id: Some(uuid::Uuid::new_v4()),
             account_email: Some("owner@example.com".to_string()),

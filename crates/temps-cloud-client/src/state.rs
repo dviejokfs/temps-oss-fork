@@ -56,6 +56,11 @@ pub struct EnrollmentState {
     /// Base URL of the managed backend.
     pub base_url: String,
 
+    /// Records the explicit policy decision that admitted a loopback
+    /// development origin. This survives restart without an ambient bypass.
+    #[serde(default)]
+    pub allow_loopback_development: bool,
+
     /// Bearer token. `None` means "known backend, not linked" — a different
     /// state from having no file at all, and worth distinguishing in the UI.
     pub token: Option<String>,
@@ -86,6 +91,7 @@ impl EnrollmentState {
         Self {
             instance_id: Uuid::new_v4(),
             base_url: base_url.into(),
+            allow_loopback_development: false,
             token: None,
             tenant_id: None,
             account_email: None,
@@ -94,6 +100,28 @@ impl EnrollmentState {
 
     pub fn is_linked(&self) -> bool {
         self.token.is_some()
+    }
+
+    fn migrate_legacy_loopback_policy(&mut self) -> bool {
+        if self.allow_loopback_development {
+            return false;
+        }
+        let Ok(url) = url::Url::parse(&self.base_url) else {
+            return false;
+        };
+        let loopback = url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("localhost"))
+            || matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
+            || matches!(url.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback());
+        if url.scheme() == "http" && loopback {
+            // Production validation has never admitted this shape, so a
+            // persisted loopback HTTP origin proves prior explicit dev opt-in.
+            self.allow_loopback_development = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// Load, or `Ok(None)` when this instance has never been linked.
@@ -130,12 +158,14 @@ impl EnrollmentState {
             }
         };
 
-        serde_json::from_str(&raw)
-            .map(Some)
-            .map_err(|e| StateError::Corrupt {
-                path: path.display().to_string(),
-                reason: e.to_string(),
-            })
+        let mut state: Self = serde_json::from_str(&raw).map_err(|e| StateError::Corrupt {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        if state.migrate_legacy_loopback_policy() {
+            state.save(path)?;
+        }
+        Ok(Some(state))
     }
 
     /// Load the versioned encrypted format, atomically migrating a legacy
@@ -161,18 +191,22 @@ impl EnrollmentState {
                     operation: "decrypt",
                     reason: error.to_string(),
                 })?;
-            return serde_json::from_str(&plaintext).map(Some).map_err(|error| {
-                StateError::Corrupt {
+            let mut state: Self =
+                serde_json::from_str(&plaintext).map_err(|error| StateError::Corrupt {
                     path: path.display().to_string(),
                     reason: format!("decrypted state is invalid: {error}"),
-                }
-            });
+                })?;
+            if state.migrate_legacy_loopback_policy() {
+                state.save_encrypted(path, encryption)?;
+            }
+            return Ok(Some(state));
         }
 
-        let legacy: Self = serde_json::from_str(&raw).map_err(|error| StateError::Corrupt {
+        let mut legacy: Self = serde_json::from_str(&raw).map_err(|error| StateError::Corrupt {
             path: path.display().to_string(),
             reason: error.to_string(),
         })?;
+        legacy.migrate_legacy_loopback_policy();
         legacy.save_encrypted(path, encryption)?;
         Ok(Some(legacy))
     }
@@ -358,6 +392,35 @@ mod tests {
             EnrollmentState::load_encrypted(&path, &encryption).unwrap(),
             Some(state)
         );
+    }
+
+    #[test]
+    fn encrypted_legacy_loopback_state_is_safely_migrated() {
+        let (_directory, path) = temp();
+        let encryption = temps_core::EncryptionService::new_from_password("legacy-loopback-key");
+        let plaintext = serde_json::json!({
+            "instance_id": Uuid::new_v4(),
+            "base_url": "http://127.0.0.1:19202/",
+            "token": null,
+            "tenant_id": null,
+            "account_email": null
+        })
+        .to_string();
+        let envelope = EncryptedEnrollmentState {
+            version: ENCRYPTED_STATE_VERSION,
+            ciphertext: encryption.encrypt_string(&plaintext).unwrap(),
+        };
+        write_state_file(&path, &serde_json::to_string(&envelope).unwrap()).unwrap();
+
+        let migrated = EnrollmentState::load_encrypted(&path, &encryption)
+            .unwrap()
+            .expect("legacy state");
+        assert!(migrated.allow_loopback_development);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let persisted: EncryptedEnrollmentState = serde_json::from_str(&raw).unwrap();
+        let migrated_plaintext = encryption.decrypt_string(&persisted.ciphertext).unwrap();
+        assert!(migrated_plaintext.contains("\"allow_loopback_development\": true"));
     }
 
     #[test]
