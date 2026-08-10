@@ -1,5 +1,10 @@
 -- Backfill proxy_logs.bot_name with canonical AI-agent names.
 --
+-- This is the TimescaleDB (Postgres) path only. Deployments running the
+-- ClickHouse ProxyLogStorage backend (TEMPS_CLICKHOUSE_* set) have a
+-- separate proxy_logs table with different SQL syntax — use
+-- backfill-ai-agent-bot-names-clickhouse.sql for those.
+--
 -- WHY THIS IS A MANUAL SCRIPT, NOT A MIGRATION
 -- --------------------------------------------
 -- Sea-ORM migrations run inside `establish_connection` (Migrator::up) which
