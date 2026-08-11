@@ -152,7 +152,10 @@ function generateHeader(
 ## Installation
 
 \`\`\`bash
-temps [command]
+bunx @temps-sdk/cli@${version} [command]
+
+# Fallback when Bun is unavailable
+npx @temps-sdk/cli@${version} [command]
 \`\`\`
 
 ## Authentication
@@ -161,10 +164,10 @@ Before using most commands, you need to authenticate:
 
 \`\`\`bash
 # Login interactively
-temps login
+bunx @temps-sdk/cli@${version} login
 
 # Or configure with wizard
-temps configure
+bunx @temps-sdk/cli@${version} configure
 \`\`\`
 
 ## Global Options
@@ -180,7 +183,7 @@ temps configure
 `
 }
 
-function generateFooter(): string {
+function generateFooter(version: string): string {
   return `
 ---
 
@@ -190,48 +193,48 @@ function generateFooter(): string {
 
 \`\`\`bash
 # Login to Temps
-temps login
+bunx @temps-sdk/cli@${version} login
 
 # Create a new project
-temps projects create --name my-app
+bunx @temps-sdk/cli@${version} projects create --name my-app
 
 # Deploy to production
-temps --target-context production deploy --project my-app --environment production
+bunx @temps-sdk/cli@${version} --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-temps deployments logs --project my-app --follow
+bunx @temps-sdk/cli@${version} deployments logs --project my-app --follow
 
 # Stream runtime container logs
-temps runtime-logs --project my-app
+bunx @temps-sdk/cli@${version} runtime-logs --project my-app
 
 # List containers
-temps containers list --project-id 1 --environment-id 1
+bunx @temps-sdk/cli@${version} containers list --project-id 1 --environment-id 1
 \`\`\`
 
 ### Managing Environments
 
 \`\`\`bash
 # List environments
-temps environments list --project my-app
+bunx @temps-sdk/cli@${version} environments list --project my-app
 
 # Set environment variables
-temps environments vars set --project my-app --key DATABASE_URL
+bunx @temps-sdk/cli@${version} environments vars set --project my-app --key DATABASE_URL
 
 # View environment variables
-temps environments vars list --project my-app
+bunx @temps-sdk/cli@${version} environments vars list --project my-app
 \`\`\`
 
 ### Managing Domains
 
 \`\`\`bash
 # Add a custom domain
-temps domains add --project my-app --domain app.example.com
+bunx @temps-sdk/cli@${version} domains add --project my-app --domain app.example.com
 
 # List domains
-temps domains list --project my-app
+bunx @temps-sdk/cli@${version} domains list --project my-app
 
 # Remove a domain
-temps domains remove --project my-app --domain app.example.com
+bunx @temps-sdk/cli@${version} domains remove --project my-app --domain app.example.com
 \`\`\`
 
 ## Environment Variables
@@ -251,7 +254,7 @@ Configuration is stored in:
 - **Config file**: \`~/.temps/config.json\`
 - **Credentials**: Stored securely in \`~/.temps/\` with restricted file permissions
 
-Use \`temps configure show\` to view current configuration.
+Use \`bunx @temps-sdk/cli@${version} configure show\` to view current configuration.
 
 ## Support
 
@@ -275,10 +278,11 @@ export async function generateDocs(options: DocsOptions): Promise<void> {
     output = JSON.stringify(commands, null, 2)
   } else {
     const format = options.format === 'mdx' ? 'mdx' : 'markdown'
-    output = generateHeader(format, program.version() ?? 'unknown')
+    const version = program.version() ?? 'unknown'
+    output = generateHeader(format, version)
     output += generateCommandIndex(commands)
     output += generateMarkdown(commands, 2, format)
-    output += generateFooter()
+    output += generateFooter(version)
   }
 
   if (options.output) {

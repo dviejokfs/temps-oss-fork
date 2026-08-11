@@ -10,7 +10,10 @@
 ## Installation
 
 ```bash
-temps [command]
+bunx @temps-sdk/cli@0.1.31 [command]
+
+# Fallback when Bun is unavailable
+npx @temps-sdk/cli@0.1.31 [command]
 ```
 
 ## Authentication
@@ -19,10 +22,10 @@ Before using most commands, you need to authenticate:
 
 ```bash
 # Login interactively
-temps login
+bunx @temps-sdk/cli@0.1.31 login
 
 # Or configure with wizard
-temps configure
+bunx @temps-sdk/cli@0.1.31 configure
 ```
 
 ## Global Options
@@ -6413,48 +6416,48 @@ Upgrade your plan
 
 ```bash
 # Login to Temps
-temps login
+bunx @temps-sdk/cli@0.1.31 login
 
 # Create a new project
-temps projects create --name my-app
+bunx @temps-sdk/cli@0.1.31 projects create --name my-app
 
 # Deploy to production
-temps --target-context production deploy --project my-app --environment production
+bunx @temps-sdk/cli@0.1.31 --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-temps deployments logs --project my-app --follow
+bunx @temps-sdk/cli@0.1.31 deployments logs --project my-app --follow
 
 # Stream runtime container logs
-temps runtime-logs --project my-app
+bunx @temps-sdk/cli@0.1.31 runtime-logs --project my-app
 
 # List containers
-temps containers list --project-id 1 --environment-id 1
+bunx @temps-sdk/cli@0.1.31 containers list --project-id 1 --environment-id 1
 ```
 
 ### Managing Environments
 
 ```bash
 # List environments
-temps environments list --project my-app
+bunx @temps-sdk/cli@0.1.31 environments list --project my-app
 
 # Set environment variables
-temps environments vars set --project my-app --key DATABASE_URL
+bunx @temps-sdk/cli@0.1.31 environments vars set --project my-app --key DATABASE_URL
 
 # View environment variables
-temps environments vars list --project my-app
+bunx @temps-sdk/cli@0.1.31 environments vars list --project my-app
 ```
 
 ### Managing Domains
 
 ```bash
 # Add a custom domain
-temps domains add --project my-app --domain app.example.com
+bunx @temps-sdk/cli@0.1.31 domains add --project my-app --domain app.example.com
 
 # List domains
-temps domains list --project my-app
+bunx @temps-sdk/cli@0.1.31 domains list --project my-app
 
 # Remove a domain
-temps domains remove --project my-app --domain app.example.com
+bunx @temps-sdk/cli@0.1.31 domains remove --project my-app --domain app.example.com
 ```
 
 ## Environment Variables
@@ -6474,7 +6477,7 @@ Configuration is stored in:
 - **Config file**: `~/.temps/config.json`
 - **Credentials**: Stored securely in `~/.temps/` with restricted file permissions
 
-Use `temps configure show` to view current configuration.
+Use `bunx @temps-sdk/cli@0.1.31 configure show` to view current configuration.
 
 ## Support
 

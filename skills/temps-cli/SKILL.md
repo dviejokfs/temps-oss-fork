@@ -1,29 +1,31 @@
 ---
 name: temps-cli
-description: Operate Temps through the installed `temps` CLI. Use when the user mentions Temps CLI, `@temps-sdk/cli`, a `temps ...` command, or asks to deploy, configure, inspect, automate, or administer Temps from a terminal. Covers contexts, projects, deployments, environments, services, domains, monitoring, backups, telemetry, Cloud, platform administration, and read-only managed-data browsing. Apply the target-context, secret-handling, confirmation, and verification rules for every agentic CLI operation.
+description: Operate Temps through the pinned `@temps-sdk/cli` package with bunx or npx. Use when the user mentions Temps CLI, `@temps-sdk/cli`, a CLI command, or asks to deploy, configure, inspect, automate, or administer Temps from a terminal. Covers contexts, projects, deployments, environments, services, domains, monitoring, backups, telemetry, Cloud, platform administration, and read-only managed-data browsing. Apply the target-context, secret-handling, confirmation, and verification rules for every agentic CLI operation.
 ---
 
 # Temps CLI
 
-Use the installed `temps` binary to operate a Temps server. Treat this skill as
-procedural guidance and command documentation, not as authorization to mutate a
-server.
+Use the pinned zero-install package invocation to operate a Temps server. Prefer
+`bunx @temps-sdk/cli@0.1.31`; use `npx @temps-sdk/cli@0.1.31` when Bun is not
+available. Treat this skill as procedural guidance and command documentation,
+not as authorization to mutate a server.
 
 ## Required workflow
 
-1. Run `command -v temps` and `temps --version`.
-2. Require the reviewed `0.1.31` runtime. If it is missing or different, stop
-   and show the pinned installation procedure below. Do not install or upgrade
-   without explicit approval.
+1. Run `command -v bunx || command -v npx` to select an available package
+   runner. Prefer `bunx` when both exist.
+2. Verify the reviewed package integrity as shown below, then run
+   `bunx @temps-sdk/cli@0.1.31 --version` (or its pinned `npx` equivalent).
+   Never omit the version.
 3. Identify the requested operation and locate its command in
    [references/COMMANDS.md](references/COMMANDS.md). Search only the relevant
    command group instead of loading the entire reference.
-4. Run `temps <group> <command> --help` when flags or behavior may have changed.
-   Installed help is authoritative.
+4. Run `bunx @temps-sdk/cli@0.1.31 <group> <command> --help` when flags or
+   behavior may have changed. Runtime help is authoritative.
 5. Classify the operation as read-only, state-changing, destructive, or
    secret-bearing.
 6. For every state-changing operation, name the intended server and insert
-   `--target-context <name>` immediately after `temps`.
+   `--target-context <name>` immediately after the package specifier.
 7. Explain the expected effect before executing a write. Obtain explicit
    confirmation for destructive or secret-bearing operations.
 8. Verify the result with a read-only command and report the target context,
@@ -52,10 +54,9 @@ For common multi-command journeys, read
 - Do not reproduce tokens, passwords, private keys, connection strings, or
   credential-reveal output.
 
-## Install the reviewed runtime
+## Verify the reviewed runtime
 
-Install only after explicit approval. Verify the registry artifact and disable
-dependency lifecycle scripts:
+Verify the immutable registry artifact before its first execution in a task:
 
 ```bash
 expected_temps_cli_integrity='sha512-nz1MrIyi2hxcTmY4isY9MN44lclmgQdtifiAXaCNc+A5ZS9MqoDkwZL/NpEMNeld0PoAubCyyim+NvLou1eqHg=='
@@ -65,14 +66,17 @@ test "$actual_temps_cli_integrity" = "$expected_temps_cli_integrity" || {
   exit 1
 }
 
-npm install --global --ignore-scripts @temps-sdk/cli@0.1.31
-command -v temps
-temps --version
+bunx @temps-sdk/cli@0.1.31 --version
 ```
 
-Do not execute this skill's examples through `npx`, `bunx`, another on-demand
-package runner, or a downloaded script. Those mechanisms can execute code that
-changed after this skill was reviewed.
+When Bun is unavailable, use the same immutable version with npm:
+
+```bash
+npx @temps-sdk/cli@0.1.31 --version
+```
+
+Never use unpinned `bunx @temps-sdk/cli`, `npx @temps-sdk/cli`, a globally
+installed mutable version, or a downloaded script.
 
 ## Discover commands efficiently
 
@@ -94,13 +98,13 @@ Use these routing hints:
 | Authenticate or select a server | `login`, `logout`, `whoami`, `context`, `configure` |
 | Create and deploy an application | `projects`, `deploy`, `deployments`, `environments` |
 | Manage databases and storage | `services`, `backups`, `data`, `kv`, `blob` |
-| Configure traffic and TLS | `domains`, `custom-domains`, `dns`, `certificates` |
-| Inspect runtime behavior | `containers`, `runtime-logs`, `proxy-logs`, `metrics` |
-| Operate observability | `analytics`, `errors`, `traces`, `replay`, `monitors`, `incidents` |
-| Configure telemetry forwarding | `otel-forward`, `instance-defaults` |
+| Configure traffic and TLS | `domains`, `custom-domains`, `dns`, `dns-provider` |
+| Inspect runtime behavior | `containers`, `runtime-logs`, `proxy-logs`, `services` |
+| Operate observability | `analytics`, `errors`, `traces`, `session-replay`, `monitors`, `incidents` |
+| Configure telemetry forwarding | `otel-forward` |
 | Manage Cloud integration | `cloud` |
-| Manage agent capabilities | `sandbox`, `skills`, `mcp`, `secrets`, `workflows`, `ai` |
-| Administer the platform | `platform`, `settings`, `users`, `audit-logs` |
+| Manage agent capabilities | `sandbox`, `skills`, `mcp-servers`, `secrets`, `workflow`, `ai` |
+| Administer the platform | `platform`, `settings`, `users`, `audit` |
 
 ## Target contexts
 
@@ -108,15 +112,15 @@ Use one named context per Temps server. Inspect contexts read-only before a
 write:
 
 ```bash
-temps context list
-temps context show production
-temps --target-context production whoami
+bunx @temps-sdk/cli@0.1.31 context list
+bunx @temps-sdk/cli@0.1.31 context show production
+bunx @temps-sdk/cli@0.1.31 --target-context production whoami
 ```
 
-Place the global option immediately after the binary:
+Place the global option immediately after the package specifier:
 
 ```bash
-temps --target-context production projects list
+bunx @temps-sdk/cli@0.1.31 --target-context production projects list
 ```
 
 Do not rely on `context use` for agentic writes because it mutates ambient
@@ -127,8 +131,8 @@ state for subsequent commands.
 Use interactive browser login for a person:
 
 ```bash
-temps login https://temps.example.com --context production
-temps --target-context production whoami
+bunx @temps-sdk/cli@0.1.31 login https://temps.example.com --context production
+bunx @temps-sdk/cli@0.1.31 --target-context production whoami
 ```
 
 For CI, inject `TEMPS_TOKEN` and `TEMPS_API_URL` from the CI secret store. Do
@@ -137,9 +141,9 @@ not print them or persist them in repository files.
 Configuration commands manage non-secret CLI preferences:
 
 ```bash
-temps configure show
-temps configure get output-format
-temps configure set output-format json
+bunx @temps-sdk/cli@0.1.31 configure show
+bunx @temps-sdk/cli@0.1.31 configure get output-format
+bunx @temps-sdk/cli@0.1.31 configure set output-format json
 ```
 
 Relevant environment variables:
@@ -159,10 +163,10 @@ Pair every mutation with a read-only check against the same explicit context:
 
 ```bash
 # Mutation shown only as a structural example; confirm before running it.
-temps --target-context staging projects create --name example
+bunx @temps-sdk/cli@0.1.31 --target-context staging projects create --name example
 
 # Read-only evidence.
-temps --target-context staging projects list --json
+bunx @temps-sdk/cli@0.1.31 --target-context staging projects list --json
 ```
 
 Prefer structured output when available. Parse only fields required for the
