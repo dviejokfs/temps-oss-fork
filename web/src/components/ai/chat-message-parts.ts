@@ -24,6 +24,11 @@ export interface ChatMessage {
   parts?: ChatPart[]
 }
 
+export interface PendingActionLike {
+  public_id: string
+  status: string
+}
+
 /**
  * Render segments for an assistant message, with compatibility for persisted
  * turns whose ordered parts contain tool cards but whose prose lives only in
@@ -44,4 +49,50 @@ export function assistantParts(message: ChatMessage): ChatPart[] {
   for (const tool of message.tools ?? []) parts.push({ type: 'tool', tool })
   if (message.content) parts.push({ type: 'text', text: message.content })
   return parts
+}
+
+/** Action ids already represented by persisted `temps_write` tool results. */
+export function representedPendingActionIds(
+  messages: ChatMessage[]
+): Set<string> {
+  const ids = new Set<string>()
+  for (const message of messages) {
+    for (const part of assistantParts(message)) {
+      if (part.type !== 'tool' || part.tool.name !== 'temps_write') continue
+      try {
+        const result = JSON.parse(part.tool.result ?? '') as {
+          status?: string
+          action_id?: unknown
+          steps?: Array<{ action_id?: unknown }>
+        }
+        if (result.status === 'proposed' && result.action_id) {
+          ids.add(String(result.action_id))
+        }
+        if (result.status === 'proposed_plan') {
+          for (const step of result.steps ?? []) {
+            if (step.action_id) ids.add(String(step.action_id))
+          }
+        }
+      } catch {
+        // Help and validation results are plain text, not proposal receipts.
+      }
+    }
+  }
+  return ids
+}
+
+/**
+ * Pending proposals are durable even when linking the tool receipt back to the
+ * assistant message fails. Return the proposed actions that need a standalone
+ * confirmation card so a reload can never strand an executable proposal.
+ */
+export function unrepresentedPendingActions<T extends PendingActionLike>(
+  messages: ChatMessage[],
+  actions: T[]
+): T[] {
+  const represented = representedPendingActionIds(messages)
+  return actions.filter(
+    (action) =>
+      action.status === 'proposed' && !represented.has(action.public_id)
+  )
 }

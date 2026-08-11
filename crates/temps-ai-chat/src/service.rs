@@ -2301,6 +2301,10 @@ impl ConversationService {
                 existing image to another environment; `rollback_to_deployment` reverts to an \
                 older one; neither is a redeploy). If no available operation matches the \
                 request, say so and ask — do NOT substitute a different operation. \
+                Object and array flag values MUST be strict JSON with double-quoted keys and \
+                string values, wrapped in single quotes so the CLI receives them intact (for \
+                example `--parameters '{\"database\":\"postgres\",\"username\":\"postgres\"}'`). \
+                Never emit JavaScript-style object literals such as `{database:postgres}`. \
                 When an operation needs a concrete id or target you don't already have \
                 (e.g. a redeploy via `trigger_project_pipeline` needs `--environment_id`, and \
                 a container action needs a `container_id`), FIRST look it up with the read-only \
@@ -2327,6 +2331,8 @@ impl ConversationService {
                                         Discovery: `--help` → sections; `<section> --help` → operations; \
                                         `<section> <operation> --help` → flags. \
                                         Run: `<section> <operation> --flag value …`. \
+                                        Object/array flags require strict JSON wrapped in single \
+                                        quotes, e.g. `--parameters '{\"database\":\"postgres\"}'`. \
                                         project_id is auto-filled. \
                                         This PROPOSES a change — it does NOT execute immediately."
                     },
@@ -2357,7 +2363,9 @@ impl ConversationService {
                  (don't assume a verb lives in an obvious section — e.g. a redeploy/rebuild of \
                  a project is `trigger_project_pipeline`, not a `deployments` op). Read \
                  `<operation> --help` to verify flags, and never approximate with a \
-                 similarly-named operation. If nothing matches, say so and ask.\n\n\
+                 similarly-named operation. Object/array flags must be strict JSON with \
+                 double-quoted keys and string values, wrapped in single quotes. If nothing \
+                 matches, say so and ask.\n\n\
                  Available write operations (permissions permitting):\n```\n{help}```"
             ))
         } else {

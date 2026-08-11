@@ -4,7 +4,9 @@ import {
   getAiProviderStatus,
   getConversation,
   getProject,
+  listPendingActions,
   refreshAiProviderStatus,
+  type PendingActionResponse,
   updateProjectSettings,
 } from '@/api/client'
 import {
@@ -83,6 +85,7 @@ import {
 } from './chat-page-state'
 import {
   assistantParts,
+  unrepresentedPendingActions,
   type ChatMessage,
   type ChatPart,
   type ToolCall,
@@ -1070,16 +1073,9 @@ function WriteProposalCard({
   return <PendingActionCard projectId={projectId} tool={tool} onFix={onFix} />
 }
 
-/**
- * A slim, in-chat affordance to turn on AI *write actions* for this project —
- * shown only while they're off. Enabling is a deliberate, security-sensitive
- * step (it lets the AI PROPOSE mutations), so it goes through a confirmation
- * dialog rather than a bare toggle; every proposed action is still individually
- * confirm-gated at execution time. This removes the trip to Settings without
- * cheapening the opt-in.
- */
+/** A visible, reversible project-level control for Temps write proposals. */
 function WriteActionsEnabler({ projectId }: { projectId: number }) {
-  // null = still loading / unknown; true = on (render nothing); false = off.
+  // null = still loading / unknown.
   const [enabled, setEnabled] = useState<boolean | null>(null)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -1100,56 +1096,100 @@ function WriteActionsEnabler({ projectId }: { projectId: number }) {
     }
   }, [projectId])
 
-  const enable = async () => {
+  const update = async (nextEnabled: boolean) => {
     setBusy(true)
     try {
       const { error } = await updateProjectSettings({
         path: { project_id: projectId },
-        // Enable the read-only chat too, so a project never ends up with write
-        // actions on but the chat itself off (the chat is where you propose and
-        // confirm those writes).
-        body: { ai_write_actions_enabled: true, ai_debug_chat_enabled: true },
+        // Enabling writes also enables chat, because chat is where proposals
+        // are reviewed. Disabling writes must not unexpectedly disable chat.
+        body: {
+          ai_write_actions_enabled: nextEnabled,
+          ...(nextEnabled ? { ai_debug_chat_enabled: true } : {}),
+        },
       })
       if (error) throw error
-      setEnabled(true)
+      setEnabled(nextEnabled)
       setConfirmOpen(false)
-      toast.success('AI write actions enabled for this project')
+      toast.success(
+        nextEnabled
+          ? 'AI write proposals enabled for this project'
+          : 'AI write proposals disabled for this project'
+      )
     } catch {
       toast.error(
-        "Couldn't enable write actions — you may need project admin permission."
+        `Couldn't ${nextEnabled ? 'enable' : 'disable'} write proposals — you may need project admin permission.`
       )
     } finally {
       setBusy(false)
     }
   }
 
-  // Hidden while loading, unknown, or already enabled.
-  if (enabled !== false) return null
+  if (enabled === null) {
+    return (
+      <Skeleton
+        className="h-8 w-48 rounded-md"
+        aria-label="Loading AI write status"
+      />
+    )
+  }
 
   return (
     <>
       <button
         type="button"
         onClick={() => setConfirmOpen(true)}
-        className="flex w-full items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-1.5 text-left text-xs text-amber-700 transition-colors hover:bg-amber-500/10 dark:text-amber-400"
+        className={cn(
+          'flex w-full items-center gap-2 rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors',
+          enabled
+            ? 'border-green-500/30 bg-green-500/5 text-green-700 hover:bg-green-500/10 dark:text-green-400'
+            : 'border-amber-500/30 bg-amber-500/5 text-amber-700 hover:bg-amber-500/10 dark:text-amber-400'
+        )}
       >
-        <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+        {enabled ? (
+          <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+        ) : (
+          <Shield className="h-3.5 w-3.5 shrink-0" />
+        )}
         <span className="min-w-0 flex-1">
-          Read-only. <span className="font-medium">Enable write actions</span>{' '}
-          to let the AI propose changes.
+          {enabled ? (
+            <>
+              <span className="font-medium">Write proposals enabled.</span>{' '}
+              Every action still requires confirmation.
+            </>
+          ) : (
+            <>
+              Read-only.{' '}
+              <span className="font-medium">Enable write proposals</span> to let
+              the AI suggest changes.
+            </>
+          )}
         </span>
       </button>
       <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Enable AI write actions?</AlertDialogTitle>
+            <AlertDialogTitle>
+              {enabled
+                ? 'Disable AI write proposals?'
+                : 'Enable AI write proposals?'}
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              This lets the assistant <strong>propose</strong> changes to this
-              project — redeploys, restarts, environment variables, domains.
-              Nothing runs automatically: every proposed action waits for you to
-              review and <strong>Confirm</strong> it here in the chat, and runs
-              with your own permissions. You can turn this off anytime in
-              Settings → Security.
+              {enabled ? (
+                <>
+                  The assistant will return to read-only access and cannot stage
+                  new changes. Existing proposals remain available for you to
+                  confirm or reject.
+                </>
+              ) : (
+                <>
+                  This lets the assistant <strong>propose</strong> changes to
+                  this project — redeploys, restarts, environment variables,
+                  domains. Nothing runs automatically: every proposal waits for
+                  you to review and <strong>Confirm</strong> it here in chat,
+                  and runs with your own permissions.
+                </>
+              )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1157,12 +1197,12 @@ function WriteActionsEnabler({ projectId }: { projectId: number }) {
             <AlertDialogAction
               onClick={(e) => {
                 e.preventDefault()
-                void enable()
+                void update(!enabled)
               }}
               disabled={busy}
             >
               {busy && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
-              Enable write actions
+              {enabled ? 'Disable write proposals' : 'Enable write proposals'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -1564,6 +1604,10 @@ export function DebugChatPanel({
     (model) => model.id === runtimeSelection.modelId
   )
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [pendingActionSnapshot, setPendingActionSnapshot] = useState<{
+    conversationId: string
+    actions: PendingActionResponse[]
+  } | null>(null)
   const [input, setInput] = useState(() => {
     try {
       return localStorage.getItem(draftKey) ?? ''
@@ -1675,6 +1719,39 @@ export function DebugChatPanel({
     setError,
     setWsTurnActive
   )
+
+  // Pending actions are durable rows. Linking their proposal receipt back to
+  // an assistant message is deliberately best-effort, so load the rows too:
+  // otherwise a transient persistence failure can leave a real proposal with
+  // no Confirm/Reject UI after a reload.
+  useEffect(() => {
+    if (!publicId) return
+    if (streaming) return
+    let cancelled = false
+    listPendingActions({
+      path: { project_id: projectId, public_id: publicId },
+    })
+      .then(({ data }) => {
+        if (!cancelled) {
+          setPendingActionSnapshot({
+            conversationId: publicId,
+            actions: data ?? [],
+          })
+        }
+      })
+      .catch(() => {
+        // The transcript remains usable; an ordinary API error banner would
+        // obscure the composer. The next completed turn retries this query.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [messages.length, projectId, publicId, streaming])
+
+  const recoveredPendingActions =
+    publicId && pendingActionSnapshot?.conversationId === publicId
+      ? unrepresentedPendingActions(messages, pendingActionSnapshot.actions)
+      : []
 
   const stop = useCallback(() => {
     abortRef.current?.abort()
@@ -2225,6 +2302,29 @@ export function DebugChatPanel({
             </div>
           )
         })}
+
+        {recoveredPendingActions.map((action) => (
+          <div key={action.public_id} className="flex items-start">
+            <div className="min-w-0 flex-1 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5">
+              <PendingActionCard
+                projectId={projectId}
+                tool={{
+                  id: `pending-${action.public_id}`,
+                  name: 'temps_write',
+                  arguments: '',
+                  result: JSON.stringify({
+                    status: 'proposed',
+                    action_id: action.public_id,
+                    operation: action.operation_id,
+                    method: action.method,
+                    summary: action.summary,
+                  }),
+                }}
+                onFix={(text) => void send(text)}
+              />
+            </div>
+          </div>
+        ))}
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}

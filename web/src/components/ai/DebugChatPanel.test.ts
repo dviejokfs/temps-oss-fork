@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 
-import { assistantParts, type ChatMessage } from './chat-message-parts'
+import {
+  assistantParts,
+  representedPendingActionIds,
+  unrepresentedPendingActions,
+  type ChatMessage,
+} from './chat-message-parts'
 
 const completedTool = {
   id: 'tool-call-1',
@@ -35,5 +40,70 @@ describe('assistantParts', () => {
     }
 
     expect(assistantParts(message)).toEqual(message.parts!)
+  })
+})
+
+describe('pending action recovery', () => {
+  test('restores a proposal whose tool receipt was not persisted', () => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'assistant',
+        content: 'Please confirm the proposal.',
+        parts: [
+          { type: 'text' as const, text: 'Please confirm the proposal.' },
+        ],
+      },
+    ]
+    const actions = [
+      { public_id: 'action-missing', status: 'proposed' },
+      { public_id: 'action-done', status: 'executed' },
+    ]
+
+    expect(unrepresentedPendingActions(messages, actions)).toEqual([actions[0]])
+  })
+
+  test('does not duplicate single or plan proposal cards', () => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'assistant',
+        content: '',
+        tools: [
+          {
+            id: 'single',
+            name: 'temps_write',
+            arguments: '{}',
+            result: JSON.stringify({
+              status: 'proposed',
+              action_id: 'action-single',
+            }),
+          },
+          {
+            id: 'plan',
+            name: 'temps_write',
+            arguments: '{}',
+            result: JSON.stringify({
+              status: 'proposed_plan',
+              steps: [
+                { action_id: 'action-plan-1' },
+                { action_id: 'action-plan-2' },
+              ],
+            }),
+          },
+        ],
+      },
+    ]
+
+    expect([...representedPendingActionIds(messages)].sort()).toEqual([
+      'action-plan-1',
+      'action-plan-2',
+      'action-single',
+    ])
+    expect(
+      unrepresentedPendingActions(messages, [
+        { public_id: 'action-single', status: 'proposed' },
+        { public_id: 'action-plan-1', status: 'proposed' },
+        { public_id: 'action-plan-2', status: 'proposed' },
+      ])
+    ).toEqual([])
   })
 })
