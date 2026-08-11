@@ -195,11 +195,15 @@ mod tests {
 
         // The compatibility migration is deliberately reversible as a no-op:
         // the concurrently managed index must survive both down and re-up.
+        let latest_migration_name = Migrator::migrations()
+            .last()
+            .map(|migration| migration.name().to_string())
+            .ok_or_else(|| anyhow::anyhow!("migration registry is empty"))?;
         Migrator::down(connection.as_ref(), Some(1)).await?;
         let pending_after_down = get_pending_migration_names(connection.as_ref()).await?;
         assert_eq!(
             pending_after_down.last().map(String::as_str),
-            Some("m20260806_000001_index_permission_denied_retention")
+            Some(latest_migration_name.as_str())
         );
         Migrator::up(connection.as_ref(), Some(1)).await?;
         let index_after_round_trip = connection
