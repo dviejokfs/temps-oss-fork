@@ -271,9 +271,9 @@ test.describe('Temps Cloud activation onboarding', () => {
     await page.goto('/settings/cloud')
     await expectAppMounted(page)
     await expect(page.getByText('Cloud connection is degraded')).toBeVisible()
-    await expect(
-      page.getByText('Cloud is unreachable; 12 spans are buffered locally.')
-    ).toBeVisible()
+    await expect(page.getByRole('alert')).toContainText(
+      'Cloud is unreachable; 12 spans are buffered locally.'
+    )
     await expect(
       page.getByRole('button', { name: 'Check again' })
     ).toBeVisible()

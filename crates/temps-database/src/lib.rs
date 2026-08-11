@@ -193,13 +193,19 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("invalid retention index was not rebuilt"))?;
         assert!(repaired.try_get::<bool>("", "is_valid")?);
 
-        // The compatibility migration is deliberately reversible as a no-op:
-        // the concurrently managed index must survive both down and re-up.
+        // The latest migration must remain reversible without disturbing the
+        // separately managed concurrent index. Resolve its name dynamically so
+        // appending a migration cannot make this assertion stale.
+        let migrations = Migrator::migrations();
+        let latest_migration_name = migrations
+            .last()
+            .map(|migration| migration.name().to_owned())
+            .ok_or_else(|| anyhow::anyhow!("migration registry is empty"))?;
         Migrator::down(connection.as_ref(), Some(1)).await?;
         let pending_after_down = get_pending_migration_names(connection.as_ref()).await?;
         assert_eq!(
             pending_after_down.last().map(String::as_str),
-            Some("m20260806_000001_index_permission_denied_retention")
+            Some(latest_migration_name.as_str())
         );
         Migrator::up(connection.as_ref(), Some(1)).await?;
         let index_after_round_trip = connection
