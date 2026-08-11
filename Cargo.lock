@@ -11227,6 +11227,8 @@ dependencies = [
  "temps-migrations",
  "temps-notifications",
  "temps-projects",
+ "temps-proxy",
+ "temps-routes",
  "thiserror 2.0.19",
  "time",
  "tokio",
