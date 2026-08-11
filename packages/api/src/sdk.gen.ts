@@ -547,6 +547,9 @@ import type {
   DetachScheduleServiceData,
   DetachScheduleServiceErrors,
   DetachScheduleServiceResponses,
+  DetectPublicEnvExampleData,
+  DetectPublicEnvExampleErrors,
+  DetectPublicEnvExampleResponses,
   DetectPublicPresetsData,
   DetectPublicPresetsErrors,
   DetectPublicPresetsResponses,
@@ -1146,6 +1149,12 @@ import type {
   GetPublicBranchesData,
   GetPublicBranchesErrors,
   GetPublicBranchesResponses,
+  GetPublicComposePreviewData,
+  GetPublicComposePreviewErrors,
+  GetPublicComposePreviewResponses,
+  GetPublicComposeServicesData,
+  GetPublicComposeServicesErrors,
+  GetPublicComposeServicesResponses,
   GetPublicIpData,
   GetPublicIpErrors,
   GetPublicIpResponses,
@@ -1173,6 +1182,15 @@ import type {
   GetRepositoryByNameData,
   GetRepositoryByNameErrors,
   GetRepositoryByNameResponses,
+  GetRepositoryComposePreviewData,
+  GetRepositoryComposePreviewErrors,
+  GetRepositoryComposePreviewResponses,
+  GetRepositoryComposeServicesLiveData,
+  GetRepositoryComposeServicesLiveErrors,
+  GetRepositoryComposeServicesLiveResponses,
+  GetRepositoryEnvExampleLiveData,
+  GetRepositoryEnvExampleLiveErrors,
+  GetRepositoryEnvExampleLiveResponses,
   GetRepositoryPresetByNameData,
   GetRepositoryPresetByNameErrors,
   GetRepositoryPresetByNameResponses,
@@ -1406,12 +1424,18 @@ import type {
   IngestTracesData,
   IngestTracesErrors,
   IngestTracesResponses,
+  IngestTunneledEnvelopeData,
+  IngestTunneledEnvelopeErrors,
+  IngestTunneledEnvelopeResponses,
   InitSessionReplayData,
   InitSessionReplayErrors,
   InitSessionReplayResponses,
   InspectDropArchiveData,
   InspectDropArchiveErrors,
   InspectDropArchiveResponses,
+  IssueRuntimeCredentialsData,
+  IssueRuntimeCredentialsErrors,
+  IssueRuntimeCredentialsResponses,
   JobLogsData,
   JobLogsErrors,
   JobLogsResponses,
@@ -1981,6 +2005,9 @@ import type {
   RevealNotificationProviderConfigData,
   RevealNotificationProviderConfigErrors,
   RevealNotificationProviderConfigResponses,
+  RevealServiceEnvironmentVariablesData,
+  RevealServiceEnvironmentVariablesErrors,
+  RevealServiceEnvironmentVariablesResponses,
   RevealServiceParameterData,
   RevealServiceParameterErrors,
   RevealServiceParameterResponses,
@@ -2636,6 +2663,44 @@ export const recordEventMetrics = <ThrowOnError extends boolean = false>(
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Ingest a browser-tunneled Sentry envelope.
+ *
+ * No DSN credential — the project/environment/deployment are resolved from
+ * the `Host` header via the proxy's route table, the same way
+ * `/api/_temps/event` (analytics) resolves. Browser SDKs reach this path via
+ * `Sentry.init({ tunnel: SENTRY_TUNNEL_ROUTE_PATH })`, which the proxy
+ * forwards to the console from any domain a project is deployed on
+ * (`ROUTE_PREFIX_TEMPS`), so it works on custom domains and previews without
+ * per-domain DSN configuration.
+ *
+ * Since there is no credential, an `Origin`/`Referer` check stands in for
+ * authentication: the request must claim to come from the same host it
+ * resolves to, or it is rejected. This is weaker than a DSN (both are
+ * visible to anyone who can read the page), but it closes the trivial case
+ * of a script targeting an arbitrary victim domain with no recon at all.
+ */
+export const ingestTunneledEnvelope = <ThrowOnError extends boolean = false>(
+  options: Options<IngestTunneledEnvelopeData, ThrowOnError>,
+): RequestResult<
+  IngestTunneledEnvelopeResponses,
+  IngestTunneledEnvelopeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    IngestTunneledEnvelopeResponses,
+    IngestTunneledEnvelopeErrors,
+    ThrowOnError
+  >({
+    bodySerializer: null,
+    url: "/_temps/sentry/envelope",
+    ...options,
+    headers: {
+      "Content-Type": "application/octet-stream",
       ...options.headers,
     },
   });
@@ -6849,6 +6914,28 @@ export const getClusterHealth = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Reveal a service's basic environment variables in plaintext, before it is
+ * linked to any project. Used by the new-project wizard to fill a detected
+ * variable (e.g. `DATABASE_URL`) from a service the user just picked or
+ * created — every successful reveal is recorded, matching the audited
+ * single-variable reveal used once a service is project-linked.
+ */
+export const revealServiceEnvironmentVariables = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<RevealServiceEnvironmentVariablesData, ThrowOnError>,
+): RequestResult<
+  RevealServiceEnvironmentVariablesResponses,
+  RevealServiceEnvironmentVariablesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    RevealServiceEnvironmentVariablesResponses,
+    RevealServiceEnvironmentVariablesErrors,
+    ThrowOnError
+  >({ url: "/external-services/{id}/environment", ...options });
+
+/**
  * Run a health check for one service right now
  *
  * Triggers the same engine-specific probe as the background monitor, writes
@@ -7370,6 +7457,41 @@ export const getServiceEnvironmentVariable = <
     ThrowOnError
   >({
     url: "/external-services/{id}/projects/{project_id}/environment/{var_name}",
+    ...options,
+  });
+
+/**
+ * Issue live connection credentials for a service in an environment
+ *
+ * Provisions the per-tenant database if it does not exist yet, then returns
+ * the connection variables in plaintext — the same values a deployment gets
+ * injected at runtime.
+ *
+ * **This is a POST because it is not a read.** It creates a database as a
+ * side effect, and its response is a live credential: a GET would be
+ * prefetchable, cacheable, and liable to end up in a proxy access log with
+ * the whole connection in the URL's neighbourhood. Nothing about it is safe
+ * or idempotent in the HTTP sense.
+ *
+ * Intended for callers that need to *connect* an application to a managed
+ * service — the console's own deploy path does this in-process; external
+ * plugins reach it here. For inspecting configuration, use the masked bulk
+ * read or the single-variable reveal instead.
+ */
+export const issueRuntimeCredentials = <ThrowOnError extends boolean = false>(
+  options: Options<IssueRuntimeCredentialsData, ThrowOnError>,
+): RequestResult<
+  IssueRuntimeCredentialsResponses,
+  IssueRuntimeCredentialsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    IssueRuntimeCredentialsResponses,
+    IssueRuntimeCredentialsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/{id}/projects/{project_id}/environments/{environment_id}/runtime-credentials",
     ...options,
   });
 
@@ -8764,6 +8886,65 @@ export const getPublicBranches = <ThrowOnError extends boolean = false>(
     GetPublicBranchesErrors,
     ThrowOnError
   >({ url: "/git/public/{provider}/{owner}/{repo}/branches", ...options });
+
+/**
+ * Parse a compose file's services for a public repository (supports GitHub
+ * and GitLab). Unlike env-example detection, the caller already knows the
+ * path (from the `compose_files` list `/preset` already returned), so this
+ * fetches that one file directly rather than scanning the tree first.
+ */
+export const getPublicComposeServices = <ThrowOnError extends boolean = false>(
+  options: Options<GetPublicComposeServicesData, ThrowOnError>,
+): RequestResult<
+  GetPublicComposeServicesResponses,
+  GetPublicComposeServicesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetPublicComposeServicesResponses,
+    GetPublicComposeServicesErrors,
+    ThrowOnError
+  >({ url: "/git/public/{provider}/{owner}/{repo}/compose-file", ...options });
+
+/**
+ * Render a redacted effective Compose preview for a public repository.
+ */
+export const getPublicComposePreview = <ThrowOnError extends boolean = false>(
+  options: Options<GetPublicComposePreviewData, ThrowOnError>,
+): RequestResult<
+  GetPublicComposePreviewResponses,
+  GetPublicComposePreviewErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    GetPublicComposePreviewResponses,
+    GetPublicComposePreviewErrors,
+    ThrowOnError
+  >({
+    url: "/git/public/{provider}/{owner}/{repo}/compose-file",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Detect and parse a `.env.example`-style file for a public repository
+ * (supports GitHub and GitLab)
+ */
+export const detectPublicEnvExample = <ThrowOnError extends boolean = false>(
+  options: Options<DetectPublicEnvExampleData, ThrowOnError>,
+): RequestResult<
+  DetectPublicEnvExampleResponses,
+  DetectPublicEnvExampleErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    DetectPublicEnvExampleResponses,
+    DetectPublicEnvExampleErrors,
+    ThrowOnError
+  >({ url: "/git/public/{provider}/{owner}/{repo}/env-example", ...options });
 
 /**
  * Detect presets for a public repository (supports GitHub and GitLab)
@@ -16078,6 +16259,76 @@ export const getRepositoryTags = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/repositories/{owner}/{repo}/tags",
+    ...options,
+  });
+
+/**
+ * Parse a compose file's services for a connected repository, live
+ */
+export const getRepositoryComposeServicesLive = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetRepositoryComposeServicesLiveData, ThrowOnError>,
+): RequestResult<
+  GetRepositoryComposeServicesLiveResponses,
+  GetRepositoryComposeServicesLiveErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetRepositoryComposeServicesLiveResponses,
+    GetRepositoryComposeServicesLiveErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/repositories/{repository_id}/compose-file/live",
+    ...options,
+  });
+
+/**
+ * Render a redacted effective Compose preview for a connected repository.
+ */
+export const getRepositoryComposePreview = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetRepositoryComposePreviewData, ThrowOnError>,
+): RequestResult<
+  GetRepositoryComposePreviewResponses,
+  GetRepositoryComposePreviewErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    GetRepositoryComposePreviewResponses,
+    GetRepositoryComposePreviewErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/repositories/{repository_id}/compose-file/preview",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Detect and parse a `.env.example`-style file for a connected repository
+ */
+export const getRepositoryEnvExampleLive = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetRepositoryEnvExampleLiveData, ThrowOnError>,
+): RequestResult<
+  GetRepositoryEnvExampleLiveResponses,
+  GetRepositoryEnvExampleLiveErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetRepositoryEnvExampleLiveResponses,
+    GetRepositoryEnvExampleLiveErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/repositories/{repository_id}/env-example/live",
     ...options,
   });
 
