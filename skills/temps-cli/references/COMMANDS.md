@@ -3,6 +3,9 @@
 > Auto-generated documentation for the Temps CLI.
 >
 > Generated from: `@temps-sdk/cli@0.1.31`
+>
+> Apply the authorization, target-context, and secret-handling rules in
+> [the Temps CLI skill](../SKILL.md) before executing a command.
 
 ## Installation
 
@@ -31,6 +34,86 @@ temps configure
 | `--no-color` | Disable colored output |
 | `--debug` | Enable debug output |
 | `-h, --help` | Display help for command |
+
+## Command index
+
+Use this index or search for a top-level command heading to load only the relevant group.
+
+- [`login`](#login) - Authenticate with a Temps server. Opens the browser for interactive logins; use --api-key for headless / CI.
+- [`logout`](#logout) - Revoke the active context's API key on the server and forget it locally
+- [`whoami`](#whoami) - Display current authenticated user and active context
+- [`context`](#context) - Manage CLI contexts (one set of credentials per Temps server)
+- [`configure`](#configure) - Configure CLI settings (AWS-style wizard)
+- [`projects`](#projects) - Manage projects
+- [`drop`](#drop) - Detect and deploy a local source directory or ZIP without Git
+- [`deploy`](#deploy) - Deploy a project from git
+- [`deploy:static`](#deploystatic) - Deploy static files (tar.gz, zip, or directory)
+- [`deploy:image`](#deployimage) - Deploy a pre-built Docker image
+- [`deploy:local-image`](#deploylocal-image) - Build and deploy a local Docker image (or deploy existing image with --image)
+- [`deployments`](#deployments) - Manage deployments
+- [`domains`](#domains) - Manage custom domains
+- [`environments`](#environments) - Manage environments and environment variables
+- [`providers`](#providers) - Manage Git providers
+- [`backups`](#backups) - Manage backup schedules and backups
+- [`runtime-logs`](#runtime-logs) - View runtime container logs (use -f to follow in real-time)
+- [`notifications`](#notifications) - Manage notification providers (Slack, Email, Webhook, etc.)
+- [`dns`](#dns) - Manage DNS providers for automated domain verification
+- [`services`](#services) - Manage external services (databases, caches, storage)
+- [`settings`](#settings) - Manage platform settings
+- [`users`](#users) - Manage platform users
+- [`teams`](#teams) - Manage teams and project access
+- [`access`](#access) - Manage which teams can reach a project
+- [`apikeys`](#apikeys) - Manage API keys for programmatic access
+- [`monitors`](#monitors) - Manage uptime monitors for status pages
+- [`webhooks`](#webhooks) - Manage webhooks for project events
+- [`containers`](#containers) - Manage project containers in environments
+- [`tokens`](#tokens) - Manage deployment tokens for project API access (KV, Blob, etc.)
+- [`errors`](#errors) - Manage error tracking and error groups
+- [`traces`](#traces) - Inspect distributed traces and operation latency
+- [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
+- [`kv`](#kv) - KV store commands (coming soon)
+- [`flags`](#flags) - Manage feature flags (runtime config that changes without a redeploy)
+- [`data`](#data) - Browse the data inside a service (tables, collections, keys, objects) — read-only
+- [`blob`](#blob) - Blob storage commands (coming soon)
+- [`dsn`](#dsn) - Manage Data Source Names (DSNs) for error tracking and analytics
+- [`scans`](#scans) - Manage vulnerability scans
+- [`custom-domains`](#custom-domains) - Manage project custom domains
+- [`dns-provider`](#dns-provider) - Manage DNS providers and managed domains
+- [`ip-access`](#ip-access) - Manage IP access control rules
+- [`audit`](#audit) - View audit logs
+- [`proxy-logs`](#proxy-logs) - View proxy request logs and statistics
+- [`email-domains`](#email-domains) - Manage email domains for transactional email
+- [`email-providers`](#email-providers) - Manage email providers (SES, Scaleway) for transactional email
+- [`incidents`](#incidents) - Manage incidents for status pages and monitoring
+- [`emails`](#emails) - Manage and send emails
+- [`load-balancer`](#load-balancer) - Manage load balancer routes
+- [`migrate`](#migrate) - Migrate a project from another platform (Vercel, Coolify, Dokploy, CapRover, Portainer, Kubernetes, Docker) into temps
+- [`templates`](#templates) - Browse deployment templates
+- [`platform`](#platform) - View platform and server information
+- [`presets`](#presets) - Browse available build presets
+- [`analytics`](#analytics) - View project analytics
+- [`funnels`](#funnels) - Manage analytics funnels for projects
+- [`notification-preferences`](#notification-preferences) - Manage notification preferences
+- [`skills`](#skills) - Manage AI skill definitions (global or project-scoped)
+- [`mcp-servers`](#mcp-servers) - Manage MCP server definitions (global or project-scoped)
+- [`secrets`](#secrets) - Manage agent secrets. env-type: reference as ${TEMPS_SECRET:name} in MCP config. file-type: written to --mount-path in sandbox; reference that path.
+- [`sandbox`](#sandbox) - Manage standalone sandboxes (/v1/sandbox API)
+- [`workflow`](#workflow) - Trigger and inspect agent/workflow runs
+- [`revenue`](#revenue) - Manage revenue integrations and import historical data
+- [`session-replay`](#session-replay) - Manage session replay recordings
+- [`init`](#init) - Initialize a Temps project in the current directory
+- [`link`](#link) - Link current directory to a Temps project
+- [`up`](#up) - Deploy the current project (runs setup wizard if not linked)
+- [`status`](#status) - Show project deployment status
+- [`ai`](#ai) - AI assistant status for a project
+- [`instances`](#instances) - Manage Temps server instances
+- [`env:pull`](#envpull) - Pull environment variables to a .env file
+- [`env:push`](#envpush) - Push environment variables from a .env file
+- [`rollback`](#rollback) - Rollback to a previous deployment
+- [`open`](#open) - Open project URL in browser
+- [`exec`](#exec) - Execute a command in a running container (coming soon)
+- [`dev`](#dev) - Start a local development tunnel (coming soon)
+- [`cloud`](#cloud) - Temps Cloud
 
 ## Commands
 
@@ -6395,5 +6478,5 @@ Use `temps configure show` to view current configuration.
 
 ## Support
 
-- Documentation: https://temps.dev/docs
-- Issues: https://github.com/kfs/temps/issues
+- Documentation: https://temps.sh/docs
+- Issues: https://github.com/gotempsh/temps/issues

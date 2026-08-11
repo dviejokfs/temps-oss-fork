@@ -110,6 +110,25 @@ function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown'
   return md
 }
 
+function markdownAnchor(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+}
+
+function generateCommandIndex(commands: CommandInfo[]): string {
+  let index = '## Command index\n\n'
+  index += 'Use this index or search for a top-level command heading to load only the relevant group.\n\n'
+
+  for (const command of commands) {
+    index += `- [\`${command.name}\`](#${markdownAnchor(command.name)}) - ${command.description}\n`
+  }
+
+  return `${index}\n## Commands\n\n`
+}
+
 function generateHeader(
   format: 'markdown' | 'mdx' = 'markdown',
   version: string,
@@ -126,6 +145,9 @@ function generateHeader(
 > Auto-generated documentation for the Temps CLI.
 >
 > Generated from: \`@temps-sdk/cli@${version}\`
+>
+> Apply the authorization, target-context, and secret-handling rules in
+> [the Temps CLI skill](../SKILL.md) before executing a command.
 
 ## Installation
 
@@ -154,8 +176,6 @@ temps configure
 | \`--no-color\` | Disable colored output |
 | \`--debug\` | Enable debug output |
 | \`-h, --help\` | Display help for command |
-
-## Commands
 
 `
 }
@@ -235,8 +255,8 @@ Use \`temps configure show\` to view current configuration.
 
 ## Support
 
-- Documentation: https://temps.dev/docs
-- Issues: https://github.com/kfs/temps/issues
+- Documentation: https://temps.sh/docs
+- Issues: https://github.com/gotempsh/temps/issues
 `
 }
 
@@ -256,6 +276,7 @@ export async function generateDocs(options: DocsOptions): Promise<void> {
   } else {
     const format = options.format === 'mdx' ? 'mdx' : 'markdown'
     output = generateHeader(format, program.version() ?? 'unknown')
+    output += generateCommandIndex(commands)
     output += generateMarkdown(commands, 2, format)
     output += generateFooter()
   }

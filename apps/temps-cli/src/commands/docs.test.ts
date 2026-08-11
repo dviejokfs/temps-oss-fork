@@ -39,4 +39,20 @@ describe('generateDocs', () => {
 
     expect(await readFile(output, 'utf8')).toBe(await readFile(committedReference, 'utf8'))
   })
+
+  test('keeps the always-loaded skill concise and routes detail to references', async () => {
+    const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), '../../../..')
+    const skill = await readFile(join(repositoryRoot, 'skills/temps-cli/SKILL.md'), 'utf8')
+    const commandReference = await readFile(
+      join(repositoryRoot, 'skills/temps-cli/references/COMMANDS.md'),
+      'utf8',
+    )
+
+    expect(skill.split('\n').length).toBeLessThanOrEqual(500)
+    expect(skill).toContain('[references/COMMANDS.md](references/COMMANDS.md)')
+    expect(skill).toContain('[references/WORKFLOWS.md](references/WORKFLOWS.md)')
+    expect(commandReference).toContain('## Command index')
+    expect(commandReference).toContain('[`backups`](#backups)')
+    expect(commandReference).toContain('[`otel-forward`](#otel-forward)')
+  })
 })
