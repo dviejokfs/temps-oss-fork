@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   chatProviderLabel,
+  reconcileChatRuntimeAfterRefresh,
   resolveChatRuntimeSelection,
   type ChatProviderOption,
 } from './chat-runtime-options'
@@ -93,4 +94,38 @@ describe('resolveChatRuntimeSelection', () => {
 
 test('provider labels identify ambient host credentials', () => {
   expect(chatProviderLabel(providers[1])).toBe('Codex · Host environment')
+})
+
+test('a model refresh drops a stale thinking sentinel without switching harnesses', () => {
+  const refreshed: ChatProviderOption[] = [
+    {
+      id: 'opencode',
+      name: 'OpenCode',
+      auth_source: 'host_environment',
+      models: [
+        {
+          id: 'opencode/big-pickle',
+          name: 'Big Pickle',
+          thinking_options: [],
+        },
+      ],
+      default_model_id: 'opencode/big-pickle',
+      permission_modes: [{ id: 'build', name: 'Build' }],
+      default_permission_mode_id: 'build',
+    },
+  ]
+
+  expect(
+    reconcileChatRuntimeAfterRefresh(refreshed, {
+      providerId: 'opencode',
+      modelId: 'opencode/big-pickle',
+      thinkingOptionId: 'default',
+      permissionModeId: 'build',
+    })
+  ).toEqual({
+    providerId: 'opencode',
+    modelId: 'opencode/big-pickle',
+    thinkingOptionId: null,
+    permissionModeId: 'build',
+  })
 })

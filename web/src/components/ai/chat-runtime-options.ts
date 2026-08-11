@@ -87,6 +87,21 @@ export function resolveChatRuntimeSelection(
   }
 }
 
+/**
+ * Keep the pinned harness while reconciling model capabilities returned by a
+ * forced refresh. Stale model/thinking values are dropped, but a temporarily
+ * absent provider never makes an existing conversation switch harnesses.
+ */
+export function reconcileChatRuntimeAfterRefresh(
+  providers: ChatProviderOption[],
+  current: ChatRuntimeSelection
+): ChatRuntimeSelection {
+  if (!providers.some((provider) => provider.id === current.providerId)) {
+    return current
+  }
+  return resolveChatRuntimeSelection(providers, current.providerId, current)
+}
+
 export function chatProviderLabel(provider: ChatProviderOption): string {
   const source =
     provider.auth_source === 'host_environment'

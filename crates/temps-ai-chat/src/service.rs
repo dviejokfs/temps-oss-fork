@@ -367,6 +367,30 @@ fn model_supports_thinking(provider: &str, model: &str) -> bool {
     provider == "openai" && (model.starts_with("gpt-5") || model.starts_with('o'))
 }
 
+/// `default` is a UI/protocol sentinel meaning "let the harness choose". It
+/// is not a reasoning variant and must never be validated or passed to a CLI.
+fn normalize_thinking_level(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty() && *value != "default")
+}
+
+fn discovered_thinking_level(
+    model: &temps_agents::ai_cli::AiCliModelCapability,
+    requested: Option<&str>,
+) -> Option<String> {
+    let requested = normalize_thinking_level(requested);
+    requested
+        .or_else(|| {
+            model.default_reasoning_option.as_deref().filter(|default| {
+                model
+                    .reasoning_options
+                    .iter()
+                    .any(|option| option == default)
+            })
+        })
+        .or_else(|| model.reasoning_options.first().map(String::as_str))
+        .map(str::to_string)
+}
+
 fn valid_thinking(provider: &str, model: &str, value: Option<&str>) -> bool {
     match provider {
         "claude_cli" if model.contains("haiku") => value.is_none(),
@@ -381,7 +405,7 @@ fn valid_thinking(provider: &str, model: &str, value: Option<&str>) -> bool {
         "codex_cli" => value.is_some_and(|v| {
             matches!(v, "low" | "medium" | "high") || (v == "xhigh" && !model.contains("mini"))
         }),
-        "opencode" => value.is_some_and(|v| matches!(v, "default" | "high")),
+        "opencode" => value.is_none() || value.is_some_and(|v| v == "high"),
         _ if model_supports_thinking(provider, model) => {
             value.is_some_and(|v| matches!(v, "low" | "medium" | "high" | "xhigh"))
         }
@@ -1150,6 +1174,8 @@ impl ConversationService {
     ) -> Result<ConversationRuntime, ChatError> {
         use temps_entities::ai_provider_keys;
 
+        let requested_thinking_level = normalize_thinking_level(requested_thinking_level);
+
         let provider = match requested {
             Some(value) => value.to_string(),
             None => {
@@ -1238,24 +1264,17 @@ impl ConversationService {
             )));
         }
         let model = resolve_cli_model_id(&provider, &discovered_models, requested_model)?;
-        let default_thinking = match provider.as_str() {
-            "claude_cli" => "high",
-            "codex_cli" => "high",
-            "opencode" => "default",
-            _ => "default",
-        };
         let discovered_model = discovered_models.iter().find(|item| item.id == model);
-        let thinking_level = if provider == "claude_cli" && model.contains("haiku") {
+        let thinking_level = if let Some(discovered) = discovered_model {
+            discovered_thinking_level(discovered, requested_thinking_level)
+        } else if provider == "claude_cli" && model.contains("haiku") {
             requested_thinking_level.map(str::to_string)
         } else {
-            Some(
-                requested_thinking_level
-                    .or_else(|| {
-                        discovered_model.and_then(|item| item.default_reasoning_option.as_deref())
-                    })
-                    .unwrap_or(default_thinking)
-                    .to_string(),
-            )
+            requested_thinking_level
+                .or_else(|| {
+                    matches!(provider.as_str(), "claude_cli" | "codex_cli").then_some("high")
+                })
+                .map(str::to_string)
         };
         let thinking_is_valid = if let Some(discovered) = discovered_model {
             thinking_level.as_deref().is_none_or(|thinking| {
@@ -1325,11 +1344,9 @@ impl ConversationService {
     ) -> Result<ai_conversations::Model, ChatError> {
         let desired_model = model.unwrap_or(&conv.ai_model);
         let model_changed = desired_model != conv.ai_model;
-        let desired_thinking = thinking_level.or_else(|| {
-            (!model_changed)
-                .then_some(conv.ai_thinking_level.as_deref())
-                .flatten()
-        });
+        let current_thinking = normalize_thinking_level(conv.ai_thinking_level.as_deref());
+        let desired_thinking = normalize_thinking_level(thinking_level)
+            .or_else(|| (!model_changed).then_some(current_thinking).flatten());
         let desired_permission = permission_mode.unwrap_or(&conv.ai_permission_mode);
         if desired_model == conv.ai_model
             && desired_thinking == conv.ai_thinking_level.as_deref()
@@ -3630,6 +3647,43 @@ mod tests {
         ));
         assert!(valid_thinking("claude_cli", "haiku", None));
         assert!(!valid_thinking("claude_cli", "haiku", Some("high")));
+    }
+
+    #[test]
+    fn models_without_thinking_variants_do_not_invent_default() {
+        let big_pickle = temps_agents::ai_cli::AiCliModelCapability {
+            id: "opencode/big-pickle".to_string(),
+            name: "Big Pickle".to_string(),
+            reasoning_options: vec![],
+            default_reasoning_option: None,
+        };
+
+        assert_eq!(normalize_thinking_level(Some("default")), None);
+        assert_eq!(discovered_thinking_level(&big_pickle, None), None);
+        assert_eq!(
+            discovered_thinking_level(&big_pickle, Some("default")),
+            None
+        );
+        assert!(valid_thinking("opencode", "opencode/big-pickle", None));
+    }
+
+    #[test]
+    fn discovered_model_uses_only_an_advertised_thinking_default() {
+        let model = temps_agents::ai_cli::AiCliModelCapability {
+            id: "openai/gpt-5.4".to_string(),
+            name: "GPT-5.4".to_string(),
+            reasoning_options: vec!["low".to_string(), "medium".to_string()],
+            default_reasoning_option: Some("medium".to_string()),
+        };
+
+        assert_eq!(
+            discovered_thinking_level(&model, None).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            discovered_thinking_level(&model, Some("low")).as_deref(),
+            Some("low")
+        );
     }
 
     #[test]

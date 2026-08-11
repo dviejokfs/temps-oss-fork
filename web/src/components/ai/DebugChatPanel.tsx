@@ -42,6 +42,7 @@ import {
   Lock,
   Loader2,
   Paperclip,
+  RefreshCw,
   Send,
   ShieldCheck,
   Shield,
@@ -70,6 +71,7 @@ import rehypeHighlight from 'rehype-highlight'
 import { useAiAssistant } from './AiAssistantContext'
 import {
   chatProviderLabel,
+  reconcileChatRuntimeAfterRefresh,
   resolveChatRuntimeSelection,
   type ChatProviderOption,
   type ChatRuntimeSelection,
@@ -1546,6 +1548,7 @@ export function DebugChatPanel({
   const [providerStatusState, setProviderStatusState] = useState<
     'loading' | 'success' | 'error'
   >('loading')
+  const [providerRefreshing, setProviderRefreshing] = useState(false)
   const [runtimeSelection, setRuntimeSelection] =
     useState<ChatRuntimeSelection>({
       providerId: 'gateway',
@@ -1594,7 +1597,8 @@ export function DebugChatPanel({
   // Once the first message creates the row, `publicId` locks only the provider
   // harness. Model, reasoning, and permission mode remain turn-level controls.
   const loadProviderStatus = useCallback(async (forceRefresh = false) => {
-    setProviderStatusState('loading')
+    if (forceRefresh) setProviderRefreshing(true)
+    else setProviderStatusState('loading')
     try {
       const statusResult = forceRefresh
         ? await refreshAiProviderStatus({ throwOnError: true })
@@ -1625,6 +1629,12 @@ export function DebugChatPanel({
           : options
       )
 
+      if (providerPinnedRef.current) {
+        setRuntimeSelection((current) =>
+          reconcileChatRuntimeAfterRefresh(options, current)
+        )
+      }
+
       const active =
         status?.active_provider_type === 'agent_cli'
           ? status.agent_cli_provider_id
@@ -1640,7 +1650,13 @@ export function DebugChatPanel({
       }
       setProviderStatusState('success')
     } catch {
-      setProviderStatusState('error')
+      if (forceRefresh) {
+        toast.error('Couldn’t refresh provider authentication and models')
+      } else {
+        setProviderStatusState('error')
+      }
+    } finally {
+      setProviderRefreshing(false)
     }
   }, [])
 
@@ -2481,6 +2497,24 @@ export function DebugChatPanel({
                       </SelectContent>
                     </Select>
                   )}
+
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 shrink-0"
+                  disabled={providerRefreshing || streaming || starting}
+                  onClick={() => void loadProviderStatus(true)}
+                  aria-label="Refresh provider authentication and models"
+                  title="Refresh provider authentication and models"
+                >
+                  <RefreshCw
+                    className={cn(
+                      'h-3.5 w-3.5',
+                      providerRefreshing && 'animate-spin'
+                    )}
+                  />
+                </Button>
               </>
             )}
           </div>
