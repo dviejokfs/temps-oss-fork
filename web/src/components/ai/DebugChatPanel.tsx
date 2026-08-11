@@ -1659,6 +1659,19 @@ export function DebugChatPanel({
   }, [])
 
   const composerRef = useRef<HTMLTextAreaElement>(null)
+  const composerDisabled = streaming || (!publicId && !starting && !lazyCreate)
+
+  // `autoFocus` handles a composer that mounts enabled. Existing chats first
+  // mount disabled while their conversation id loads, so focus again whenever
+  // the composer becomes usable. This also returns keyboard focus after a turn
+  // finishes, matching normal chat-composer behaviour.
+  useEffect(() => {
+    if (composerDisabled) return
+    const frame = window.requestAnimationFrame(() => {
+      composerRef.current?.focus({ preventScroll: true })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [composerDisabled, projectId, contextType, ctxId])
 
   // Keep short prompts compact, grow with wrapped/new lines, then hand longer
   // drafts to an internal scrollbar so the composer cannot consume the chat.
@@ -2250,11 +2263,12 @@ export function DebugChatPanel({
       <div className="shrink-0 overflow-hidden rounded-lg border border-input bg-background transition-[border-color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/20">
         <Textarea
           ref={composerRef}
+          autoFocus
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder={placeholder}
           rows={2}
-          disabled={streaming || (!publicId && !starting && !lazyCreate)}
+          disabled={composerDisabled}
           className="min-h-[72px] resize-none overflow-y-hidden rounded-none border-0 shadow-none focus-visible:border-0 focus-visible:outline-none focus-visible:ring-0"
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
