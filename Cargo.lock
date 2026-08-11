@@ -10227,6 +10227,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "regex",
  "sea-orm",
  "serde",
  "serde_json",

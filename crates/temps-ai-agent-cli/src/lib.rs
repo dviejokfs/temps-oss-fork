@@ -16,5 +16,5 @@
 pub mod dispatch;
 pub mod service;
 
-pub use dispatch::{ActiveProviderReader, DispatchingAiService};
+pub use dispatch::{ActiveProviderReader, AiProviderRegistry, DispatchingAiService};
 pub use service::{AgentCliAiService, ScopedMcpBridge};

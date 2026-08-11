@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::streaming::{
     ChatStreamDelta, ChatTurnRequest, ChatTurnResponse, ChatTurnStream, TokenStream, ToolExecutor,
+    TurnServices,
 };
+use crate::{ProviderCapabilities, RefreshPolicy};
 
 /// A single AI completion request. Construct with `..Default::default()` and set
 /// only what you need:
@@ -105,6 +107,17 @@ pub trait AiService: Send + Sync {
         self.chat_capable().await
     }
 
+    /// Return the normalized controls and realtime features for one provider.
+    /// UI and conversation validation consume this contract, so adding an
+    /// adapter never requires provider-id branches in either layer.
+    async fn capabilities_for(
+        &self,
+        _provider: Option<&str>,
+        _refresh: RefreshPolicy,
+    ) -> Result<ProviderCapabilities, AiError> {
+        Err(AiError::NotAvailable)
+    }
+
     /// Low-level completion. Prefer the [`crate::complete_text`] /
     /// [`crate::complete_typed`] helpers for everyday use.
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError>;
@@ -148,5 +161,17 @@ pub trait AiService: Send + Sync {
         _executor: Option<ToolExecutor>,
     ) -> Result<ChatTurnStream, AiError> {
         self.chat_stream_turn(request).await
+    }
+
+    /// Provider-neutral turn entry point. Tools, user interactions, streaming,
+    /// and cancellation use the same runtime contract for gateway and harness
+    /// adapters. The executor-only method remains as a compatibility shim.
+    async fn chat_stream_turn_with_services(
+        &self,
+        request: ChatTurnRequest,
+        services: TurnServices,
+    ) -> Result<ChatTurnStream, AiError> {
+        self.chat_stream_turn_with_executor(request, services.tools)
+            .await
     }
 }

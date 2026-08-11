@@ -48,6 +48,24 @@ pub struct ToolCall {
 pub type ToolExecutor =
     Arc<dyn Fn(ToolCall) -> BoxFuture<'static, Result<String, AiError>> + Send + Sync>;
 
+/// Request-scoped bridge for provider-initiated user interactions (questions,
+/// plan approval, or other normalized permission prompts). The runtime owns
+/// persistence and authorization; adapters only await the returned decision.
+pub type InteractionExecutor = Arc<
+    dyn Fn(PermissionRequest) -> BoxFuture<'static, Result<PermissionDecision, AiError>>
+        + Send
+        + Sync,
+>;
+
+/// Common per-turn services supplied to every provider adapter. Adding a new
+/// provider never creates a new chat entry point: adapters receive the same
+/// scoped tools and interaction channel through this value.
+#[derive(Clone, Default)]
+pub struct TurnServices {
+    pub tools: Option<ToolExecutor>,
+    pub interactions: Option<InteractionExecutor>,
+}
+
 /// One turn of a conversation. Deliberately flat so it is provider-agnostic and
 /// trivially persisted as an `ai_messages` row. `tool_calls` / `tool_call_id`
 /// are only populated transiently during an agentic tool loop and are never

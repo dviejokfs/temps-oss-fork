@@ -52,6 +52,7 @@ impl TempsPlugin for AiChatPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
+            let encryption = context.require_service::<temps_core::EncryptionService>();
             let ai = context.require_service::<dyn temps_ai::AiService>();
             let log_service = context.require_service::<temps_logs::LogService>();
             // Audit logger for chat write operations (registered by AuditPlugin,
@@ -85,8 +86,11 @@ impl TempsPlugin for AiChatPlugin {
 
             // Pending-action service (propose-then-confirm write actions).
             // Audit is emitted by the handler layer (with full RequestMetadata).
-            let pending_actions =
-                Arc::new(PendingActionService::new(db.clone(), write_handle.clone()));
+            let pending_actions = Arc::new(PendingActionService::new(
+                db.clone(),
+                write_handle.clone(),
+                encryption,
+            ));
             context.register_service(pending_actions.clone());
 
             // Built-in providers (one per context_type). Future context types add
@@ -117,29 +121,6 @@ impl TempsPlugin for AiChatPlugin {
                 service = service.with_config(cfg.clone());
             }
 
-            // ADR-038 Phase 2: wire the interactive Claude CLI bridge so
-            // `should_use_interactive_cli()` can actually route turns through
-            // `run_interactive` when an operator opts in via
-            // `interactive_bridge_enabled`. Without this, the toggle persists
-            // but has no effect — `interactive_cli` stays `None` and every
-            // turn silently falls back to the one-shot path.
-            if let Some(cfg) = &config_service {
-                let scratch_dir = cfg.data_dir().join("interactive-cli-scratch");
-                if let Err(e) = std::fs::create_dir_all(&scratch_dir) {
-                    tracing::error!(
-                        "Failed to create interactive CLI scratch dir {}: {e} — \
-                         interactive bridge will be unavailable",
-                        scratch_dir.display()
-                    );
-                } else {
-                    service = service.with_interactive_cli(crate::service::InteractiveCliHandle {
-                        provider: Arc::new(temps_agents::ai_cli::claude::ClaudeCliProvider),
-                        scratch_dir,
-                        timeout: std::time::Duration::from_secs(15 * 60),
-                        concurrency: Arc::new(tokio::sync::Semaphore::new(2)),
-                    });
-                }
-            }
             let service = Arc::new(service);
             context.register_service(service.clone());
 

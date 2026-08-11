@@ -2,7 +2,10 @@ use async_trait::async_trait;
 use std::process::Stdio;
 use tokio::process::Command;
 
-use super::{AiCliProvider, AiCliStatus, AiRunConfig, AiRunResult};
+use super::{
+    copy_environment_variable, sanitize_command_environment, AiCliProvider, AiCliStatus,
+    AiRunConfig, AiRunResult,
+};
 use crate::error::AgentError;
 use crate::sandbox::user::SANDBOX_USER;
 
@@ -24,6 +27,8 @@ pub struct ClaudeCliProvider;
 
 fn cancellation_safe_command(program: &str) -> Command {
     let mut command = Command::new(program);
+    sanitize_command_environment(&mut command);
+    copy_environment_variable(&mut command, "ANTHROPIC_API_KEY");
     command.kill_on_drop(true);
     command
 }
@@ -57,6 +62,16 @@ async fn configure_chat_mcp(cmd: &mut Command, config: &AiRunConfig) -> Result<(
     }
     cmd.arg("--mcp-config")
         .arg(path)
+        // A chat turn must not inherit Claude Code's host shell/filesystem
+        // tools. The authenticated, project-scoped MCP bridge is the only
+        // application tool surface. Interactive mode additionally needs the
+        // two protocol tools that produce question/plan control requests.
+        .arg("--tools")
+        .arg(if config.permission_bridge.is_some() {
+            "AskUserQuestion,ExitPlanMode"
+        } else {
+            ""
+        })
         // The bridge itself is already authorization/project scoped, and
         // `temps_write` only stages confirm-gated proposals. Let Claude invoke
         // these MCP tools without an unrelated terminal permission prompt.
@@ -363,6 +378,50 @@ impl AiCliProvider for ClaudeCliProvider {
         }
     }
 
+    async fn discover_model_capabilities(&self) -> Vec<super::AiCliModelCapability> {
+        discover_models()
+            .await
+            .into_iter()
+            .map(|model| {
+                let has_reasoning =
+                    !model.effort_levels.is_empty() || model.supports_adaptive_thinking;
+                let mut reasoning_options = if has_reasoning {
+                    vec!["off".to_string()]
+                } else {
+                    Vec::new()
+                };
+                reasoning_options.extend(model.effort_levels.iter().cloned());
+                if model.supports_adaptive_thinking {
+                    reasoning_options.push("auto".to_string());
+                }
+                let default_reasoning_option = model
+                    .effort_levels
+                    .iter()
+                    .find(|effort| effort.as_str() == "medium")
+                    .or_else(|| model.effort_levels.first())
+                    .cloned();
+                super::AiCliModelCapability {
+                    id: model.id,
+                    name: model.name,
+                    reasoning_options,
+                    default_reasoning_option,
+                }
+            })
+            .collect()
+    }
+
+    fn extract_assistant_text(&self, line: &str) -> Option<String> {
+        extract_assistant_text(line)
+    }
+
+    fn extract_partial_text(&self, line: &str) -> Option<String> {
+        extract_partial_text(line)
+    }
+
+    fn dropped_tool_use_name(&self, line: &str) -> Option<String> {
+        dropped_tool_use_name(line)
+    }
+
     async fn run(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -519,6 +578,14 @@ impl AiCliProvider for ClaudeCliProvider {
             session_id: parsed.session_id,
             is_max_turns_error: parsed.is_max_turns_error,
         })
+    }
+
+    async fn run_turn(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
+        if config.permission_bridge.is_some() {
+            self.run_interactive(config).await
+        } else {
+            self.run(config).await
+        }
     }
 
     async fn continue_conversation(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
@@ -876,6 +943,26 @@ impl ClaudeCliProvider {
                             .unwrap_or(serde_json::Value::Null);
 
                         if let Some(bridge) = &permission_bridge {
+                            if !matches!(tool_name.as_str(), "AskUserQuestion" | "ExitPlanMode") {
+                                tracing::warn!(
+                                    provider = %provider_name,
+                                    request_id = %request_id,
+                                    tool_name = %tool_name,
+                                    "denying native Claude tool outside the chat allowlist"
+                                );
+                                let response_json = build_deny_response(&request_id);
+                                if stdin.write_all(response_json.as_bytes()).await.is_err()
+                                    || stdin.write_all(b"\n").await.is_err()
+                                    || stdin.flush().await.is_err()
+                                {
+                                    tracing::warn!(
+                                        provider = %provider_name,
+                                        request_id = %request_id,
+                                        "failed to write native-tool denial to claude stdin"
+                                    );
+                                }
+                                continue;
+                            }
                             // Derive the permission kind from `tool_name`, not
                             // `subtype`.  The Claude CLI uses `subtype` only for
                             // its own internal flow control; the human-visible
@@ -1469,6 +1556,7 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--allowedTools", "mcp__temps-chat__*"]));
+        assert!(args.windows(2).any(|pair| pair == ["--tools", ""]));
         let json: serde_json::Value = serde_json::from_slice(
             &tokio::fs::read(scratch.path().join(".temps-chat-mcp.json"))
                 .await
@@ -1479,6 +1567,45 @@ mod tests {
             json["mcpServers"]["temps-chat"]["headers"]["Authorization"],
             "Bearer ephemeral-test-token"
         );
+    }
+
+    #[tokio::test]
+    async fn interactive_claude_only_exposes_protocol_and_scoped_mcp_tools() {
+        let scratch = tempfile::tempdir().expect("create scratch directory");
+        let config = super::super::AiRunConfig {
+            work_dir: scratch.path().to_owned(),
+            prompt: "hello".to_string(),
+            api_key: String::new(),
+            max_turns: 1,
+            timeout: std::time::Duration::from_secs(30),
+            model: None,
+            thinking_level: None,
+            permission_mode: Some("default".to_string()),
+            on_event: None,
+            permission_bridge: Some(std::sync::Arc::new(super::super::PermissionBridge {
+                on_permission_request: std::sync::Arc::new(|_| {
+                    let (_tx, rx) = tokio::sync::oneshot::channel();
+                    rx
+                }),
+            })),
+            resume_session_id: None,
+            mcp_server: Some(super::super::McpServerConfig {
+                url: "http://127.0.0.1:32123/mcp/turn".to_string(),
+                authorization_token: "ephemeral-test-token".to_string(),
+            }),
+        };
+        let mut command = cancellation_safe_command("claude");
+        configure_chat_mcp(&mut command, &config)
+            .await
+            .expect("write MCP config");
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--tools", "AskUserQuestion,ExitPlanMode"]));
     }
 
     #[test]
@@ -1832,10 +1959,10 @@ mod tests {
     }
 
     /// Integration test: `run_interactive` with a real permission bridge that
-    /// auto-allows the first tool request.  Skips gracefully if `claude` is
+    /// answers the first user question. Skips gracefully if `claude` is
     /// absent/unauthenticated (CI).
     #[tokio::test]
-    async fn test_run_interactive_with_permission_bridge_auto_allows() {
+    async fn test_run_interactive_with_permission_bridge_answers_question() {
         use std::sync::Arc;
         use temps_ai::streaming::{PermissionDecision, PermissionRequest};
         use tokio::sync::oneshot;
@@ -1846,22 +1973,23 @@ mod tests {
             return;
         }
 
-        // Bridge that immediately allows any tool request.
+        let bridge_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = bridge_called.clone();
         let bridge = super::super::PermissionBridge {
-            on_permission_request: Arc::new(|_req: PermissionRequest| {
+            on_permission_request: Arc::new(move |req: PermissionRequest| {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(req.tool_name, "AskUserQuestion");
                 let (tx, rx) = oneshot::channel::<PermissionDecision>();
-                // Immediately send "allow" without waiting.
-                let _ = tx.send(PermissionDecision::AllowTool);
+                let _ = tx.send(PermissionDecision::AnswerQuestion {
+                    answers: serde_json::json!({"Which option?": "Alpha"}),
+                });
                 rx
             }),
         };
 
         let config = super::super::AiRunConfig {
             work_dir: std::env::temp_dir(),
-            // Force a Bash tool call so the CLI emits a control_request.
-            // `--allowedTools "Bash"` without `--dangerously-skip-permissions`
-            // means the CLI will ask permission before running Bash.
-            prompt: "Run the shell command `echo hello_from_bridge` and output the result."
+            prompt: "Use AskUserQuestion exactly once. Ask `Which option?` with Alpha and Beta, then acknowledge the answer."
                 .to_string(),
             api_key: String::new(),
             max_turns: 3,
@@ -1885,6 +2013,10 @@ mod tests {
                 // Whether "hello_from_bridge" appears depends on auth/model,
                 // so we only check that we got some output back.
                 assert!(!result.output.is_empty(), "must return non-empty output");
+                assert!(
+                    bridge_called.load(std::sync::atomic::Ordering::SeqCst),
+                    "real Claude control request must traverse the permission bridge"
+                );
             }
             Err(crate::error::AgentError::AiCliNotInstalled { .. })
             | Err(crate::error::AgentError::AiCliFailed { .. })

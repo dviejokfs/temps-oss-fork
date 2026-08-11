@@ -4,7 +4,8 @@ pub mod codex;
 pub mod opencode;
 
 pub use catalog::{
-    find_provider, AuthFlavor, CredentialFormat, ProviderCatalogEntry, PROVIDER_CATALOG,
+    find_provider, AuthFlavor, CredentialFormat, HostAccessRequirement, ProviderCatalogEntry,
+    ProviderOption, PROVIDER_CATALOG,
 };
 
 use async_trait::async_trait;
@@ -15,9 +16,48 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use temps_ai::streaming::{PermissionDecision, PermissionRequest};
+use tokio::process::Command;
 use tokio::sync::oneshot;
 
 use crate::error::AgentError;
+
+/// Remove the Temps server environment before launching an AI harness.
+///
+/// Harnesses may expose native shell tools to the model, so inheriting the
+/// server process environment would also expose database URLs, signing keys,
+/// and credentials for unrelated integrations. Keep only the small set needed
+/// to locate the executable and the authenticated user's CLI config. Provider
+/// credentials and the ephemeral MCP token are added explicitly by adapters.
+pub(crate) fn sanitize_command_environment(command: &mut Command) {
+    const ALLOWED: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ];
+    let preserved = ALLOWED
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (*name, value)))
+        .collect::<Vec<_>>();
+    command.env_clear();
+    command.envs(preserved);
+}
+
+pub(crate) fn copy_environment_variable(command: &mut Command, name: &str) {
+    if let Some(value) = std::env::var_os(name) {
+        command.env(name, value);
+    }
+}
 
 /// Callback invoked for each line of AI CLI output (for real-time streaming)
 pub type OnEventCallback =
@@ -119,65 +159,9 @@ pub struct AiCliModelCapability {
 }
 
 pub async fn discover_model_capabilities(provider: &str) -> Vec<AiCliModelCapability> {
-    match provider {
-        "claude_cli" => claude::discover_models()
-            .await
-            .into_iter()
-            .map(|model| {
-                let has_reasoning =
-                    !model.effort_levels.is_empty() || model.supports_adaptive_thinking;
-                let mut reasoning_options = if has_reasoning {
-                    vec!["off".to_string()]
-                } else {
-                    Vec::new()
-                };
-                reasoning_options.extend(model.effort_levels.iter().cloned());
-                if model.supports_adaptive_thinking {
-                    reasoning_options.push("auto".to_string());
-                }
-                let default_reasoning_option = model
-                    .effort_levels
-                    .iter()
-                    .find(|effort| effort.as_str() == "medium")
-                    .or_else(|| model.effort_levels.first())
-                    .cloned();
-                AiCliModelCapability {
-                    id: model.id,
-                    name: model.name,
-                    reasoning_options,
-                    default_reasoning_option,
-                }
-            })
-            .collect(),
-        "codex_cli" => codex::discover_models()
-            .await
-            .into_iter()
-            .map(|model| AiCliModelCapability {
-                id: model.id,
-                name: model.name,
-                reasoning_options: model.reasoning_efforts,
-                default_reasoning_option: model.default_reasoning_effort,
-            })
-            .collect(),
-        "opencode" => opencode::discover_models()
-            .await
-            .into_iter()
-            .map(|model| {
-                let default_reasoning_option = model
-                    .variants
-                    .iter()
-                    .find(|variant| variant.as_str() == "medium")
-                    .or_else(|| model.variants.first())
-                    .cloned();
-                AiCliModelCapability {
-                    id: model.id,
-                    name: model.name,
-                    reasoning_options: model.variants,
-                    default_reasoning_option,
-                }
-            })
-            .collect(),
-        _ => Vec::new(),
+    match create_provider(provider) {
+        Some(provider) => provider.discover_model_capabilities().await,
+        None => Vec::new(),
     }
 }
 
@@ -186,10 +170,88 @@ pub trait AiCliProvider: Send + Sync {
     fn name(&self) -> &str;
     async fn check_installed(&self) -> bool;
     async fn get_status(&self) -> AiCliStatus;
+    async fn discover_model_capabilities(&self) -> Vec<AiCliModelCapability> {
+        Vec::new()
+    }
+    fn extract_assistant_text(&self, _line: &str) -> Option<String> {
+        None
+    }
+    fn extract_partial_text(&self, _line: &str) -> Option<String> {
+        None
+    }
+    fn dropped_tool_use_name(&self, _line: &str) -> Option<String> {
+        None
+    }
+
+    async fn capabilities(&self) -> Option<temps_ai::ProviderCapabilities> {
+        let registration = find_provider(self.name())?;
+        let models = self
+            .discover_model_capabilities()
+            .await
+            .into_iter()
+            .map(|model| temps_ai::ModelCapability {
+                id: model.id,
+                name: model.name,
+                thinking_modes: model
+                    .reasoning_options
+                    .into_iter()
+                    .map(|id| temps_ai::SelectOption {
+                        name: display_option_name(&id),
+                        id,
+                        description: Some("Supported by this model".to_string()),
+                    })
+                    .collect(),
+                default_thinking_mode_id: model.default_reasoning_option,
+            })
+            .collect::<Vec<_>>();
+        Some(temps_ai::ProviderCapabilities {
+            id: registration.id.to_string(),
+            name: registration.name.to_string(),
+            auth_source: temps_ai::ProviderAuthSource::HostEnvironment,
+            default_model_id: models.first().map(|model| model.id.clone()),
+            models,
+            permission_modes: registration
+                .permission_modes
+                .iter()
+                .map(|mode| temps_ai::SelectOption {
+                    id: mode.id.to_string(),
+                    name: mode.name.to_string(),
+                    description: Some(mode.description.to_string()),
+                })
+                .collect(),
+            default_permission_mode_id: Some(registration.default_permission_mode_id.to_string()),
+            realtime: temps_ai::RealtimeCapabilities {
+                text_streaming: registration.text_streaming,
+                reasoning_streaming: registration.reasoning_streaming,
+                tool_events: true,
+                user_interactions: registration.user_interactions,
+                cancellation: true,
+            },
+        })
+    }
     async fn run(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError>;
+    /// Execute one normalized chat turn. Most adapters use their regular run
+    /// protocol; adapters with a bidirectional interaction protocol override
+    /// this without requiring a special path in ConversationService.
+    async fn run_turn(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
+        self.run(config).await
+    }
     /// Continue an existing conversation in the same work directory.
     /// Uses `--continue` to resume the most recent session.
     async fn continue_conversation(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError>;
+}
+
+fn display_option_name(id: &str) -> String {
+    match id {
+        "xhigh" => "Extra high".to_string(),
+        value => {
+            let mut characters = value.chars();
+            characters
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + characters.as_str())
+                .unwrap_or_default()
+        }
+    }
 }
 
 /// Parse raw CLI output into the common parsed shape for any provider.
@@ -233,11 +295,7 @@ pub fn parse_output(provider: &str, output: &str) -> claude::ParsedClaudeOutput 
 /// schema differs, so dispatch on `provider` (an `AiCliProvider::name()`
 /// value) the same way [`parse_output`] does.
 pub fn extract_assistant_text(provider: &str, line: &str) -> Option<String> {
-    match provider {
-        "codex_cli" => codex::extract_assistant_text(line),
-        "opencode" => opencode::extract_assistant_text(line),
-        _ => claude::extract_assistant_text(line),
-    }
+    create_provider(provider)?.extract_assistant_text(line)
 }
 
 /// Extract one incremental text delta from a line, for providers whose CLI
@@ -248,10 +306,7 @@ pub fn extract_assistant_text(provider: &str, line: &str) -> Option<String> {
 /// back to [`extract_assistant_text`] for those providers, which still
 /// delivers the full reply, just not incrementally.
 pub fn extract_partial_text(provider: &str, line: &str) -> Option<String> {
-    match provider {
-        "codex_cli" | "opencode" => None,
-        _ => claude::extract_partial_text(line),
-    }
+    create_provider(provider)?.extract_partial_text(line)
 }
 
 /// Name the tool/action a dropped event invoked, when `line` is a tool call
@@ -264,11 +319,7 @@ pub fn extract_partial_text(provider: &str, line: &str) -> Option<String> {
 /// diagnostics — never log the returned name's surrounding `input`/`part`
 /// data, which may carry user content or command output.
 pub fn dropped_tool_use_name(provider: &str, line: &str) -> Option<String> {
-    match provider {
-        "codex_cli" => codex::dropped_tool_use_name(line),
-        "opencode" => opencode::dropped_tool_use_name(line),
-        _ => claude::dropped_tool_use_name(line),
-    }
+    create_provider(provider)?.dropped_tool_use_name(line)
 }
 
 /// Turn a failed CLI's raw stream output into a short, actionable message.
@@ -385,24 +436,35 @@ pub fn scrub_and_bound(s: &str) -> String {
 
 /// Create an AI CLI provider by name
 pub fn create_provider(name: &str) -> Option<Box<dyn AiCliProvider>> {
-    match name {
-        "claude_cli" => Some(Box::new(claude::ClaudeCliProvider)),
-        "codex_cli" => Some(Box::new(codex::CodexCliProvider)),
-        "opencode" => Some(Box::new(opencode::OpenCodeCliProvider)),
-        _ => None,
-    }
+    find_provider(name).map(|registration| (registration.factory)())
 }
-
-/// All supported provider names.
-pub const PROVIDER_NAMES: &[(&str, &str)] = &[
-    ("claude_cli", "Claude Code"),
-    ("opencode", "OpenCode"),
-    ("codex_cli", "Codex"),
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitized_harness_environment_drops_server_secrets() {
+        let mut command = Command::new("provider");
+        command.env("DATABASE_URL", "postgres://secret");
+        command.env("TEMPS_ENCRYPTION_KEY", "secret");
+        sanitize_command_environment(&mut command);
+        let environment = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(environment.get("DATABASE_URL"), None);
+        assert_eq!(environment.get("TEMPS_ENCRYPTION_KEY"), None);
+        if std::env::var_os("PATH").is_some() {
+            assert!(environment.contains_key("PATH"));
+        }
+    }
 
     #[test]
     fn test_summarize_cli_failure_rate_limit_rejected() {

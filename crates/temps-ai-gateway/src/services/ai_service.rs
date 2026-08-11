@@ -15,10 +15,11 @@ use tracing::debug;
 
 use temps_ai::{
     AiError, AiRequest, AiResponse, AiService, ChatMessage, ChatStreamDelta, ChatTool,
-    ChatTurnRequest, ChatTurnResponse, ChatTurnStream, TokenStream, ToolCall,
+    ChatTurnRequest, ChatTurnResponse, ChatTurnStream, ProviderCapabilities, RefreshPolicy,
+    TokenStream, ToolCall,
 };
 
-use crate::services::{ByokOverride, GatewayService};
+use crate::services::{gateway_provider_capabilities, ByokOverride, GatewayService};
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, MessageContent,
 };
@@ -301,6 +302,59 @@ impl AiService for GatewayAiService {
 
     async fn chat_capable_for(&self, provider: Option<&str>) -> bool {
         self.is_available_for(provider).await
+    }
+
+    async fn capabilities_for(
+        &self,
+        provider: Option<&str>,
+        _refresh: RefreshPolicy,
+    ) -> Result<ProviderCapabilities, AiError> {
+        let key = match provider {
+            Some(route) if route.starts_with("gateway_key:") => {
+                let raw_id = route.trim_start_matches("gateway_key:");
+                let key_id = raw_id.parse::<i32>().map_err(|_| AiError::Provider {
+                    purpose: "provider.capabilities".to_string(),
+                    reason: format!("invalid gateway provider key id '{raw_id}'"),
+                })?;
+                temps_entities::ai_provider_keys::Entity::find_by_id(key_id)
+                    .one(self.db.as_ref())
+                    .await
+                    .map_err(|error| AiError::Provider {
+                        purpose: "provider.capabilities".to_string(),
+                        reason: error.to_string(),
+                    })?
+            }
+            Some("gateway") | None => temps_entities::ai_provider_keys::Entity::find()
+                .filter(temps_entities::ai_provider_keys::Column::IsActive.eq(true))
+                .one(self.db.as_ref())
+                .await
+                .map_err(|error| AiError::Provider {
+                    purpose: "provider.capabilities".to_string(),
+                    reason: error.to_string(),
+                })?,
+            Some(route) => {
+                return Err(AiError::Provider {
+                    purpose: "provider.capabilities".to_string(),
+                    reason: format!("invalid gateway provider route '{route}'"),
+                });
+            }
+        }
+        .filter(|key| key.is_active)
+        .ok_or(AiError::NotAvailable)?;
+        let model_ids = self
+            .gateway
+            .available_models_for_provider(&key.provider)
+            .into_iter()
+            .map(|model| model.id)
+            .filter(|id| !id.starts_with("text-embedding-"))
+            .collect();
+        Ok(gateway_provider_capabilities(
+            format!("gateway_key:{}", key.id),
+            key.display_name,
+            &key.provider,
+            key.default_model,
+            model_ids,
+        ))
     }
 
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {

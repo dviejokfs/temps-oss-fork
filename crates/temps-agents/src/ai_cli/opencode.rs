@@ -2,7 +2,10 @@ use async_trait::async_trait;
 use std::process::Stdio;
 use tokio::process::Command;
 
-use super::{AiCliProvider, AiCliStatus, AiRunConfig, AiRunResult};
+use super::{
+    copy_environment_variable, sanitize_command_environment, AiCliProvider, AiCliStatus,
+    AiRunConfig, AiRunResult,
+};
 use crate::error::AgentError;
 
 const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -12,6 +15,18 @@ pub struct OpenCodeCliProvider;
 
 fn cancellation_safe_command() -> Command {
     let mut command = Command::new("opencode");
+    sanitize_command_environment(&mut command);
+    for name in [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "XAI_API_KEY",
+        "DEEPSEEK_API_KEY",
+    ] {
+        copy_environment_variable(&mut command, name);
+    }
     command.kill_on_drop(true);
     command
 }
@@ -25,7 +40,14 @@ fn apply_chat_mcp(cmd: &mut Command, config: &AiRunConfig) {
                     "type": "remote",
                     "url": server.url,
                     "headers": { "Authorization": format!("Bearer {}", server.authorization_token) }
-                }}
+                }},
+                // Chat runs may invoke only the ephemeral, authenticated MCP
+                // bridge. Deny OpenCode's host bash/filesystem/web tools even
+                // when the selected host agent normally enables them.
+                "permission": {
+                    "*": "deny",
+                    "temps_chat_*": "allow"
+                }
             })
             .to_string(),
         );
@@ -204,6 +226,35 @@ impl AiCliProvider for OpenCodeCliProvider {
             subscription_type: None,
             setup_hint,
         }
+    }
+
+    async fn discover_model_capabilities(&self) -> Vec<super::AiCliModelCapability> {
+        discover_models()
+            .await
+            .into_iter()
+            .map(|model| {
+                let default_reasoning_option = model
+                    .variants
+                    .iter()
+                    .find(|variant| variant.as_str() == "medium")
+                    .or_else(|| model.variants.first())
+                    .cloned();
+                super::AiCliModelCapability {
+                    id: model.id,
+                    name: model.name,
+                    reasoning_options: model.variants,
+                    default_reasoning_option,
+                }
+            })
+            .collect()
+    }
+
+    fn extract_assistant_text(&self, line: &str) -> Option<String> {
+        extract_assistant_text(line)
+    }
+
+    fn dropped_tool_use_name(&self, line: &str) -> Option<String> {
+        dropped_tool_use_name(line)
     }
 
     async fn run(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
@@ -685,6 +736,8 @@ ollama/qwen3.5:9b
         assert_eq!(json["mcp"]["temps-chat"]["type"], "remote");
         assert!(json["mcp"]["temps-chat"].get("codemode").is_none());
         assert!(json["mcp"]["temps-chat"].get("enabled").is_none());
+        assert_eq!(json["permission"]["*"], "deny");
+        assert_eq!(json["permission"]["temps_chat_*"], "allow");
     }
 
     #[test]

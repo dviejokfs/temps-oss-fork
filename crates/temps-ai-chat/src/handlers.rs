@@ -41,6 +41,7 @@ use crate::audit::{
     ConversationCreatedAudit, ConversationRenamedAudit, PermissionResolvedAudit,
 };
 use crate::pending_actions::{PendingActionError, PendingActionService};
+use crate::sensitive::{display_value, redact_json_string, redact_text, redact_value};
 use crate::service::ChatStreamEvent;
 use crate::{ChatError, ConversationService};
 
@@ -159,17 +160,34 @@ pub enum MessagePart {
 
 impl From<ai_messages::Model> for MessageResponse {
     fn from(m: ai_messages::Model) -> Self {
+        let redact_tool = |mut tool: ToolInfo| {
+            tool.arguments = redact_json_string(&tool.arguments);
+            tool.result = tool.result.map(|result| redact_json_string(&result));
+            tool
+        };
         let tools = m
             .metadata
             .as_ref()
             .and_then(|v| v.get("tools"))
             .and_then(|t| serde_json::from_value::<Vec<ToolInfo>>(t.clone()).ok())
+            .map(|tools| tools.into_iter().map(&redact_tool).collect::<Vec<_>>())
             .filter(|t| !t.is_empty());
         let parts = m
             .metadata
             .as_ref()
             .and_then(|v| v.get("parts"))
             .and_then(|p| serde_json::from_value::<Vec<MessagePart>>(p.clone()).ok())
+            .map(|parts| {
+                parts
+                    .into_iter()
+                    .map(|part| match part {
+                        MessagePart::Tool { tool } => MessagePart::Tool {
+                            tool: redact_tool(tool),
+                        },
+                        text => text,
+                    })
+                    .collect::<Vec<_>>()
+            })
             .filter(|p| !p.is_empty());
         Self {
             role: m.role,
@@ -264,8 +282,8 @@ pub struct ToolResultEvent {
 }
 
 /// Payload for the `permission_requested` SSE event (ADR-038 Phase 2).
-/// The interactive Claude CLI subprocess is paused waiting for the user to
-/// approve or deny a tool/question/plan.  Resolve via
+/// The active provider turn is paused waiting for the user to approve or deny
+/// a tool/question/plan. Resolve via
 /// `POST .../permissions/{id}/resolve`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PermissionRequestedEvent {
@@ -368,36 +386,24 @@ impl From<PendingActionError> for Problem {
                     .with_title("Internal Server Error")
                     .with_detail(e.to_string())
             }
+            PendingActionError::Encryption { .. } => {
+                problemdetails::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Protected Action Data Error")
+                    .with_detail(e.to_string())
+            }
         }
     }
 }
 
-/// Scrub top-level object keys that may carry sensitive values.
+/// Recursively scrub object keys that may carry sensitive values.
 ///
 /// Any key whose name (case-insensitive) is or contains one of:
 /// `value`, `secret`, `password`, `token`, `key`
-/// has its value replaced with `"***"`. Structural fields
-/// (`operation`, `method`, `summary`, etc.) are left intact.
-/// Non-object values are returned unchanged.
+/// has its value replaced with `"***"`. Objects nested below neutral wrapper
+/// keys such as `parameters` and objects inside arrays are traversed too.
+/// Structural fields (`operation`, `method`, `summary`, etc.) are left intact.
 fn redact_params(v: &serde_json::Value) -> serde_json::Value {
-    const SENSITIVE: &[&str] = &["value", "secret", "password", "token", "key"];
-    let obj = match v.as_object() {
-        Some(o) => o,
-        None => return v.clone(),
-    };
-    let redacted: serde_json::Map<String, serde_json::Value> = obj
-        .iter()
-        .map(|(k, val)| {
-            let lower = k.to_ascii_lowercase();
-            let is_sensitive = SENSITIVE.iter().any(|s| lower.contains(s));
-            if is_sensitive {
-                (k.clone(), serde_json::Value::String("***".to_string()))
-            } else {
-                (k.clone(), val.clone())
-            }
-        })
-        .collect();
-    serde_json::Value::Object(redacted)
+    redact_value(v)
 }
 
 // --- Pending-action DTO ------------------------------------------------------
@@ -444,9 +450,9 @@ impl From<ai_pending_actions::Model> for PendingActionResponse {
             required_permission: m.required_permission,
             // Scrub sensitive values (e.g. env-var values) before returning to
             // clients who may only hold a broad read permission.
-            params: redact_params(&m.params),
-            result: m.result,
-            error: m.error,
+            params: display_value(&m.params),
+            result: m.result.as_ref().map(redact_params),
+            error: m.error.map(|error| redact_text(&error)),
             created_at: m.created_at.to_rfc3339(),
             confirmed_at: m.confirmed_at.map(|t| t.to_rfc3339()),
             executed_at: m.executed_at.map(|t| t.to_rfc3339()),
@@ -493,23 +499,36 @@ fn ensure_runtime_permission(
     provider: Option<&str>,
     permission_mode: Option<&str>,
 ) -> Result<(), Problem> {
-    if provider
-        .and_then(temps_agents::ai_cli::find_provider)
-        .is_some()
-        && !auth.has_permission(&Permission::AiGatewayWrite)
-    {
-        return Err(problemdetails::new(axum::http::StatusCode::FORBIDDEN)
-            .with_title("Host AI Provider Access Denied")
-            .with_detail(
-                "Using a host-authenticated AI CLI requires AI provider administration permission.",
-            ));
-    }
-    if permission_mode == Some("full-access") && !auth.has_permission(&Permission::SystemAdmin) {
-        return Err(problemdetails::new(axum::http::StatusCode::FORBIDDEN)
-            .with_title("Full AI Access Denied")
-            .with_detail(
-                "Full-access AI permission mode requires system administrator permission.",
-            ));
+    if let Some(provider) = provider.and_then(temps_agents::ai_cli::find_provider) {
+        let has_host_access = match provider.host_access_requirement {
+            temps_agents::ai_cli::HostAccessRequirement::AiGatewayWrite => {
+                auth.has_permission(&Permission::AiGatewayWrite)
+            }
+            temps_agents::ai_cli::HostAccessRequirement::SystemAdmin => {
+                auth.has_permission(&Permission::SystemAdmin)
+            }
+        };
+        if !has_host_access {
+            return Err(problemdetails::new(axum::http::StatusCode::FORBIDDEN)
+                .with_title("Host AI Provider Access Denied")
+                .with_detail(format!(
+                    "Your role cannot run the host-authenticated {} provider.",
+                    provider.name
+                )));
+        }
+        let requires_system_admin = permission_mode
+            .and_then(|mode| {
+                provider
+                    .permission_modes
+                    .iter()
+                    .find(|option| option.id == mode)
+            })
+            .is_some_and(|mode| mode.requires_system_admin);
+        if requires_system_admin && !auth.has_permission(&Permission::SystemAdmin) {
+            return Err(problemdetails::new(axum::http::StatusCode::FORBIDDEN)
+                .with_title("Full AI Access Denied")
+                .with_detail("This AI permission mode requires system administrator permission."));
+        }
     }
     Ok(())
 }
@@ -523,10 +542,9 @@ async fn ensure_enabled(state: &AppState, project_id: i32) -> Result<(), Problem
         return Err(problemdetails::new(axum::http::StatusCode::CONFLICT)
             .with_title("AI Not Configured")
             .with_detail(
-                "Configure an AI provider to use debugging chat — a BYOK provider key or a \
-                 subscription agent CLI (Claude Code, Codex) both work. Note that only a BYOK \
-                 key can use tool-calling (live API lookups, repo exploration, write actions); \
-                 an agent CLI still chats, just without those.",
+                "Configure an AI provider to use debugging chat — a gateway key or a \
+                 host-authenticated provider both support the common chat, tool, and \
+                 realtime runtime.",
             ));
     }
     Ok(())
@@ -1121,16 +1139,46 @@ pub async fn archive_conversation(
 
 /// Resolve a pending interactive permission request (ADR-038 Phase 2).
 ///
-/// The interactive Claude CLI subprocess emits a `control_request` frame when
-/// a tool needs approval.  `run_interactive` registers the pending request in
-/// an in-process registry and emits a `permission_requested` SSE event so the
-/// UI can render the approval card.  This endpoint lets the user send their
-/// decision, which unblocks the subprocess and lets the turn continue.
+/// A provider adapter emits a normalized interaction request when user input
+/// is required. The common runtime registers it and emits a
+/// `permission_requested` SSE event. This endpoint sends the decision back to
+/// the waiting turn without knowing the provider protocol.
 ///
 /// The claim is atomic (remove-to-claim): a concurrent request for the same
 /// `permission_id` receives 409 Conflict.  If the subprocess already exited
 /// (and the registry was drained with a synthetic deny), the entry is gone and
 /// the caller receives 404.
+fn permission_decision_matches_kind(kind: &PermissionKind, decision: &PermissionDecision) -> bool {
+    matches!(
+        (kind, decision),
+        (PermissionKind::ToolApproval, PermissionDecision::AllowTool)
+            | (
+                PermissionKind::ToolApproval,
+                PermissionDecision::DenyTool { .. }
+            )
+            | (
+                PermissionKind::Question,
+                PermissionDecision::AnswerQuestion { .. }
+            )
+            | (
+                PermissionKind::PlanApproval,
+                PermissionDecision::ApprovePlan
+            )
+            | (
+                PermissionKind::PlanApproval,
+                PermissionDecision::RejectPlan { .. }
+            )
+    )
+}
+
+fn permission_kind_name(kind: &PermissionKind) -> &'static str {
+    match kind {
+        PermissionKind::ToolApproval => "tool_approval",
+        PermissionKind::Question => "question",
+        PermissionKind::PlanApproval => "plan_approval",
+    }
+}
+
 #[utoipa::path(
     post, tag = "AI Chat",
     path = "/projects/{project_id}/ai/conversations/{public_id}/permissions/{permission_id}/resolve",
@@ -1224,20 +1272,16 @@ pub async fn resolve_permission(
     // All three operations (lookup, ownership check, remove) happen under the
     // same lock acquisition, so there is no window for a concurrent resolve to
     // claim the entry between our check and our remove.
-    let (tx, stored_kind) = {
+    let tx = {
         let mut registry = state.service.pending_permissions.lock().map_err(|_| {
             problemdetails::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail("Permission registry lock poisoned")
         })?;
 
-        // Clone only the conv_public_id so the shared borrow ends before we
-        // mutably borrow the registry for `remove`.
-        let stored_conv_id = registry
-            .get(&permission_id)
-            .map(|e| e.conv_public_id.clone());
+        let stored_entry = registry.get(&permission_id);
 
-        match stored_conv_id {
+        match stored_entry {
             // Entry absent: timed-out, auto-denied, or already resolved.
             None => {
                 return Err(problemdetails::new(axum::http::StatusCode::NOT_FOUND)
@@ -1250,7 +1294,7 @@ pub async fn resolve_permission(
             // Entry exists but belongs to a different conversation.
             // Return 404 (not 403) to avoid confirming the id's existence
             // in another session to the caller.
-            Some(ref stored) if stored != &public_id => {
+            Some(entry) if entry.conv_public_id != public_id => {
                 return Err(problemdetails::new(axum::http::StatusCode::NOT_FOUND)
                     .with_title("Permission Not Found")
                     .with_detail(format!(
@@ -1259,52 +1303,24 @@ pub async fn resolve_permission(
                     )));
             }
             // Entry belongs to this conversation — claim it atomically.
-            Some(_) => {
-                let entry = registry
-                    .remove(&permission_id)
-                    .expect("entry was present on the get() check above");
-                (entry.sender, entry.kind)
+            Some(entry) => {
+                if !permission_decision_matches_kind(&entry.kind, &req.decision) {
+                    let expected_kind = permission_kind_name(&entry.kind);
+                    return Err(ChatError::PermissionKindMismatch {
+                        expected_kind: expected_kind.to_string(),
+                        received: decision_kind.clone(),
+                    }
+                    .into());
+                }
+                let Some(entry) = registry.remove(&permission_id) else {
+                    return Err(problemdetails::new(axum::http::StatusCode::CONFLICT)
+                        .with_title("Permission Already Resolved")
+                        .with_detail("The permission request was resolved concurrently."));
+                };
+                entry.sender
             }
         }
     };
-
-    // Validate that the submitted decision variant is compatible with the stored
-    // kind.  Mismatches are client errors (400).  Accept all valid pairings:
-    //   ToolApproval → AllowTool | DenyTool
-    //   Question     → AnswerQuestion
-    //   PlanApproval → ApprovePlan | RejectPlan
-    let decision_kind_ok = matches!(
-        (&stored_kind, &req.decision),
-        (PermissionKind::ToolApproval, PermissionDecision::AllowTool)
-            | (
-                PermissionKind::ToolApproval,
-                PermissionDecision::DenyTool { .. }
-            )
-            | (
-                PermissionKind::Question,
-                PermissionDecision::AnswerQuestion { .. }
-            )
-            | (
-                PermissionKind::PlanApproval,
-                PermissionDecision::ApprovePlan
-            )
-            | (
-                PermissionKind::PlanApproval,
-                PermissionDecision::RejectPlan { .. }
-            )
-    );
-    if !decision_kind_ok {
-        let expected_kind = match &stored_kind {
-            PermissionKind::ToolApproval => "tool_approval",
-            PermissionKind::Question => "question",
-            PermissionKind::PlanApproval => "plan_approval",
-        };
-        return Err(ChatError::PermissionKindMismatch {
-            expected_kind: expected_kind.to_string(),
-            received: decision_kind.clone(),
-        }
-        .into());
-    }
 
     // Persist the answer as a synthetic `user` message BEFORE sending it down
     // the oneshot — once sent, the subprocess may resume and append its own
@@ -1942,9 +1958,17 @@ mod tests {
 
         let provider_admin =
             custom_auth(vec![Permission::ProjectsWrite, Permission::AiGatewayWrite]);
-        assert!(
-            ensure_runtime_permission(&provider_admin, Some("codex_cli"), Some("auto"),).is_ok()
-        );
+        let denied = ensure_runtime_permission(&provider_admin, Some("codex_cli"), Some("auto"))
+            .expect_err("Codex host access requires system administration");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+
+        let system_admin = custom_auth(vec![
+            Permission::ProjectsWrite,
+            Permission::AiGatewayWrite,
+            Permission::SystemAdmin,
+        ]);
+        ensure_runtime_permission(&system_admin, Some("codex_cli"), Some("auto"))
+            .expect("system administrator may opt into the Codex host boundary");
     }
 
     #[test]
@@ -2200,6 +2224,34 @@ mod tests {
     }
 
     #[test]
+    fn test_redact_params_recurses_through_nested_objects_and_arrays() {
+        let params = serde_json::json!({
+            "parameters": {
+                "database": [{
+                    "name": "primary",
+                    "credentials": {
+                        "password": "nested-password",
+                        "apiKey": "nested-key"
+                    }
+                }]
+            },
+            "result": [{"access_token": "nested-token", "status": "ok"}]
+        });
+        let redacted = redact_params(&params);
+        assert_eq!(redacted["parameters"]["database"][0]["name"], "primary");
+        assert_eq!(
+            redacted["parameters"]["database"][0]["credentials"]["password"],
+            "***"
+        );
+        assert_eq!(
+            redacted["parameters"]["database"][0]["credentials"]["apiKey"],
+            "***"
+        );
+        assert_eq!(redacted["result"][0]["access_token"], "***");
+        assert_eq!(redacted["result"][0]["status"], "ok");
+    }
+
+    #[test]
     fn test_redact_params_empty_object_passthrough() {
         let empty = serde_json::json!({});
         assert_eq!(redact_params(&empty), empty);
@@ -2214,6 +2266,38 @@ mod tests {
         let redacted = redact_params(&params);
         assert_eq!(redacted["VALUE"], serde_json::json!("***"));
         assert_eq!(redacted["Secret"], serde_json::json!("***"));
+    }
+
+    #[test]
+    fn reloaded_tool_metadata_never_returns_embedded_write_secret() {
+        let secret = "must-not-survive-reload";
+        let arguments = serde_json::json!({
+            "command": format!("projects create_environment_variable --name API_TOKEN --value {secret}")
+        })
+        .to_string();
+        let message = ai_messages::Model {
+            id: 1,
+            conversation_id: 1,
+            role: "assistant".to_string(),
+            content: String::new(),
+            metadata: Some(serde_json::json!({
+                "tools": [{
+                    "id": "call-1",
+                    "name": "temps_write",
+                    "arguments": arguments,
+                    "result": format!("HTTP 400: token={secret}")
+                }]
+            })),
+            tokens_in: None,
+            tokens_out: None,
+            cost_microcents: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let response = MessageResponse::from(message);
+        let serialized = serde_json::to_string(&response).expect("message serializes");
+        assert!(!serialized.contains(secret));
+        assert!(serialized.contains("***"));
     }
 
     // ----- SSE mapping tests (ADR-038 Phase 2, milestone 3) -----
@@ -2319,6 +2403,7 @@ mod tests {
                 kind: PermissionKind::ToolApproval,
                 tool_name: "Bash".to_string(),
                 input: serde_json::Value::Null,
+                generation: uuid::Uuid::new_v4(),
             },
         );
         let registry = Arc::new(Mutex::new(registry));
@@ -2375,6 +2460,45 @@ mod tests {
             detail.contains("allow_tool"),
             "detail must mention the received decision"
         );
+    }
+
+    #[test]
+    fn mismatched_permission_decision_can_be_retried() {
+        use std::collections::HashMap;
+        use temps_ai::streaming::{PermissionDecision, PermissionKind};
+        use tokio::sync::oneshot;
+
+        let (tx, _rx) = oneshot::channel();
+        let mut registry = HashMap::new();
+        registry.insert(
+            "question-1".to_string(),
+            PendingPermissionEntry {
+                sender: tx,
+                conv_public_id: "conv-1".to_string(),
+                kind: PermissionKind::Question,
+                tool_name: "AskUserQuestion".to_string(),
+                input: serde_json::Value::Null,
+                generation: uuid::Uuid::new_v4(),
+            },
+        );
+
+        assert!(!permission_decision_matches_kind(
+            &registry["question-1"].kind,
+            &PermissionDecision::AllowTool
+        ));
+        assert!(
+            registry.contains_key("question-1"),
+            "validation must happen before remove-to-claim"
+        );
+
+        let retry = PermissionDecision::AnswerQuestion {
+            answers: serde_json::json!({"answer": "yes"}),
+        };
+        assert!(permission_decision_matches_kind(
+            &registry["question-1"].kind,
+            &retry
+        ));
+        assert!(registry.remove("question-1").is_some());
     }
 
     /// Finding 3 (MEDIUM): oversized `reason` in a `DenyTool` payload is caught

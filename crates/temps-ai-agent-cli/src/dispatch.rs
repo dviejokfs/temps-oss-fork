@@ -1,6 +1,6 @@
-//! [`DispatchingAiService`]: a delegating wrapper around an existing
-//! [`AiService`] that routes each call to whichever provider is active
-//! (ADR-037 Phase 2/3).
+//! Provider-neutral runtime registry. It selects an adapter, then delegates the
+//! complete normalized [`AiService`] contract without owning chat, tool,
+//! persistence, permission, or transport behavior.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use temps_ai::{
     AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    TokenStream, ToolExecutor,
+    ProviderCapabilities, RefreshPolicy, TokenStream, ToolExecutor, TurnServices,
 };
 
 /// Read seam for the instance-level provider preference (`ai_gateway_config`).
@@ -26,7 +26,7 @@ pub trait ActiveProviderReader: Send + Sync {
 }
 
 /// A no-op reader that never selects an agent-CLI provider — used by
-/// [`DispatchingAiService::new`] so Phase 1 callers (and every existing test)
+/// [`AiProviderRegistry::new`] so callers without provider selection
 /// keep the original pure-passthrough-to-gateway behaviour unchanged.
 struct NeverAgentCli;
 
@@ -46,14 +46,14 @@ impl ActiveProviderReader for NeverAgentCli {
 /// Multi-turn function calling follows the pinned/active provider too. Agent
 /// CLI services receive a scoped executor and register it through their native
 /// MCP configuration; gateway services retain their native tool-call loop.
-pub struct DispatchingAiService {
+pub struct AiProviderRegistry {
     gateway: Arc<dyn AiService>,
     preference: Arc<dyn ActiveProviderReader>,
     /// Agent-CLI-backed `AiService` per catalog id, built once at startup.
     agent_cli_services: HashMap<String, Arc<dyn AiService>>,
 }
 
-impl DispatchingAiService {
+impl AiProviderRegistry {
     /// Phase 1 constructor: pure passthrough to `gateway`. Kept for callers
     /// (and tests) that don't need CLI routing.
     pub fn new(gateway: Arc<dyn AiService>) -> Self {
@@ -67,7 +67,7 @@ impl DispatchingAiService {
     /// Phase 2/3 constructor: routes to `agent_cli_services[id]` when
     /// `preference` reports an active agent-CLI provider whose id is present
     /// in the map, else falls back to `gateway`.
-    pub fn with_agent_cli(
+    pub fn with_providers(
         gateway: Arc<dyn AiService>,
         preference: Arc<dyn ActiveProviderReader>,
         agent_cli_services: HashMap<String, Arc<dyn AiService>>,
@@ -77,6 +77,17 @@ impl DispatchingAiService {
             preference,
             agent_cli_services,
         }
+    }
+
+    /// Compatibility constructor for existing composition roots. New code
+    /// should use [`Self::with_providers`]; the registry itself is not tied to
+    /// CLI transports.
+    pub fn with_agent_cli(
+        gateway: Arc<dyn AiService>,
+        preference: Arc<dyn ActiveProviderReader>,
+        providers: HashMap<String, Arc<dyn AiService>>,
+    ) -> Self {
+        Self::with_providers(gateway, preference, providers)
     }
 
     /// The service to use for a workload an agent CLI can actually serve.
@@ -99,7 +110,7 @@ impl DispatchingAiService {
 }
 
 #[async_trait]
-impl AiService for DispatchingAiService {
+impl AiService for AiProviderRegistry {
     async fn is_available(&self) -> bool {
         match self.routed(None).await {
             Some(service) => service.is_available().await,
@@ -126,6 +137,24 @@ impl AiService for DispatchingAiService {
             Some(service) => service.chat_capable_for(provider).await,
             None => false,
         }
+    }
+
+    async fn capabilities_for(
+        &self,
+        provider: Option<&str>,
+        refresh: RefreshPolicy,
+    ) -> Result<ProviderCapabilities, AiError> {
+        let service = self
+            .routed(provider)
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.capabilities".to_string(),
+                reason: format!(
+                    "pinned provider '{}' is unavailable",
+                    provider.unwrap_or("unknown")
+                ),
+            })?;
+        service.capabilities_for(provider, refresh).await
     }
 
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {
@@ -194,7 +223,28 @@ impl AiService for DispatchingAiService {
             .chat_stream_turn_with_executor(request, executor)
             .await
     }
+
+    async fn chat_stream_turn_with_services(
+        &self,
+        request: ChatTurnRequest,
+        services: TurnServices,
+    ) -> Result<ChatTurnStream, AiError> {
+        let service = self
+            .routed(request.provider.as_deref())
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: "pinned chat provider is unavailable".to_string(),
+            })?;
+        service
+            .chat_stream_turn_with_services(request, services)
+            .await
+    }
 }
+
+/// Backwards-compatible name retained while downstream plugins migrate to the
+/// provider-neutral registry terminology.
+pub type DispatchingAiService = AiProviderRegistry;
 
 // ---------------------------------------------------------------------------
 // Unit tests
@@ -238,6 +288,21 @@ mod tests {
                 self.tag,
                 request.purpose,
                 executor.is_some()
+            ));
+            Ok(Box::pin(futures::stream::iter(vec![Ok(event)])))
+        }
+
+        async fn chat_stream_turn_with_services(
+            &self,
+            request: ChatTurnRequest,
+            services: TurnServices,
+        ) -> Result<ChatTurnStream, AiError> {
+            let event = temps_ai::ChatStreamDelta::Text(format!(
+                "{}:{}:{}:{}",
+                self.tag,
+                request.purpose,
+                services.tools.is_some(),
+                services.interactions.is_some()
             ));
             Ok(Box::pin(futures::stream::iter(vec![Ok(event)])))
         }
@@ -347,6 +412,63 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.text, "codex_cli:test");
+    }
+
+    #[tokio::test]
+    async fn adding_a_provider_requires_no_registry_or_chat_code_change() {
+        let mut providers = HashMap::new();
+        providers.insert("future_provider".to_string(), tagged_service("future"));
+        let registry = AiProviderRegistry::with_providers(
+            tagged_service("gateway"),
+            Arc::new(FixedPreference(None)),
+            providers,
+        );
+
+        let result = registry
+            .complete(AiRequest {
+                purpose: "contract".to_string(),
+                provider: Some("future_provider".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("registered provider routes through the common contract");
+
+        assert_eq!(result.text, "future:contract");
+    }
+
+    #[tokio::test]
+    async fn future_provider_receives_the_common_turn_services_contract() {
+        use futures::StreamExt;
+
+        let mut providers = HashMap::new();
+        providers.insert("future_provider".to_string(), tagged_service("future"));
+        let registry = AiProviderRegistry::with_providers(
+            tagged_service("gateway"),
+            Arc::new(FixedPreference(None)),
+            providers,
+        );
+        let interactions: temps_ai::InteractionExecutor =
+            Arc::new(|_| Box::pin(async { Ok(temps_ai::PermissionDecision::AllowTool) }));
+        let tools: ToolExecutor = Arc::new(|_| Box::pin(async { Ok("ok".to_string()) }));
+        let mut stream = registry
+            .chat_stream_turn_with_services(
+                ChatTurnRequest {
+                    purpose: "turn".to_string(),
+                    provider: Some("future_provider".to_string()),
+                    ..Default::default()
+                },
+                TurnServices {
+                    tools: Some(tools),
+                    interactions: Some(interactions),
+                },
+            )
+            .await
+            .expect("future provider receives normalized turn services");
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(temps_ai::ChatStreamDelta::Text(text))) if text == "future:turn:true:true"
+        ));
     }
 
     #[tokio::test]

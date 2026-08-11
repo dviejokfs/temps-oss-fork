@@ -17,6 +17,8 @@ use temps_auth::context::AuthContext;
 use temps_auth::permissions::Permission;
 use temps_entities::ai_pending_actions;
 
+use crate::sensitive::{decrypt_value, encrypt_value, redact_text, redact_value};
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -53,6 +55,12 @@ pub enum PendingActionError {
 
     #[error("database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error("failed to {operation} protected pending-action parameters: {reason}")]
+    Encryption {
+        operation: &'static str,
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -63,11 +71,20 @@ pub enum PendingActionError {
 pub struct PendingActionService {
     db: Arc<DatabaseConnection>,
     write_handle: Arc<WriteApiToolsHandle>,
+    encryption: Arc<temps_core::EncryptionService>,
 }
 
 impl PendingActionService {
-    pub fn new(db: Arc<DatabaseConnection>, write_handle: Arc<WriteApiToolsHandle>) -> Self {
-        Self { db, write_handle }
+    pub fn new(
+        db: Arc<DatabaseConnection>,
+        write_handle: Arc<WriteApiToolsHandle>,
+        encryption: Arc<temps_core::EncryptionService>,
+    ) -> Self {
+        Self {
+            db,
+            write_handle,
+            encryption,
+        }
     }
 
     /// Insert a new `proposed` pending action row.
@@ -92,7 +109,14 @@ impl PendingActionService {
             operation_id: Set(prepared.operation_id.clone()),
             method: Set(prepared.method.clone()),
             summary: Set(prepared.summary.clone()),
-            params: Set(prepared.params.clone()),
+            params: Set(
+                encrypt_value(self.encryption.as_ref(), &prepared.params).map_err(|reason| {
+                    PendingActionError::Encryption {
+                        operation: "encrypt",
+                        reason,
+                    }
+                })?,
+            ),
             required_permission: Set(required_permission),
             status: Set("proposed".to_string()),
             result: Set(None),
@@ -128,30 +152,35 @@ impl PendingActionService {
         let mut created = Vec::with_capacity(steps.len());
         for (idx, (prepared, required_permission)) in steps.iter().enumerate() {
             let public_id = uuid::Uuid::new_v4().simple().to_string();
-            let model = ai_pending_actions::ActiveModel {
-                public_id: Set(public_id),
-                conversation_id: Set(conversation_id),
-                message_id: Set(None),
-                project_id: Set(project_id),
-                plan_public_id: Set(Some(plan_public_id.clone())),
-                step_index: Set(idx as i32),
-                operation_id: Set(prepared.operation_id.clone()),
-                method: Set(prepared.method.clone()),
-                summary: Set(prepared.summary.clone()),
-                params: Set(prepared.params.clone()),
-                required_permission: Set(required_permission.clone()),
-                status: Set("proposed".to_string()),
-                result: Set(None),
-                error: Set(None),
-                created_by: Set(created_by),
-                confirmed_by: Set(None),
-                created_at: Set(now),
-                confirmed_at: Set(None),
-                executed_at: Set(None),
-                ..Default::default()
-            }
-            .insert(self.db.as_ref())
-            .await?;
+            let model =
+                ai_pending_actions::ActiveModel {
+                    public_id: Set(public_id),
+                    conversation_id: Set(conversation_id),
+                    message_id: Set(None),
+                    project_id: Set(project_id),
+                    plan_public_id: Set(Some(plan_public_id.clone())),
+                    step_index: Set(idx as i32),
+                    operation_id: Set(prepared.operation_id.clone()),
+                    method: Set(prepared.method.clone()),
+                    summary: Set(prepared.summary.clone()),
+                    params: Set(encrypt_value(self.encryption.as_ref(), &prepared.params)
+                        .map_err(|reason| PendingActionError::Encryption {
+                            operation: "encrypt",
+                            reason,
+                        })?),
+                    required_permission: Set(required_permission.clone()),
+                    status: Set("proposed".to_string()),
+                    result: Set(None),
+                    error: Set(None),
+                    created_by: Set(created_by),
+                    confirmed_by: Set(None),
+                    created_at: Set(now),
+                    confirmed_at: Set(None),
+                    executed_at: Set(None),
+                    ..Default::default()
+                }
+                .insert(self.db.as_ref())
+                .await?;
             created.push(model);
         }
         Ok(created)
@@ -268,6 +297,17 @@ impl PendingActionService {
             // real boundary at execute time).
         }
 
+        // Decrypt before claiming the row. A corrupt payload is an operator
+        // error, not an execution attempt, and must not strand the action in
+        // the transient `executing` state.
+        let executable_params =
+            decrypt_value(self.encryption.as_ref(), &action.params).map_err(|reason| {
+                PendingActionError::Encryption {
+                    operation: "decrypt",
+                    reason,
+                }
+            })?;
+
         // 5. Atomic claim: flip to "executing" only if still "proposed".
         let now = Utc::now();
         let rows_affected = ai_pending_actions::Entity::update_many()
@@ -308,7 +348,7 @@ impl PendingActionService {
             project_ids: vec![project_id],
         };
         let exec_result = caller
-            .execute_write(&action.operation_id, action.params.clone(), &scope)
+            .execute_write(&action.operation_id, executable_params, &scope)
             .await;
 
         // 8. Persist outcome regardless of success/failure.
@@ -317,7 +357,7 @@ impl PendingActionService {
                 ai_pending_actions::ActiveModel {
                     id: Set(action.id),
                     status: Set("executed".to_string()),
-                    result: Set(Some(resp.body)),
+                    result: Set(Some(redact_value(&resp.body))),
                     confirmed_by: Set(confirmed_by),
                     confirmed_at: Set(Some(now)),
                     executed_at: Set(Some(Utc::now())),
@@ -330,7 +370,7 @@ impl PendingActionService {
                 let failed = ai_pending_actions::ActiveModel {
                     id: Set(action.id),
                     status: Set("failed".to_string()),
-                    error: Set(Some(e.to_string())),
+                    error: Set(Some(redact_text(&e.to_string()))),
                     confirmed_by: Set(confirmed_by),
                     confirmed_at: Set(Some(now)),
                     ..Default::default()
@@ -488,7 +528,7 @@ impl PendingActionService {
         ai_pending_actions::ActiveModel {
             id: Set(action.id),
             status: Set("failed".to_string()),
-            error: Set(Some(reason.to_string())),
+            error: Set(Some(redact_text(reason))),
             confirmed_at: Set(Some(Utc::now())),
             ..Default::default()
         }
@@ -618,8 +658,12 @@ mod tests {
         Arc::new(WriteApiToolsHandle::new())
     }
 
+    fn test_encryption() -> Arc<temps_core::EncryptionService> {
+        Arc::new(temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap())
+    }
+
     fn make_svc(db: sea_orm::DatabaseConnection) -> PendingActionService {
-        PendingActionService::new(Arc::new(db), noop_write_handle())
+        PendingActionService::new(Arc::new(db), noop_write_handle(), test_encryption())
     }
 
     // create inserts a proposed row.
@@ -636,6 +680,32 @@ mod tests {
         let model = result.unwrap();
         assert_eq!(model.status, "proposed");
         assert_eq!(model.project_id, 7);
+    }
+
+    #[tokio::test]
+    async fn create_never_persists_plaintext_write_secrets() {
+        let row = make_proposed(1, "abc", 7);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![row]])
+                .into_connection(),
+        );
+        let svc = PendingActionService::new(db.clone(), noop_write_handle(), test_encryption());
+        let mut prepared = make_prepared();
+        prepared.params = serde_json::json!({
+            "name": "DATABASE_PASSWORD",
+            "value": "must-not-reach-the-database-in-plaintext"
+        });
+
+        svc.create(1, 7, &prepared, None, Some(1))
+            .await
+            .expect("encrypted action is created");
+        drop(svc);
+        let db = Arc::try_unwrap(db).expect("release mock database");
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(!log.contains("must-not-reach-the-database-in-plaintext"));
+        assert!(log.contains("__temps_encrypted_v1"));
+        assert!(log.contains("***"));
     }
 
     // get: not-found returns NotFound.
@@ -665,7 +735,7 @@ mod tests {
                 .append_query_results([Vec::<ai_pending_actions::Model>::new()])
                 .into_connection(),
         );
-        let svc = PendingActionService::new(db.clone(), noop_write_handle());
+        let svc = PendingActionService::new(db.clone(), noop_write_handle(), test_encryption());
         let auth = make_auth();
 
         assert!(svc

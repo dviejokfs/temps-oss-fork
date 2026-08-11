@@ -13,6 +13,7 @@ pub mod pending_actions;
 pub mod plugin;
 pub mod provider;
 pub mod providers;
+mod sensitive;
 pub mod service;
 
 pub use pending_actions::{PendingActionError, PendingActionService};

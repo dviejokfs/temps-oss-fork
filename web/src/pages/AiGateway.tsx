@@ -11,7 +11,6 @@ import {
 } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
@@ -4310,18 +4309,6 @@ console.log(response.choices[0].message.content);`,
                     ))
                   : cliProviders.map((cli) => {
                       const isActive = activeCliProviderId === cli.id
-                      // interactive_bridge_status is present on the backend but not
-                      // yet in the generated type — read defensively.
-                      const extendedStatus = providerPreference as
-                        | (typeof providerPreference & {
-                            interactive_bridge_status?: string | null
-                          })
-                        | undefined
-                      const bridgeStatus =
-                        extendedStatus?.interactive_bridge_status ?? null
-                      // Treat any non-null value as "enabled" (backend returns
-                      // "healthy" or "unavailable" when opted in).
-                      const bridgeEnabled = bridgeStatus !== null
                       return (
                         <TableRow key={cli.id} className="hover:bg-transparent">
                           <TableCell className="py-2 pr-0" />
@@ -4354,71 +4341,6 @@ console.log(response.choices[0].message.content);`,
                                     : (cli.host_auth_hint ??
                                       'Not authenticated on this host yet')}
                                 </p>
-                                {/* Interactive bridge toggle — Claude Code only,
-                                and only when this row is the active provider.
-                                Codex/OpenCode have no equivalent control
-                                protocol so we never show it for them. */}
-                                {isActive && cli.id === 'claude_cli' && (
-                                  <div className="mt-2 flex items-start gap-2">
-                                    <Switch
-                                      id={`interactive-bridge-${cli.id}`}
-                                      checked={bridgeEnabled}
-                                      disabled={preferenceMutation.isPending}
-                                      onCheckedChange={(checked) => {
-                                        // `interactive_bridge_enabled` is
-                                        // present on the backend but not yet in
-                                        // the generated type — use a cast.
-                                        type ExtendedPreferenceBody =
-                                          Parameters<
-                                            typeof preferenceMutation.mutate
-                                          >[0]['body'] & {
-                                            interactive_bridge_enabled?: boolean
-                                          }
-                                        preferenceMutation.mutate(
-                                          {
-                                            body: {
-                                              provider_type: 'agent_cli',
-                                              agent_cli_provider_id: cli.id,
-                                              interactive_bridge_enabled:
-                                                checked,
-                                            } as ExtendedPreferenceBody,
-                                          },
-                                          {
-                                            onSuccess: () => {
-                                              toast.success(
-                                                checked
-                                                  ? 'Interactive tools enabled'
-                                                  : 'Interactive tools disabled'
-                                              )
-                                            },
-                                            onError: () => {
-                                              toast.error(
-                                                'Could not update interactive tools setting'
-                                              )
-                                            },
-                                          }
-                                        )
-                                      }}
-                                      className="mt-0.5"
-                                    />
-                                    <Label
-                                      htmlFor={`interactive-bridge-${cli.id}`}
-                                      className="cursor-pointer space-y-0.5"
-                                    >
-                                      <span className="text-xs font-medium">
-                                        Interactive tools{' '}
-                                        <span className="font-normal text-muted-foreground">
-                                          (beta)
-                                        </span>
-                                      </span>
-                                      <p className="text-[11px] leading-snug text-muted-foreground">
-                                        Lets Claude ask questions and request
-                                        plan/tool approval mid-conversation,
-                                        instead of running fully autonomously.
-                                      </p>
-                                    </Label>
-                                  </div>
-                                )}
                               </div>
                             </div>
                           </TableCell>

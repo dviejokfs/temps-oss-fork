@@ -2,7 +2,10 @@ use async_trait::async_trait;
 use std::process::Stdio;
 use tokio::process::Command;
 
-use super::{AiCliProvider, AiCliStatus, AiRunConfig, AiRunResult};
+use super::{
+    copy_environment_variable, sanitize_command_environment, AiCliProvider, AiCliStatus,
+    AiRunConfig, AiRunResult,
+};
 use crate::error::AgentError;
 
 const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -19,6 +22,8 @@ pub struct CodexModelInfo {
 
 fn codex_command() -> Command {
     let mut command = Command::new("codex");
+    sanitize_command_environment(&mut command);
+    copy_environment_variable(&mut command, "OPENAI_API_KEY");
     command.kill_on_drop(true);
     command
 }
@@ -311,6 +316,27 @@ impl AiCliProvider for CodexCliProvider {
                 )
             },
         }
+    }
+
+    async fn discover_model_capabilities(&self) -> Vec<super::AiCliModelCapability> {
+        discover_models()
+            .await
+            .into_iter()
+            .map(|model| super::AiCliModelCapability {
+                id: model.id,
+                name: model.name,
+                reasoning_options: model.reasoning_efforts,
+                default_reasoning_option: model.default_reasoning_effort,
+            })
+            .collect()
+    }
+
+    fn extract_assistant_text(&self, line: &str) -> Option<String> {
+        extract_assistant_text(line)
+    }
+
+    fn dropped_tool_use_name(&self, line: &str) -> Option<String> {
+        dropped_tool_use_name(line)
     }
 
     async fn run(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {

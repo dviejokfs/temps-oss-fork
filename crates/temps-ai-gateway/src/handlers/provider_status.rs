@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use temps_auth::permission_guard;
+use temps_auth::permissions::Permission;
 use temps_auth::RequireAuth;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::{problemdetails, AuditContext, AuditOperation, RequestMetadata};
@@ -123,23 +124,11 @@ pub struct AiProviderStatusResponse {
     /// Live status of the selected agent CLI, or `null` when
     /// `active_provider_type` is `"gateway"`.
     pub agent_cli_status: Option<AiCliStatusDto>,
-    /// Whether the active provider path supports mid-turn interactive tools
-    /// (`AskUserQuestion`, `ExitPlanMode`, tool permission prompts).
-    ///
-    /// Truth table (ADR-038 Phase 2):
-    /// - Gateway / BYOK provider: always `true` — function-calling is native.
-    /// - Agent CLI, provider != `claude_cli`: always `false` — no control protocol.
-    /// - Agent CLI, `claude_cli`, `interactive_bridge_enabled = false`: `false`.
-    /// - Agent CLI, `claude_cli`, `interactive_bridge_enabled = true`: `true`.
+    /// Whether the active adapter's normalized realtime contract exposes tool
+    /// events. Kept under the legacy field name for API compatibility.
     pub supports_interactive_tools: bool,
-    /// Live health of the interactive bridge, when opted in.
-    ///
-    /// - `"healthy"`: bridge is enabled AND the Claude CLI reports
-    ///   `host_authenticated = true`; tool approvals will route correctly.
-    /// - `"unavailable"`: bridge is enabled but the CLI is not installed or not
-    ///   authenticated; tool approvals cannot be bridged until auth is fixed.
-    /// - `null`: the bridge is not opted in, or the active provider is not
-    ///   `claude_cli` — the field is not meaningful in those cases.
+    /// Health of normalized mid-turn user interactions, or `null` when the
+    /// active adapter does not advertise them. Kept for API compatibility.
     pub interactive_bridge_status: Option<String>,
 }
 
@@ -177,148 +166,23 @@ pub struct AiSelectOptionDto {
     pub description: Option<String>,
 }
 
-fn option(id: &str, name: &str, description: &str) -> AiSelectOptionDto {
-    AiSelectOptionDto {
-        id: id.to_string(),
-        name: name.to_string(),
-        description: Some(description.to_string()),
-    }
-}
-
-fn thinking_options(provider_id: &str, model: &str) -> (Vec<AiSelectOptionDto>, Option<String>) {
-    if provider_id == "claude_cli" {
-        if model.contains("haiku") {
-            return (Vec::new(), None);
-        }
-        let supports_xhigh = matches!(model, "sonnet" | "opus")
-            || model.contains("-5")
-            || model.contains("-4-7")
-            || model.contains("-4-8");
-        let mut options = vec![
-            option("off", "Off", "Disable extended thinking for this model"),
-            option("low", "Low", "Use a small reasoning budget"),
-            option("medium", "Medium", "Use a balanced reasoning budget"),
-            option("high", "High", "Use a larger reasoning budget"),
-        ];
-        if supports_xhigh {
-            options.push(option(
-                "xhigh",
-                "Extra high",
-                "Use the model's extra-high reasoning budget",
-            ));
-        }
-        options.push(option("max", "Max", "Use the maximum reasoning budget"));
-        if supports_xhigh {
-            options.push(option(
-                "ultracode",
-                "Ultra code",
-                "Use extra-high effort with Claude's Ultracode mode",
-            ));
-        }
-        return (options, Some("high".to_string()));
-    }
-    let (ids, default): (&[(&str, &str)], &str) = match provider_id {
-        "codex_cli" if model.contains("mini") => (
-            &[("low", "Low"), ("medium", "Medium"), ("high", "High")],
-            "medium",
-        ),
-        "codex_cli" => (
-            &[
-                ("low", "Low"),
-                ("medium", "Medium"),
-                ("high", "High"),
-                ("xhigh", "Extra high"),
-            ],
-            "high",
-        ),
-        "opencode" => (&[("default", "Default"), ("high", "High")], "default"),
-        "openai" if model.starts_with("gpt-5") || model.starts_with('o') => (
-            &[
-                ("low", "Low"),
-                ("medium", "Medium"),
-                ("high", "High"),
-                ("xhigh", "Extra high"),
-            ],
-            "medium",
-        ),
-        _ => return (Vec::new(), None),
-    };
-    (
-        ids.iter()
-            .map(|(id, name)| option(id, name, "Provider-specific reasoning depth"))
-            .collect(),
-        Some(default.to_string()),
-    )
-}
-
-fn permission_options(provider_id: &str) -> (Vec<AiSelectOptionDto>, Option<String>) {
-    let modes = match provider_id {
-        "claude_cli" => vec![
-            option("default", "Default", "Ask before sensitive actions"),
-            option(
-                "accept-edits",
-                "Accept edits",
-                "Automatically approve file edits",
-            ),
-            option("plan", "Plan", "Plan without making changes"),
-            option("full-access", "Full access", "Bypass permission prompts"),
-        ],
-        "codex_cli" => vec![
-            option(
-                "auto",
-                "Default permissions",
-                "Automatic approvals in a workspace-write sandbox",
-            ),
-            option(
-                "auto-review",
-                "Auto-review",
-                "Ask for approval when the CLI judges it necessary",
-            ),
-            option(
-                "full-access",
-                "Full access",
-                "Disable sandbox and approval prompts",
-            ),
-        ],
-        "opencode" => vec![
-            option("build", "Build", "Use OpenCode's build agent"),
-            option("plan", "Plan", "Use OpenCode's read-only planning agent"),
-        ],
-        _ => vec![option(
-            "confirm-actions",
-            "Confirm actions",
-            "Require confirmation for write actions",
-        )],
-    };
-    let default = match provider_id {
-        "codex_cli" => "auto",
-        "opencode" => "build",
-        "claude_cli" => "default",
-        _ => "confirm-actions",
-    };
-    (modes, Some(default.to_string()))
-}
-
-async fn cli_provider_option(provider_id: &str) -> Option<AvailableAiProviderDto> {
-    let catalog = temps_agents::ai_cli::find_provider(provider_id)?;
-    let models = temps_agents::ai_cli::discover_model_capabilities(provider_id)
-        .await
+fn provider_option(capabilities: temps_ai::ProviderCapabilities) -> AvailableAiProviderDto {
+    let models = capabilities
+        .models
         .into_iter()
         .map(|model| AiModelOptionDto {
             id: model.id,
             name: model.name,
             thinking_options: model
-                .reasoning_options
-                .iter()
-                .map(|option_id| {
-                    option(
-                        option_id,
-                        &display_option_name(option_id),
-                        "Supported by this model",
-                    )
+                .thinking_modes
+                .into_iter()
+                .map(|option| AiSelectOptionDto {
+                    id: option.id,
+                    name: option.name,
+                    description: option.description,
                 })
                 .collect(),
-            default_thinking_option_id: model.default_reasoning_option,
+            default_thinking_option_id: model.default_thinking_mode_id,
         })
         .collect::<Vec<_>>();
     let model_discovery_status = if models.is_empty() {
@@ -329,34 +193,31 @@ async fn cli_provider_option(provider_id: &str) -> Option<AvailableAiProviderDto
     let model_discovery_error = models.is_empty().then(|| {
         format!(
             "Could not query {} for its current model list. The CLI default remains usable; retry provider discovery to load model controls.",
-            catalog.name
+            capabilities.name
         )
     });
-    let (permission_modes, default_permission_mode_id) = permission_options(provider_id);
-    Some(AvailableAiProviderDto {
-        id: provider_id.to_string(),
-        name: catalog.name.to_string(),
-        auth_source: "host_environment".to_string(),
+    AvailableAiProviderDto {
+        id: capabilities.id,
+        name: capabilities.name,
+        auth_source: match capabilities.auth_source {
+            temps_ai::ProviderAuthSource::ConfiguredKey => "configured_key",
+            temps_ai::ProviderAuthSource::HostEnvironment => "host_environment",
+        }
+        .to_string(),
         models,
-        default_model_id: None,
+        default_model_id: capabilities.default_model_id,
         model_discovery_status: model_discovery_status.to_string(),
         model_discovery_error,
-        permission_modes,
-        default_permission_mode_id,
-    })
-}
-
-fn display_option_name(id: &str) -> String {
-    match id {
-        "xhigh" => "Extra high".to_string(),
-        "none" => "None".to_string(),
-        value => {
-            let mut characters = value.chars();
-            characters
-                .next()
-                .map(|first| first.to_uppercase().collect::<String>() + characters.as_str())
-                .unwrap_or_default()
-        }
+        permission_modes: capabilities
+            .permission_modes
+            .into_iter()
+            .map(|mode| AiSelectOptionDto {
+                id: mode.id,
+                name: mode.name,
+                description: mode.description,
+            })
+            .collect(),
+        default_permission_mode_id: capabilities.default_permission_mode_id,
     }
 }
 
@@ -451,18 +312,8 @@ pub struct UpdateProviderPreferenceRequest {
     pub provider_type: String,
     /// Required when `provider_type` is `"agent_cli"`.
     pub agent_cli_provider_id: Option<String>,
-    /// Opt in to the interactive Claude CLI bridge (ADR-038 Phase 2).
-    ///
-    /// When `true`, `ConversationService` routes chat turns through
-    /// `ClaudeCliProvider::run_interactive` (long-lived subprocess with
-    /// `--permission-prompt-tool stdio`) instead of the one-shot
-    /// `--dangerously-skip-permissions` path, enabling mid-turn tool
-    /// approval, `AskUserQuestion`, and `ExitPlanMode` (milestone 3+).
-    ///
-    /// Setting this to `true` is only valid when `provider_type == "agent_cli"`
-    /// AND `agent_cli_provider_id == "claude_cli"` — Codex and OpenCode have
-    /// no equivalent interactive control protocol.  Omitting the field
-    /// (`null`) preserves the existing toggle value in the database.
+    /// Deprecated compatibility field. Adapter realtime behavior is derived
+    /// from its capability contract and cannot be toggled independently.
     pub interactive_bridge_enabled: Option<bool>,
 }
 
@@ -551,53 +402,42 @@ async fn build_status_response(
                 model_ids.insert(0, default_model.to_string());
             }
         }
-        let models = model_ids
-            .iter()
-            .map(|model| {
-                let (thinking_options, default_thinking_option_id) =
-                    thinking_options(&key.provider, model);
-                AiModelOptionDto {
-                    id: model.clone(),
-                    name: model.clone(),
-                    thinking_options,
-                    default_thinking_option_id,
-                }
-            })
-            .collect();
-        let (permission_modes, default_permission_mode_id) = permission_options(&key.provider);
-        available_providers.push(AvailableAiProviderDto {
-            id: format!("gateway_key:{}", key.id),
-            name: key.display_name.clone(),
-            auth_source: "configured_key".to_string(),
-            models,
-            default_model_id: key
-                .default_model
-                .clone()
-                .or_else(|| model_ids.first().cloned()),
-            model_discovery_status: "ready".to_string(),
-            model_discovery_error: None,
-            permission_modes,
-            default_permission_mode_id,
-        });
+        available_providers.push(provider_option(
+            crate::services::gateway_provider_capabilities(
+                format!("gateway_key:{}", key.id),
+                key.display_name.clone(),
+                &key.provider,
+                key.default_model.clone(),
+                model_ids,
+            ),
+        ));
     }
     // Probe independent CLIs concurrently. A cold cache is bounded by the
     // slowest provider rather than the sum of every subprocess timeout.
     let cli_probes =
-        futures_util::future::join_all(temps_agents::ai_cli::PROVIDER_NAMES.iter().map(
-            |(provider_id, _label)| async move {
-                let provider = temps_agents::ai_cli::create_provider(provider_id)?;
-                let (status, option) =
-                    tokio::join!(provider.get_status(), cli_provider_option(provider_id));
-                Some(((*provider_id).to_string(), status, option))
+        futures_util::future::join_all(temps_agents::ai_cli::PROVIDER_CATALOG.iter().map(
+            |registration| async move {
+                let provider = temps_agents::ai_cli::create_provider(registration.id)?;
+                let (status, capabilities) =
+                    tokio::join!(provider.get_status(), provider.capabilities());
+                let realtime = capabilities
+                    .as_ref()
+                    .map(|capabilities| capabilities.realtime.clone());
+                let option = capabilities.map(provider_option);
+                Some((registration.id.to_string(), status, option, realtime))
             },
         ))
         .await;
     let mut cli_statuses = HashMap::new();
-    for (provider_id, status, option) in cli_probes.into_iter().flatten() {
+    let mut cli_realtime = HashMap::new();
+    for (provider_id, status, option, realtime) in cli_probes.into_iter().flatten() {
         if status.installed && status.authenticated {
             if let Some(option) = option {
                 available_providers.push(option);
             }
+        }
+        if let Some(realtime) = realtime {
+            cli_realtime.insert(provider_id.clone(), realtime);
         }
         cli_statuses.insert(provider_id, status);
     }
@@ -659,46 +499,23 @@ async fn build_status_response(
         (configured, reason, setup_path, None)
     };
 
-    // Read `interactive_bridge_enabled` from the raw config row (not surfaced by
-    // `resolve_active_agent_cli_provider`, which only returns the provider id).
-    let interactive_bridge_enabled = match app_state
-        .provider_preference_service
-        .get("instance")
-        .await
-        .map_err(Problem::from)?
-    {
-        Some(row) => row.interactive_bridge_enabled,
-        None => false,
-    };
-
-    // Compute `supports_interactive_tools` based on the full truth table:
-    //   - Gateway / BYOK: always true (native function-calling).
-    //   - Agent CLI, not claude_cli: always false (no control protocol).
-    //   - Agent CLI, claude_cli, bridge disabled: false.
-    //   - Agent CLI, claude_cli, bridge enabled: true.
-    let is_claude_cli_active = active_provider_type == "agent_cli"
-        && agent_cli_provider_id.as_deref() == Some("claude_cli");
-    let supports_interactive_tools =
-        active_provider_type == "gateway" || (is_claude_cli_active && interactive_bridge_enabled);
-
-    // Derive `interactive_bridge_status` — DB-state only, no live subprocess
-    // health check.  Only meaningful when the bridge is opted in.
-    let interactive_bridge_status = if is_claude_cli_active && interactive_bridge_enabled {
-        // Determine if the CLI is currently authenticated so we can report
-        // "healthy" vs. "unavailable". The CLI status is already available in
-        // `agent_cli_status` when `active_provider_type == "agent_cli"`.
-        let authenticated = agent_cli_status
-            .as_ref()
-            .map(|s| s.authenticated)
-            .unwrap_or(false);
-        if authenticated {
-            Some("healthy".to_string())
-        } else {
-            Some("unavailable".to_string())
-        }
-    } else {
-        None
-    };
+    // Legacy response fields are now derived from the provider-neutral
+    // realtime contract. The old Claude-only bridge toggle no longer controls
+    // whether chat gets tools, streaming, cancellation, or interactions.
+    let active_realtime = agent_cli_provider_id
+        .as_deref()
+        .and_then(|provider| cli_realtime.get(provider));
+    let supports_interactive_tools = active_provider_type == "gateway"
+        || active_realtime.is_some_and(|realtime| realtime.tool_events);
+    let interactive_bridge_status = active_realtime
+        .filter(|realtime| realtime.user_interactions)
+        .map(|_| {
+            if configured {
+                "healthy".to_string()
+            } else {
+                "unavailable".to_string()
+            }
+        });
 
     Ok(AiProviderStatusResponse {
         active_provider_type,
@@ -756,10 +573,30 @@ async fn get_ai_provider_status(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AiGatewayAppState>>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayRead);
+    // Chat is a project feature, not an AI-provider administration surface.
+    // The response exposes capability metadata only (never credentials), so a
+    // project reader may load the composer even without AiGatewayRead.
+    if !can_read_provider_status(&auth) {
+        return Err(problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Insufficient Permissions")
+            .with_detail(
+                "Reading AI chat provider capabilities requires ProjectsRead or AiGatewayRead",
+            ));
+    }
 
     let response = cached_status_response(&app_state).await?;
     Ok(Json(response))
+}
+
+fn can_read_provider_status(auth: &temps_auth::AuthContext) -> bool {
+    provider_status_permission_granted(
+        auth.has_permission(&Permission::AiGatewayRead),
+        auth.has_permission(&Permission::ProjectsRead),
+    )
+}
+
+fn provider_status_permission_granted(ai_gateway_read: bool, projects_read: bool) -> bool {
+    ai_gateway_read || projects_read
 }
 
 #[utoipa::path(
@@ -902,135 +739,9 @@ mod tests {
     }
 
     #[test]
-    fn claude_thinking_options_are_model_specific() {
-        let (latest, default) = thinking_options("claude_cli", "sonnet");
-        assert_eq!(
-            latest
-                .iter()
-                .map(|option| option.id.as_str())
-                .collect::<Vec<_>>(),
-            ["off", "low", "medium", "high", "xhigh", "max", "ultracode"]
-        );
-        assert_eq!(default.as_deref(), Some("high"));
-
-        let (sonnet_46, _) = thinking_options("claude_cli", "claude-sonnet-4-6");
-        assert_eq!(
-            sonnet_46
-                .iter()
-                .map(|option| option.id.as_str())
-                .collect::<Vec<_>>(),
-            ["off", "low", "medium", "high", "max"]
-        );
-        assert!(thinking_options("claude_cli", "haiku").0.is_empty());
-    }
-
-    /// Truth table for `supports_interactive_tools` and
-    /// `interactive_bridge_status` (ADR-038 Phase 2, deliverable 3).
-    ///
-    /// These are pure boolean / string computations extracted from
-    /// `build_status_response` so they can be verified without a DB or
-    /// running server.
-    fn compute_supports_interactive_tools(
-        active_provider_type: &str,
-        agent_cli_provider_id: Option<&str>,
-        interactive_bridge_enabled: bool,
-    ) -> bool {
-        let is_claude_cli_active =
-            active_provider_type == "agent_cli" && agent_cli_provider_id == Some("claude_cli");
-        active_provider_type == "gateway" || (is_claude_cli_active && interactive_bridge_enabled)
-    }
-
-    fn compute_interactive_bridge_status(
-        active_provider_type: &str,
-        agent_cli_provider_id: Option<&str>,
-        interactive_bridge_enabled: bool,
-        cli_authenticated: bool,
-    ) -> Option<String> {
-        let is_claude_cli_active =
-            active_provider_type == "agent_cli" && agent_cli_provider_id == Some("claude_cli");
-        if is_claude_cli_active && interactive_bridge_enabled {
-            if cli_authenticated {
-                Some("healthy".to_string())
-            } else {
-                Some("unavailable".to_string())
-            }
-        } else {
-            None
-        }
-    }
-
-    // --- supports_interactive_tools truth table ---
-
-    #[test]
-    fn gateway_always_supports_interactive_tools() {
-        assert!(compute_supports_interactive_tools("gateway", None, false));
-        assert!(compute_supports_interactive_tools("gateway", None, true));
-    }
-
-    #[test]
-    fn claude_cli_with_bridge_enabled_supports_interactive_tools() {
-        assert!(compute_supports_interactive_tools(
-            "agent_cli",
-            Some("claude_cli"),
-            true
-        ));
-    }
-
-    #[test]
-    fn claude_cli_with_bridge_disabled_does_not_support_interactive_tools() {
-        assert!(!compute_supports_interactive_tools(
-            "agent_cli",
-            Some("claude_cli"),
-            false
-        ));
-    }
-
-    #[test]
-    fn non_claude_cli_provider_does_not_support_interactive_tools() {
-        // codex_cli and opencode have no permission-prompt-tool protocol.
-        assert!(!compute_supports_interactive_tools(
-            "agent_cli",
-            Some("codex_cli"),
-            true
-        ));
-        assert!(!compute_supports_interactive_tools(
-            "agent_cli",
-            Some("opencode"),
-            true
-        ));
-    }
-
-    // --- interactive_bridge_status truth table ---
-
-    #[test]
-    fn bridge_status_is_none_for_gateway() {
-        assert_eq!(
-            compute_interactive_bridge_status("gateway", None, false, true),
-            None
-        );
-    }
-
-    #[test]
-    fn bridge_status_is_none_when_bridge_disabled() {
-        assert_eq!(
-            compute_interactive_bridge_status("agent_cli", Some("claude_cli"), false, true),
-            None
-        );
-    }
-
-    #[test]
-    fn bridge_status_healthy_when_enabled_and_authenticated() {
-        assert_eq!(
-            compute_interactive_bridge_status("agent_cli", Some("claude_cli"), true, true),
-            Some("healthy".to_string())
-        );
-    }
-
-    #[test]
-    fn bridge_status_unavailable_when_enabled_but_not_authenticated() {
-        assert_eq!(
-            compute_interactive_bridge_status("agent_cli", Some("claude_cli"), true, false),
-            Some("unavailable".to_string())
-        );
+    fn chat_project_readers_can_load_provider_capabilities() {
+        assert!(provider_status_permission_granted(false, true));
+        assert!(provider_status_permission_granted(true, false));
+        assert!(!provider_status_permission_granted(false, false));
     }
 }

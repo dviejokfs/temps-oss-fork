@@ -60,14 +60,11 @@ impl TempsPlugin for AiGatewayPlugin {
             // text or typed/structured output from the configured model through
             // one governed seam. Best-effort + self-gating, safe to always register.
             //
-            // ADR-037 Phase 2/3: DispatchingAiService routes is_available/
-            // complete/chat_stream to whichever provider is active (BYOK
-            // gateway or a subscription agent CLI) so every AI feature that
-            // reads through this seam — not just AI Workflows — treats both
-            // kinds of provider the same way. Tool-calling (chat/
-            // chat_stream_turn, the debugging chat's write actions) always
-            // stays on the gateway: no agent CLI has an external
-            // function-calling protocol to hand it.
+            // The provider registry routes every normalized AI capability to
+            // the selected adapter. Gateway keys use native function calling;
+            // host harnesses receive the same scoped tools through the
+            // turn-local MCP bridge. Chat and feature code never branches on
+            // provider transport.
             let gateway_ai_service: Arc<dyn temps_ai::AiService> = Arc::new(
                 crate::services::GatewayAiService::new(gateway_service.clone(), db.clone()),
             );
@@ -94,8 +91,8 @@ impl TempsPlugin for AiGatewayPlugin {
 
             let mut agent_cli_services: HashMap<String, Arc<dyn temps_ai::AiService>> =
                 HashMap::new();
-            for (id, _label) in temps_agents::ai_cli::PROVIDER_NAMES {
-                if let Some(provider) = temps_agents::ai_cli::create_provider(id) {
+            for registration in temps_agents::ai_cli::PROVIDER_CATALOG {
+                if let Some(provider) = temps_agents::ai_cli::create_provider(registration.id) {
                     let provider: Arc<dyn temps_agents::ai_cli::AiCliProvider> = provider.into();
                     let svc = Arc::new(temps_ai_agent_cli::AgentCliAiService::new(
                         provider,
@@ -103,14 +100,16 @@ impl TempsPlugin for AiGatewayPlugin {
                         AI_CLI_TIMEOUT,
                         AI_CLI_CONCURRENCY,
                     ));
-                    agent_cli_services
-                        .insert((*id).to_string(), svc as Arc<dyn temps_ai::AiService>);
+                    agent_cli_services.insert(
+                        registration.id.to_string(),
+                        svc as Arc<dyn temps_ai::AiService>,
+                    );
                 }
             }
 
             let preference_reader: Arc<dyn temps_ai_agent_cli::ActiveProviderReader> =
                 provider_preference_service.clone();
-            let ai_service = Arc::new(temps_ai_agent_cli::DispatchingAiService::with_agent_cli(
+            let ai_service = Arc::new(temps_ai_agent_cli::AiProviderRegistry::with_providers(
                 gateway_ai_service,
                 preference_reader,
                 agent_cli_services,

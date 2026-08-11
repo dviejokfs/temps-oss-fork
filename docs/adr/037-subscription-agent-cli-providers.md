@@ -10,9 +10,71 @@
 > must still be installed and authenticated. ADR-038 records the implementation
 > addendum.
 
-**Status:** Proposed
+> **Architecture update (2026-08-11):** Provider selection and turn execution
+> now use provider-neutral contracts. `ProviderCapabilities` is the only model,
+> thinking, permission, authentication-source, and realtime capability shape
+> consumed by chat and settings. `TurnServices` is the only injection point for
+> scoped tools and user interactions. `AiProviderRegistry` routes both gateway
+> and CLI adapters through the same conversation loop. Provider-specific code is
+> limited to authentication/status discovery, capability discovery, command/API
+> invocation, and wire-event parsing.
+
+**Status:** Accepted
 **Date:** 2026-08-08
 **Author:** David Viejo
+
+## Current architecture
+
+```text
+Chat / diagnostics / future AI features
+                  │
+                  ▼
+        temps_ai::AiService
+          ├─ capabilities_for(provider, refresh)
+          └─ chat_stream_turn_with_services(request, TurnServices)
+                  │
+                  ▼
+          AiProviderRegistry
+          ├─ gateway adapter
+          └─ CLI adapter registry
+               ├─ Claude Code
+               ├─ Codex
+               ├─ OpenCode
+               └─ future adapter
+                  │
+                  ▼
+       one ConversationService turn loop
+       persistence · scoped tools · write proposals
+       user interactions · streaming · cancellation · errors
+```
+
+The extension boundary is deliberately narrow:
+
+1. A provider adapter reports `ProviderCapabilities`, including the exact
+   account-visible models and per-model thinking modes.
+2. It implements the common `AiService` turn contract, or delegates CLI turns
+   through `AiCliProvider::run_turn`.
+3. A CLI-backed adapter adds one `ProviderCatalogEntry` containing its factory,
+   permission modes, host-access requirement, and realtime flags.
+
+Conversation persistence, project/user authorization, tool registration,
+confirm-gated writes, interaction resolution, SSE events, cancellation, and
+error handling do not belong to adapters. This prevents a fourth provider from
+copying the Claude/Codex/OpenCode integration and drifting from it.
+
+### Security and lifecycle invariants
+
+- Harness subprocesses start from an empty environment and receive only a small
+  runtime allowlist, their own provider credential, and the ephemeral MCP token.
+- The MCP bridge is loopback-only, bearer-authenticated, scoped to one turn, and
+  emits a terminal result for success, failure, and timeout so a call cannot be
+  replayed by the fallback dispatcher.
+- Provider tasks and pending interaction waiters are owned by the returned
+  stream. Stop, disconnect, and timeout cancel the complete turn and remove its
+  exact pending approval registration.
+- Executable write-proposal parameters are encrypted at rest. Browser-visible
+  action data and persisted tool metadata contain only recursively redacted
+  display values.
 
 ## Context
 

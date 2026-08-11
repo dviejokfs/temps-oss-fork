@@ -1,10 +1,8 @@
 //! The conversation service: create/find/history + streaming `send_message`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use tokio::sync::{broadcast, oneshot};
 
@@ -15,7 +13,6 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
     QuerySelect, Set,
 };
-use sha2::{Digest, Sha256};
 
 use temps_ai::{
     streaming::{PermissionDecision, PermissionKind},
@@ -47,14 +44,53 @@ pub struct PendingPermissionEntry {
     pub tool_name: String,
     /// The original `control_request`'s `input` payload, verbatim.
     pub input: serde_json::Value,
+    /// Unique registration generation. A cancelled older request must not
+    /// remove a newer request that reused the same provider-supplied id.
+    pub generation: uuid::Uuid,
+}
+
+/// Removes one exact pending interaction when its waiter is completed or
+/// cancelled. This binds approval-card lifetime to the provider turn instead
+/// of leaving stale, actionable registry entries after Stop/timeout.
+struct PendingPermissionGuard {
+    registry: Arc<Mutex<HashMap<String, PendingPermissionEntry>>>,
+    permission_id: String,
+    generation: uuid::Uuid,
+}
+
+impl Drop for PendingPermissionGuard {
+    fn drop(&mut self) {
+        let mut registry = match self.registry.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if registry
+            .get(&self.permission_id)
+            .is_some_and(|entry| entry.generation == self.generation)
+        {
+            registry.remove(&self.permission_id);
+        }
+    }
 }
 use temps_auth::context::AuthContext;
 use temps_entities::{ai_conversations, ai_messages};
 
 use temps_ai_api_tools::{ApiCallScope, WriteApiToolsHandle, WritePrepareOutcome};
 
+/// Owns a turn task for exactly as long as the returned SSE stream exists.
+/// Browser Stop aborts the request, which drops the stream and therefore the
+/// provider task instead of merely detaching it in the background.
+struct AbortTurnOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTurnOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 use crate::pending_actions::PendingActionService;
 use crate::provider::ConversationContextProvider;
+use crate::sensitive::redact_json_string;
 use crate::ChatError;
 
 /// Render a `control_request` (ADR-038 Phase 2) as human-readable text for the
@@ -164,272 +200,10 @@ struct ConversationRuntime {
     permission_mode: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolExecutionPath {
-    InteractiveClaude,
-    GenericToolLoop,
-    PlainStream,
-}
-
-/// Bump when the interactive provider/MCP session contract changes in a way
-/// that could make a resumed CLI retain stale assumptions.
-const INTERACTIVE_CLI_SESSION_CONTRACT_VERSION: &str = "temps-interactive-cli-session-v1";
-const INTERACTIVE_TOOL_PROGRESS_CONTENT: &str =
-    "The tool completed successfully. Waiting for the assistant's final answer…";
-
-fn canonical_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut keys = map.keys().collect::<Vec<_>>();
-            keys.sort_unstable();
-            let fields = keys
-                .into_iter()
-                .map(|key| {
-                    format!(
-                        "{}:{}",
-                        canonical_json(&serde_json::json!(key)),
-                        canonical_json(&map[key])
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{fields}}}")
-        }
-        serde_json::Value::Array(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(canonical_json)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        _ => value.to_string(),
-    }
-}
-
-fn hash_contract_part(hasher: &mut Sha256, part: &str) {
-    hasher.update(part.len().to_be_bytes());
-    hasher.update(part.as_bytes());
-}
-
-fn interactive_cli_contract_fingerprint(
-    provider: &str,
-    model: &str,
-    thinking_level: Option<&str>,
-    permission_mode: &str,
-    tools: &[ChatTool],
-    provider_contracts: &[String],
-) -> String {
-    let mut hasher = Sha256::new();
-    for part in [
-        INTERACTIVE_CLI_SESSION_CONTRACT_VERSION,
-        provider,
-        model,
-        thinking_level.unwrap_or(""),
-        permission_mode,
-    ] {
-        hash_contract_part(&mut hasher, part);
-    }
-
-    let mut tool_contracts = tools
-        .iter()
-        .map(|tool| {
-            format!(
-                "{}\n{}\n{}",
-                tool.name,
-                tool.description,
-                canonical_json(&tool.parameters)
-            )
-        })
-        .collect::<Vec<_>>();
-    tool_contracts.sort_unstable();
-    for tool in tool_contracts {
-        hash_contract_part(&mut hasher, &tool);
-    }
-
-    let mut provider_contracts = provider_contracts.to_vec();
-    provider_contracts.sort_unstable();
-    for contract in provider_contracts {
-        hash_contract_part(&mut hasher, &contract);
-    }
-
-    format!("v1:{}", hex::encode(hasher.finalize()))
-}
-
-fn resumable_cli_session_id(
-    session_id: Option<&str>,
-    stored_fingerprint: Option<&str>,
-    current_fingerprint: &str,
-) -> Option<String> {
-    match (session_id, stored_fingerprint) {
-        (Some(session_id), Some(stored)) if stored == current_fingerprint => {
-            Some(session_id.to_string())
-        }
-        _ => None,
-    }
-}
-
-fn select_tool_execution_path(interactive_claude: bool, has_tools: bool) -> ToolExecutionPath {
-    if interactive_claude {
-        ToolExecutionPath::InteractiveClaude
-    } else if has_tools {
-        ToolExecutionPath::GenericToolLoop
-    } else {
-        ToolExecutionPath::PlainStream
-    }
-}
-
-fn build_interactive_cli_prompt(
-    messages: &[ChatMessage],
-    refresh_existing_history: bool,
-) -> String {
-    if refresh_existing_history {
-        // Claude owns the prior conversation in its resumed session, but the
-        // server-controlled framing is rebuilt every turn from live context
-        // and the current API catalog. Refresh that framing without replaying
-        // stale user/assistant history already present in the session.
-        let current_system = messages.iter().find(|message| message.role == "system");
-        let latest_user = messages.iter().rev().find(|message| message.role == "user");
-        return current_system
-            .into_iter()
-            .chain(latest_user)
-            .filter(|message| !message.content.is_empty())
-            .map(|message| format!("[{}]\n{}", message.role, message.content))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-    }
-
-    messages
-        .iter()
-        .filter(|message| !message.content.is_empty())
-        .map(|message| format!("[{}]\n{}", message.role, message.content))
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-fn should_refresh_interactive_cli_prompt(
-    conv: &ai_conversations::Model,
-    messages: &[ChatMessage],
-) -> bool {
-    conv.cli_session_id.is_some()
-        || conv.cli_session_fingerprint.is_some()
-        || messages
-            .iter()
-            .filter(|message| message.role == "user")
-            .count()
-            > 1
-}
-
-fn gateway_model_ids(provider: &str) -> &'static [&'static str] {
-    match provider {
-        "openai" => &[
-            "gpt-5.4",
-            "gpt-5.4-pro",
-            "gpt-5-mini",
-            "gpt-5-nano",
-            "gpt-5",
-            "gpt-4.1",
-            "gpt-4.1-mini",
-            "gpt-4.1-nano",
-            "o3",
-            "o3-pro",
-            "o4-mini",
-            "o3-mini",
-            "gpt-4o",
-            "gpt-4o-mini",
-        ],
-        "anthropic" => &["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
-        "xai" => &[
-            "grok-4-1-fast-reasoning",
-            "grok-4-1-fast-non-reasoning",
-            "grok-code-fast-1",
-            "grok-4-fast-reasoning",
-            "grok-4-fast-non-reasoning",
-            "grok-4-0709",
-            "grok-3",
-            "grok-3-mini",
-        ],
-        "gemini" => &[
-            "gemini-3.1-pro",
-            "gemini-3.1-flash-lite",
-            "gemini-3-flash",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2-flash",
-            "gemini-2-flash-lite",
-        ],
-        _ => &[],
-    }
-}
-
-fn model_supports_thinking(provider: &str, model: &str) -> bool {
-    provider == "openai" && (model.starts_with("gpt-5") || model.starts_with('o'))
-}
-
 /// `default` is a UI/protocol sentinel meaning "let the harness choose". It
 /// is not a reasoning variant and must never be validated or passed to a CLI.
 fn normalize_thinking_level(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty() && *value != "default")
-}
-
-fn discovered_thinking_level(
-    model: &temps_agents::ai_cli::AiCliModelCapability,
-    requested: Option<&str>,
-) -> Option<String> {
-    let requested = normalize_thinking_level(requested);
-    requested
-        .or_else(|| {
-            model.default_reasoning_option.as_deref().filter(|default| {
-                model
-                    .reasoning_options
-                    .iter()
-                    .any(|option| option == default)
-            })
-        })
-        .or_else(|| model.reasoning_options.first().map(String::as_str))
-        .map(str::to_string)
-}
-
-fn valid_thinking(provider: &str, model: &str, value: Option<&str>) -> bool {
-    match provider {
-        "claude_cli" if model.contains("haiku") => value.is_none(),
-        "claude_cli" => value.is_some_and(|value| {
-            let supports_xhigh = matches!(model, "sonnet" | "opus")
-                || model.contains("-5")
-                || model.contains("-4-7")
-                || model.contains("-4-8");
-            matches!(value, "off" | "low" | "medium" | "high" | "max" | "auto")
-                || (supports_xhigh && matches!(value, "xhigh" | "ultracode"))
-        }),
-        "codex_cli" => value.is_some_and(|v| {
-            matches!(v, "low" | "medium" | "high") || (v == "xhigh" && !model.contains("mini"))
-        }),
-        "opencode" => value.is_none() || value.is_some_and(|v| v == "high"),
-        _ if model_supports_thinking(provider, model) => {
-            value.is_some_and(|v| matches!(v, "low" | "medium" | "high" | "xhigh"))
-        }
-        _ => value.is_none(),
-    }
-}
-
-fn resolve_cli_model_id(
-    provider: &str,
-    capabilities: &[temps_agents::ai_cli::AiCliModelCapability],
-    requested_model: Option<&str>,
-) -> Result<String, ChatError> {
-    let model = requested_model
-        .map(str::to_string)
-        .or_else(|| capabilities.first().map(|model| model.id.clone()))
-        .unwrap_or_else(|| "default".to_string());
-    let available = capabilities.iter().any(|candidate| candidate.id == model)
-        || (capabilities.is_empty() && model == "default");
-    if !available {
-        return Err(ChatError::Ai(format!(
-            "model '{model}' is not available for provider '{provider}'"
-        )));
-    }
-    Ok(model)
 }
 
 fn cli_session_after_model_change(
@@ -450,103 +224,6 @@ fn cli_session_fingerprint_after_model_change(
     (current_model == next_model)
         .then(|| current_fingerprint.map(str::to_string))
         .flatten()
-}
-
-async fn persist_cli_session_contract(
-    db: &DatabaseConnection,
-    conversation_id: i64,
-    session_id: &str,
-    fingerprint: &str,
-) -> Result<(), ChatError> {
-    ai_conversations::ActiveModel {
-        id: Set(conversation_id),
-        cli_session_id: Set(Some(session_id.to_string())),
-        cli_session_fingerprint: Set(Some(fingerprint.to_string())),
-        ..Default::default()
-    }
-    .update(db)
-    .await
-    .map(|_| ())
-    .map_err(ChatError::from)
-}
-
-fn interactive_tool_metadata(tools: &[serde_json::Value]) -> Option<serde_json::Value> {
-    if tools.is_empty() {
-        return None;
-    }
-    let parts = tools
-        .iter()
-        .map(|tool| serde_json::json!({"type": "tool", "tool": tool}))
-        .collect::<Vec<_>>();
-    Some(serde_json::json!({
-        "tools": tools,
-        "parts": parts
-    }))
-}
-
-fn interactive_terminal_content(
-    content: String,
-    tools: &[serde_json::Value],
-    failure: Option<&str>,
-) -> String {
-    if !content.trim().is_empty() {
-        return content;
-    }
-    if let Some(failure) = failure {
-        return format!(
-            "The tool call completed, but the interactive assistant stopped before providing a final answer: {failure}"
-        );
-    }
-    if !tools.is_empty() {
-        return "The tool call completed successfully, but the assistant did not provide a final answer. Review the tool result above or ask me to summarize it."
-            .to_string();
-    }
-    content
-}
-
-async fn persist_interactive_assistant(
-    db: &DatabaseConnection,
-    conversation_id: i64,
-    message_id: &mut Option<i64>,
-    content: String,
-    tools: &[serde_json::Value],
-) -> Result<i64, ChatError> {
-    let metadata = interactive_tool_metadata(tools);
-    if let Some(id) = *message_id {
-        ai_messages::ActiveModel {
-            id: Set(id),
-            content: Set(content),
-            metadata: Set(metadata),
-            ..Default::default()
-        }
-        .update(db)
-        .await
-        .map(|message| message.id)
-        .map_err(ChatError::from)
-    } else {
-        let message = ai_messages::ActiveModel {
-            conversation_id: Set(conversation_id),
-            role: Set("assistant".to_string()),
-            content: Set(content),
-            metadata: Set(metadata),
-            created_at: Set(Utc::now()),
-            ..Default::default()
-        }
-        .insert(db)
-        .await
-        .map_err(ChatError::from)?;
-        *message_id = Some(message.id);
-        Ok(message.id)
-    }
-}
-
-fn valid_permission(provider: &str, value: &str) -> bool {
-    match provider {
-        "claude_cli" => matches!(value, "default" | "accept-edits" | "plan" | "full-access"),
-        "codex_cli" => matches!(value, "auto" | "auto-review" | "full-access"),
-        "opencode" => matches!(value, "build" | "plan"),
-        _ => value == "confirm-actions",
-    }
 }
 
 /// Normalise a model-generated title: take the first non-empty line, strip
@@ -651,8 +328,8 @@ pub enum ChatStreamEvent {
         name: String,
         content: String,
     },
-    /// The interactive Claude CLI subprocess is waiting for the user to approve
-    /// or deny a tool/question/plan (ADR-038 Phase 2, milestone 3+).  The SSE
+    /// The active provider is waiting for the user to approve or deny a
+    /// tool/question/plan. The SSE
     /// handler emits this as a `permission_requested` event so the UI can
     /// render the appropriate card.  The user resolves it via
     /// `POST .../permissions/{id}/resolve`, which unblocks the subprocess.
@@ -686,28 +363,6 @@ struct WriteSupport {
     pending: Arc<PendingActionService>,
 }
 
-/// Everything `ConversationService` needs to drive a `ClaudeCliProvider::run_interactive`
-/// turn (ADR-038 Phase 2, deliverable 4).
-///
-/// Supply via [`ConversationService::with_interactive_cli`].  When absent, all
-/// conversations fall through to the existing one-shot or gateway path.
-pub struct InteractiveCliHandle {
-    /// The provider that implements `run_interactive` with the
-    /// `--permission-prompt-tool stdio` protocol.
-    pub provider: Arc<temps_agents::ai_cli::claude::ClaudeCliProvider>,
-    /// Root directory for per-turn tempdirs.  The CLI subprocess is launched
-    /// with `work_dir = <scratch_dir>/<uuid>` so concurrent turns are fully
-    /// isolated from each other.  Must exist and be writable before any call.
-    pub scratch_dir: PathBuf,
-    /// Hard deadline per `run_interactive` call.  Should be longer than a
-    /// typical agentic turn (minutes, not seconds) to allow multi-step tasks
-    /// while still ensuring stalled turns don't block a semaphore slot forever.
-    pub timeout: Duration,
-    /// Limits how many interactive CLI subprocesses may run concurrently on
-    /// this host.  A reasonable default is 2 (same as `AgentCliAiService`).
-    pub concurrency: Arc<tokio::sync::Semaphore>,
-}
-
 /// Owns conversation persistence + AI turn streaming. Construct once with the
 /// registered context providers; resolve via the plugin DI.
 pub struct ConversationService {
@@ -724,14 +379,7 @@ pub struct ConversationService {
     /// instead of requiring a restart. `None` in tests and in any wiring that
     /// has not supplied it — the compiled default applies.
     config: Option<Arc<temps_config::ConfigService>>,
-    /// Optional interactive Claude CLI wiring (ADR-038 Phase 2).  When `Some`
-    /// AND the instance-scope `ai_gateway_config` row has
-    /// `interactive_bridge_enabled = true`, `send_message` routes turns through
-    /// `run_interactive` instead of the one-shot path.  `None` until
-    /// [`ConversationService::with_interactive_cli`] is called.
-    interactive_cli: Option<Arc<InteractiveCliHandle>>,
-    /// In-process registry for pending permission requests from the interactive
-    /// Claude CLI (`--permission-prompt-tool stdio`, ADR-038 Phase 2).
+    /// In-process registry for normalized provider interaction requests.
     ///
     /// Keyed by the CLI's own `request_id` (a UUID).  The resolve endpoint
     /// claims an entry by removing it (atomic remove-to-claim prevents double
@@ -745,7 +393,7 @@ pub struct ConversationService {
     ///       the kind the CLI actually requested.
     ///
     /// Entries live only for the duration of one `control_request` / await
-    /// cycle inside `run_interactive`'s stream task.  If the subprocess exits
+    /// cycle inside the provider turn task. If the provider exits
     /// before resolution, the send fails (receiver dropped) and the task
     /// auto-denies — so no entry can be orphaned indefinitely.
     ///
@@ -805,7 +453,6 @@ impl ConversationService {
             providers,
             write_support: None,
             config: None,
-            interactive_cli: None,
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -874,26 +521,8 @@ impl ConversationService {
         self
     }
 
-    /// Wire the interactive Claude CLI bridge (ADR-038 Phase 2).
-    ///
-    /// After this call, `send_message` will check `interactive_bridge_enabled`
-    /// in the instance-scope `ai_gateway_config` row on every turn.  When the
-    /// flag is set, the turn is routed through `ClaudeCliProvider::run_interactive`
-    /// instead of the one-shot or gateway path.
-    ///
-    /// Calling this more than once replaces the previous handle — the last
-    /// call wins.  Not calling it leaves `interactive_cli = None`, which
-    /// preserves the pre-Phase-2 behaviour.
-    pub fn with_interactive_cli(mut self, handle: InteractiveCliHandle) -> Self {
-        self.interactive_cli = Some(Arc::new(handle));
-        self
-    }
-
-    /// Is AI configured at all? (Capability gate; feature opt-in is checked at
-    /// the handler.) A subscription agent CLI counts here even though it
-    /// can't do multi-turn tool-calling ([`temps_ai::AiService::chat_capable`])
-    /// — [`Self::send_message`] degrades to a tool-less conversation for
-    /// such a provider instead of refusing to chat at all.
+    /// Is the selected AI provider configured? Feature opt-in is checked by
+    /// the handler; transport-specific readiness stays behind `AiService`.
     pub async fn ai_available(&self) -> bool {
         self.ai.is_available().await
     }
@@ -1172,119 +801,46 @@ impl ConversationService {
         requested_thinking_level: Option<&str>,
         requested_permission_mode: Option<&str>,
     ) -> Result<ConversationRuntime, ChatError> {
-        use temps_entities::ai_provider_keys;
-
         let requested_thinking_level = normalize_thinking_level(requested_thinking_level);
-
         let provider = match requested {
             Some(value) => value.to_string(),
-            None => {
-                let key = ai_provider_keys::Entity::find()
-                    .filter(ai_provider_keys::Column::IsActive.eq(true))
-                    .order_by_asc(ai_provider_keys::Column::Id)
-                    .one(self.db.as_ref())
-                    .await?
-                    .ok_or(ChatError::AiUnavailable)?;
-                format!("gateway_key:{}", key.id)
-            }
+            None => self.resolve_default_provider().await?,
         };
-
-        if let Some(raw_id) = provider.strip_prefix("gateway_key:") {
-            let key_id = raw_id.parse::<i32>().map_err(|_| {
-                ChatError::Ai(format!("invalid gateway provider key id '{raw_id}'"))
+        let capabilities = self
+            .ai
+            .capabilities_for(Some(&provider), temps_ai::RefreshPolicy::Cached)
+            .await
+            .map_err(|error| {
+                ChatError::Ai(format!(
+                    "provider '{provider}' is not ready for a new conversation: {error}"
+                ))
             })?;
-            let key = ai_provider_keys::Entity::find_by_id(key_id)
-                .one(self.db.as_ref())
-                .await?
-                .filter(|key| key.is_active)
-                .ok_or_else(|| {
-                    ChatError::Ai(format!(
-                        "gateway provider key {key_id} is missing or inactive"
-                    ))
-                })?;
-            let model = requested_model
-                .map(str::to_string)
-                .or_else(|| key.default_model.clone())
-                .or_else(|| {
-                    gateway_model_ids(&key.provider)
-                        .first()
-                        .map(|m| (*m).to_string())
-                })
-                .ok_or_else(|| {
-                    ChatError::Ai(format!(
-                        "gateway provider key {key_id} has no selectable chat model"
-                    ))
-                })?;
-            let advertised = gateway_model_ids(&key.provider).contains(&model.as_str())
-                || key.default_model.as_deref() == Some(model.as_str());
-            if !advertised {
-                return Err(ChatError::Ai(format!(
-                    "model '{model}' is not available for gateway provider key {key_id}"
-                )));
-            }
-            let thinking_level = if model_supports_thinking(&key.provider, &model) {
-                Some(requested_thinking_level.unwrap_or("medium").to_string())
-            } else {
-                requested_thinking_level.map(str::to_string)
-            };
-            if !valid_thinking(&key.provider, &model, thinking_level.as_deref()) {
-                return Err(ChatError::Ai(format!(
-                    "thinking option '{}' is not available for model '{model}'",
-                    thinking_level.as_deref().unwrap_or("")
-                )));
-            }
-            let permission_mode = requested_permission_mode.unwrap_or("confirm-actions");
-            if !valid_permission(&key.provider, permission_mode) {
-                return Err(ChatError::Ai(format!(
-                    "permission mode '{permission_mode}' is not available for provider '{provider}'"
-                )));
-            }
-            return Ok(ConversationRuntime {
-                provider,
-                model,
-                thinking_level,
-                permission_mode: permission_mode.to_string(),
-            });
-        }
-
-        temps_agents::ai_cli::find_provider(&provider).ok_or_else(|| {
-            ChatError::Ai(format!(
-                "unknown AI provider '{provider}' selected for new conversation"
-            ))
-        })?;
-        let cli = temps_agents::ai_cli::create_provider(&provider)
-            .ok_or_else(|| ChatError::Ai(format!("host provider '{provider}' is not supported")))?;
-        let (status, discovered_models) = tokio::join!(
-            cli.get_status(),
-            temps_agents::ai_cli::discover_model_capabilities(&provider)
-        );
-        if !status.installed || !status.authenticated {
+        let model = requested_model
+            .map(str::to_string)
+            .or_else(|| capabilities.default_model_id.clone())
+            .or_else(|| capabilities.models.first().map(|model| model.id.clone()))
+            .unwrap_or_else(|| "default".to_string());
+        let discovered_model = capabilities.model(&model);
+        if discovered_model.is_none() && !(capabilities.models.is_empty() && model == "default") {
             return Err(ChatError::Ai(format!(
-                "host provider '{provider}' is not installed and authenticated"
+                "model '{model}' is not available for provider '{provider}'"
             )));
         }
-        let model = resolve_cli_model_id(&provider, &discovered_models, requested_model)?;
-        let discovered_model = discovered_models.iter().find(|item| item.id == model);
-        let thinking_level = if let Some(discovered) = discovered_model {
-            discovered_thinking_level(discovered, requested_thinking_level)
-        } else if provider == "claude_cli" && model.contains("haiku") {
-            requested_thinking_level.map(str::to_string)
-        } else {
-            requested_thinking_level
-                .or_else(|| {
-                    matches!(provider.as_str(), "claude_cli" | "codex_cli").then_some("high")
-                })
-                .map(str::to_string)
-        };
-        let thinking_is_valid = if let Some(discovered) = discovered_model {
-            thinking_level.as_deref().is_none_or(|thinking| {
-                discovered
-                    .reasoning_options
-                    .iter()
-                    .any(|option| option == thinking)
+        let thinking_level = discovered_model
+            .and_then(|model| {
+                requested_thinking_level
+                    .map(str::to_string)
+                    .or_else(|| model.default_thinking_mode_id.clone())
             })
-        } else {
-            valid_thinking(&provider, &model, thinking_level.as_deref())
+            .or_else(|| requested_thinking_level.map(str::to_string));
+        let thinking_is_valid = match discovered_model {
+            Some(model) => thinking_level.as_deref().is_none_or(|thinking| {
+                model
+                    .thinking_modes
+                    .iter()
+                    .any(|option| option.id == thinking)
+            }),
+            None => thinking_level.is_none(),
         };
         if !thinking_is_valid {
             return Err(ChatError::Ai(format!(
@@ -1292,14 +848,15 @@ impl ConversationService {
                 thinking_level.as_deref().unwrap_or("")
             )));
         }
-        let default_permission = match provider.as_str() {
-            "claude_cli" => "default",
-            "codex_cli" => "auto",
-            "opencode" => "build",
-            _ => "default",
-        };
-        let permission_mode = requested_permission_mode.unwrap_or(default_permission);
-        if !valid_permission(&provider, permission_mode) {
+        let permission_mode = requested_permission_mode
+            .map(str::to_string)
+            .or(capabilities.default_permission_mode_id.clone())
+            .ok_or_else(|| {
+                ChatError::Ai(format!(
+                    "provider '{provider}' has no default permission mode"
+                ))
+            })?;
+        if capabilities.permission_mode(&permission_mode).is_none() {
             return Err(ChatError::Ai(format!(
                 "permission mode '{permission_mode}' is not available for provider '{provider}'"
             )));
@@ -1308,8 +865,31 @@ impl ConversationService {
             provider,
             model,
             thinking_level,
-            permission_mode: permission_mode.to_string(),
+            permission_mode,
         })
+    }
+    async fn resolve_default_provider(&self) -> Result<String, ChatError> {
+        use temps_entities::{ai_gateway_config, ai_provider_keys};
+
+        if let Some(preference) = ai_gateway_config::Entity::find()
+            .filter(ai_gateway_config::Column::Scope.eq("instance"))
+            .one(self.db.as_ref())
+            .await?
+        {
+            if preference.provider_type == "agent_cli" {
+                return preference.agent_cli_provider_id.ok_or_else(|| {
+                    ChatError::Ai("active agent CLI preference has no provider id".to_string())
+                });
+            }
+        }
+
+        let key = ai_provider_keys::Entity::find()
+            .filter(ai_provider_keys::Column::IsActive.eq(true))
+            .order_by_asc(ai_provider_keys::Column::Id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ChatError::AiUnavailable)?;
+        Ok(format!("gateway_key:{}", key.id))
     }
 
     async fn insert_message(
@@ -1544,11 +1124,7 @@ impl ConversationService {
         // than guessing keywords for search_api. Sourced from the API-tools
         // provider so it always reflects the live allowlist; merged into EVERY
         // context for the same reason its tools are.
-        let mut cli_session_contracts = Vec::new();
         if let Some(api_tools_provider) = self.providers.get("__api_tools__") {
-            if let Some(contract) = api_tools_provider.cli_session_contract(auth) {
-                cli_session_contracts.push(contract);
-            }
             if let Some(appendix) = api_tools_provider.system_appendix(auth) {
                 match messages.iter_mut().find(|m| m.role == "system") {
                     Some(sys) => {
@@ -1576,23 +1152,14 @@ impl ConversationService {
             }
         }
 
-        // Agentic tool path: gather the tools available for this turn — the
+        // Gather the scoped tools available for this turn — the
         // context provider's own tools (e.g. a git-backed deployment can read
         // repo files) PLUS the shared, project-scoped trace tools (available in
         // every context when a trace store is configured) PLUS the ADR-024 generic
         // API meta-tools (search_api, describe_api, call_api) registered under the
-        // sentinel context_type "__api_tools__". When any tool exists, run a
-        // non-streaming tool loop and return the final answer; fall back to plain
-        // streaming if the model can't do tools or the loop yields nothing.
-        //
-        // Skipped entirely when the active provider isn't `chat_capable()` (a
-        // subscription agent CLI has no external function-calling protocol to
-        // hand tool definitions to) — building tools and a write-action
-        // appendix the model can never actually invoke would just describe
-        // capabilities that silently don't work. Falling through to plain
-        // `chat_stream()` below still gives that provider a genuinely working
-        // conversational chat, just without live API/repo tools or write
-        // actions — real usage instead of a hard block.
+        // sentinel context_type "__api_tools__". Gateway adapters receive
+        // native function schemas; host adapters receive the same catalog via
+        // their turn-scoped MCP bridge.
         let chat_capable = self.ai.chat_capable_for(Some(&conv.ai_provider)).await;
         let provider = self.providers.get(conv.context_type.as_str()).cloned();
         let mut tools: Vec<ChatTool> = Vec::new();
@@ -1638,7 +1205,6 @@ impl ConversationService {
                 None
             };
             if let Some(appendix) = write_appendix {
-                cli_session_contracts.push(appendix.clone());
                 // Append the write-CLI section map to the system framing so the model
                 // knows what mutations are available and that they require confirmation.
                 match messages.iter_mut().find(|m| m.role == "system") {
@@ -1651,620 +1217,14 @@ impl ConversationService {
             }
         }
 
-        // ADR-038 Phase 2: interactive Claude CLI path.
-        //
-        // When `interactive_bridge_enabled` is set on the instance-scope config
-        // row AND the `InteractiveCliHandle` is wired, route the turn through
-        // `ClaudeCliProvider::run_interactive` (bidirectional stdio, permission
-        // cards) instead of the one-shot / gateway `chat_stream` path below.
-        // This branch only fires for claude_cli — all other providers fall
-        // through.
-        let execution_path = select_tool_execution_path(
-            self.should_use_interactive_cli(conv).await,
-            !tools.is_empty(),
-        );
-        if execution_path == ToolExecutionPath::InteractiveClaude {
-            if let Some(ref handle) = self.interactive_cli.clone() {
-                return Ok(self
-                    .send_message_via_interactive_cli(
-                        conv,
-                        messages,
-                        handle,
-                        provider,
-                        tools,
-                        cli_session_contracts,
-                        auth,
-                    )
-                    .await);
-            }
-        }
-
-        if execution_path == ToolExecutionPath::GenericToolLoop {
-            return Ok(self
-                .try_tool_loop(conv, messages, provider, tools, auth)
-                .await);
-        }
-
-        let req = ChatTurnRequest {
-            purpose: format!("chat.{}", conv.context_type),
-            project_id: Some(conv.project_id),
-            provider: Some(conv.ai_provider.clone()),
-            model: Some(conv.ai_model.clone()),
-            thinking_level: conv.ai_thinking_level.clone(),
-            permission_mode: Some(conv.ai_permission_mode.clone()),
-            messages,
-            ..Default::default()
-        };
-        let mut token_stream = self
-            .ai
-            .chat_stream(req)
-            .await
-            .map_err(|e| ChatError::Ai(e.to_string()))?;
-
-        // Disconnect-safe persistence: drive the AI stream, accumulation, and the
-        // final DB insert inside a DETACHED task, relaying tokens to the client
-        // over an mpsc channel. If the client (the receiver) disconnects
-        // mid-stream the send fails, but the task keeps running to completion and
-        // still persists the assistant turn — so a dropped SSE connection never
-        // orphans the user turn. The send error is ignored on purpose.
-        let db = self.db.clone();
-        let conv_id = conv.id;
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
-
-        tokio::spawn(async move {
-            let mut acc = String::new();
-            while let Some(item) = token_stream.next().await {
-                match item {
-                    Ok(tok) => {
-                        acc.push_str(&tok);
-                        // If the send fails the client disconnected (Stop / navigate
-                        // away) — stop pulling tokens so dropping `token_stream`
-                        // cancels the upstream provider request, then persist what we
-                        // have so the turn isn't orphaned.
-                        if tx.send(Ok(ChatStreamEvent::Token(tok))).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(ChatError::Ai(e.to_string())));
-                        break;
-                    }
-                }
-            }
-            // Persist the assistant turn once the reply is complete (or was stopped),
-            // regardless of whether the client is still listening.
-            if !acc.is_empty() {
-                let am = ai_messages::ActiveModel {
-                    conversation_id: Set(conv_id),
-                    role: Set("assistant".to_string()),
-                    content: Set(acc),
-                    created_at: Set(Utc::now()),
-                    ..Default::default()
-                };
-                let _ = am.insert(db.as_ref()).await;
-            }
-        });
-        // Relay channel -> stream. Dropping this stream drops `rx`, which makes
-        // `tx.send` fail in the task, but the task continues and persists.
-        let out = async_stream::stream! {
-            while let Some(item) = rx.recv().await {
-                yield item;
-            }
-        };
-        Ok(Box::pin(out))
+        // Every provider now enters the same turn runtime. The adapter decides
+        // how to transport normalized text/tool/interaction events; chat owns
+        // persistence, authorization, retries, and SSE for all providers.
+        Ok(self
+            .try_tool_loop(conv, messages, provider, tools, auth)
+            .await)
     }
 
-    /// Return `true` when ALL of these are true:
-    ///
-    /// * [`Self::interactive_cli`] is wired (the plugin supplied an
-    ///   `InteractiveCliHandle` via [`Self::with_interactive_cli`]).
-    /// * The instance-scope `ai_gateway_config` row has
-    ///   `provider_type = "agent_cli"`, `agent_cli_provider_id = "claude_cli"`,
-    ///   AND `interactive_bridge_enabled = true`.
-    ///
-    /// Best-effort: any DB error or a missing config row returns `false` —
-    /// the turn falls through to the plain `chat_stream` path rather than
-    /// failing hard.
-    async fn should_use_interactive_cli(&self, conv: &ai_conversations::Model) -> bool {
-        if self.interactive_cli.is_none() {
-            return false;
-        }
-        if conv.ai_provider != "claude_cli" {
-            return false;
-        }
-        // Once a Claude conversation owns a resumable CLI session, continue
-        // through that bridge even if the operator later changes the global
-        // default provider. Switching the instance preference must not orphan
-        // an already-pinned conversation.
-        if conv.cli_session_id.is_some() {
-            return true;
-        }
-        use temps_entities::ai_gateway_config;
-        let config = match ai_gateway_config::Entity::find()
-            .filter(ai_gateway_config::Column::Scope.eq("instance"))
-            .one(self.db.as_ref())
-            .await
-        {
-            Ok(Some(c)) => c,
-            _ => return false,
-        };
-        config.interactive_bridge_enabled
-    }
-
-    /// Drive a single chat turn via [`ClaudeCliProvider::run_interactive`]
-    /// (ADR-038 Phase 2, deliverable 4).
-    ///
-    /// # Streaming
-    ///
-    /// Returns a stream identical in shape to the `chat_stream` path:
-    ///
-    /// * `ChatStreamEvent::Token` — a chunk of assistant prose.
-    /// * `ChatStreamEvent::PermissionRequested` — the CLI wants human
-    ///   approval for a tool/question/plan; the resolve endpoint supplies it.
-    ///
-    /// The whole run lives in a detached task so a dropped SSE connection
-    /// does not leave the subprocess hanging.
-    ///
-    /// # Session continuity (deliverable 5)
-    ///
-    /// A session is resumed only when its stored contract fingerprint matches
-    /// the current provider/tool catalog. Both resumed sessions and fresh
-    /// replacements for stale/legacy sessions receive only the current
-    /// server-controlled system framing plus the latest user message, so an
-    /// obsolete assistant claim cannot poison the replacement. A genuinely
-    /// new conversation may flatten its complete initial seed as before.
-    ///
-    /// After the subprocess exits, the returned `session_id` (from the
-    /// `system/init` or `result` event) is persisted back to
-    /// `ai_conversations.cli_session_id` so the NEXT turn can resume.
-    #[allow(clippy::too_many_arguments)]
-    async fn send_message_via_interactive_cli(
-        &self,
-        conv: &ai_conversations::Model,
-        messages: Vec<ChatMessage>,
-        handle: &Arc<InteractiveCliHandle>,
-        context_provider: Option<Arc<dyn ConversationContextProvider>>,
-        tools: Vec<ChatTool>,
-        provider_contracts: Vec<String>,
-        auth: &AuthContext,
-    ) -> Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>> {
-        use temps_agents::ai_cli::{AiRunConfig, OnEventCallback, PermissionBridge};
-        use temps_ai::streaming::PermissionRequest;
-
-        // Acquire a concurrency permit.  `try_acquire_owned` returns immediately:
-        // if all slots are taken we fail fast rather than queuing indefinitely,
-        // so a burst of concurrent users doesn't cause unbounded latency.
-        let permit = match handle.concurrency.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                let (tx, mut rx) =
-                    tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
-                let _ = tx.send(Err(ChatError::Ai(
-                    "the interactive CLI concurrency limit is reached; \
-                     please wait for another turn to finish and try again"
-                        .to_string(),
-                )));
-                let out = async_stream::stream! {
-                    while let Some(item) = rx.recv().await {
-                        yield item;
-                    }
-                };
-                return Box::pin(out);
-            }
-        };
-
-        // Per-turn tempdir inside the configured scratch root.  The CLI
-        // subprocess is launched here; isolated per turn so concurrent runs
-        // don't interfere.
-        let scratch = tempfile::tempdir_in(&handle.scratch_dir);
-        let work_dir = match scratch {
-            Ok(ref d) => d.path().to_path_buf(),
-            Err(e) => {
-                let (tx, mut rx) =
-                    tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
-                let _ = tx.send(Err(ChatError::Ai(format!(
-                    "failed to create temp work dir for interactive CLI turn: {e}"
-                ))));
-                let out = async_stream::stream! {
-                    while let Some(item) = rx.recv().await {
-                        yield item;
-                    }
-                };
-                return Box::pin(out);
-            }
-        };
-
-        let current_fingerprint = interactive_cli_contract_fingerprint(
-            &conv.ai_provider,
-            &conv.ai_model,
-            conv.ai_thinking_level.as_deref(),
-            &conv.ai_permission_mode,
-            &tools,
-            &provider_contracts,
-        );
-        let resume_session_id = resumable_cli_session_id(
-            conv.cli_session_id.as_deref(),
-            conv.cli_session_fingerprint.as_deref(),
-            &current_fingerprint,
-        );
-        // A mismatched/legacy session must not poison its replacement by
-        // replaying stale assistant claims. This is intentionally independent
-        // of `resume_session_id`: existing conversations get the current
-        // system/catalog plus latest user only, while a genuinely new chat may
-        // still use its complete seed. The message-count fallback covers rows
-        // whose legacy session id was cleared by the fingerprint migration.
-        let refresh_existing_history = should_refresh_interactive_cli_prompt(conv, &messages);
-        let prompt = build_interactive_cli_prompt(&messages, refresh_existing_history);
-
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
-
-        // Claude's interactive transport keeps its bidirectional permission
-        // bridge and resumable session, while context tools are exposed through
-        // the same turn-scoped MCP executor used by the other agent CLIs.
-        let execution_state = Arc::new(tokio::sync::Mutex::new(ToolExecutionState::default()));
-        let tool_metadata = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
-        let api_tools = self.providers.get("__api_tools__").cloned();
-        let repo_tools = self.providers.get("__repo_tools__").cloned();
-        let write_handle = self
-            .write_support
-            .as_ref()
-            .and_then(|support| support.write_handle.get());
-        let pending = self
-            .write_support
-            .as_ref()
-            .map(|support| support.pending.clone());
-        let executor_state = execution_state.clone();
-        let executor_context = context_provider.clone();
-        let executor_api = api_tools.clone();
-        let executor_repo = repo_tools.clone();
-        let executor_write = write_handle.clone();
-        let executor_pending = pending.clone();
-        let executor_context_id = conv.context_id.clone();
-        let executor_auth = auth.clone();
-        let project_id = conv.project_id;
-        let executor_conv_id = conv.id;
-        let executor: temps_ai::ToolExecutor = Arc::new(move |call: ToolCall| {
-            let state = executor_state.clone();
-            let context_provider = executor_context.clone();
-            let api_tools = executor_api.clone();
-            let repo_tools = executor_repo.clone();
-            let write_handle = executor_write.clone();
-            let pending = executor_pending.clone();
-            let context_id = executor_context_id.clone();
-            let auth = executor_auth.clone();
-            Box::pin(async move {
-                let mut state = state.lock().await;
-                Ok(dispatch_conversation_tool(
-                    &call,
-                    project_id,
-                    executor_conv_id,
-                    &context_id,
-                    &auth,
-                    context_provider.as_ref(),
-                    api_tools.as_ref(),
-                    repo_tools.as_ref(),
-                    write_handle.as_deref(),
-                    pending.as_deref(),
-                    &mut state,
-                )
-                .await)
-            })
-        });
-        let mut mcp_bridge = match temps_ai_agent_cli::ScopedMcpBridge::start(tools, executor).await
-        {
-            Ok(bridge) => bridge,
-            Err(error) => {
-                let _ = tx.send(Err(ChatError::Ai(error.to_string())));
-                let out = async_stream::stream! {
-                    while let Some(item) = rx.recv().await {
-                        yield item;
-                    }
-                };
-                return Box::pin(out);
-            }
-        };
-        let mcp_config = mcp_bridge.config.clone();
-        let mut mcp_events = mcp_bridge.take_events();
-        let tx_mcp = tx.clone();
-        let tool_metadata_for_events = tool_metadata.clone();
-        let db_for_tool_progress = self.db.clone();
-        let conv_id_for_tool_progress = conv.id;
-        let mcp_event_task = tokio::spawn(async move {
-            let mut assistant_message_id = None;
-            while let Some(event) = mcp_events.recv().await {
-                match event {
-                    Ok(ChatStreamDelta::ToolCall(call)) => {
-                        let _ = tx_mcp.send(Ok(ChatStreamEvent::ToolCall {
-                            id: call.id,
-                            name: call.name,
-                            arguments: call.arguments,
-                        }));
-                    }
-                    Ok(ChatStreamDelta::ToolResult { call, result }) => {
-                        let tools = {
-                            let mut tools = tool_metadata_for_events.lock().await;
-                            tools.push(serde_json::json!({
-                                "id": call.id.clone(),
-                                "name": call.name.clone(),
-                                "arguments": call.arguments.clone(),
-                                "result": result.clone(),
-                            }));
-                            tools.clone()
-                        };
-                        // Tool events are user-visible immediately. Persist the
-                        // same progress before waiting for Claude's terminal
-                        // frame so a stalled/tool-only turn survives reload.
-                        if let Err(error) = persist_interactive_assistant(
-                            db_for_tool_progress.as_ref(),
-                            conv_id_for_tool_progress,
-                            &mut assistant_message_id,
-                            INTERACTIVE_TOOL_PROGRESS_CONTENT.to_string(),
-                            &tools,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                conv_id = conv_id_for_tool_progress,
-                                "failed to persist interactive tool progress: {error}"
-                            );
-                        }
-                        let _ = tx_mcp.send(Ok(ChatStreamEvent::ToolResult {
-                            id: call.id,
-                            name: call.name,
-                            content: result,
-                        }));
-                    }
-                    Ok(ChatStreamDelta::Text(_)) | Ok(ChatStreamDelta::PermissionRequested(_)) => {}
-                    Err(error) => {
-                        let _ = tx_mcp.send(Err(ChatError::Ai(error.to_string())));
-                    }
-                }
-            }
-            assistant_message_id
-        });
-
-        // on_event: extract assistant text from each NDJSON line and forward it
-        // as a Token event.  Everything else (hook events, tool-call deltas,
-        // control_request frames) is handled inside `run_interactive` itself.
-        //
-        // `extract_partial_text` covers the actual token-by-token stream (the
-        // CLI runs with `--include-partial-messages` — see `run_interactive`),
-        // so the response fills in as the model generates it instead of
-        // appearing all at once when the turn ends. Once a turn has forwarded
-        // any delta, the later consolidated `assistant` event is skipped
-        // rather than forwarded — it repeats the same text in one shot.
-        let tx_events = tx.clone();
-        let streamed_partial = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let on_event: OnEventCallback = Arc::new(move |line: String| {
-            let tx = tx_events.clone();
-            let streamed_partial = streamed_partial.clone();
-            Box::pin(async move {
-                if let Some(delta) = temps_agents::ai_cli::extract_partial_text("claude_cli", &line)
-                {
-                    streamed_partial.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = tx.send(Ok(ChatStreamEvent::Token(delta)));
-                } else if let (false, Some(text)) = (
-                    streamed_partial.load(std::sync::atomic::Ordering::Relaxed),
-                    temps_agents::ai_cli::extract_assistant_text("claude_cli", &line),
-                ) {
-                    let _ = tx.send(Ok(ChatStreamEvent::Token(text)));
-                }
-            })
-        });
-
-        // PermissionBridge: for each control_request frame from the CLI:
-        //   1. Insert a oneshot sender into the shared pending-permissions map.
-        //   2. Emit PermissionRequested on the SSE stream.
-        //   3. Return the receiver so run_interactive can await the decision.
-        let tx_perms = tx.clone();
-        let pending_map = self.pending_permissions.clone();
-        let conv_public_id = conv.public_id.clone();
-        let db_for_ask = self.db.clone();
-        let conv_id_for_ask = conv.id;
-        let bridge = Arc::new(PermissionBridge {
-            on_permission_request: Arc::new(move |req: PermissionRequest| {
-                let (sender, receiver) =
-                    tokio::sync::oneshot::channel::<temps_ai::streaming::PermissionDecision>();
-                let entry = PendingPermissionEntry {
-                    sender,
-                    conv_public_id: conv_public_id.clone(),
-                    kind: req.kind.clone(),
-                    tool_name: req.tool_name.clone(),
-                    input: req.input.clone(),
-                };
-                {
-                    // Sync mutex: critical section is tiny (HashMap insert, no I/O).
-                    let mut map = match pending_map.lock() {
-                        Ok(g) => g,
-                        Err(e) => e.into_inner(),
-                    };
-                    map.insert(req.id.clone(), entry);
-                }
-
-                // Persist what was asked as a synthetic `assistant` message so a
-                // page reload shows the original question/plan/tool request, not
-                // just the eventual outcome. Best-effort, fire-and-forget: this
-                // closure is sync and must not block emitting the SSE event.
-                let content = format_permission_asked(&req.kind, &req.tool_name, &req.input);
-                let db = db_for_ask.clone();
-                tokio::spawn(async move {
-                    let am = ai_messages::ActiveModel {
-                        conversation_id: Set(conv_id_for_ask),
-                        role: Set("assistant".to_string()),
-                        content: Set(content),
-                        created_at: Set(Utc::now()),
-                        ..Default::default()
-                    };
-                    if let Err(e) = am.insert(db.as_ref()).await {
-                        tracing::warn!(
-                            conv_id_for_ask,
-                            "failed to persist permission-asked message: {e}"
-                        );
-                    }
-                });
-
-                let _ = tx_perms.send(Ok(ChatStreamEvent::PermissionRequested {
-                    id: req.id,
-                    kind: req.kind,
-                    tool_name: req.tool_name,
-                    input: req.input,
-                }));
-                receiver
-            }),
-        });
-
-        // Clone everything the detached task needs — `send_message` borrows
-        // `&self`, so the task owns its own copies.
-        let provider = handle.provider.clone();
-        let timeout = handle.timeout;
-        let db = self.db.clone();
-        let conv_id = conv.id;
-        let model = conv.ai_model.clone();
-        let thinking_level = conv.ai_thinking_level.clone();
-        let permission_mode = conv.ai_permission_mode.clone();
-
-        tokio::spawn(async move {
-            // `scratch` is moved in and kept alive for the full subprocess
-            // lifetime — dropping it would delete the work dir mid-run.
-            let _scratch = scratch;
-            // `permit` is held for the full task lifetime — dropped on exit.
-            let _permit = permit;
-
-            let config = AiRunConfig {
-                work_dir,
-                prompt,
-                api_key: String::new(), // CLI uses its own stored credential
-                max_turns: 0,           // no artificial cap; timeout is the governor
-                timeout,
-                model: Some(model),
-                thinking_level,
-                permission_mode: Some(permission_mode),
-                on_event: Some(on_event),
-                permission_bridge: Some(bridge),
-                resume_session_id,
-                mcp_server: Some(mcp_config),
-            };
-
-            let run_result = provider.run_interactive(config).await;
-            mcp_bridge.shutdown().await;
-            let mut assistant_message_id = match mcp_event_task.await {
-                Ok(message_id) => message_id,
-                Err(error) => {
-                    tracing::warn!(conv_id, "interactive MCP event task failed: {error}");
-                    None
-                }
-            };
-            match run_result {
-                Ok(result) => {
-                    // Persist session_id back so the next turn can resume.
-                    if let Some(ref session_id) = result.session_id {
-                        if let Err(e) = persist_cli_session_contract(
-                            db.as_ref(),
-                            conv_id,
-                            session_id,
-                            &current_fingerprint,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                conv_id,
-                                "failed to persist cli_session_id after interactive turn: {e}"
-                            );
-                        }
-                    }
-
-                    // Extract the full assistant text from the accumulated output
-                    // for persistence in ai_messages (history replay).
-                    let content: String = result
-                        .output
-                        .lines()
-                        .filter_map(|line| {
-                            temps_agents::ai_cli::extract_assistant_text("claude_cli", line)
-                        })
-                        .collect();
-
-                    let tools = tool_metadata.lock().await.clone();
-                    let content = interactive_terminal_content(content, &tools, None);
-                    if !content.is_empty() || !tools.is_empty() {
-                        match persist_interactive_assistant(
-                            db.as_ref(),
-                            conv_id,
-                            &mut assistant_message_id,
-                            content,
-                            &tools,
-                        )
-                        .await
-                        {
-                            Ok(message_id) => {
-                                let proposed = execution_state
-                                    .lock()
-                                    .await
-                                    .proposed_action_ids
-                                    .clone();
-                                if !proposed.is_empty() {
-                                    if let Some(pending) = &pending {
-                                        if let Err(error) = pending
-                                            .link_message(&proposed, message_id)
-                                            .await
-                                        {
-                                            tracing::warn!(conv_id, "failed to link interactive CLI proposals: {error}");
-                                        }
-                                    }
-                                }
-                            }
-                            Err(error) => tracing::warn!(
-                                conv_id,
-                                "failed to persist assistant message after interactive turn: {error}"
-                            ),
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(conv_id, "run_interactive failed: {e}");
-                    let tools = tool_metadata.lock().await.clone();
-                    if !tools.is_empty() {
-                        let content = interactive_terminal_content(
-                            String::new(),
-                            &tools,
-                            Some(&e.to_string()),
-                        );
-                        if let Err(error) = persist_interactive_assistant(
-                            db.as_ref(),
-                            conv_id,
-                            &mut assistant_message_id,
-                            content,
-                            &tools,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                conv_id,
-                                "failed to persist failed interactive tool turn: {error}"
-                            );
-                        }
-                    }
-                    // Surface the error to the client.  The `tx` sender may
-                    // already be closed if the client disconnected — that is
-                    // fine; the error is just dropped.
-                    let _ = tx.send(Err(ChatError::Ai(format!(
-                        "interactive CLI turn failed: {e}"
-                    ))));
-                }
-            }
-        });
-
-        let out = async_stream::stream! {
-            while let Some(item) = rx.recv().await {
-                yield item;
-            }
-        };
-        Box::pin(out)
-    }
-
-    /// Load the `ai_write_actions_enabled` flag for a project from the DB.
-    /// Best-effort: returns `None` on DB error (caller treats as `false`).
     async fn load_write_actions_enabled(&self, project_id: i32) -> Option<bool> {
         let project = temps_entities::projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
@@ -2384,12 +1344,11 @@ impl ConversationService {
     /// calls, that streamed prose is the final answer. A simple chat that needs no
     /// tools is therefore exactly one streaming call.
     ///
-    /// The whole loop runs inside a detached task: if the client drops the SSE
-    /// stream the sends start failing (ignored) but the task still runs to
-    /// completion and persists the assistant turn, so a dropped connection never
-    /// orphans the user turn. We persist `content` (all prose, for history replay)
-    /// plus ordered `parts` (text/tool segments in occurrence order) and the
-    /// executed `tools`, so a reload renders identically to the live stream.
+    /// The whole loop runs inside a task owned by the returned stream. Dropping
+    /// the SSE stream aborts the task and upstream provider request. Completed
+    /// turns persist `content` (all prose, for history replay) plus ordered
+    /// `parts` (text/tool segments in occurrence order) and the executed `tools`,
+    /// so a reload renders identically to the live stream.
     async fn try_tool_loop(
         &self,
         conv: &ai_conversations::Model,
@@ -2456,12 +1415,14 @@ impl ConversationService {
              or describe tools you would call. If the data is insufficient, briefly state what \
              you found and what is still missing.";
 
-        // Own everything the detached task needs (the service is borrowed `&self`).
+        // Own everything the stream-owned task needs (the service borrows `&self`).
         let ai = self.ai.clone();
         let db = self.db.clone();
         let api_tools = self.providers.get("__api_tools__").cloned();
         let repo_tools = self.providers.get("__repo_tools__").cloned();
         let conv_id = conv.id;
+        let conv_public_id = conv.public_id.clone();
+        let pending_permissions = self.pending_permissions.clone();
         let project_id = conv.project_id;
         let context_type = conv.context_type.clone();
         let context_id = conv.context_id.clone();
@@ -2480,15 +1441,75 @@ impl ConversationService {
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
 
-        // The loop, streaming, and persistence all run in this detached task. When
-        // the client drops the SSE stream (Stop, navigate away) `tx.send` fails; we
-        // notice that (`client_gone`), stop generating — dropping the AI stream
-        // cancels the upstream provider request so a stopped turn stops costing
-        // tokens — and persist whatever streamed so far, so the user turn is never
-        // orphaned even though it was cut short.
-        tokio::spawn(async move {
+        // The loop, streaming, and persistence run in a stream-owned task. A
+        // failed send lets the loop persist partial text; dropping the relay
+        // stream aborts immediately and drops the upstream provider request.
+        let turn_task = tokio::spawn(async move {
             let mut messages = base_messages;
             let execution_state = Arc::new(tokio::sync::Mutex::new(ToolExecutionState::default()));
+            let interaction_db = db.clone();
+            let interaction_conv_public_id = conv_public_id.clone();
+            let interaction_registry = pending_permissions.clone();
+            let interactions: temps_ai::InteractionExecutor = Arc::new(move |request| {
+                let db = interaction_db.clone();
+                let conv_public_id = interaction_conv_public_id.clone();
+                let registry = interaction_registry.clone();
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                let generation = uuid::Uuid::new_v4();
+                let entry = PendingPermissionEntry {
+                    sender,
+                    conv_public_id,
+                    kind: request.kind.clone(),
+                    tool_name: request.tool_name.clone(),
+                    input: request.input.clone(),
+                    generation,
+                };
+                match registry.lock() {
+                    Ok(mut pending) => {
+                        pending.insert(request.id.clone(), entry);
+                    }
+                    Err(poisoned) => {
+                        poisoned.into_inner().insert(request.id.clone(), entry);
+                    }
+                }
+
+                let content =
+                    format_permission_asked(&request.kind, &request.tool_name, &request.input);
+                let message = ai_messages::ActiveModel {
+                    conversation_id: Set(conv_id),
+                    role: Set("assistant".to_string()),
+                    content: Set(content),
+                    created_at: Set(Utc::now()),
+                    ..Default::default()
+                };
+                let permission_id = request.id.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = message.insert(db.as_ref()).await {
+                        tracing::warn!(
+                            conversation_id = conv_id,
+                            permission_id = %permission_id,
+                            "failed to persist provider interaction request: {error}"
+                        );
+                    }
+                });
+
+                let guard = PendingPermissionGuard {
+                    registry: registry.clone(),
+                    permission_id: request.id.clone(),
+                    generation,
+                };
+                Box::pin(async move {
+                    let result = receiver.await.map_err(|_| temps_ai::AiError::Provider {
+                        purpose: "chat.permission".to_string(),
+                        reason: format!(
+                            "permission request '{}' ended before it was resolved",
+                            request.id
+                        ),
+                    });
+                    drop(guard);
+                    result
+                })
+            });
             // Structured record of each executed tool, persisted on the assistant
             // message's metadata so the chat replays its tool work after a reload.
             let mut tools_meta: Vec<serde_json::Value> = Vec::new();
@@ -2576,7 +1597,15 @@ impl ConversationService {
                 // A single streaming pass: text deltas and tool calls arrive
                 // inline. An error here (e.g. the model can't do tools) ends the
                 // loop; the salvage below still tries a tool-free reply.
-                let mut stream = match ai.chat_stream_turn_with_executor(req, Some(executor)).await
+                let mut stream = match ai
+                    .chat_stream_turn_with_services(
+                        req,
+                        temps_ai::TurnServices {
+                            tools: Some(executor),
+                            interactions: Some(interactions.clone()),
+                        },
+                    )
+                    .await
                 {
                     Ok(s) => s,
                     Err(e) => {
@@ -2625,7 +1654,7 @@ impl ConversationService {
                                 .send(Ok(ChatStreamEvent::ToolCall {
                                     id: tc.id.clone(),
                                     name: tc.name.clone(),
-                                    arguments: tc.arguments.clone(),
+                                    arguments: redact_json_string(&tc.arguments),
                                 }))
                                 .is_err()
                             {
@@ -2636,11 +1665,13 @@ impl ConversationService {
                         }
                         Ok(ChatStreamDelta::ToolResult { call, result }) => {
                             native_tool_ids.insert(call.id.clone());
+                            let display_arguments = redact_json_string(&call.arguments);
+                            let display_result = redact_json_string(&result);
                             if tx
                                 .send(Ok(ChatStreamEvent::ToolResult {
                                     id: call.id.clone(),
                                     name: call.name.clone(),
-                                    content: result.clone(),
+                                    content: display_result.clone(),
                                 }))
                                 .is_err()
                             {
@@ -2650,8 +1681,8 @@ impl ConversationService {
                             let tool_part = serde_json::json!({
                                 "id": call.id,
                                 "name": call.name,
-                                "arguments": call.arguments,
-                                "result": result,
+                                "arguments": display_arguments,
+                                "result": display_result,
                             });
                             tools_meta.push(tool_part.clone());
                             parts.push(serde_json::json!({ "type": "tool", "tool": tool_part }));
@@ -2749,12 +1780,14 @@ impl ConversationService {
                         )
                         .await
                     };
+                    let display_arguments = redact_json_string(&tc.arguments);
+                    let display_result = redact_json_string(&result);
                     // Surface the result right after — live.
                     if tx
                         .send(Ok(ChatStreamEvent::ToolResult {
                             id: tc.id.clone(),
                             name: tc.name.clone(),
-                            content: result.clone(),
+                            content: display_result.clone(),
                         }))
                         .is_err()
                     {
@@ -2763,8 +1796,8 @@ impl ConversationService {
                     let tool_part = serde_json::json!({
                         "id": tc.id.clone(),
                         "name": tc.name.clone(),
-                        "arguments": tc.arguments.clone(),
-                        "result": result.clone(),
+                        "arguments": display_arguments,
+                        "result": display_result,
                     });
                     tools_meta.push(tool_part.clone());
                     parts.push(serde_json::json!({ "type": "tool", "tool": tool_part }));
@@ -2849,7 +1882,15 @@ impl ConversationService {
                     messages: final_messages,
                     ..Default::default()
                 };
-                let salvage = ai.chat_stream_turn_with_executor(req, None).await;
+                let salvage = ai
+                    .chat_stream_turn_with_services(
+                        req,
+                        temps_ai::TurnServices {
+                            tools: None,
+                            interactions: Some(interactions.clone()),
+                        },
+                    )
+                    .await;
                 if let Err(e) = &salvage {
                     tracing::warn!("chat_stream_turn failed for conv {conv_id} (salvage): {e}");
                     last_provider_error = Some(e.to_string());
@@ -2950,6 +1991,7 @@ impl ConversationService {
         });
 
         let out = async_stream::stream! {
+            let _abort_on_drop = AbortTurnOnDrop(turn_task);
             while let Some(item) = rx.recv().await {
                 yield item;
             }
@@ -3445,273 +2487,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interactive_claude_remains_selected_when_context_tools_are_present() {
-        assert_eq!(
-            select_tool_execution_path(true, true),
-            ToolExecutionPath::InteractiveClaude
-        );
-        assert_eq!(
-            select_tool_execution_path(false, true),
-            ToolExecutionPath::GenericToolLoop
-        );
-    }
-
-    #[test]
-    fn resumed_claude_prompt_refreshes_catalog_without_replaying_history() {
-        let messages = vec![
-            ChatMessage::system(
-                "Current live context\nAPI catalog:\nDeployments: get_project_deployments"
-                    .to_string(),
-            ),
-            ChatMessage::user("old question".to_string()),
-            ChatMessage::assistant("old answer claiming the operation is absent".to_string()),
-            ChatMessage::user("show recent deployments".to_string()),
-        ];
-
-        let prompt = build_interactive_cli_prompt(&messages, true);
-
-        assert!(prompt.contains("Current live context"));
-        assert!(prompt.contains("get_project_deployments"));
-        assert!(prompt.contains("show recent deployments"));
-        assert!(!prompt.contains("old question"));
-        assert!(!prompt.contains("old answer"));
-    }
-
-    #[test]
-    fn fresh_claude_prompt_preserves_full_nonempty_history() {
-        let messages = vec![
-            ChatMessage::system("current system".to_string()),
-            ChatMessage::assistant("initial seed".to_string()),
-            ChatMessage::user("first question".to_string()),
-        ];
-        let conv = test_conversation();
-        assert!(!should_refresh_interactive_cli_prompt(&conv, &messages));
-
-        assert_eq!(
-            build_interactive_cli_prompt(
-                &messages,
-                should_refresh_interactive_cli_prompt(&conv, &messages)
-            ),
-            "[system]\ncurrent system\n\n[assistant]\ninitial seed\n\n[user]\nfirst question"
-        );
-    }
-
-    fn test_cli_contract_fingerprint(catalog: &str) -> String {
-        interactive_cli_contract_fingerprint(
-            "claude_cli",
-            "sonnet",
-            Some("high"),
-            "default",
-            &[ChatTool {
-                name: "temps".to_string(),
-                description: "Scoped Temps CLI".to_string(),
-                parameters: serde_json::json!({
-                    "properties": {"command": {"type": "string"}},
-                    "type": "object"
-                }),
-            }],
-            &[catalog.to_string()],
-        )
-    }
-
-    #[test]
-    fn unchanged_cli_catalog_resumes_without_replaying_old_history() {
-        let fingerprint = test_cli_contract_fingerprint("get_projects\tGET\t/projects");
-        let resume = resumable_cli_session_id(Some("session-1"), Some(&fingerprint), &fingerprint);
-        assert_eq!(resume.as_deref(), Some("session-1"));
-
-        let messages = vec![
-            ChatMessage::system("current catalog".to_string()),
-            ChatMessage::user("old question".to_string()),
-            ChatMessage::assistant("old answer".to_string()),
-            ChatMessage::user("latest question".to_string()),
-        ];
-        let mut conv = test_conversation();
-        conv.cli_session_id = resume;
-        conv.cli_session_fingerprint = Some(fingerprint);
-        let prompt = build_interactive_cli_prompt(
-            &messages,
-            should_refresh_interactive_cli_prompt(&conv, &messages),
-        );
-        assert!(!prompt.contains("old question"));
-        assert!(!prompt.contains("old answer"));
-        assert!(prompt.contains("latest question"));
-    }
-
-    #[test]
-    fn changed_or_legacy_cli_catalog_starts_fresh_without_replaying_stale_history() {
-        let old_fingerprint = test_cli_contract_fingerprint("list_projects\tGET\t/projects");
-        let current_fingerprint = test_cli_contract_fingerprint(
-            "get_projects\tGET\t/projects\nlist_projects\tGET\t/projects",
-        );
-        assert_ne!(old_fingerprint, current_fingerprint);
-
-        for stored_fingerprint in [Some(old_fingerprint.as_str()), None] {
-            let resume = resumable_cli_session_id(
-                Some("stale-session"),
-                stored_fingerprint,
-                &current_fingerprint,
-            );
-            assert_eq!(resume, None);
-
-            let messages = vec![
-                ChatMessage::system("current catalog includes get_projects".to_string()),
-                ChatMessage::user("old question".to_string()),
-                ChatMessage::assistant("old answer claiming it is absent".to_string()),
-                ChatMessage::user("try get_projects again".to_string()),
-            ];
-            let mut conv = test_conversation();
-            conv.cli_session_id = Some("stale-session".to_string());
-            conv.cli_session_fingerprint = stored_fingerprint.map(str::to_string);
-            let prompt = build_interactive_cli_prompt(
-                &messages,
-                should_refresh_interactive_cli_prompt(&conv, &messages),
-            );
-            assert!(prompt.contains("current catalog includes get_projects"));
-            assert!(!prompt.contains("old question"));
-            assert!(!prompt.contains("old answer claiming it is absent"));
-            assert!(prompt.contains("try get_projects again"));
-        }
-    }
-
-    #[test]
-    fn migrated_legacy_session_with_cleared_columns_still_uses_safe_refresh_prompt() {
-        let messages = vec![
-            ChatMessage::system("current catalog includes get_projects".to_string()),
-            ChatMessage::user("old question".to_string()),
-            ChatMessage::assistant("old answer claiming it is absent".to_string()),
-            ChatMessage::user("try get_projects again".to_string()),
-        ];
-        let conv = test_conversation();
-        assert!(should_refresh_interactive_cli_prompt(&conv, &messages));
-
-        let prompt = build_interactive_cli_prompt(
-            &messages,
-            should_refresh_interactive_cli_prompt(&conv, &messages),
-        );
-        assert!(prompt.contains("current catalog includes get_projects"));
-        assert!(prompt.contains("try get_projects again"));
-        assert!(!prompt.contains("old question"));
-        assert!(!prompt.contains("old answer claiming it is absent"));
-    }
-
-    #[test]
-    fn cli_contract_fingerprint_is_independent_of_tool_order_and_json_key_order() {
-        let first = vec![
-            ChatTool {
-                name: "b".to_string(),
-                description: "second".to_string(),
-                parameters: serde_json::json!({"type": "object", "properties": {"z": {}, "a": {}}}),
-            },
-            ChatTool {
-                name: "a".to_string(),
-                description: "first".to_string(),
-                parameters: serde_json::json!({"required": ["x"], "type": "object"}),
-            },
-        ];
-        let second = vec![
-            ChatTool {
-                name: "a".to_string(),
-                description: "first".to_string(),
-                parameters: serde_json::json!({"type": "object", "required": ["x"]}),
-            },
-            ChatTool {
-                name: "b".to_string(),
-                description: "second".to_string(),
-                parameters: serde_json::json!({"properties": {"a": {}, "z": {}}, "type": "object"}),
-            },
-        ];
-        let fingerprint = |tools: &[ChatTool]| {
-            interactive_cli_contract_fingerprint(
-                "claude_cli",
-                "sonnet",
-                None,
-                "default",
-                tools,
-                &["catalog".to_string()],
-            )
-        };
-        assert_eq!(fingerprint(&first), fingerprint(&second));
-    }
-
-    #[test]
-    fn claude_thinking_validation_tracks_model_capabilities() {
-        for option in [
-            "off",
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-            "max",
-            "ultracode",
-            "auto",
-        ] {
-            assert!(valid_thinking("claude_cli", "sonnet", Some(option)));
-        }
-        assert!(!valid_thinking(
-            "claude_cli",
-            "claude-sonnet-4-6",
-            Some("xhigh")
-        ));
-        assert!(valid_thinking("claude_cli", "haiku", None));
-        assert!(!valid_thinking("claude_cli", "haiku", Some("high")));
-    }
-
-    #[test]
-    fn models_without_thinking_variants_do_not_invent_default() {
-        let big_pickle = temps_agents::ai_cli::AiCliModelCapability {
-            id: "opencode/big-pickle".to_string(),
-            name: "Big Pickle".to_string(),
-            reasoning_options: vec![],
-            default_reasoning_option: None,
-        };
-
-        assert_eq!(normalize_thinking_level(Some("default")), None);
-        assert_eq!(discovered_thinking_level(&big_pickle, None), None);
-        assert_eq!(
-            discovered_thinking_level(&big_pickle, Some("default")),
-            None
-        );
-        assert!(valid_thinking("opencode", "opencode/big-pickle", None));
-    }
-
-    #[test]
-    fn discovered_model_uses_only_an_advertised_thinking_default() {
-        let model = temps_agents::ai_cli::AiCliModelCapability {
-            id: "openai/gpt-5.4".to_string(),
-            name: "GPT-5.4".to_string(),
-            reasoning_options: vec!["low".to_string(), "medium".to_string()],
-            default_reasoning_option: Some("medium".to_string()),
-        };
-
-        assert_eq!(
-            discovered_thinking_level(&model, None).as_deref(),
-            Some("medium")
-        );
-        assert_eq!(
-            discovered_thinking_level(&model, Some("low")).as_deref(),
-            Some("low")
-        );
-    }
-
-    #[test]
-    fn harness_advertised_claude_alias_is_accepted_for_chat_creation() {
-        let capabilities = vec![temps_agents::ai_cli::AiCliModelCapability {
-            id: "opus[1m]".to_string(),
-            name: "Opus 5 (1M context)".to_string(),
-            reasoning_options: vec!["medium".to_string(), "high".to_string()],
-            default_reasoning_option: Some("medium".to_string()),
-        }];
-
-        assert_eq!(
-            resolve_cli_model_id("claude_cli", &capabilities, Some("opus[1m]"))
-                .expect("harness-advertised model must be accepted"),
-            "opus[1m]"
-        );
-        assert!(resolve_cli_model_id("claude_cli", &capabilities, Some("opus")).is_err());
-    }
-
-    #[test]
     fn changing_models_starts_a_fresh_cli_session() {
         assert_eq!(
             cli_session_after_model_change("sonnet", "sonnet", Some("session-1")).as_deref(),
@@ -4057,6 +2832,37 @@ mod tests {
         async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
             Err(AiError::NotAvailable)
         }
+        async fn capabilities_for(
+            &self,
+            provider: Option<&str>,
+            _refresh: temps_ai::RefreshPolicy,
+        ) -> Result<temps_ai::ProviderCapabilities, AiError> {
+            Ok(temps_ai::ProviderCapabilities {
+                id: provider.unwrap_or("gateway_key:1").to_string(),
+                name: "Test provider".to_string(),
+                auth_source: temps_ai::ProviderAuthSource::ConfiguredKey,
+                models: vec![temps_ai::ModelCapability {
+                    id: "gpt-4o-mini".to_string(),
+                    name: "GPT-4o mini".to_string(),
+                    thinking_modes: Vec::new(),
+                    default_thinking_mode_id: None,
+                }],
+                default_model_id: Some("gpt-4o-mini".to_string()),
+                permission_modes: vec![temps_ai::SelectOption {
+                    id: "confirm-actions".to_string(),
+                    name: "Confirm actions".to_string(),
+                    description: None,
+                }],
+                default_permission_mode_id: Some("confirm-actions".to_string()),
+                realtime: temps_ai::RealtimeCapabilities {
+                    text_streaming: true,
+                    reasoning_streaming: false,
+                    tool_events: true,
+                    user_interactions: true,
+                    cancellation: true,
+                },
+            })
+        }
         async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
             Err(AiError::NotAvailable)
         }
@@ -4207,158 +3013,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn new_cli_session_persists_its_current_contract_fingerprint() {
-        use sea_orm::{DatabaseBackend, MockDatabase};
-
-        let mut updated = test_conversation();
-        updated.cli_session_id = Some("new-session".to_string());
-        updated.cli_session_fingerprint = Some("v1:new-fingerprint".to_string());
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![updated]])
-            .into_connection();
-
-        persist_cli_session_contract(&db, 1, "new-session", "v1:new-fingerprint")
-            .await
-            .expect("session contract should persist");
-
-        let sql = format!("{:?}", db.into_transaction_log());
-        assert!(
-            sql.contains("cli_session_id"),
-            "missing session id update: {sql}"
-        );
-        assert!(
-            sql.contains("cli_session_fingerprint"),
-            "missing fingerprint update: {sql}"
-        );
-        assert!(sql.contains("new-session"), "missing session value: {sql}");
-        assert!(
-            sql.contains("v1:new-fingerprint"),
-            "missing fingerprint value: {sql}"
-        );
-    }
-
-    fn interactive_tool_record() -> serde_json::Value {
-        serde_json::json!({
-            "id": "tool-1",
-            "name": "temps",
-            "arguments": serde_json::json!({"command": "projects get_projects"}).to_string(),
-            "result": serde_json::json!({"status": 200, "data": [{"id": 7, "name": "Temps"}]}).to_string()
-        })
-    }
-
-    fn interactive_assistant_model(
-        id: i64,
-        content: &str,
-        tools: &[serde_json::Value],
-    ) -> ai_messages::Model {
-        ai_messages::Model {
-            id,
-            conversation_id: 1,
-            role: "assistant".to_string(),
-            content: content.to_string(),
-            metadata: interactive_tool_metadata(tools),
-            tokens_in: None,
-            tokens_out: None,
-            cost_microcents: None,
-            created_at: Utc::now(),
-        }
-    }
-
-    #[tokio::test]
-    async fn interactive_tool_and_final_text_persist_as_one_coherent_assistant_message() {
-        let tools = vec![interactive_tool_record()];
-        let progress = interactive_assistant_model(91, INTERACTIVE_TOOL_PROGRESS_CONTENT, &tools);
-        let complete = interactive_assistant_model(91, "You have one project: Temps.", &tools);
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![progress], vec![complete]])
-            .into_connection();
-        let mut message_id = None;
-
-        persist_interactive_assistant(
-            &db,
-            1,
-            &mut message_id,
-            INTERACTIVE_TOOL_PROGRESS_CONTENT.to_string(),
-            &tools,
-        )
-        .await
-        .expect("tool progress should persist immediately");
-        persist_interactive_assistant(
-            &db,
-            1,
-            &mut message_id,
-            "You have one project: Temps.".to_string(),
-            &tools,
-        )
-        .await
-        .expect("final text should update the progress message");
-
-        assert_eq!(message_id, Some(91));
-        let sql = format!("{:?}", db.into_transaction_log());
-        assert_eq!(
-            sql.matches("INSERT INTO \\\"ai_messages\\\"").count(),
-            1,
-            "{sql}"
-        );
-        assert_eq!(
-            sql.matches("UPDATE \\\"ai_messages\\\"").count(),
-            1,
-            "{sql}"
-        );
-        assert!(
-            sql.contains("projects get_projects"),
-            "missing tool metadata: {sql}"
-        );
-        assert!(
-            sql.contains("You have one project: Temps."),
-            "missing final text: {sql}"
-        );
-    }
-
-    #[tokio::test]
-    async fn interactive_tool_only_termination_persists_an_explicit_outcome() {
-        let tools = vec![interactive_tool_record()];
-        let outcome = interactive_terminal_content(String::new(), &tools, None);
-        assert!(outcome.contains("tool call completed successfully"));
-
-        let progress = interactive_assistant_model(92, INTERACTIVE_TOOL_PROGRESS_CONTENT, &tools);
-        let complete = interactive_assistant_model(92, &outcome, &tools);
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![progress], vec![complete]])
-            .into_connection();
-        let mut message_id = None;
-        persist_interactive_assistant(
-            &db,
-            1,
-            &mut message_id,
-            INTERACTIVE_TOOL_PROGRESS_CONTENT.to_string(),
-            &tools,
-        )
-        .await
-        .expect("tool progress should persist immediately");
-        persist_interactive_assistant(&db, 1, &mut message_id, outcome.clone(), &tools)
-            .await
-            .expect("tool-only completion should update the progress message");
-
-        let sql = format!("{:?}", db.into_transaction_log());
-        assert_eq!(
-            sql.matches("INSERT INTO \\\"ai_messages\\\"").count(),
-            1,
-            "{sql}"
-        );
-        assert_eq!(
-            sql.matches("UPDATE \\\"ai_messages\\\"").count(),
-            1,
-            "{sql}"
-        );
-        assert!(sql.contains("tool call completed successfully"), "{sql}");
-        assert!(sql.contains("projects get_projects"), "{sql}");
-    }
-
-    /// A throwaway admin `AuthContext` for the tool-loop tests. The mock
-    /// providers ignore it (they don't override `execute_tool_with_auth`); it
-    /// only needs to be a valid value to satisfy the signature.
     fn test_auth() -> AuthContext {
         let now = Utc::now();
         let user = temps_entities::users::Model {
@@ -4416,7 +3070,6 @@ mod tests {
             providers: HashMap::new(),
             write_support: None,
             config: None,
-            interactive_cli: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
@@ -4853,7 +3506,6 @@ mod tests {
             providers: HashMap::new(),
             write_support: None,
             config: None,
-            interactive_cli: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -4866,7 +3518,6 @@ mod tests {
             providers: HashMap::new(),
             write_support: None,
             config: None,
-            interactive_cli: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -4896,19 +3547,50 @@ mod tests {
         }
     }
 
-    fn gateway_key() -> temps_entities::ai_provider_keys::Model {
+    fn agent_cli_preference(provider_id: Option<&str>) -> temps_entities::ai_gateway_config::Model {
         let now = Utc::now();
-        temps_entities::ai_provider_keys::Model {
+        temps_entities::ai_gateway_config::Model {
             id: 1,
-            provider: "openai".to_string(),
-            display_name: "Test OpenAI".to_string(),
-            api_key_encrypted: "encrypted".to_string(),
-            base_url: None,
-            default_model: Some("gpt-4o-mini".to_string()),
-            is_active: true,
+            scope: "instance".to_string(),
+            allowed_models: None,
+            max_requests_per_minute: None,
+            max_cost_per_month_microcents: None,
             created_at: now,
             updated_at: now,
+            provider_type: "agent_cli".to_string(),
+            agent_cli_provider_id: provider_id.map(str::to_string),
+            interactive_bridge_enabled: false,
         }
+    }
+
+    #[tokio::test]
+    async fn omitted_provider_uses_active_agent_cli_preference() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[agent_cli_preference(Some("opencode"))]])
+            .into_connection();
+        let service = db_service(db);
+
+        assert_eq!(
+            service
+                .resolve_default_provider()
+                .await
+                .expect("active CLI preference"),
+            "opencode"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_agent_cli_preference_requires_a_provider_id() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[agent_cli_preference(None)]])
+            .into_connection();
+        let service = db_service(db);
+
+        let error = service
+            .resolve_default_provider()
+            .await
+            .expect_err("invalid preference must fail closed");
+        assert!(matches!(error, ChatError::Ai(message) if message.contains("no provider id")));
     }
 
     fn system_message(id: i64, conversation_id: i64) -> ai_messages::Model {
@@ -4986,11 +3668,9 @@ mod tests {
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([Vec::<ai_conversations::Model>::new()])
-            .append_query_results([vec![gateway_key()]])
             .append_query_results([vec![user_11.clone()]])
             .append_query_results([vec![system_message(1, user_11.id)]])
             .append_query_results([Vec::<ai_conversations::Model>::new()])
-            .append_query_results([vec![gateway_key()]])
             .append_query_results([vec![user_22.clone()]])
             .append_query_results([vec![system_message(2, user_22.id)]])
             .into_connection();
@@ -5003,7 +3683,6 @@ mod tests {
             providers,
             write_support: None,
             config: None,
-            interactive_cli: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
@@ -5419,6 +4098,7 @@ mod tests {
                     kind: PermissionKind::ToolApproval,
                     tool_name: "Bash".to_string(),
                     input: serde_json::Value::Null,
+                    generation: uuid::Uuid::new_v4(),
                 },
             );
         }
@@ -5456,6 +4136,7 @@ mod tests {
                 kind: PermissionKind::ToolApproval,
                 tool_name: "Bash".to_string(),
                 input: serde_json::Value::Null,
+                generation: uuid::Uuid::new_v4(),
             },
         );
 
@@ -5482,6 +4163,46 @@ mod tests {
         assert!(result.is_none(), "unknown id must return None");
     }
 
+    #[test]
+    fn cancelled_permission_guard_removes_only_its_registration() {
+        use temps_ai::streaming::PermissionKind;
+        use tokio::sync::oneshot;
+
+        let registry = Arc::new(Mutex::new(HashMap::new()));
+        let old_generation = uuid::Uuid::new_v4();
+        let newer_generation = uuid::Uuid::new_v4();
+        let (sender, _receiver) = oneshot::channel();
+        registry.lock().unwrap().insert(
+            "shared-id".to_string(),
+            PendingPermissionEntry {
+                sender,
+                conv_public_id: "conversation".to_string(),
+                kind: PermissionKind::ToolApproval,
+                tool_name: "temps".to_string(),
+                input: serde_json::Value::Null,
+                generation: newer_generation,
+            },
+        );
+
+        drop(PendingPermissionGuard {
+            registry: registry.clone(),
+            permission_id: "shared-id".to_string(),
+            generation: old_generation,
+        });
+        assert_eq!(
+            registry.lock().unwrap()["shared-id"].generation,
+            newer_generation,
+            "an older cancelled waiter must not delete a replacement"
+        );
+
+        drop(PendingPermissionGuard {
+            registry: registry.clone(),
+            permission_id: "shared-id".to_string(),
+            generation: newer_generation,
+        });
+        assert!(registry.lock().unwrap().is_empty());
+    }
+
     /// Drain-on-close: when the subprocess exits (simulate by dropping the receiver),
     /// a synthetic deny sent to the still-pending sender propagates the "denied"
     /// decision and unblocks any waiting task.
@@ -5502,6 +4223,7 @@ mod tests {
                 kind: PermissionKind::ToolApproval,
                 tool_name: "Bash".to_string(),
                 input: serde_json::Value::Null,
+                generation: uuid::Uuid::new_v4(),
             },
         );
 

@@ -9,11 +9,13 @@ use async_trait::async_trait;
 use axum::response::{IntoResponse, Response};
 use tokio::sync::Semaphore;
 
-use temps_agents::ai_cli::{scrub_and_bound, AiCliProvider, AiRunConfig, OnEventCallback};
+use temps_agents::ai_cli::{
+    scrub_and_bound, AiCliProvider, AiRunConfig, OnEventCallback, PermissionBridge,
+};
 use temps_agents::error::AgentError;
 use temps_ai::{
     extract_json_block, AiError, AiRequest, AiResponse, AiService, ChatStreamDelta, ChatTool,
-    ChatTurnRequest, ChatTurnStream, TokenStream, ToolCall, ToolExecutor,
+    ChatTurnRequest, ChatTurnStream, TokenStream, ToolCall, ToolExecutor, TurnServices,
 };
 
 #[derive(Clone)]
@@ -119,30 +121,36 @@ async fn mcp_bridge_handler(
                     .events
                     .send(Ok(ChatStreamDelta::ToolCall(call.clone())))
                     .await;
-                match tokio::time::timeout(state.tool_timeout, (state.executor)(call.clone())).await
-                {
-                    Err(_) => serde_json::json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": {"content": [{"type": "text", "text": format!("Temps tool '{}' timed out after {}s", call.name, state.tool_timeout.as_secs_f64())}], "isError": true}
-                    }),
-                    Ok(Ok(result)) => {
-                        let _ = state
-                            .events
-                            .send(Ok(ChatStreamDelta::ToolResult {
-                                call,
-                                result: result.clone(),
-                            }))
-                            .await;
-                        serde_json::json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "result": {"content": [{"type": "text", "text": result}], "isError": false}
-                        })
-                    }
-                    Ok(Err(error)) => serde_json::json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": {"content": [{"type": "text", "text": error.to_string()}], "isError": true}
-                    }),
-                }
+                // Every claimed native call gets a terminal ToolResult, including
+                // failures. The common conversation loop uses this event to mark
+                // the call handled; omitting it would make the fallback dispatcher
+                // execute the same write proposal a second time.
+                let (result, is_error) =
+                    match tokio::time::timeout(state.tool_timeout, (state.executor)(call.clone()))
+                        .await
+                    {
+                        Err(_) => (
+                            format!(
+                                "Temps tool '{}' timed out after {}s",
+                                call.name,
+                                state.tool_timeout.as_secs_f64()
+                            ),
+                            true,
+                        ),
+                        Ok(Ok(result)) => (result, false),
+                        Ok(Err(error)) => (error.to_string(), true),
+                    };
+                let _ = state
+                    .events
+                    .send(Ok(ChatStreamDelta::ToolResult {
+                        call,
+                        result: result.clone(),
+                    }))
+                    .await;
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"content": [{"type": "text", "text": result}], "isError": is_error}
+                })
             }
         }
         _ => serde_json::json!({
@@ -234,6 +242,34 @@ impl Drop for ScopedMcpBridge {
         // A cancelled/panicked provider turn must not leave the authenticated
         // listener alive. Normal completion uses `shutdown()` and awaits it.
         self.task.abort();
+    }
+}
+
+/// Couples a spawned provider turn to the stream returned to its caller.
+/// Dropping the stream aborts the task; dropping the provider future then
+/// drops its `kill_on_drop` child process instead of leaving it detached.
+struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Request-scoped owner for provider interaction waiters. A harness can block
+/// on a question or approval while its output stream is open; when that stream
+/// is cancelled, every waiter must be cancelled with the harness turn.
+struct InteractionTaskOwner(Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>);
+
+impl Drop for InteractionTaskOwner {
+    fn drop(&mut self) {
+        let mut tasks = match self.0.lock() {
+            Ok(tasks) => tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for task in tasks.drain(..) {
+            task.abort();
+        }
     }
 }
 
@@ -412,6 +448,27 @@ impl AiService for AgentCliAiService {
     async fn is_available(&self) -> bool {
         let status = self.provider.get_status().await;
         status.installed && status.authenticated
+    }
+
+    async fn capabilities_for(
+        &self,
+        _provider: Option<&str>,
+        _refresh: temps_ai::RefreshPolicy,
+    ) -> Result<temps_ai::ProviderCapabilities, AiError> {
+        let status = self.provider.get_status().await;
+        if !status.installed || !status.authenticated {
+            return Err(AiError::NotAvailable);
+        }
+        self.provider
+            .capabilities()
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.capabilities".to_string(),
+                reason: format!(
+                    "provider '{}' has no registered capability contract",
+                    self.provider.name()
+                ),
+            })
     }
 
     /// CLI chat exposes scoped tools through a per-turn loopback MCP bridge.
@@ -605,7 +662,7 @@ impl AiService for AgentCliAiService {
         // is held for the full CLI lifetime, not just while the stream consumer
         // is alive. When the CLI finishes (or times out), `on_event` is
         // dropped, closing the channel and terminating the stream.
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _permit = permit;
             let _tempdir = run_dir; // keep tempdir alive for the run
             let result = tokio::time::timeout(timeout, provider.run(cfg)).await;
@@ -624,9 +681,15 @@ impl AiService for AgentCliAiService {
 
         // Wrap the receiver as a TokenStream using unfold. This is Send
         // because Receiver<String>: Send.
-        let stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
+        let stream = futures::stream::unfold(
+            (rx, AbortTaskOnDrop(task)),
+            |(mut receiver, abort_on_drop)| async move {
+                receiver
+                    .recv()
+                    .await
+                    .map(|item| (item, (receiver, abort_on_drop)))
+            },
+        );
 
         Ok(Box::pin(stream))
     }
@@ -648,16 +711,27 @@ impl AiService for AgentCliAiService {
         request: ChatTurnRequest,
         executor: Option<ToolExecutor>,
     ) -> Result<ChatTurnStream, AiError> {
+        self.chat_stream_turn_with_services(
+            request,
+            TurnServices {
+                tools: executor,
+                interactions: None,
+            },
+        )
+        .await
+    }
+
+    async fn chat_stream_turn_with_services(
+        &self,
+        request: ChatTurnRequest,
+        services: TurnServices,
+    ) -> Result<ChatTurnStream, AiError> {
         use futures::StreamExt;
 
-        if request.tools.is_empty() {
+        if request.tools.is_empty() && services.interactions.is_none() {
             let stream = self.chat_stream(request).await?;
             return Ok(Box::pin(stream.map(|item| item.map(ChatStreamDelta::Text))));
         }
-        let executor = executor.ok_or_else(|| AiError::Provider {
-            purpose: request.purpose.clone(),
-            reason: "scoped tool executor is required for CLI chat".to_string(),
-        })?;
         let prompt = build_chat_prompt(&request);
         check_prompt_size(&request.purpose, &prompt)?;
         let permit = Arc::clone(&self.concurrency)
@@ -672,18 +746,27 @@ impl AiService for AgentCliAiService {
                 reason: format!("failed to create isolated CLI chat directory: {error}"),
             })?;
 
-        let mut mcp_bridge = ScopedMcpBridge::start(request.tools.clone(), executor).await?;
-        let mcp_config = mcp_bridge.config.clone();
-        let mut mcp_events = mcp_bridge.take_events();
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-        let bridge_events_tx = events_tx.clone();
-        let bridge_event_task = tokio::spawn(async move {
-            while let Some(event) = mcp_events.recv().await {
-                if bridge_events_tx.send(event).is_err() {
-                    break;
+        let (mut mcp_bridge, bridge_event_task, mcp_config) = if request.tools.is_empty() {
+            (None, None, None)
+        } else {
+            let executor = services.tools.clone().ok_or_else(|| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: "scoped tool executor is required for CLI chat".to_string(),
+            })?;
+            let mut bridge = ScopedMcpBridge::start(request.tools.clone(), executor).await?;
+            let config = bridge.config.clone();
+            let mut mcp_events = bridge.take_events();
+            let bridge_events_tx = events_tx.clone();
+            let event_task = tokio::spawn(async move {
+                while let Some(event) = mcp_events.recv().await {
+                    if bridge_events_tx.send(event).is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            });
+            (Some(bridge), Some(event_task), Some(config))
+        };
 
         let provider_name = self.provider.name().to_string();
         let streamed_partial = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -708,6 +791,34 @@ impl AiService for AgentCliAiService {
             })
         });
 
+        let interaction_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let interaction_task_owner = InteractionTaskOwner(interaction_tasks.clone());
+        let permission_bridge = services.interactions.map(|interactions| {
+            let permission_events = events_tx.clone();
+            let interaction_tasks = interaction_tasks.clone();
+            Arc::new(PermissionBridge {
+                on_permission_request: Arc::new(move |request| {
+                    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+                    // The common handler registers synchronously when called.
+                    // Do that before publishing the event so an immediate UI
+                    // response cannot race into a missing-permission error.
+                    let decision = interactions(request.clone());
+                    let _ = permission_events
+                        .send(Ok(ChatStreamDelta::PermissionRequested(request.clone())));
+                    let waiter = tokio::spawn(async move {
+                        if let Ok(decision) = decision.await {
+                            let _ = decision_tx.send(decision);
+                        }
+                    });
+                    match interaction_tasks.lock() {
+                        Ok(mut tasks) => tasks.push(waiter),
+                        Err(poisoned) => poisoned.into_inner().push(waiter),
+                    }
+                    decision_rx
+                }),
+            })
+        });
+
         let config = AiRunConfig {
             work_dir: run_dir.path().to_owned(),
             prompt,
@@ -718,17 +829,18 @@ impl AiService for AgentCliAiService {
             thinking_level: request.thinking_level,
             permission_mode: request.permission_mode,
             on_event: Some(on_event),
-            permission_bridge: None,
+            permission_bridge,
             resume_session_id: None,
-            mcp_server: Some(mcp_config),
+            mcp_server: mcp_config,
         };
         let provider = self.provider.clone();
         let purpose = request.purpose;
         let timeout = self.timeout;
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            let _interaction_tasks = interaction_task_owner;
             let _permit = permit;
             let _run_dir = run_dir;
-            let outcome = tokio::time::timeout(timeout, provider.run(config)).await;
+            let outcome = tokio::time::timeout(timeout, provider.run_turn(config)).await;
             let error = match outcome {
                 Ok(Ok(_)) => None,
                 Ok(Err(error)) => Some(map_agent_error(&purpose, error)),
@@ -740,13 +852,23 @@ impl AiService for AgentCliAiService {
             if let Some(error) = error {
                 let _ = events_tx.send(Err(error));
             }
-            mcp_bridge.shutdown().await;
-            let _ = bridge_event_task.await;
+            if let Some(bridge) = mcp_bridge.take() {
+                bridge.shutdown().await;
+            }
+            if let Some(event_task) = bridge_event_task {
+                let _ = event_task.await;
+            }
         });
 
-        let stream = futures::stream::unfold(events_rx, |mut receiver| async move {
-            receiver.recv().await.map(|event| (event, receiver))
-        });
+        let stream = futures::stream::unfold(
+            (events_rx, AbortTaskOnDrop(task)),
+            |(mut receiver, abort_on_drop)| async move {
+                receiver
+                    .recv()
+                    .await
+                    .map(|event| (event, (receiver, abort_on_drop)))
+            },
+        );
         Ok(Box::pin(stream))
     }
 }
@@ -758,7 +880,7 @@ impl AiService for AgentCliAiService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use temps_agents::ai_cli::{AiCliStatus, AiRunResult};
@@ -867,7 +989,88 @@ mod tests {
         }
     }
 
+    struct CancellationProvider {
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct MarkDropped(Arc<AtomicBool>);
+
+    impl Drop for MarkDropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl AiCliProvider for CancellationProvider {
+        fn name(&self) -> &str {
+            "cancellation-test"
+        }
+
+        async fn check_installed(&self) -> bool {
+            true
+        }
+
+        async fn get_status(&self) -> AiCliStatus {
+            available_status()
+        }
+
+        async fn run(&self, _config: AiRunConfig) -> Result<AiRunResult, AgentError> {
+            let _mark_dropped = MarkDropped(self.dropped.clone());
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn continue_conversation(
+            &self,
+            config: AiRunConfig,
+        ) -> Result<AiRunResult, AgentError> {
+            self.run(config).await
+        }
+    }
+
     struct FailingProvider;
+
+    struct InteractionProvider;
+
+    #[async_trait]
+    impl AiCliProvider for InteractionProvider {
+        fn name(&self) -> &str {
+            "claude_cli"
+        }
+
+        async fn check_installed(&self) -> bool {
+            true
+        }
+
+        async fn get_status(&self) -> AiCliStatus {
+            available_status()
+        }
+
+        async fn run(&self, _config: AiRunConfig) -> Result<AiRunResult, AgentError> {
+            Ok(fixed_result("", None))
+        }
+
+        async fn run_turn(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
+            let bridge = config.permission_bridge.expect("interaction bridge");
+            let decision = (bridge.on_permission_request)(temps_ai::PermissionRequest {
+                id: "permission-1".to_string(),
+                kind: temps_ai::PermissionKind::ToolApproval,
+                tool_name: "temps".to_string(),
+                input: serde_json::json!({}),
+            });
+            let _ = decision.await;
+            Ok(fixed_result("", None))
+        }
+
+        async fn continue_conversation(
+            &self,
+            config: AiRunConfig,
+        ) -> Result<AiRunResult, AgentError> {
+            self.run(config).await
+        }
+    }
 
     #[async_trait]
     impl AiCliProvider for FailingProvider {
@@ -1050,6 +1253,135 @@ mod tests {
             !called.load(Ordering::SeqCst),
             "provider.run() must not be called when tools are present"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_chat_stream_cancels_the_provider_turn() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let provider: Arc<dyn AiCliProvider> = Arc::new(CancellationProvider {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        });
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = AgentCliAiService::new(
+            provider,
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+        let stream = service
+            .chat_stream(ChatTurnRequest {
+                purpose: "test.cancel".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("stream starts");
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("provider started");
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider future cancelled when stream dropped");
+    }
+
+    #[tokio::test]
+    async fn interaction_is_registered_before_its_stream_event_is_visible() {
+        use futures::StreamExt;
+
+        let provider: Arc<dyn AiCliProvider> = Arc::new(InteractionProvider);
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = AgentCliAiService::new(
+            provider,
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+        let registered = Arc::new(AtomicBool::new(false));
+        let registered_for_interaction = registered.clone();
+        let interactions: temps_ai::InteractionExecutor = Arc::new(move |_| {
+            registered_for_interaction.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(temps_ai::PermissionDecision::AllowTool) })
+        });
+        let mut stream = service
+            .chat_stream_turn_with_services(
+                ChatTurnRequest {
+                    purpose: "test.interaction-order".to_string(),
+                    ..Default::default()
+                },
+                TurnServices {
+                    tools: None,
+                    interactions: Some(interactions),
+                },
+            )
+            .await
+            .expect("turn starts");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("interaction event arrives")
+            .expect("stream item")
+            .expect("interaction event succeeds");
+        assert!(matches!(event, ChatStreamDelta::PermissionRequested(_)));
+        assert!(
+            registered.load(Ordering::SeqCst),
+            "interaction must be registered before the UI can resolve it"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_turn_drops_pending_interaction_waiter() {
+        use futures::StreamExt;
+
+        let provider: Arc<dyn AiCliProvider> = Arc::new(InteractionProvider);
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = AgentCliAiService::new(
+            provider,
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_interaction = dropped.clone();
+        let interactions: temps_ai::InteractionExecutor = Arc::new(move |_| {
+            let marker = MarkDropped(dropped_for_interaction.clone());
+            Box::pin(async move {
+                let _marker = marker;
+                std::future::pending().await
+            })
+        });
+        let mut stream = service
+            .chat_stream_turn_with_services(
+                ChatTurnRequest {
+                    purpose: "test.interaction-cancel".to_string(),
+                    ..Default::default()
+                },
+                TurnServices {
+                    tools: None,
+                    interactions: Some(interactions),
+                },
+            )
+            .await
+            .expect("turn starts");
+
+        tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("interaction event arrives");
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("interaction waiter cancelled with turn");
     }
 
     #[tokio::test]
@@ -1307,6 +1639,48 @@ mod tests {
         assert!(matches!(
             events.recv().await,
             Some(Ok(ChatStreamDelta::ToolCall(_)))
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(ChatStreamDelta::ToolResult { result, .. })) if result.contains("timed out")
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_bridge_emits_terminal_result_when_executor_fails() {
+        let (mut state, mut events) = test_mcp_state();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_executor = calls.clone();
+        state.executor = Arc::new(move |_call| {
+            calls_for_executor.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(AiError::Provider {
+                    purpose: "test.tool".to_string(),
+                    reason: "executor failed".to_string(),
+                })
+            })
+        });
+        let response = mcp_bridge_handler(
+            axum::extract::State(state),
+            authorized_headers(),
+            axum::Json(serde_json::json!({
+                "id": 6,
+                "method": "tools/call",
+                "params": {"name": "temps", "arguments": {}}
+            })),
+        )
+        .await;
+        let body = response_json(response).await;
+
+        assert_eq!(body["result"]["isError"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(ChatStreamDelta::ToolCall(_)))
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(ChatStreamDelta::ToolResult { result, .. })) if result.contains("executor failed")
         ));
     }
 
