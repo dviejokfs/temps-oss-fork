@@ -261,6 +261,12 @@ impl MarkDeploymentCompleteJob {
         let client = reqwest::Client::builder()
             .timeout(request_timeout)
             .redirect(reqwest::redirect::Policy::none())
+            // This is a control-plane probe that must always hit the local
+            // Temps proxy selected by `resolve` below. Inheriting HTTP(S)_PROXY
+            // would route the request through an external proxy instead,
+            // bypassing the DNS pin and making readiness depend on runner or
+            // operator proxy settings.
+            .no_proxy()
             .resolve(hostname, proxy_address)
             .build()
             .map_err(|e| format!("Failed to build public readiness HTTP client: {e}"))?;
