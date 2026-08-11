@@ -363,7 +363,11 @@ async fn ingest_tunneled_envelope(
             .into_response();
     }
 
-    let route = match state.route_table.get_route(&host) {
+    // Exact + wildcard resolution, matching the precedence the proxy itself
+    // used to route this request here in the first place (`services.rs`'s
+    // `get_route_by_host`) — the narrower `get_route` (legacy map only)
+    // would 404 wildcard custom routes that the proxy successfully forwards.
+    let route = match state.route_table.get_route_by_host(&host) {
         Some(route) => route,
         None => {
             tracing::debug!("Sentry tunnel: host {} not found in route table", host);
@@ -485,9 +489,13 @@ async fn process_parsed_envelope(
             .await
         {
             tracing::error!("Failed to store event {}: {:?}", event.event_id, e);
+            // Shared by the DSN-authenticated AND the credential-free tunnel
+            // path — never echo `e` (a `DbErr` Display leaks table/column/
+            // constraint names) to a caller that reached this with no auth
+            // at all.
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to store event: {}", e),
+                "Internal server error".to_string(),
             )
                 .into_response();
         }
