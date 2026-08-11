@@ -8,7 +8,8 @@ use crate::externalsvc::{
     rustfs::RustfsService,
     s3::S3Service,
     AvailableContainer, ClusterMemberResult, ClusterMemberSpec, ExternalService, HealthProbeStatus,
-    ManagedS3BackendKind, ManagedS3BackendSelection, ServiceConfig, ServiceType,
+    ManagedS3BackendKind, ManagedS3BackendSelection, PgAutoFailoverState, ServiceConfig,
+    ServiceType,
 };
 use crate::parameter_strategies;
 use crate::remote_service_client::{
@@ -41,6 +42,70 @@ const NONCE_LENGTH: usize = 12;
 /// Keep control-plane connections on the same address: `localhost` may resolve
 /// to IPv6 first on Linux even though Docker is only listening on 127.0.0.1.
 pub(crate) const LOCAL_CLUSTER_HOST: &str = "127.0.0.1";
+
+/// Whether a live pg_auto_failover state identifies a node that accepts writes.
+///
+/// Keep connection planning, backups, deletion guards, and DNS reconciliation
+/// on the typed state model. In particular, `wait_primary` is writable: it is
+/// the stable state of a promoted node that currently has no standby attached.
+fn live_state_is_writable_primary(state: Option<&str>) -> bool {
+    state
+        .and_then(|state| state.parse::<PgAutoFailoverState>().ok())
+        .is_some_and(PgAutoFailoverState::is_primary)
+}
+
+/// Return the monitor identity of the sole healthy, recently reporting writer.
+///
+/// pg_auto_failover retains a stopped node's last `reported_state`, so a stale
+/// unhealthy `primary` can coexist with the promoted healthy `wait_primary`.
+/// Selecting solely by state and member order can therefore route connections
+/// or backups to the dead node. Ambiguous reports fail closed.
+fn healthy_writable_primary_nodename(health: &ClusterHealthReport) -> Option<&str> {
+    if health.monitor_error.is_some() {
+        return None;
+    }
+    let mut candidates = health.members.iter().filter(|member| {
+        member.health == 1
+            && member.seconds_since_report < 30
+            && live_state_is_writable_primary(Some(&member.reported_state))
+    });
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(&candidate.nodename)
+}
+
+/// Select the network endpoint advertised for a managed cluster member.
+///
+/// The local application-network address is deliberately considered only for
+/// control-plane members (`node_id = None`). Docker bridge addresses are local
+/// to one daemon and must never replace a remote member's overlay/underlay
+/// address.
+fn select_member_dns_endpoint(
+    node_id: Option<i32>,
+    overlay_ip: Option<&str>,
+    local_network_ip: Option<&str>,
+    underlay_endpoint: Option<(String, i32)>,
+    container_port: u16,
+) -> Option<(String, i32)> {
+    let valid_ip = |ip: &str| {
+        let trimmed = ip.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+
+    if let Some(ip) = overlay_ip.and_then(valid_ip) {
+        return Some((ip, container_port as i32));
+    }
+
+    if node_id.is_none() {
+        return local_network_ip
+            .and_then(valid_ip)
+            .map(|ip| (ip, container_port as i32));
+    }
+
+    underlay_endpoint
+}
 
 #[derive(Error, Debug)]
 pub enum ExternalServiceError {
@@ -2700,7 +2765,7 @@ impl ExternalServiceManager {
     ///   - the service isn't a cluster
     ///   - the monitor is unreachable (callers should treat this as
     ///     "primary unknown" rather than "no primary")
-    ///   - the monitor knows of no node in `primary | single` state
+    ///   - the monitor knows of no node in a writable-primary state
     ///
     /// Replaces the old `members.iter().find(|m| m.role == "primary")`
     /// pattern, which broke the moment we stopped storing the primary
@@ -2717,15 +2782,19 @@ impl ExternalServiceManager {
         if health.monitor_error.is_some() {
             return Ok(None);
         }
-        let primary_name = health
-            .members
-            .iter()
-            .find(|h| matches!(h.reported_state.as_str(), "primary" | "single"))
-            .map(|h| h.nodename.clone());
-        let Some(name) = primary_name else {
+        let Some(name) = healthy_writable_primary_nodename(&health) else {
             return Ok(None);
         };
-        Ok(members.iter().find(|m| m.container_name == name))
+        let mut matches = members.iter().filter(|member| {
+            is_role_data_member(&member.role)
+                && member.status == "running"
+                && member.container_name == name
+        });
+        let member = matches.next();
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        Ok(member)
     }
 
     /// Live primary check: ask the pg_auto_failover monitor whether the
@@ -2786,14 +2855,7 @@ impl ExternalServiceManager {
             .members
             .iter()
             .find(|h| h.nodename == container_name)
-            .map(|h| {
-                <crate::externalsvc::PgAutoFailoverState as std::str::FromStr>::from_str(
-                    &h.reported_state,
-                )
-                .expect("PgAutoFailoverState::from_str is Infallible")
-                .is_primary()
-            })
-            .unwrap_or(false)
+            .is_some_and(|h| live_state_is_writable_primary(Some(&h.reported_state)))
     }
 
     /// Same shape as `get_service_members`, but for cluster topologies
@@ -3197,7 +3259,7 @@ impl ExternalServiceManager {
             // AND the node is healthy. A stale ghost-primary
             // (`reportedstate='primary'` but `health<=0`) would otherwise
             // route us to a dead host and the panel would lose sync data.
-            if matches!(reported_state.as_str(), "primary" | "single")
+            if live_state_is_writable_primary(Some(&reported_state))
                 && health == 1
                 && seconds_since_report < 30
             {
@@ -3384,21 +3446,16 @@ impl ExternalServiceManager {
             });
         }
 
-        let members = self.get_service_members_with_live_state(service.id).await?;
-        // `live_state` is the runtime FSM state from pg_auto_failover.
-        // Backup must run against the writable primary; "single" is the
-        // single-node form pg_auto_failover uses before a replica
-        // catches up — also writable. Anything else (secondary,
-        // catchingup, report_lsn, …) is a replica.
-        let primary = members
-            .iter()
-            .find(|m| {
-                m.status == "running"
-                    && matches!(m.live_state.as_deref(), Some("primary") | Some("single"))
-            })
+        let members = self.get_service_members(service.id).await?;
+        let health = self.cluster_health(service).await;
+        // Resolve the sole healthy, fresh writer back through persisted member
+        // identity. Monitor state is authoritative for role, but never for a
+        // credential destination.
+        let primary = healthy_writable_primary_nodename(&health)
+            .and_then(|nodename| trusted_primary_member(&members, nodename))
             .ok_or(ExternalServiceError::InitializationFailed {
                 id: service.id,
-                reason: "Cannot run backup: cluster has no running primary (monitor unreachable or no node in primary state)".to_string(),
+                reason: "Cannot run backup: cluster has no unique healthy, recently reporting primary (monitor unreachable, election incomplete, or primary state ambiguous)".to_string(),
             })?;
 
         // Write the external_service_backups row up front so the UI's
@@ -4309,11 +4366,10 @@ echo "[restore] Pre-seed complete"
         // Using the stored role here would have produced the same lag
         // bug the UI hit — Browse Data and other callers would dial a
         // freshly-demoted node post-failover.
-        let members = self.get_service_members_with_live_state(service_id).await?;
-        let primary = members.iter().find(|m| {
-            m.status == "running"
-                && matches!(m.live_state.as_deref(), Some("primary") | Some("single"))
-        });
+        let members = self.get_service_members(service_id).await?;
+        let health = self.cluster_health(&service).await;
+        let primary = healthy_writable_primary_nodename(&health)
+            .and_then(|nodename| trusted_primary_member(&members, nodename));
 
         if let Some(primary) = primary {
             self.stored_member_endpoint(service_id, primary)
@@ -4322,7 +4378,7 @@ echo "[restore] Pre-seed complete"
         } else {
             Err(ExternalServiceError::InternalError {
                 reason: format!(
-                    "Cluster service {} has no running primary data node",
+                    "Cluster service {} has no unique healthy, recently reporting primary data node",
                     service_id
                 ),
             })
@@ -5341,25 +5397,22 @@ echo "[restore] Pre-seed complete"
 
                 // Register the per-member A record (ADR-011, Tier 2).
                 //
-                // Prefer the overlay IP when the container is on
-                // `temps0` — that points other containers straight at
-                // each other on the multi-host bridge. If the overlay
-                // isn't attached (single-host setups, or the monitor on
-                // a control plane that's not in the allocator), fall
-                // back to the underlay address + the published host
-                // port so dialing through Docker's port forward still
-                // works. This is what makes `MONITOR_URI=<fqdn>:<port>`
-                // resolve from inside any container.
-                let (record_ip, record_port) = match compute_ip.clone() {
-                    Some(ip) => (Some(ip), member_port as i32),
-                    None => match self
-                        .resolve_member_underlay(spec.node_id, host_port, member_port)
-                        .await
-                    {
-                        Some((ip, port)) => (Some(ip), port),
-                        None => (None, member_port as i32),
-                    },
-                };
+                // Local members are directly reachable from application
+                // containers on `temps-app-network`; their loopback-only host
+                // port is intentionally *not* reachable through the node's
+                // underlay address. Remote members still prefer their overlay
+                // IP and otherwise use the underlay/host-port fallback.
+                let (record_ip, record_port) = self
+                    .resolve_member_dns_endpoint(
+                        spec.node_id,
+                        compute_ip.as_deref(),
+                        &result.container_name,
+                        host_port,
+                        member_port,
+                    )
+                    .await
+                    .map(|(ip, port)| (Some(ip), port))
+                    .unwrap_or((None, member_port as i32));
 
                 if let Some(ip) = record_ip {
                     let draft = temps_dns::EndpointDraft {
@@ -6425,21 +6478,19 @@ echo "[restore] Pre-seed complete"
             return;
         }
 
-        // Register Tier-2 DNS A record. Prefer the overlay IP; fall
-        // back to (node_underlay, host_port) so the FQDN still works
-        // when the overlay isn't attached. Best-effort: a failed
-        // registration logs loudly but doesn't mark the member as
-        // failed — the role reconciler will try again on its next tick.
-        let (record_ip, record_port) = match compute_ip.clone() {
-            Some(ip) => (Some(ip), plan.member_port as i32),
-            None => match self
-                .resolve_member_underlay(plan.spec.node_id, host_port, plan.member_port)
-                .await
-            {
-                Some((ip, port)) => (Some(ip), port),
-                None => (None, plan.member_port as i32),
-            },
-        };
+        // Register Tier-2 DNS A record using the same topology-aware
+        // selection as initial cluster creation.
+        let (record_ip, record_port) = self
+            .resolve_member_dns_endpoint(
+                plan.spec.node_id,
+                compute_ip.as_deref(),
+                &plan.container_name,
+                host_port,
+                plan.member_port,
+            )
+            .await
+            .map(|(ip, port)| (Some(ip), port))
+            .unwrap_or((None, plan.member_port as i32));
         if let Some(ip) = record_ip {
             let draft = temps_dns::EndpointDraft {
                 fqdn: plan.member_fqdn.clone(),
@@ -7180,6 +7231,88 @@ echo "[restore] Pre-seed complete"
         }?;
 
         Some((ip, port))
+    }
+
+    /// Resolve the address published for a service-member FQDN.
+    ///
+    /// Local managed-service ports bind to `127.0.0.1` for security, so the
+    /// control-plane underlay address plus host port is not reachable from an
+    /// application container. Local members instead publish their container
+    /// address on the shared application network and the container port.
+    /// Remote members retain the overlay-first, underlay-fallback behavior.
+    async fn resolve_member_dns_endpoint(
+        &self,
+        node_id: Option<i32>,
+        overlay_ip: Option<&str>,
+        container_name: &str,
+        host_port: Option<i32>,
+        container_port: u16,
+    ) -> Option<(String, i32)> {
+        if let Some(endpoint) =
+            select_member_dns_endpoint(node_id, overlay_ip, None, None, container_port)
+        {
+            return Some(endpoint);
+        }
+
+        if node_id.is_none() {
+            let local_network_ip = self
+                .lookup_container_network_ip(container_name, &temps_core::NETWORK_NAME)
+                .await;
+            if let Some(endpoint) = select_member_dns_endpoint(
+                node_id,
+                None,
+                local_network_ip.as_deref(),
+                None,
+                container_port,
+            ) {
+                return Some(endpoint);
+            }
+        }
+
+        if node_id.is_some() {
+            let underlay = self
+                .resolve_member_underlay(node_id, host_port, container_port)
+                .await;
+            return select_member_dns_endpoint(node_id, None, None, underlay, container_port);
+        }
+
+        // Publishing the control plane's underlay address here would be
+        // actively misleading: local managed-service ports bind only to
+        // 127.0.0.1, so application containers cannot reach that address.
+        None
+    }
+
+    async fn lookup_container_network_ip(
+        &self,
+        container_name: &str,
+        network_name: &str,
+    ) -> Option<String> {
+        use bollard::query_parameters::InspectContainerOptions;
+
+        match self
+            .docker
+            .inspect_container(container_name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => info
+                .network_settings
+                .as_ref()
+                .and_then(|settings| settings.networks.as_ref())
+                .and_then(|networks| networks.get(network_name))
+                .and_then(|endpoint| endpoint.ip_address.as_deref())
+                .map(str::trim)
+                .filter(|ip| !ip.is_empty())
+                .map(str::to_string),
+            Err(error) => {
+                warn!(
+                    container = container_name,
+                    network = network_name,
+                    error = %error,
+                    "Failed to inspect local cluster member network address"
+                );
+                None
+            }
+        }
     }
 
     /// Look up the gateway IP of the multi-host overlay docker network
@@ -10562,6 +10695,82 @@ mod tests {
             sync_state: None,
             replay_lag_ms: None,
         }
+    }
+
+    /// Regression for deployment environment resolution and cluster backups:
+    /// both paths used to hand-match only `primary | single`, so an application
+    /// deployment could fail with "no running primary data node" during the
+    /// normal writable `wait_primary` state even though cluster health passed.
+    #[test]
+    fn writable_primary_live_state_includes_wait_primary() {
+        for state in ["primary", "single", "wait_primary"] {
+            assert!(
+                live_state_is_writable_primary(Some(state)),
+                "{state} must be accepted as a writable primary"
+            );
+        }
+
+        for state in ["secondary", "catchingup", "demoted", "unknown"] {
+            assert!(
+                !live_state_is_writable_primary(Some(state)),
+                "{state} must not be accepted as a writable primary"
+            );
+        }
+        assert!(!live_state_is_writable_primary(None));
+    }
+
+    /// A dead node keeps its last reported `primary` state in the monitor.
+    /// Selection must ignore that stale row, choose the healthy promoted
+    /// `wait_primary`, and fail closed if two live writers are ever reported.
+    #[test]
+    fn healthy_primary_selection_ignores_stale_rows_and_rejects_ambiguity() {
+        let mut unhealthy_primary = cluster_member_health("orders-1", "primary");
+        unhealthy_primary.health = 0;
+        unhealthy_primary.seconds_since_report = 1;
+        let promoted = cluster_member_health("orders-2", "wait_primary");
+        let unhealthy_report = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members: vec![unhealthy_primary, promoted.clone()],
+        };
+        assert_eq!(
+            healthy_writable_primary_nodename(&unhealthy_report),
+            Some("orders-2")
+        );
+
+        let mut stale_primary = cluster_member_health("orders-1", "primary");
+        stale_primary.health = 1;
+        stale_primary.seconds_since_report = 30;
+        let stale_report = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members: vec![stale_primary, promoted],
+        };
+        assert_eq!(
+            healthy_writable_primary_nodename(&stale_report),
+            Some("orders-2")
+        );
+
+        let ambiguous = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members: vec![
+                cluster_member_health("orders-1", "primary"),
+                cluster_member_health("orders-2", "wait_primary"),
+            ],
+        };
+        assert!(healthy_writable_primary_nodename(&ambiguous).is_none());
+
+        let unreachable = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 0,
+            monitor_error: Some("monitor unavailable".to_string()),
+            members: vec![cluster_member_health("orders-2", "wait_primary")],
+        };
+        assert!(healthy_writable_primary_nodename(&unreachable).is_none());
     }
 
     /// Regression for `remove_cluster_member`'s delete-protection gate
@@ -14654,5 +14863,52 @@ mod tests {
             .expect("the exposed dynamic port must have a matching host binding");
         assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
         assert_eq!(binding.host_port.as_deref(), Some("6040"));
+    }
+
+    #[test]
+    fn local_member_dns_uses_shared_network_ip_and_container_port() {
+        let endpoint = select_member_dns_endpoint(
+            None,
+            None,
+            Some("172.19.0.7"),
+            Some(("10.52.0.10".to_string(), 6011)),
+            5432,
+        );
+
+        assert_eq!(endpoint, Some(("172.19.0.7".to_string(), 5432)));
+    }
+
+    #[test]
+    fn local_member_dns_never_publishes_loopback_only_underlay_fallback() {
+        let endpoint = select_member_dns_endpoint(
+            None,
+            None,
+            None,
+            Some(("10.52.0.10".to_string(), 6011)),
+            5432,
+        );
+
+        assert_eq!(endpoint, None);
+    }
+
+    #[test]
+    fn remote_member_dns_preserves_overlay_then_underlay_behavior() {
+        let overlay = select_member_dns_endpoint(
+            Some(7),
+            Some("10.99.0.12"),
+            Some("172.19.0.7"),
+            Some(("10.52.0.11".to_string(), 6012)),
+            5432,
+        );
+        assert_eq!(overlay, Some(("10.99.0.12".to_string(), 5432)));
+
+        let underlay = select_member_dns_endpoint(
+            Some(7),
+            None,
+            Some("172.19.0.7"),
+            Some(("10.52.0.11".to_string(), 6012)),
+            5432,
+        );
+        assert_eq!(underlay, Some(("10.52.0.11".to_string(), 6012)));
     }
 }
