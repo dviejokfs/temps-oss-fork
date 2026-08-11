@@ -2531,6 +2531,11 @@ export type ConnectionResponse = {
     consecutive_health_failures: number;
     created_at: string;
     /**
+     * Whether this connection can make authenticated provider requests.
+     * This exposes capability only; credential values are never serialized.
+     */
+    has_authenticated_credentials: boolean;
+    /**
      * Human-readable reason when health_status is "unhealthy"; null otherwise.
      */
     health_message?: string | null;
@@ -2538,11 +2543,6 @@ export type ConnectionResponse = {
      * Current health status: "healthy", "unhealthy", or "unknown".
      */
     health_status: string;
-    /**
-     * Whether this connection can make authenticated provider requests.
-     * Credential values are never returned.
-     */
-    has_authenticated_credentials: boolean;
     id: number;
     installation_id?: string | null;
     is_active: boolean;
@@ -4430,6 +4430,12 @@ export type DeleteResponse = {
 
 export type DeployFromImageRequest = {
     /**
+     * Claim an image already present in the platform host's Docker daemon.
+     * Temps retags it into a generated project-owned namespace and records
+     * its immutable image ID. Never set this for a registry image.
+     */
+    claim_local?: boolean;
+    /**
      * External image ID (if already registered). If provided without image_ref,
      * the image reference will be fetched from the registered external image.
      */
@@ -4462,8 +4468,8 @@ export type DeployFromImageUploadQuery = {
      */
     health_check_path?: string | null;
     /**
-     * Tag to apply to the imported image (e.g., "myapp:v1.0")
-     * If not provided, a unique tag will be generated
+     * Deprecated display hint retained for wire compatibility. Temps always
+     * generates the actual project-scoped internal image reference.
      */
     tag?: string | null;
 };
@@ -5755,7 +5761,8 @@ export type DrainStatusResponse = {
      */
     can_remove: boolean;
     /**
-     * Whether the drain is complete (all containers migrated)
+     * Whether the source node is empty and safe to remove. Replacement
+     * deployments may still be converging asynchronously on other nodes.
      */
     drain_complete: boolean;
     message: string;
@@ -5800,7 +5807,7 @@ export type DropOffPoint = {
 };
 
 export type DropPresetCandidate = {
-    composePath?: string;
+    composePath?: string | null;
     confidence: string;
     directory: string;
     isStatic: boolean;
@@ -9402,6 +9409,16 @@ export type ListPresetsResponse = {
     total: number;
 };
 
+/**
+ * Paginated renewal-attempt history for one domain, newest first.
+ */
+export type ListRenewalAttemptsResponse = {
+    attempts: Array<RenewalAttemptResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
 export type ListRunsResponse = {
     items: Array<AgentRunResponse>;
     page: number;
@@ -11892,9 +11909,31 @@ export type PlatformInfo = {
 };
 
 /**
+ * What a plugin is allowed to do with the platform API over the channel.
+ *
+ * Coarse on purpose. Fine-grained authorization already exists in the
+ * permission system and is enforced per request against the acting user;
+ * this exists so an operator installing a binary can see at a glance
+ * whether it intends to *write* at all, without reading its source.
+ */
+export type PluginCapability = 'api_read' | 'api_write';
+
+/**
  * The complete plugin manifest — the handshake contract.
  */
 export type PluginManifest = {
+    /**
+     * What this plugin may do with the platform's own API over the channel.
+     *
+     * Empty by default, and empty means read-only channel queries and
+     * nothing else: a plugin that never asks cannot deploy, cannot create
+     * projects, and cannot provision databases. Declaring a capability is
+     * not by itself permission to act — every call still runs the real
+     * handler's `permission_guard!` as the user the plugin is acting for,
+     * so a capability can only ever narrow what that user could already do
+     * through the console.
+     */
+    capabilities?: Array<PluginCapability>;
     /**
      * Short description of what the plugin does
      */
@@ -11922,6 +11961,20 @@ export type PluginManifest = {
      */
     health_path?: string;
     /**
+     * Suppress the console's own header strip above this plugin's UI.
+     *
+     * The console normally renders the plugin's icon, display name and
+     * version above the iframe. For a plugin whose UI is a full working
+     * surface with its own header, that is a second title bar competing
+     * for the same vertical space — and vertical space is exactly what a
+     * dense full-page layout has none of. Opt out and the frame gets the
+     * full height.
+     *
+     * The nav entry still names the plugin, so nothing becomes
+     * unidentifiable by setting this.
+     */
+    hide_header?: boolean;
+    /**
      * Unique plugin identifier (kebab-case, e.g., "backup-manager")
      */
     name: string;
@@ -11930,9 +11983,35 @@ export type PluginManifest = {
      */
     nav?: Array<NavEntry>;
     /**
+     * Routes this plugin authenticates itself, which the platform's proxy
+     * therefore does not gate.
+     *
+     * Every other proxied route requires an authenticated caller before it
+     * reaches the plugin. That is right for anything a signed-in user
+     * drives, and wrong for the endpoints a plugin exposes to clients that
+     * hold no platform session — an agent in a sandbox presenting a
+     * capability token, a share link opened by someone with no account.
+     * This is the external-plugin counterpart of the in-process
+     * `configure_public_routes`.
+     *
+     * Paths are relative to the plugin's mount point and match by prefix,
+     * so `/webhooks/incoming` covers everything beneath it. A listed route is
+     * reachable by anyone who can reach the instance: it **must** check its
+     * own credential. Listing a route that does not is an open door.
+     */
+    public_paths?: Array<string>;
+    /**
      * Whether the plugin needs database access
      */
     requires_db?: boolean;
+    /**
+     * Whether the plugin may read the platform's host data root.
+     *
+     * This is a highly privileged capability: the directory can contain
+     * encryption keys and instance-owned state. It is independent of direct
+     * database access and defaults to `false`.
+     */
+    requires_host_data_access?: boolean;
     ui?: null | UiManifest;
     /**
      * SemVer version string
@@ -13569,6 +13648,32 @@ export type RenameConversationRequest = {
     title: string;
 };
 
+/**
+ * One row of the standard (non-on-demand) renewal-attempt audit log, backing
+ * the domain detail page's renewal timeline.
+ */
+export type RenewalAttemptResponse = {
+    /**
+     * When the attempt was recorded (epoch millis).
+     */
+    created_at: number;
+    error?: string | null;
+    error_type?: string | null;
+    id: number;
+    /**
+     * `"success"` | `"failed"`.
+     */
+    outcome: string;
+    /**
+     * `"request_challenge"` | `"complete_challenge"`.
+     */
+    stage: string;
+    /**
+     * `"http-01"` | `"dns-01"`.
+     */
+    verification_method: string;
+};
+
 export type RepositoryComposeServicesResponse = {
     path: string;
     repositoryId: number;
@@ -14223,6 +14328,22 @@ export type RunExternalServiceBackupRequest = {
      * ID of the S3 source to store the backup. If omitted, the current default S3 source is used.
      */
     s3_source_id?: number | null;
+};
+
+/**
+ * Live connection variables for a service in one environment.
+ *
+ * Every value is plaintext — this is the response of the audited issuance
+ * endpoint, not of the masked bulk read. Callers must treat it as a
+ * credential: do not log it, do not cache it, do not put it in an error.
+ */
+export type RuntimeCredentialsResponse = {
+    /**
+     * Connection variables, e.g. `POSTGRES_URL`, `POSTGRES_PASSWORD`.
+     */
+    variables: {
+        [key: string]: string;
+    };
 };
 
 /**
@@ -19834,6 +19955,52 @@ export type RecordEventMetricsResponses = {
 };
 
 export type RecordEventMetricsResponse = RecordEventMetricsResponses[keyof RecordEventMetricsResponses];
+
+export type IngestTunneledEnvelopeData = {
+    /**
+     * Sentry envelope as binary data
+     */
+    body: string;
+    path?: never;
+    query?: never;
+    url: '/_temps/sentry/envelope';
+};
+
+export type IngestTunneledEnvelopeErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Origin/Referer does not match the resolved host
+     */
+    403: unknown;
+    /**
+     * Unknown host
+     */
+    404: unknown;
+    /**
+     * Request body too large (exceeds 2 MiB)
+     */
+    413: unknown;
+    /**
+     * Rate limit exceeded
+     */
+    429: unknown;
+};
+
+export type IngestTunneledEnvelopeResponses = {
+    /**
+     * Envelope ingested
+     */
+    200: unknown;
+    /**
+     * Host resolved to a route with no attributable project (sandbox/orphan)
+     */
+    204: void;
+};
+
+export type IngestTunneledEnvelopeResponse = IngestTunneledEnvelopeResponses[keyof IngestTunneledEnvelopeResponses];
 
 export type AddSessionReplayEventsData = {
     body: SessionReplayEventsRequest;
@@ -26168,6 +26335,51 @@ export type RenewDomainResponses = {
 
 export type RenewDomainResponse = RenewDomainResponses[keyof RenewDomainResponses];
 
+export type ListRenewalAttemptsData = {
+    body?: never;
+    path: {
+        /**
+         * Domain name
+         */
+        domain: string;
+    };
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number | null;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number | null;
+    };
+    url: '/domains/{domain}/renewal-attempts';
+};
+
+export type ListRenewalAttemptsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListRenewalAttemptsResponses = {
+    /**
+     * Renewal attempts retrieved successfully
+     */
+    200: ListRenewalAttemptsResponse;
+};
+
+export type ListRenewalAttemptsResponse2 = ListRenewalAttemptsResponses[keyof ListRenewalAttemptsResponses];
+
 export type CheckDomainStatusData = {
     body?: never;
     path: {
@@ -28707,6 +28919,54 @@ export type GetServiceEnvironmentVariableResponses = {
 
 export type GetServiceEnvironmentVariableResponse = GetServiceEnvironmentVariableResponses[keyof GetServiceEnvironmentVariableResponses];
 
+export type IssueRuntimeCredentialsData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/projects/{project_id}/environments/{environment_id}/runtime-credentials';
+};
+
+export type IssueRuntimeCredentialsErrors = {
+    /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
+    /**
+     * Service, project, or environment not found
+     */
+    404: unknown;
+    /**
+     * Service is not linked to the project
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type IssueRuntimeCredentialsResponses = {
+    /**
+     * Connection credentials issued
+     */
+    200: RuntimeCredentialsResponse;
+};
+
+export type IssueRuntimeCredentialsResponse = IssueRuntimeCredentialsResponses[keyof IssueRuntimeCredentialsResponses];
+
 export type UpdateServiceResourcesData = {
     body: ServiceResourceLimits;
     path: {
@@ -30470,13 +30730,25 @@ export type UpdateConnectionTokenData = {
 
 export type UpdateConnectionTokenErrors = {
     /**
+     * Invalid token configuration
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Connection not found
      */
     404: unknown;
+    /**
+     * Git provider rate limit exceeded
+     */
+    429: unknown;
     /**
      * Internal server error
      */
@@ -30510,9 +30782,17 @@ export type ValidateConnectionErrors = {
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Connection not found
      */
     404: unknown;
+    /**
+     * Git provider rate limit exceeded
+     */
+    429: unknown;
     /**
      * Internal server error
      */
@@ -31230,6 +31510,10 @@ export type GetPublicRepositoryErrors = {
      */
     400: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -31282,6 +31566,10 @@ export type GetPublicBranchesErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository not found
      */
@@ -31494,6 +31782,10 @@ export type DetectPublicPresetsErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository or branch not found
      */
@@ -35371,6 +35663,14 @@ export type QueryTracesData = {
          * Filter by deployment ID
          */
         deployment_id?: number;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string;
+        /**
+         * Filter by span name pattern (ILIKE)
+         */
+        name_pattern?: string;
         /**
          * Max spans to return (default: 100, max: 1000)
          */
@@ -41215,8 +41515,8 @@ export type DeployFromImageUploadData = {
     };
     query?: {
         /**
-         * Tag to apply to the imported image (e.g., "myapp:v1.0")
-         * If not provided, a unique tag will be generated
+         * Deprecated display hint retained for wire compatibility. Temps always
+         * generates the actual project-scoped internal image reference.
          */
         tag?: string | null;
         /**
@@ -43735,8 +44035,11 @@ export type ObservabilityListEventsData = {
     };
     query?: {
         /**
-         * Comma-separated kinds: `log,request,span,error,revenue`. Empty or
-         * missing returns every kind.
+         * Comma-separated kinds: `request,span,error,revenue`. Empty or
+         * missing returns every kind. There is no `log` kind — runtime logs
+         * intentionally never appear in this feed (see `ObservabilityEvent`'s
+         * "No `Log` variant" doc); passing `kinds=log` is rejected with 400
+         * `InvalidKindsFilter`, not silently ignored.
          */
         kinds?: string;
         /**
@@ -46774,6 +47077,10 @@ export type GetRepositoryBranchesErrors = {
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -46822,6 +47129,10 @@ export type GetRepositoryTagsErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository not found
      */
@@ -47075,6 +47386,10 @@ export type GetBranchesByRepositoryIdErrors = {
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -47119,6 +47434,10 @@ export type ListCommitsByRepositoryIdErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository not found
      */
@@ -47212,6 +47531,10 @@ export type GetTagsByRepositoryIdErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository not found
      */
