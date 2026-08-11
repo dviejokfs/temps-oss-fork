@@ -2661,6 +2661,12 @@ impl ConversationService {
                         }
                         Err(e) => {
                             tracing::warn!("chat_stream_turn item error for conv {conv_id}: {e}");
+                            // Provider subprocess failures arrive as stream items
+                            // after `chat_stream_turn_with_executor` has returned.
+                            // Preserve the concrete reason so an empty turn reports
+                            // the authentication/model error instead of the generic
+                            // "provider returned no response" fallback.
+                            last_provider_error = Some(e.to_string());
                             break;
                         }
                     }
@@ -4333,7 +4339,7 @@ mod tests {
     /// Build a service whose only DB interaction (the final assistant insert) is
     /// satisfied by one mocked query result, plus the `echo` tool list to drive
     /// the loop. The provider is passed directly to `try_tool_loop` per test.
-    fn service_with(ai: Arc<ScriptedAi>) -> (ConversationService, Vec<ChatTool>) {
+    fn service_with(ai: Arc<dyn AiService>) -> (ConversationService, Vec<ChatTool>) {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![assistant_msg_model()]])
             .into_connection();
@@ -4366,6 +4372,34 @@ mod tests {
             }
         }
         out
+    }
+
+    struct StreamErrorAi;
+
+    #[async_trait]
+    impl AiService for StreamErrorAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream_turn(
+            &self,
+            _request: ChatTurnRequest,
+        ) -> Result<ChatTurnStream, AiError> {
+            let stream = futures::stream::iter(vec![Err(AiError::Provider {
+                purpose: "chat.test.tools".to_string(),
+                reason: "Token refresh failed: 401".to_string(),
+            })]);
+            Ok(Box::pin(stream))
+        }
     }
 
     /// Concatenate every `Token` event's text, in order.
@@ -4486,6 +4520,35 @@ mod tests {
         assert!(
             out.is_empty(),
             "errored call with no tools -> nothing; got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_surfaces_provider_error_received_inside_stream() {
+        let ai: Arc<dyn AiService> = Arc::new(StreamErrorAi);
+        let provider: Arc<dyn ConversationContextProvider> = Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let (svc, tools) = service_with(ai);
+
+        let mut stream = svc
+            .try_tool_loop(
+                &test_conversation(),
+                vec![],
+                Some(provider),
+                tools,
+                &test_auth(),
+            )
+            .await;
+        let error = stream
+            .next()
+            .await
+            .expect("the empty turn should report its provider failure")
+            .expect_err("the event should be an error");
+
+        assert!(
+            error.to_string().contains("Token refresh failed: 401"),
+            "the concrete streamed provider error must reach the user: {error}"
         );
     }
 

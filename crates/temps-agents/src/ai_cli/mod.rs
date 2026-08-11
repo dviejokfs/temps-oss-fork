@@ -314,6 +314,18 @@ pub fn summarize_cli_failure(provider: &str, output: &str) -> String {
                 }
             }
         }
+        // OpenCode can exit successfully while reporting a provider/auth
+        // failure as a JSON event. Surface its human message instead of
+        // treating the run as an empty successful reply.
+        if v.get("type").and_then(|t| t.as_str()) == Some("error") {
+            let message = v
+                .pointer("/error/data/message")
+                .or_else(|| v.pointer("/error/message"))
+                .and_then(|message| message.as_str());
+            if let Some(message) = message.filter(|message| !message.trim().is_empty()) {
+                return scrub_and_bound(message);
+            }
+        }
     }
     // Fallback: last non-JSON line (CLIs print human errors to the tail),
     // else a bounded slice of the output.
@@ -408,6 +420,15 @@ mod tests {
         assert_eq!(
             summarize_cli_failure("claude_cli", output),
             "Invalid API key"
+        );
+    }
+
+    #[test]
+    fn test_summarize_opencode_zero_exit_error_frame() {
+        let output = r#"{"type":"error","error":{"name":"UnknownError","data":{"message":"Token refresh failed: 401"}}}"#;
+        assert_eq!(
+            summarize_cli_failure("opencode", output),
+            "Token refresh failed: 401"
         );
     }
 

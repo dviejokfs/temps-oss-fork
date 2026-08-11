@@ -10,6 +10,26 @@ export interface ChatComposerLayout {
   overflowY: 'auto' | 'hidden'
 }
 
+/**
+ * Streaming never locks the draft: a user can type the instruction that
+ * interrupts the active turn. Creation state is the only reason to disable it.
+ */
+export function isChatComposerDisabled(
+  hasConversation: boolean,
+  starting: boolean,
+  lazyCreate: boolean
+): boolean {
+  return !hasConversation && !starting && !lazyCreate
+}
+
+export function chatComposerSubmitAction(
+  input: string,
+  streaming: boolean
+): 'none' | 'send' | 'interrupt-and-send' {
+  if (!input.trim()) return 'none'
+  return streaming ? 'interrupt-and-send' : 'send'
+}
+
 /** Clamp the growing composer while preserving an internal scroll escape hatch. */
 export function resolveChatComposerLayout(
   scrollHeight: number

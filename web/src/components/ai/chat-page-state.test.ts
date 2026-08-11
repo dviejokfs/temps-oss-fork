@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  chatComposerSubmitAction,
   conversationListNeedsRefresh,
   createProjectChat,
+  isChatComposerDisabled,
   resolveChatComposerLayout,
   resolvePageChat,
 } from './chat-page-state'
@@ -89,5 +91,18 @@ describe('resolveChatComposerLayout', () => {
       height: 240,
       overflowY: 'auto',
     })
+  })
+})
+
+describe('chat composer interruption', () => {
+  test('keeps an existing chat editable while a response streams', () => {
+    expect(isChatComposerDisabled(true, false, false)).toBe(false)
+    expect(chatComposerSubmitAction('change direction', true)).toBe(
+      'interrupt-and-send'
+    )
+  })
+
+  test('does not submit an empty interruption', () => {
+    expect(chatComposerSubmitAction('   ', true)).toBe('none')
   })
 })

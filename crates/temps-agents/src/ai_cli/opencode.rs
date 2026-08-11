@@ -21,12 +21,11 @@ fn apply_chat_mcp(cmd: &mut Command, config: &AiRunConfig) {
         cmd.env(
             "OPENCODE_CONFIG_CONTENT",
             serde_json::json!({
-                "mcp": { "servers": { "temps-chat": {
+                "mcp": { "temps-chat": {
                     "type": "remote",
                     "url": server.url,
-                    "headers": { "Authorization": format!("Bearer {}", server.authorization_token) },
-                    "codemode": false
-                }}}
+                    "headers": { "Authorization": format!("Bearer {}", server.authorization_token) }
+                }}
             })
             .to_string(),
         );
@@ -314,6 +313,13 @@ impl AiCliProvider for OpenCodeCliProvider {
             });
         }
 
+        if output_reports_error(&stdout) {
+            return Err(AgentError::AiCliReportedError {
+                provider: self.name().to_string(),
+                message: crate::ai_cli::summarize_cli_failure(self.name(), &stdout),
+            });
+        }
+
         // Parse OpenCode JSON output for token usage
         let (tokens_input, tokens_output, model) = parse_opencode_output(&stdout);
 
@@ -434,6 +440,13 @@ impl AiCliProvider for OpenCodeCliProvider {
             });
         }
 
+        if output_reports_error(&stdout) {
+            return Err(AgentError::AiCliReportedError {
+                provider: self.name().to_string(),
+                message: crate::ai_cli::summarize_cli_failure(self.name(), &stdout),
+            });
+        }
+
         let (tokens_input, tokens_output, model) = parse_opencode_output(&stdout);
 
         Ok(AiRunResult {
@@ -454,6 +467,16 @@ fn opencode_has_credentials(status_output: &str) -> bool {
     !normalized.is_empty()
         && !normalized.contains("no credentials")
         && !normalized.contains("0 credentials")
+}
+
+fn output_reports_error(output: &str) -> bool {
+    output.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line.trim())
+            .ok()
+            .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
+            .as_deref()
+            == Some("error")
+    })
 }
 
 /// Parse OpenCode `--format json` output for accumulated token usage and
@@ -659,11 +682,9 @@ ollama/qwen3.5:9b
             })
             .expect("OpenCode config env");
         let json: serde_json::Value = serde_json::from_str(&value).expect("parse config JSON");
-        assert_eq!(json["mcp"]["servers"]["temps-chat"]["type"], "remote");
-        assert_eq!(json["mcp"]["servers"]["temps-chat"]["codemode"], false);
-        assert!(json["mcp"]["servers"]["temps-chat"]
-            .get("enabled")
-            .is_none());
+        assert_eq!(json["mcp"]["temps-chat"]["type"], "remote");
+        assert!(json["mcp"]["temps-chat"].get("codemode").is_none());
+        assert!(json["mcp"]["temps-chat"].get("enabled").is_none());
     }
 
     #[test]
@@ -681,6 +702,15 @@ ollama/qwen3.5:9b
         assert!(input.is_none());
         assert!(output.is_none());
         assert!(model.is_none());
+    }
+
+    #[test]
+    fn detects_error_event_even_when_opencode_exits_zero() {
+        let output = r#"{"type":"error","timestamp":1,"error":{"data":{"message":"Token refresh failed: 401"}}}"#;
+        assert!(output_reports_error(output));
+        assert!(!output_reports_error(
+            r#"{"type":"text","part":{"type":"text","text":"4"}}"#
+        ));
     }
 
     #[test]

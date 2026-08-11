@@ -41,7 +41,18 @@ fn apply_runtime_args(
                 .arg("approvals_reviewer=\"auto_review\"");
         }
         _ => {
-            cmd.arg("--full-auto");
+            // `codex exec` is non-interactive: there is no terminal attached
+            // that can answer an MCP approval prompt. Plain `auto` and
+            // `approval_policy="never"` both make Codex report scoped MCP
+            // calls as "user cancelled". Its auto reviewer is the supported
+            // non-interactive path: it approves the scoped read-only call while
+            // keeping command execution inside the workspace-write sandbox.
+            cmd.arg("--sandbox")
+                .arg("workspace-write")
+                .arg("--config")
+                .arg("approval_policy=\"on-request\"")
+                .arg("--config")
+                .arg("approvals_reviewer=\"auto_review\"");
         }
     }
     if let Some(effort) = thinking_level.filter(|effort| *effort != "default") {
@@ -608,6 +619,16 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--model", "gpt-5.6-sol"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "workspace-write"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--config", "approval_policy=\"on-request\""]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--config", "approvals_reviewer=\"auto_review\""]));
+        assert!(!args.iter().any(|arg| arg == "--full-auto"));
         assert!(args.iter().any(|arg| {
             arg == "mcp_servers.temps_chat.url=\"http://127.0.0.1:32123/mcp/turn\""
         }));
@@ -819,10 +840,19 @@ not json either\n";
     }
 
     #[test]
-    fn codex_default_runtime_uses_full_auto_and_reasoning_config() {
+    fn codex_default_runtime_auto_reviews_in_workspace_sandbox() {
         assert_eq!(
             runtime_args("auto", "high"),
-            ["--full-auto", "--config", "model_reasoning_effort=\"high\""]
+            [
+                "--sandbox",
+                "workspace-write",
+                "--config",
+                "approval_policy=\"on-request\"",
+                "--config",
+                "approvals_reviewer=\"auto_review\"",
+                "--config",
+                "model_reasoning_effort=\"high\""
+            ]
         );
     }
 

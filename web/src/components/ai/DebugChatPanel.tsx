@@ -74,7 +74,11 @@ import {
   type ChatProviderOption,
   type ChatRuntimeSelection,
 } from './chat-runtime-options'
-import { resolveChatComposerLayout } from './chat-page-state'
+import {
+  chatComposerSubmitAction,
+  isChatComposerDisabled,
+  resolveChatComposerLayout,
+} from './chat-page-state'
 import {
   assistantParts,
   type ChatMessage,
@@ -1576,6 +1580,8 @@ export function DebugChatPanel({
   // unmounts). Dropping the SSE connection also tells the server to stop
   // generating, so a stopped turn doesn't keep costing tokens.
   const abortRef = useRef<AbortController | null>(null)
+  const queuedInterruptRef = useRef<string | null>(null)
+  const sendAfterInterruptRef = useRef<(text: string) => void>(() => {})
   // Counts this tab's own in-flight writes to the conversation (an active
   // send, or a permission being resolved+polled) — see useConversationStream.
   const wsSuppressRef = useRef(0)
@@ -1659,7 +1665,11 @@ export function DebugChatPanel({
   }, [])
 
   const composerRef = useRef<HTMLTextAreaElement>(null)
-  const composerDisabled = streaming || (!publicId && !starting && !lazyCreate)
+  const composerDisabled = isChatComposerDisabled(
+    Boolean(publicId),
+    starting,
+    lazyCreate
+  )
 
   // `autoFocus` handles a composer that mounts enabled. Existing chats first
   // mount disabled while their conversation id loads, so focus again whenever
@@ -1812,6 +1822,14 @@ export function DebugChatPanel({
         abortRef.current = null
         setStreaming(false)
         wsSuppressRef.current = Math.max(0, wsSuppressRef.current - 1)
+        const queuedInterrupt = queuedInterruptRef.current
+        queuedInterruptRef.current = null
+        if (queuedInterrupt) {
+          window.setTimeout(
+            () => sendAfterInterruptRef.current(queuedInterrupt),
+            0
+          )
+        }
       }
     },
     [
@@ -1829,6 +1847,19 @@ export function DebugChatPanel({
       runtimeSelection.permissionModeId,
     ]
   )
+
+  sendAfterInterruptRef.current = (text) => void send(text)
+  const submitComposer = useCallback(() => {
+    const action = chatComposerSubmitAction(input, streaming)
+    if (action === 'none') return
+    if (action === 'interrupt-and-send') {
+      queuedInterruptRef.current = input.trim()
+      setInput('')
+      stop()
+      return
+    }
+    void send(input)
+  }, [input, streaming, send, stop])
 
   const start = useCallback(async () => {
     setStarting(true)
@@ -2273,7 +2304,7 @@ export function DebugChatPanel({
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault()
-              void send(input)
+              submitComposer()
             }
           }}
         />
@@ -2453,7 +2484,7 @@ export function DebugChatPanel({
               </>
             )}
           </div>
-          {streaming ? (
+          {streaming && !input.trim() ? (
             <Button
               type="button"
               onClick={stop}
@@ -2466,14 +2497,17 @@ export function DebugChatPanel({
             </Button>
           ) : (
             <Button
-              onClick={() => void send(input)}
+              onClick={submitComposer}
               disabled={
                 !input.trim() ||
                 (!publicId && !lazyCreate) ||
                 (!publicId && providerOptions.length === 0)
               }
               size="icon"
-              aria-label="Send message"
+              aria-label={
+                streaming ? 'Interrupt and send message' : 'Send message'
+              }
+              title={streaming ? 'Interrupt and send message' : undefined}
             >
               <Send className="h-4 w-4" />
             </Button>
