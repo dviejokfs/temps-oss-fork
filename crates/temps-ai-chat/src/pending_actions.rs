@@ -187,11 +187,13 @@ impl PendingActionService {
     pub async fn get(
         &self,
         project_id: i32,
+        user_id: i32,
         public_id: &str,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         ai_pending_actions::Entity::find()
             .filter(ai_pending_actions::Column::PublicId.eq(public_id))
             .filter(ai_pending_actions::Column::ProjectId.eq(project_id))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| PendingActionError::NotFound {
@@ -207,10 +209,12 @@ impl PendingActionService {
     pub async fn list_for_conversation(
         &self,
         project_id: i32,
+        user_id: i32,
         conversation_id: i64,
     ) -> Result<Vec<ai_pending_actions::Model>, PendingActionError> {
         Ok(ai_pending_actions::Entity::find()
             .filter(ai_pending_actions::Column::ProjectId.eq(project_id))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
             .filter(ai_pending_actions::Column::ConversationId.eq(conversation_id))
             .order_by_desc(ai_pending_actions::Column::CreatedAt)
             .all(self.db.as_ref())
@@ -229,7 +233,8 @@ impl PendingActionService {
         confirmed_by: Option<i32>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         // 1. Load + project-scope check.
-        let action = self.get(project_id, public_id).await?;
+        let user_id = auth.user_id();
+        let action = self.get(project_id, user_id, public_id).await?;
 
         // 2. Defense-in-depth: re-check the write-actions toggle at confirm time
         //    (the toggle may have been turned off after the action was proposed).
@@ -246,7 +251,7 @@ impl PendingActionService {
         // 3b. Plan ordering: a chained step can only run once every earlier step
         //     has executed. Blocks before the atomic claim so a premature confirm
         //     never leaves a stuck "executing" row.
-        self.ensure_plan_step_ready(&action).await?;
+        self.ensure_plan_step_ready(&action, user_id).await?;
 
         // 4. Advisory permission check using the caller's auth.
         //    This MUST run before the atomic claim so a denied user never leaves
@@ -271,6 +276,7 @@ impl PendingActionService {
                 sea_orm::sea_query::Expr::value("executing"),
             )
             .filter(ai_pending_actions::Column::Id.eq(action.id))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
             .filter(ai_pending_actions::Column::Status.eq("proposed"))
             .exec(self.db.as_ref())
             .await?
@@ -333,7 +339,7 @@ impl PendingActionService {
                 .await?;
                 // Stop-and-report: a failed step halts the plan — the later steps
                 // must not run against a failed prerequisite.
-                self.skip_remaining_steps(&action).await;
+                self.skip_remaining_steps(&action, user_id).await;
                 failed
             }
         };
@@ -350,11 +356,12 @@ impl PendingActionService {
         &self,
         project_id: i32,
         public_id: &str,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         rejected_by: Option<i32>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         // Load first so we have the id and can return the updated row.
-        let action = self.get(project_id, public_id).await?;
+        let user_id = auth.user_id();
+        let action = self.get(project_id, user_id, public_id).await?;
 
         // Defense-in-depth: re-check the write-actions toggle (same as confirm).
         self.check_write_actions_enabled(project_id).await?;
@@ -377,6 +384,7 @@ impl PendingActionService {
                 sea_orm::sea_query::Expr::value(now),
             )
             .filter(ai_pending_actions::Column::Id.eq(action.id))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
             .filter(ai_pending_actions::Column::Status.eq("proposed"))
             .exec(self.db.as_ref())
             .await?
@@ -391,10 +399,10 @@ impl PendingActionService {
         }
 
         // Reload the row to return its current state.
-        let updated = self.get(project_id, public_id).await?;
+        let updated = self.get(project_id, user_id, public_id).await?;
 
         // Stop-and-report: rejecting a step halts the rest of the plan.
-        self.skip_remaining_steps(&updated).await;
+        self.skip_remaining_steps(&updated, user_id).await;
 
         // Audit is emitted by the handler with full RequestMetadata (ip/user_agent).
         Ok(updated)
@@ -425,12 +433,14 @@ impl PendingActionService {
     async fn ensure_plan_step_ready(
         &self,
         action: &ai_pending_actions::Model,
+        user_id: i32,
     ) -> Result<(), PendingActionError> {
         let (Some(plan_id), true) = (action.plan_public_id.as_ref(), action.step_index > 0) else {
             return Ok(());
         };
         let earlier = ai_pending_actions::Entity::find()
             .filter(ai_pending_actions::Column::PlanPublicId.eq(plan_id))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
             .filter(ai_pending_actions::Column::StepIndex.lt(action.step_index))
             .all(self.db.as_ref())
             .await?;
@@ -449,7 +459,7 @@ impl PendingActionService {
     /// `skipped` so the UI stops offering them and the chain doesn't proceed.
     /// No-op for standalone actions. Best-effort — errors are swallowed since the
     /// triggering step's outcome is already persisted.
-    async fn skip_remaining_steps(&self, action: &ai_pending_actions::Model) {
+    async fn skip_remaining_steps(&self, action: &ai_pending_actions::Model, user_id: i32) {
         let Some(plan_id) = action.plan_public_id.as_ref() else {
             return;
         };
@@ -459,6 +469,7 @@ impl PendingActionService {
                 sea_orm::sea_query::Expr::value("skipped"),
             )
             .filter(ai_pending_actions::Column::PlanPublicId.eq(plan_id))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
             .filter(ai_pending_actions::Column::StepIndex.gt(action.step_index))
             .filter(ai_pending_actions::Column::Status.eq("proposed"))
             .exec(self.db.as_ref())
@@ -635,13 +646,60 @@ mod tests {
             .into_connection();
         let svc = make_svc(db);
         let err = svc
-            .get(7, "nonexistent")
+            .get(7, 1, "nonexistent")
             .await
             .expect_err("should be not found");
         assert!(
             matches!(err, PendingActionError::NotFound { ref public_id } if public_id == "nonexistent"),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_action_surfaces_fail_closed_for_other_or_null_creators() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_pending_actions::Model>::new()])
+                .append_query_results([Vec::<ai_pending_actions::Model>::new()])
+                .append_query_results([Vec::<ai_pending_actions::Model>::new()])
+                .append_query_results([Vec::<ai_pending_actions::Model>::new()])
+                .into_connection(),
+        );
+        let svc = PendingActionService::new(db.clone(), noop_write_handle());
+        let auth = make_auth();
+
+        assert!(svc
+            .list_for_conversation(7, auth.user_id(), 1)
+            .await
+            .expect("owned action list")
+            .is_empty());
+        assert!(matches!(
+            svc.get(7, auth.user_id(), "other-user-or-legacy").await,
+            Err(PendingActionError::NotFound { .. })
+        ));
+        assert!(matches!(
+            svc.confirm(7, "other-user-or-legacy", &auth, Some(auth.user_id()))
+                .await,
+            Err(PendingActionError::NotFound { .. })
+        ));
+        assert!(matches!(
+            svc.reject(7, "other-user-or-legacy", &auth, Some(auth.user_id()))
+                .await,
+            Err(PendingActionError::NotFound { .. })
+        ));
+
+        drop(svc);
+        let db = Arc::try_unwrap(db).expect("release mock database");
+        let statements = db
+            .into_transaction_log()
+            .into_iter()
+            .flat_map(|transaction| transaction.statements().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(statements.len(), 4);
+        assert!(statements.iter().all(|statement| {
+            statement.sql.contains("created_by")
+                && format!("{statement:?}").contains(&auth.user_id().to_string())
+        }));
     }
 
     // confirm: write-actions toggle is off → Disabled before anything else.
@@ -759,7 +817,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let svc = make_svc(db);
         // No earlier-steps query is issued for a standalone action.
-        assert!(svc.ensure_plan_step_ready(&standalone).await.is_ok());
+        assert!(svc.ensure_plan_step_ready(&standalone, 1).await.is_ok());
     }
 
     // reject: proposed → rejected (atomic path: exec_result 1 row, then get).
@@ -832,7 +890,7 @@ mod tests {
             .into_connection();
         let svc = make_svc(db);
         let rows = svc
-            .list_for_conversation(7, 1)
+            .list_for_conversation(7, 1, 1)
             .await
             .expect("should succeed");
         assert_eq!(rows.len(), 2);

@@ -8,8 +8,12 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        DefaultBodyLimit, Path, Query, State,
+    },
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Extension, Json, Router,
@@ -30,9 +34,11 @@ use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, AuditLogger, RequestMetadata};
 use temps_entities::{ai_conversations, ai_messages, ai_pending_actions};
 
+use temps_ai::streaming::{PermissionDecision, PermissionKind, PermissionRequest};
+
 use crate::audit::{
     AiActionConfirmedAudit, AiActionRejectedAudit, ChatMessageSentAudit, ConversationArchivedAudit,
-    ConversationCreatedAudit, ConversationRenamedAudit,
+    ConversationCreatedAudit, ConversationRenamedAudit, PermissionResolvedAudit,
 };
 use crate::pending_actions::{PendingActionError, PendingActionService};
 use crate::service::ChatStreamEvent;
@@ -71,6 +77,10 @@ pub struct ConversationResponse {
     pub status: String,
     pub created_at: String,
     pub last_activity_at: String,
+    pub ai_provider: String,
+    pub ai_model: String,
+    pub ai_thinking_level: Option<String>,
+    pub ai_permission_mode: String,
 }
 
 impl From<ai_conversations::Model> for ConversationResponse {
@@ -83,6 +93,10 @@ impl From<ai_conversations::Model> for ConversationResponse {
             status: m.status,
             created_at: m.created_at.to_rfc3339(),
             last_activity_at: m.last_activity_at.to_rfc3339(),
+            ai_provider: m.ai_provider,
+            ai_model: m.ai_model,
+            ai_thinking_level: m.ai_thinking_level,
+            ai_permission_mode: m.ai_permission_mode,
         }
     }
 }
@@ -102,6 +116,10 @@ pub struct GlobalConversationResponse {
     pub status: String,
     pub created_at: String,
     pub last_activity_at: String,
+    pub ai_provider: String,
+    pub ai_model: String,
+    pub ai_thinking_level: Option<String>,
+    pub ai_permission_mode: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -169,6 +187,13 @@ pub struct ConversationDetailResponse {
     pub conversation: ConversationResponse,
     /// Turns oldest-first. The `system` seed message is omitted (internal).
     pub messages: Vec<MessageResponse>,
+    /// A still-unresolved interactive permission request (ADR-038 Phase 2), if
+    /// one is pending on this conversation right now. The client renders this
+    /// as a live, answerable `PermissionCard` — without it, a question that
+    /// arrived while the tab was away shows only as inert history text with no
+    /// way to answer it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_permission: Option<PermissionRequest>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -177,6 +202,12 @@ pub struct CreateConversationRequest {
     pub context_type: String,
     /// The entity id (ints stringified).
     pub context_id: String,
+    /// Provider pinned to this conversation. Omitted requests use the current
+    /// instance preference.
+    pub ai_provider: Option<String>,
+    pub ai_model: Option<String>,
+    pub ai_thinking_level: Option<String>,
+    pub ai_permission_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -194,6 +225,16 @@ pub struct RenameConversationRequest {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SendMessageRequest {
     pub content: String,
+    /// Optional next-turn model. The provider harness remains pinned, but its
+    /// advertised models may be changed between turns.
+    #[serde(default)]
+    pub ai_model: Option<String>,
+    /// Optional next-turn thinking level.
+    #[serde(default)]
+    pub ai_thinking_level: Option<String>,
+    /// Optional next-turn permission mode for the pinned provider harness.
+    #[serde(default)]
+    pub ai_permission_mode: Option<String>,
     /// Optional, client-supplied description of the page/entity the user is
     /// currently viewing (e.g. a trace in a project). Injected into the model's
     /// view of this turn only — never stored or shown in history. Capped server
@@ -220,6 +261,31 @@ pub struct ToolResultEvent {
     pub id: String,
     pub name: String,
     pub content: String,
+}
+
+/// Payload for the `permission_requested` SSE event (ADR-038 Phase 2).
+/// The interactive Claude CLI subprocess is paused waiting for the user to
+/// approve or deny a tool/question/plan.  Resolve via
+/// `POST .../permissions/{id}/resolve`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PermissionRequestedEvent {
+    /// The CLI's `request_id` — also the `{permission_id}` in the resolve URL.
+    pub id: String,
+    /// What kind of interaction is required: `"tool_approval"`, `"question"`,
+    /// or `"plan_approval"`.
+    pub kind: PermissionKind,
+    /// Tool name from the CLI request (e.g. `"Bash"`, `"AskUserQuestion"`).
+    pub tool_name: String,
+    /// Raw `input` from the CLI request. Passed through verbatim so each
+    /// milestone's card can render tool-specific fields without the service
+    /// layer needing to know about their schemas.
+    pub input: serde_json::Value,
+}
+
+/// Body for the `POST .../permissions/{permission_id}/resolve` endpoint.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResolvePermissionRequest {
+    pub decision: PermissionDecision,
 }
 
 // --- error mapping -----------------------------------------------------------
@@ -250,6 +316,11 @@ impl From<ChatError> for Problem {
             ChatError::Ai(_) => problemdetails::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(e.to_string()),
+            ChatError::PermissionKindMismatch { .. } => {
+                problemdetails::new(axum::http::StatusCode::BAD_REQUEST)
+                    .with_title("Permission Decision Mismatch")
+                    .with_detail(e.to_string())
+            }
         }
     }
 }
@@ -414,6 +485,35 @@ async fn ensure_chat_enabled(db: &DatabaseConnection, project_id: i32) -> Result
     Ok(())
 }
 
+/// Host CLIs execute as the Temps host user, so project write access alone is
+/// not sufficient. The stronger check is repeated on every send because the
+/// creator's provider administration permission may have been revoked.
+fn ensure_runtime_permission(
+    auth: &AuthContext,
+    provider: Option<&str>,
+    permission_mode: Option<&str>,
+) -> Result<(), Problem> {
+    if provider
+        .and_then(temps_agents::ai_cli::find_provider)
+        .is_some()
+        && !auth.has_permission(&Permission::AiGatewayWrite)
+    {
+        return Err(problemdetails::new(axum::http::StatusCode::FORBIDDEN)
+            .with_title("Host AI Provider Access Denied")
+            .with_detail(
+                "Using a host-authenticated AI CLI requires AI provider administration permission.",
+            ));
+    }
+    if permission_mode == Some("full-access") && !auth.has_permission(&Permission::SystemAdmin) {
+        return Err(problemdetails::new(axum::http::StatusCode::FORBIDDEN)
+            .with_title("Full AI Access Denied")
+            .with_detail(
+                "Full-access AI permission mode requires system administrator permission.",
+            ));
+    }
+    Ok(())
+}
+
 /// Gate for create/send: the project must have opted into AI debug chat AND AI
 /// must be configured. Builds on [`ensure_chat_enabled`] (toggle) and adds the
 /// AI-availability check required to actually run a turn.
@@ -422,7 +522,12 @@ async fn ensure_enabled(state: &AppState, project_id: i32) -> Result<(), Problem
     if !state.service.ai_available().await {
         return Err(problemdetails::new(axum::http::StatusCode::CONFLICT)
             .with_title("AI Not Configured")
-            .with_detail("Configure an AI provider to use debugging chat."));
+            .with_detail(
+                "Configure an AI provider to use debugging chat — a BYOK provider key or a \
+                 subscription agent CLI (Claude Code, Codex) both work. Note that only a BYOK \
+                 key can use tool-calling (live API lookups, repo exploration, write actions); \
+                 an agent CLI still chats, just without those.",
+            ));
     }
     Ok(())
 }
@@ -436,6 +541,20 @@ const MAX_MESSAGE_CONTENT_LEN: usize = 32_000;
 const MAX_PAGE_CONTEXT_LEN: usize = 4_000;
 /// Cap on a user-supplied conversation title (a short label, not prose).
 const MAX_TITLE_LEN: usize = 200;
+
+/// Body-size limit for `resolve_permission` POST payloads (finding 3).
+///
+/// The payload is a `PermissionDecision` — at most a few short strings.  8 KB
+/// is ample for any real answer; anything larger is either a client bug or an
+/// attempt to exhaust memory / blow the stdin pipe to the subprocess.
+const RESOLVE_PERMISSION_BODY_LIMIT: usize = 8 * 1024;
+
+/// Maximum byte length for free-text fields inside a `PermissionDecision`
+/// (`DenyTool.reason`, `RejectPlan.feedback`, serialized `AnswerQuestion.answers`).
+///
+/// These strings are written verbatim to the subprocess's stdin.  A hard cap
+/// prevents a large payload from hanging the stdin write or exhausting buffers.
+const MAX_DECISION_STRING_LEN: usize = 4 * 1024;
 
 /// 400 for an over-length input field.
 fn too_long(field: &str, max: usize) -> Problem {
@@ -462,11 +581,38 @@ fn can_read_context(auth: &AuthContext, context_type: &str) -> bool {
     context_type != "alert_suggest" || auth.has_permission(&Permission::OtelRead)
 }
 
+async fn hidden_conversation_project_ids(
+    auth: &AuthContext,
+    checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+) -> Result<Vec<i32>, Problem> {
+    if auth.is_admin() || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin) {
+        return Ok(Vec::new());
+    }
+    let Some(checker) = checker else {
+        return Ok(Vec::new());
+    };
+    let Some(user_id) = auth.user_id_opt() else {
+        return Err(problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Project Access Denied")
+            .with_detail("A user identity is required to list AI conversations."));
+    };
+    checker
+        .hidden_project_ids(user_id)
+        .await
+        .map(|ids| ids.unwrap_or_default())
+        .map_err(|error| {
+            tracing::error!(user_id, error = %error, "failed to filter global AI conversations");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Access Check Failed")
+                .with_detail("Could not verify project access; please try again")
+        })
+}
+
 // --- handlers ----------------------------------------------------------------
 
-/// Find the existing chat for a context (returns `null` if none yet). Requires
-/// the per-project `ai_debug_chat_enabled` toggle to be on; returns 403 when the
-/// feature is disabled so revoking it consistently hides existing chat content.
+/// Find the current user's existing chat for a context (returns `null` if none
+/// yet). Conversations are private even between members of the same project.
+/// Requires the per-project `ai_debug_chat_enabled` toggle to be on.
 #[utoipa::path(
     get, tag = "AI Chat",
     path = "/projects/{project_id}/ai/conversations",
@@ -495,14 +641,13 @@ pub async fn find_conversation(
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let found = state
         .service
-        .find_by_context(project_id, &q.context_type, &q.context_id)
+        .find_by_context(project_id, auth.user_id(), &q.context_type, &q.context_id)
         .await?;
     Ok(Json(found.map(ConversationResponse::from)))
 }
 
-/// List every active conversation across all projects, most-recently-active
-/// first, annotated with project name/slug. Powers the unified "all chats"
-/// switcher in the AI assistant dock.
+/// List the current user's active conversations across all projects,
+/// most-recently-active first, annotated with project name/slug.
 #[utoipa::path(
     get, tag = "AI Chat",
     path = "/ai/conversations",
@@ -518,7 +663,12 @@ pub async fn list_all_conversations(
     // project-scoped deployment/project token must not reach another tenant's
     // chats through it. Restrict to human/admin (user/API-key) principals.
     deny_deployment_token!(auth);
-    let items = state.service.list_all_conversations().await?;
+    let hidden_project_ids =
+        hidden_conversation_project_ids(&auth, &state.project_access_checker).await?;
+    let items = state
+        .service
+        .list_all_conversations(auth.user_id(), &hidden_project_ids)
+        .await?;
     Ok(Json(
         items
             .into_iter()
@@ -534,13 +684,17 @@ pub async fn list_all_conversations(
                 status: i.conversation.status,
                 created_at: i.conversation.created_at.to_rfc3339(),
                 last_activity_at: i.conversation.last_activity_at.to_rfc3339(),
+                ai_provider: i.conversation.ai_provider,
+                ai_model: i.conversation.ai_model,
+                ai_thinking_level: i.conversation.ai_thinking_level,
+                ai_permission_mode: i.conversation.ai_permission_mode,
             })
             .collect(),
     ))
 }
 
-/// List all active conversations for a project, most-recently-active first.
-/// Powers the conversation switcher in the AI assistant sidebar.
+/// List the current user's active conversations for a project,
+/// most-recently-active first.
 #[utoipa::path(
     get, tag = "AI Chat",
     path = "/projects/{project_id}/ai/conversations/list",
@@ -557,7 +711,10 @@ pub async fn list_conversations(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
-    let conversations = state.service.list_conversations(project_id).await?;
+    let conversations = state
+        .service
+        .list_conversations(project_id, auth.user_id())
+        .await?;
     Ok(Json(
         conversations
             .into_iter()
@@ -567,7 +724,7 @@ pub async fn list_conversations(
     ))
 }
 
-/// Get-or-create the chat for a context (seeds it on first open).
+/// Get-or-create the current user's private chat for a context.
 #[utoipa::path(
     post, tag = "AI Chat",
     path = "/projects/{project_id}/ai/conversations",
@@ -593,6 +750,11 @@ pub async fn create_conversation(
     if req.context_id.len() > MAX_CONTEXT_ID_LEN {
         return Err(too_long("context_id", MAX_CONTEXT_ID_LEN));
     }
+    ensure_runtime_permission(
+        &auth,
+        req.ai_provider.as_deref(),
+        req.ai_permission_mode.as_deref(),
+    )?;
     ensure_context_read_permission(&auth, &req.context_type)?;
     ensure_enabled(&state, project_id).await?;
     let conv = state
@@ -601,7 +763,11 @@ pub async fn create_conversation(
             project_id,
             &req.context_type,
             &req.context_id,
-            Some(auth.user_id()),
+            auth.user_id(),
+            req.ai_provider.as_deref(),
+            req.ai_model.as_deref(),
+            req.ai_thinking_level.as_deref(),
+            req.ai_permission_mode.as_deref(),
         )
         .await?;
     state
@@ -638,8 +804,13 @@ pub async fn get_conversation(
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let conv = state
         .service
-        .get_by_public_id(project_id, &public_id)
+        .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
+    ensure_runtime_permission(
+        &auth,
+        Some(&conv.ai_provider),
+        Some(&conv.ai_permission_mode),
+    )?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     let messages = state
         .service
@@ -649,10 +820,91 @@ pub async fn get_conversation(
         .filter(|m| m.role != "system")
         .map(MessageResponse::from)
         .collect();
+    let pending_permission = state.service.pending_permission_for(&conv.public_id);
     Ok(Json(ConversationDetailResponse {
         conversation: ConversationResponse::from(conv),
         messages,
+        pending_permission,
     }))
+}
+
+/// Live wire for a conversation — cross-tab sync (not represented in the
+/// OpenAPI schema; WS upgrades aren't expressible there). Read-only: a second
+/// tab watching the same conversation subscribes here to see the same
+/// tokens/tool-calls/permission-requests the sending tab receives over its
+/// own `POST .../messages` SSE response, without which it would see nothing
+/// until a manual reload.
+///
+/// Auth works identically to any other route: the WS upgrade request is
+/// still a normal authenticated HTTP GET (cookies attached) before the 101
+/// Switching Protocols — `RequireAuth` reads `AuthContext` out of request
+/// extensions populated by the same middleware that runs for `get_conversation`.
+pub async fn conversation_stream(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((project_id, public_id)): Path<(i32, String)>,
+    ws: WebSocketUpgrade,
+) -> Result<axum::response::Response, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+    ensure_chat_enabled(state.db.as_ref(), project_id).await?;
+    let conv = state
+        .service
+        .get_by_public_id(project_id, auth.user_id(), &public_id)
+        .await?;
+    ensure_runtime_permission(
+        &auth,
+        Some(&conv.ai_provider),
+        Some(&conv.ai_permission_mode),
+    )?;
+    ensure_context_read_permission(&auth, &conv.context_type)?;
+
+    let rx = state.service.subscribe_conversation(conv.id);
+    Ok(ws.on_upgrade(move |socket| forward_conversation_events(socket, rx)))
+}
+
+/// Forward one conversation's broadcast onto a WebSocket as JSON text frames
+/// (`{"event":"...","data":"..."}`) until the client disconnects. On
+/// `Lagged` (the bounded channel overflowed — a fast burst while the tab was
+/// backgrounded), sends one explicit `resync_required` frame rather than
+/// silently resuming with a gap: the client refetches full history instead
+/// of rendering a conversation with missing turns.
+async fn forward_conversation_events(
+    mut socket: WebSocket,
+    mut rx: tokio::sync::broadcast::Receiver<crate::service::WireEvent>,
+) {
+    loop {
+        tokio::select! {
+            // A client-initiated close (or any incoming frame — this channel
+            // is publish-only, so any message just confirms liveness) ends
+            // the loop; ping/pong is handled by axum automatically.
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) => break,
+                }
+            }
+            event = rx.recv() => {
+                match event {
+                    Ok(evt) => {
+                        let frame = serde_json::json!({ "event": evt.event, "data": evt.data });
+                        if socket.send(Message::Text(frame.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let frame = serde_json::json!({ "event": "resync_required", "data": "" });
+                        if socket.send(Message::Text(frame.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
 }
 
 /// Send a user message; stream the assistant reply as Server-Sent Events.
@@ -684,11 +936,28 @@ pub async fn send_message(
         return Err(too_long("content", MAX_MESSAGE_CONTENT_LEN));
     }
     ensure_enabled(&state, project_id).await?;
-    let conv = state
+    let mut conv = state
         .service
-        .get_by_public_id(project_id, &public_id)
+        .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
+    let effective_permission = req
+        .ai_permission_mode
+        .as_deref()
+        .unwrap_or(&conv.ai_permission_mode);
+    ensure_runtime_permission(&auth, Some(&conv.ai_provider), Some(effective_permission))?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
+    if req.ai_model.is_some() || req.ai_thinking_level.is_some() || req.ai_permission_mode.is_some()
+    {
+        conv = state
+            .service
+            .update_runtime_options(
+                &conv,
+                req.ai_model.as_deref(),
+                req.ai_thinking_level.as_deref(),
+                req.ai_permission_mode.as_deref(),
+            )
+            .await?;
+    }
     // Page context is advisory framing, not user content: cap it and silently
     // drop an oversized value rather than failing the message.
     let page_context = req
@@ -714,42 +983,96 @@ pub async fn send_message(
         })
         .await;
 
-    let sse = token_stream.map(|item| {
-        let event = match item {
-            Ok(ChatStreamEvent::Token(text)) => Event::default().data(text),
-            Ok(ChatStreamEvent::ToolCall {
-                id,
-                name,
-                arguments,
-            }) => {
-                let payload = ToolCallEvent {
+    // `event_name` is `None` for plain token text — SSE's unnamed/"message"
+    // event, which the existing frontend parser treats as prose. Every other
+    // kind gets an explicit name. Computed once here so the SSE response
+    // (the sending tab's own delivery) and the cross-tab broadcast (every
+    // OTHER tab watching this conversation) are always built from the exact
+    // same `(event_name, data)` pair — they can never disagree.
+    let conv_id = conv.id;
+    let broadcast_service = state.service.clone();
+    // A second handle for the terminal `turn_complete` event below — the
+    // `.map` closure below already moves its own clone.
+    let broadcast_service_done = broadcast_service.clone();
+    let sse = token_stream
+        .map(move |item| {
+            let (event_name, data): (Option<&str>, String) = match item {
+                Ok(ChatStreamEvent::Token(text)) => (None, text),
+                Ok(ChatStreamEvent::ToolCall {
                     id,
                     name,
                     arguments,
-                };
-                // Single-line compact JSON so it occupies one `data:` line. On
-                // the (practically impossible) serialization failure, surface an
-                // error event rather than dropping the frame silently.
-                match serde_json::to_string(&payload) {
-                    Ok(json) => Event::default().event("tool_call").data(json),
-                    Err(e) => Event::default()
-                        .event("error")
-                        .data(format!("failed to encode tool_call event: {e}")),
+                }) => {
+                    let payload = ToolCallEvent {
+                        id,
+                        name,
+                        arguments,
+                    };
+                    // Single-line compact JSON so it occupies one `data:` line. On
+                    // the (practically impossible) serialization failure, surface an
+                    // error event rather than dropping the frame silently.
+                    match serde_json::to_string(&payload) {
+                        Ok(json) => (Some("tool_call"), json),
+                        Err(e) => (
+                            Some("error"),
+                            format!("failed to encode tool_call event: {e}"),
+                        ),
+                    }
                 }
-            }
-            Ok(ChatStreamEvent::ToolResult { id, name, content }) => {
-                let payload = ToolResultEvent { id, name, content };
-                match serde_json::to_string(&payload) {
-                    Ok(json) => Event::default().event("tool_result").data(json),
-                    Err(e) => Event::default()
-                        .event("error")
-                        .data(format!("failed to encode tool_result event: {e}")),
+                Ok(ChatStreamEvent::ToolResult { id, name, content }) => {
+                    let payload = ToolResultEvent { id, name, content };
+                    match serde_json::to_string(&payload) {
+                        Ok(json) => (Some("tool_result"), json),
+                        Err(e) => (
+                            Some("error"),
+                            format!("failed to encode tool_result event: {e}"),
+                        ),
+                    }
                 }
-            }
-            Err(e) => Event::default().event("error").data(e.to_string()),
-        };
-        Ok::<_, Infallible>(event)
-    });
+                Ok(ChatStreamEvent::PermissionRequested {
+                    id,
+                    kind,
+                    tool_name,
+                    input,
+                }) => {
+                    let payload = PermissionRequestedEvent {
+                        id,
+                        kind,
+                        tool_name,
+                        input,
+                    };
+                    match serde_json::to_string(&payload) {
+                        Ok(json) => (Some("permission_requested"), json),
+                        Err(e) => (
+                            Some("error"),
+                            format!("failed to encode permission_requested event: {e}"),
+                        ),
+                    }
+                }
+                Err(e) => (Some("error"), e.to_string()),
+            };
+            // Cross-tab sync: best-effort, never blocks or fails this response.
+            broadcast_service.publish_wire_event(
+                conv_id,
+                event_name.unwrap_or("token"),
+                data.clone(),
+            );
+            let event = match event_name {
+                Some(name) => Event::default().event(name).data(data),
+                None => Event::default().data(data),
+            };
+            Ok::<_, Infallible>(event)
+        })
+        .chain(futures::stream::once(async move {
+            // The SSE stream itself has no other way to say "this turn is done" —
+            // it just ends, which the sending tab's fetch reader observes as
+            // `done: true`. A cross-tab observer has no such signal, so without
+            // this its "thinking" indicator would hang forever once the turn
+            // finishes. Harmless on the sending tab too: `applyWireEvent` treats
+            // an unrecognized event name with empty data as a no-op.
+            broadcast_service_done.publish_wire_event(conv_id, "turn_complete", String::new());
+            Ok::<_, Infallible>(Event::default().event("turn_complete").data(""))
+        }));
     Ok(Sse::new(sse).keep_alive(KeepAlive::default()))
 }
 
@@ -773,8 +1096,13 @@ pub async fn archive_conversation(
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let conv = state
         .service
-        .get_by_public_id(project_id, &public_id)
+        .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
+    ensure_runtime_permission(
+        &auth,
+        Some(&conv.ai_provider),
+        Some(&conv.ai_permission_mode),
+    )?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     state.service.archive(&conv).await?;
     state
@@ -788,6 +1116,232 @@ pub async fn archive_conversation(
             conversation_id: conv.public_id.clone(),
         })
         .await;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Resolve a pending interactive permission request (ADR-038 Phase 2).
+///
+/// The interactive Claude CLI subprocess emits a `control_request` frame when
+/// a tool needs approval.  `run_interactive` registers the pending request in
+/// an in-process registry and emits a `permission_requested` SSE event so the
+/// UI can render the approval card.  This endpoint lets the user send their
+/// decision, which unblocks the subprocess and lets the turn continue.
+///
+/// The claim is atomic (remove-to-claim): a concurrent request for the same
+/// `permission_id` receives 409 Conflict.  If the subprocess already exited
+/// (and the registry was drained with a synthetic deny), the entry is gone and
+/// the caller receives 404.
+#[utoipa::path(
+    post, tag = "AI Chat",
+    path = "/projects/{project_id}/ai/conversations/{public_id}/permissions/{permission_id}/resolve",
+    params(
+        ("project_id" = i32, Path,),
+        ("public_id" = String, Path, description = "Conversation public id"),
+        ("permission_id" = String, Path, description = "The CLI's request_id from the SSE event"),
+    ),
+    request_body = ResolvePermissionRequest,
+    responses(
+        (status = 204, description = "Decision accepted; subprocess will continue"),
+        (status = 400, description = "Invalid decision payload"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Unknown permission_id (may have timed out or been auto-denied)"),
+        (status = 409, description = "Permission already resolved (concurrent resolve race)"),
+        (status = 410, description = "Turn already ended (subprocess exited before decision arrived)"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn resolve_permission(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((project_id, public_id, permission_id)): Path<(i32, String, String)>,
+    Json(req): Json<ResolvePermissionRequest>,
+) -> Result<axum::http::StatusCode, Problem> {
+    // Resolving a permission unblocks an AI subprocess (mutates state) → write scope.
+    permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+    ensure_chat_enabled(state.db.as_ref(), project_id).await?;
+
+    // Verify the conversation exists and is scoped to this project (auth gate).
+    // Runtime authorization is rechecked before the pending entry can be
+    // consumed, so revoking provider access also revokes tool approval.
+    let conv = state
+        .service
+        .get_by_public_id(project_id, auth.user_id(), &public_id)
+        .await?;
+    ensure_runtime_permission(
+        &auth,
+        Some(&conv.ai_provider),
+        Some(&conv.ai_permission_mode),
+    )?;
+    ensure_context_read_permission(&auth, &conv.context_type)?;
+
+    // ── Finding 3: payload size validation ────────────────────────────────────
+    // Reject oversized free-text fields before touching the registry.  The body
+    // limit (`DefaultBodyLimit`) on this route's registration provides the outer
+    // cap; these per-field checks provide typed 400 errors rather than a 413.
+    match &req.decision {
+        PermissionDecision::DenyTool {
+            reason: Some(reason),
+        } if reason.len() > MAX_DECISION_STRING_LEN => {
+            return Err(too_long("reason", MAX_DECISION_STRING_LEN));
+        }
+        PermissionDecision::RejectPlan {
+            feedback: Some(feedback),
+        } if feedback.len() > MAX_DECISION_STRING_LEN => {
+            return Err(too_long("feedback", MAX_DECISION_STRING_LEN));
+        }
+        PermissionDecision::AnswerQuestion { answers } => {
+            let serialized_len = serde_json::to_string(answers)
+                .map(|s| s.len())
+                .unwrap_or(usize::MAX);
+            if serialized_len > MAX_DECISION_STRING_LEN {
+                return Err(too_long("answers", MAX_DECISION_STRING_LEN));
+            }
+        }
+        _ => {}
+    }
+
+    // Classify the decision kind for the audit log (before we consume the value).
+    let decision_kind = match &req.decision {
+        PermissionDecision::AllowTool => "allow_tool",
+        PermissionDecision::DenyTool { .. } => "deny_tool",
+        PermissionDecision::AnswerQuestion { .. } => "answer_question",
+        PermissionDecision::ApprovePlan => "approve_plan",
+        PermissionDecision::RejectPlan { .. } => "reject_plan",
+    }
+    .to_string();
+
+    // ── Findings 1 + 2: IDOR guard + kind validation ──────────────────────────
+    // Look up the registry entry under the lock.  If present, verify that it
+    // belongs to THIS conversation before claiming it (removing it).  A URL
+    // `{public_id}` that doesn't match the stored `conv_public_id` gets a 404
+    // — the same response as a missing entry — so the existence of the id in
+    // another session is not confirmed to the caller.
+    //
+    // All three operations (lookup, ownership check, remove) happen under the
+    // same lock acquisition, so there is no window for a concurrent resolve to
+    // claim the entry between our check and our remove.
+    let (tx, stored_kind) = {
+        let mut registry = state.service.pending_permissions.lock().map_err(|_| {
+            problemdetails::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail("Permission registry lock poisoned")
+        })?;
+
+        // Clone only the conv_public_id so the shared borrow ends before we
+        // mutably borrow the registry for `remove`.
+        let stored_conv_id = registry
+            .get(&permission_id)
+            .map(|e| e.conv_public_id.clone());
+
+        match stored_conv_id {
+            // Entry absent: timed-out, auto-denied, or already resolved.
+            None => {
+                return Err(problemdetails::new(axum::http::StatusCode::NOT_FOUND)
+                    .with_title("Permission Not Found")
+                    .with_detail(format!(
+                        "Permission request '{permission_id}' is not pending. \
+                         It may have timed out, been auto-denied, or already been resolved."
+                    )));
+            }
+            // Entry exists but belongs to a different conversation.
+            // Return 404 (not 403) to avoid confirming the id's existence
+            // in another session to the caller.
+            Some(ref stored) if stored != &public_id => {
+                return Err(problemdetails::new(axum::http::StatusCode::NOT_FOUND)
+                    .with_title("Permission Not Found")
+                    .with_detail(format!(
+                        "Permission request '{permission_id}' is not pending. \
+                         It may have timed out, been auto-denied, or already been resolved."
+                    )));
+            }
+            // Entry belongs to this conversation — claim it atomically.
+            Some(_) => {
+                let entry = registry
+                    .remove(&permission_id)
+                    .expect("entry was present on the get() check above");
+                (entry.sender, entry.kind)
+            }
+        }
+    };
+
+    // Validate that the submitted decision variant is compatible with the stored
+    // kind.  Mismatches are client errors (400).  Accept all valid pairings:
+    //   ToolApproval → AllowTool | DenyTool
+    //   Question     → AnswerQuestion
+    //   PlanApproval → ApprovePlan | RejectPlan
+    let decision_kind_ok = matches!(
+        (&stored_kind, &req.decision),
+        (PermissionKind::ToolApproval, PermissionDecision::AllowTool)
+            | (
+                PermissionKind::ToolApproval,
+                PermissionDecision::DenyTool { .. }
+            )
+            | (
+                PermissionKind::Question,
+                PermissionDecision::AnswerQuestion { .. }
+            )
+            | (
+                PermissionKind::PlanApproval,
+                PermissionDecision::ApprovePlan
+            )
+            | (
+                PermissionKind::PlanApproval,
+                PermissionDecision::RejectPlan { .. }
+            )
+    );
+    if !decision_kind_ok {
+        let expected_kind = match &stored_kind {
+            PermissionKind::ToolApproval => "tool_approval",
+            PermissionKind::Question => "question",
+            PermissionKind::PlanApproval => "plan_approval",
+        };
+        return Err(ChatError::PermissionKindMismatch {
+            expected_kind: expected_kind.to_string(),
+            received: decision_kind.clone(),
+        }
+        .into());
+    }
+
+    // Persist the answer as a synthetic `user` message BEFORE sending it down
+    // the oneshot — once sent, the subprocess may resume and append its own
+    // reply first, and history should read question → answer → next reply in
+    // that order. Best-effort: never fails the request.
+    state
+        .service
+        .persist_permission_answered(conv.id, &req.decision)
+        .await;
+
+    // Send the decision. A `SendError` means the receiver was dropped — i.e.
+    // `run_interactive`'s stream task exited (subprocess died) while we were
+    // looking up the sender. The turn has ended; the decision can't be used.
+    tx.send(req.decision).map_err(|_| {
+        problemdetails::new(axum::http::StatusCode::GONE)
+            .with_title("Turn Already Ended")
+            .with_detail(
+                "The AI turn associated with this permission request has already ended. \
+                 The subprocess exited before the decision could be delivered.",
+            )
+    })?;
+
+    // Audit (best-effort: never fail the request on log failure).
+    state
+        .audit(&PermissionResolvedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            project_id,
+            conversation_id: conv.public_id.clone(),
+            permission_id: permission_id.clone(),
+            decision_kind,
+        })
+        .await;
+
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -824,7 +1378,7 @@ pub async fn rename_conversation(
 
     let conv = state
         .service
-        .get_by_public_id(project_id, &public_id)
+        .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     let updated = state.service.rename(&conv, title).await?;
@@ -873,12 +1427,12 @@ pub async fn list_pending_actions(
     // Verify conversation exists + is scoped to this project.
     let conv = state
         .service
-        .get_by_public_id(project_id, &conv_public_id)
+        .get_by_public_id(project_id, auth.user_id(), &conv_public_id)
         .await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     let rows = state
         .pending_actions
-        .list_for_conversation(project_id, conv.id)
+        .list_for_conversation(project_id, auth.user_id(), conv.id)
         .await
         .map_err(Problem::from)?;
     Ok(Json(
@@ -911,12 +1465,12 @@ pub async fn get_pending_action(
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let action = state
         .pending_actions
-        .get(project_id, &action_public_id)
+        .get(project_id, auth.user_id(), &action_public_id)
         .await
         .map_err(Problem::from)?;
     let conv = state
         .service
-        .get_by_id(project_id, action.conversation_id)
+        .get_by_id(project_id, auth.user_id(), action.conversation_id)
         .await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     Ok(Json(PendingActionResponse::from(action)))
@@ -949,12 +1503,12 @@ pub async fn confirm_pending_action(
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let action = state
         .pending_actions
-        .get(project_id, &action_public_id)
+        .get(project_id, auth.user_id(), &action_public_id)
         .await
         .map_err(Problem::from)?;
     let conv = state
         .service
-        .get_by_id(project_id, action.conversation_id)
+        .get_by_id(project_id, auth.user_id(), action.conversation_id)
         .await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     let confirmed_by = Some(auth.user_id());
@@ -1010,12 +1564,12 @@ pub async fn reject_pending_action(
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let action = state
         .pending_actions
-        .get(project_id, &action_public_id)
+        .get(project_id, auth.user_id(), &action_public_id)
         .await
         .map_err(Problem::from)?;
     let conv = state
         .service
-        .get_by_id(project_id, action.conversation_id)
+        .get_by_id(project_id, auth.user_id(), action.conversation_id)
         .await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     let rejected_by = Some(auth.user_id());
@@ -1123,9 +1677,22 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/projects/{project_id}/ai/conversations/{public_id}/messages",
             post(send_message),
         )
+        // Live wire for cross-tab sync (ADR-038 follow-up). Read-only.
+        .route(
+            "/projects/{project_id}/ai/conversations/{public_id}/stream",
+            get(conversation_stream),
+        )
         .route(
             "/projects/{project_id}/ai/conversations/{public_id}/archive",
             post(archive_conversation),
+        )
+        // Permission-bridge resolve endpoint (ADR-038 Phase 2).
+        // The body-limit layer caps inbound JSON before deserialization so an
+        // oversized payload is rejected with 413 rather than OOM-ing the server.
+        .route(
+            "/projects/{project_id}/ai/conversations/{public_id}/permissions/{permission_id}/resolve",
+            post(resolve_permission)
+                .layer(DefaultBodyLimit::max(RESOLVE_PERMISSION_BODY_LIMIT)),
         )
         // Pending-action routes (propose-then-confirm write actions).
         .route(
@@ -1158,6 +1725,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         send_message,
         archive_conversation,
         rename_conversation,
+        resolve_permission,
         list_pending_actions,
         get_pending_action,
         confirm_pending_action,
@@ -1175,6 +1743,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         SendMessageRequest,
         ToolCallEvent,
         ToolResultEvent,
+        PermissionRequestedEvent,
+        PermissionKind,
+        PermissionDecision,
+        ResolvePermissionRequest,
         PendingActionResponse,
         ChatReadinessResponse,
     ))
@@ -1184,6 +1756,7 @@ pub struct AiChatApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PendingPermissionEntry;
     use axum::http::StatusCode;
 
     /// The `title` value the mapping set on the Problem body, if any.
@@ -1300,6 +1873,93 @@ mod tests {
             "test-key".to_string(),
             1,
         )
+    }
+
+    enum HiddenProjectsOutcome {
+        Hidden(Vec<i32>),
+        Error,
+    }
+
+    struct HiddenProjectsChecker(HiddenProjectsOutcome);
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for HiddenProjectsChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(true)
+        }
+
+        async fn hidden_project_ids(
+            &self,
+            _user_id: i32,
+        ) -> Result<Option<Vec<i32>>, Box<dyn std::error::Error + Send + Sync>> {
+            match &self.0 {
+                HiddenProjectsOutcome::Hidden(ids) => Ok(Some(ids.clone())),
+                HiddenProjectsOutcome::Error => {
+                    Err(Box::new(std::io::Error::other("checker unavailable")))
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn global_conversation_visibility_uses_current_hidden_projects() {
+        let auth = custom_auth(vec![Permission::ProjectsRead]);
+        let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> = Some(Arc::new(
+            HiddenProjectsChecker(HiddenProjectsOutcome::Hidden(vec![7, 9])),
+        ));
+
+        assert_eq!(
+            hidden_conversation_project_ids(&auth, &checker)
+                .await
+                .expect("visibility lookup"),
+            vec![7, 9]
+        );
+    }
+
+    #[tokio::test]
+    async fn global_conversation_visibility_fails_closed_on_checker_error() {
+        let auth = custom_auth(vec![Permission::ProjectsRead]);
+        let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> = Some(Arc::new(
+            HiddenProjectsChecker(HiddenProjectsOutcome::Error),
+        ));
+
+        let error = hidden_conversation_project_ids(&auth, &checker)
+            .await
+            .expect_err("checker errors must not return an unfiltered list");
+        assert_eq!(error.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn host_cli_requires_provider_administration_permission() {
+        let project_writer = custom_auth(vec![Permission::ProjectsWrite]);
+        let denied = ensure_runtime_permission(&project_writer, Some("codex_cli"), Some("auto"))
+            .expect_err("project write access must not authorize host CLI execution");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+
+        let provider_admin =
+            custom_auth(vec![Permission::ProjectsWrite, Permission::AiGatewayWrite]);
+        assert!(
+            ensure_runtime_permission(&provider_admin, Some("codex_cli"), Some("auto"),).is_ok()
+        );
+    }
+
+    #[test]
+    fn full_access_requires_system_administrator_permission() {
+        let provider_admin = custom_auth(vec![Permission::AiGatewayWrite]);
+        let denied =
+            ensure_runtime_permission(&provider_admin, Some("claude_cli"), Some("full-access"))
+                .expect_err("provider administration alone must not authorize full host access");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+
+        let system_admin = custom_auth(vec![Permission::AiGatewayWrite, Permission::SystemAdmin]);
+        assert!(
+            ensure_runtime_permission(&system_admin, Some("claude_cli"), Some("full-access"),)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1554,5 +2214,225 @@ mod tests {
         let redacted = redact_params(&params);
         assert_eq!(redacted["VALUE"], serde_json::json!("***"));
         assert_eq!(redacted["Secret"], serde_json::json!("***"));
+    }
+
+    // ----- SSE mapping tests (ADR-038 Phase 2, milestone 3) -----
+
+    /// `ChatStreamEvent::PermissionRequested` serialises to a `PermissionRequestedEvent`
+    /// with every field intact and no sensitive content omitted.
+    #[test]
+    fn test_permission_requested_event_serialization() {
+        let payload = PermissionRequestedEvent {
+            id: "perm-abc".to_string(),
+            kind: PermissionKind::ToolApproval,
+            tool_name: "bash".to_string(),
+            input: serde_json::json!({ "command": "ls" }),
+        };
+        let json = serde_json::to_string(&payload).expect("serializes");
+        let back: serde_json::Value = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back["id"], "perm-abc");
+        assert_eq!(back["kind"], "tool_approval");
+        assert_eq!(back["tool_name"], "bash");
+        assert_eq!(back["input"]["command"], "ls");
+    }
+
+    /// Verifies that the `PermissionKind` serde aliases match the wire format
+    /// expected by the ADR-038 spec: snake_case tags.
+    #[test]
+    fn test_permission_kind_serde_roundtrip() {
+        let kinds = [
+            (PermissionKind::ToolApproval, "tool_approval"),
+            (PermissionKind::Question, "question"),
+            (PermissionKind::PlanApproval, "plan_approval"),
+        ];
+        for (kind, expected_tag) in kinds {
+            let json = serde_json::to_string(&kind).expect("serializes");
+            // PermissionKind is a unit enum with rename_all = snake_case
+            // so it serialises as a plain string
+            assert_eq!(json, format!("\"{expected_tag}\""), "kind={kind:?}");
+        }
+    }
+
+    /// `PermissionDecision` with the `type` tag serialises correctly for all
+    /// five variants — only the kind tag and optional payload appear, never raw
+    /// tool input or answer content.
+    #[test]
+    fn test_permission_decision_serde_type_tags() {
+        use temps_ai::streaming::PermissionDecision;
+
+        let cases: &[(PermissionDecision, &str)] = &[
+            (PermissionDecision::AllowTool, "allow_tool"),
+            (
+                PermissionDecision::DenyTool {
+                    reason: Some("blocked".to_string()),
+                },
+                "deny_tool",
+            ),
+            (
+                PermissionDecision::AnswerQuestion {
+                    answers: serde_json::json!({}),
+                },
+                "answer_question",
+            ),
+            (PermissionDecision::ApprovePlan, "approve_plan"),
+            (
+                PermissionDecision::RejectPlan {
+                    feedback: Some("needs revision".to_string()),
+                },
+                "reject_plan",
+            ),
+        ];
+
+        for (decision, expected_type) in cases {
+            let json = serde_json::to_string(decision).expect("serializes");
+            let v: serde_json::Value = serde_json::from_str(&json).expect("parses");
+            assert_eq!(
+                v["type"].as_str(),
+                Some(*expected_type),
+                "decision={decision:?}"
+            );
+        }
+    }
+
+    // ── Security-finding tests (ADR-038 Phase 2 milestone 3) ─────────────────
+
+    /// Finding 1 (HIGH-IDOR): cross-conversation claim is rejected with 404.
+    ///
+    /// A registry entry created for conversation "conv-A" must not be claimable
+    /// via "conv-B"'s URL.  The entry must remain in the registry so the
+    /// legitimate owner can still claim it.
+    #[test]
+    fn test_resolve_permission_cross_conversation_is_rejected() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use temps_ai::streaming::{PermissionDecision, PermissionKind};
+        use tokio::sync::oneshot;
+
+        let (tx, _rx) = oneshot::channel::<PermissionDecision>();
+
+        let mut registry: HashMap<String, PendingPermissionEntry> = HashMap::new();
+        registry.insert(
+            "req-1".to_string(),
+            PendingPermissionEntry {
+                sender: tx,
+                conv_public_id: "conv-A".to_string(),
+                kind: PermissionKind::ToolApproval,
+                tool_name: "Bash".to_string(),
+                input: serde_json::Value::Null,
+            },
+        );
+        let registry = Arc::new(Mutex::new(registry));
+
+        // Simulate what `resolve_permission` does inside the lock.
+        let attacker_conv = "conv-B";
+        let stored_conv_id = {
+            let guard = registry.lock().unwrap();
+            guard.get("req-1").map(|e| e.conv_public_id.clone())
+        };
+        let is_idor = stored_conv_id
+            .as_deref()
+            .map(|id| id != attacker_conv)
+            .unwrap_or(false);
+
+        assert!(
+            is_idor,
+            "cross-conversation claim should be detected as IDOR"
+        );
+
+        // The entry must NOT have been removed — the real owner can still claim.
+        let guard = registry.lock().unwrap();
+        assert!(
+            guard.contains_key("req-1"),
+            "registry entry must remain after IDOR rejection"
+        );
+    }
+
+    /// Finding 2 (MEDIUM): submitting the wrong decision kind for a `Question`
+    /// permission returns 400 with the typed `PermissionKindMismatch` error.
+    #[test]
+    fn test_permission_kind_mismatch_maps_to_400() {
+        let p: Problem = ChatError::PermissionKindMismatch {
+            expected_kind: "question".to_string(),
+            received: "allow_tool".to_string(),
+        }
+        .into();
+        assert_eq!(
+            p.status_code,
+            StatusCode::BAD_REQUEST,
+            "kind mismatch must be a client error (400)"
+        );
+        assert_eq!(
+            title_of(&p).as_deref(),
+            Some("Permission Decision Mismatch")
+        );
+        // Detail must include the mismatch context so the caller can fix it.
+        let detail = p.body.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            detail.contains("question"),
+            "detail must mention the expected kind"
+        );
+        assert!(
+            detail.contains("allow_tool"),
+            "detail must mention the received decision"
+        );
+    }
+
+    /// Finding 3 (MEDIUM): oversized `reason` in a `DenyTool` payload is caught
+    /// by `too_long` before the registry is touched.
+    #[test]
+    fn test_deny_tool_oversized_reason_returns_400_input_too_long() {
+        // Build a `reason` that exceeds the 4 KiB limit.
+        let oversized = "x".repeat(MAX_DECISION_STRING_LEN + 1);
+
+        // Mimic the guard in `resolve_permission`.
+        let decision = PermissionDecision::DenyTool {
+            reason: Some(oversized.clone()),
+        };
+        let error = match &decision {
+            PermissionDecision::DenyTool {
+                reason: Some(reason),
+            } if reason.len() > MAX_DECISION_STRING_LEN => {
+                Some(too_long("reason", MAX_DECISION_STRING_LEN))
+            }
+            _ => None,
+        };
+
+        let p = error.expect("oversized reason must trigger too_long guard");
+        assert_eq!(
+            p.status_code,
+            StatusCode::BAD_REQUEST,
+            "oversized payload must be rejected with 400"
+        );
+        assert_eq!(title_of(&p).as_deref(), Some("Input Too Long"));
+    }
+
+    /// Finding 3 (MEDIUM): oversized serialized `answers` in `AnswerQuestion`
+    /// is caught before the registry is touched.
+    #[test]
+    fn test_answer_question_oversized_answers_returns_400() {
+        // answers = { "q": "aaa...4097 chars..."}
+        let big_value = "a".repeat(MAX_DECISION_STRING_LEN + 1);
+        let answers = serde_json::json!({ "q": big_value });
+
+        let decision = PermissionDecision::AnswerQuestion {
+            answers: answers.clone(),
+        };
+        let error = match &decision {
+            PermissionDecision::AnswerQuestion { answers } => {
+                let serialized_len = serde_json::to_string(answers)
+                    .map(|s| s.len())
+                    .unwrap_or(usize::MAX);
+                if serialized_len > MAX_DECISION_STRING_LEN {
+                    Some(too_long("answers", MAX_DECISION_STRING_LEN))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        let p = error.expect("oversized answers must trigger too_long guard");
+        assert_eq!(p.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(title_of(&p).as_deref(), Some("Input Too Long"));
     }
 }

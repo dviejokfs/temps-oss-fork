@@ -10133,6 +10133,7 @@ dependencies = [
  "tar",
  "tempfile",
  "temps-agents-mcp-proxy",
+ "temps-ai",
  "temps-auth",
  "temps-config",
  "temps-core",
@@ -10170,6 +10171,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "utoipa",
 ]
 
 [[package]]
@@ -10177,13 +10179,16 @@ name = "temps-ai-agent-cli"
 version = "0.1.0-beta.55"
 dependencies = [
  "async-trait",
+ "axum",
  "futures",
+ "serde",
  "serde_json",
  "tempfile",
  "temps-agents",
  "temps-ai",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -10221,10 +10226,15 @@ dependencies = [
  "chrono",
  "futures",
  "futures-util",
+ "hex",
  "sea-orm",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "temps-agents",
  "temps-ai",
+ "temps-ai-agent-cli",
  "temps-ai-api-tools",
  "temps-auth",
  "temps-config",
@@ -10257,9 +10267,11 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
+ "temps-agents",
  "temps-ai",
  "temps-ai-agent-cli",
  "temps-auth",
+ "temps-config",
  "temps-core",
  "temps-entities",
  "thiserror 2.0.19",

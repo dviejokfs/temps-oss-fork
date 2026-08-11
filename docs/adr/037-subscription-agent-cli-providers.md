@@ -1,5 +1,15 @@
 # ADR-037: Subscription-Backed Agent CLI Providers for Temps AI Workloads
 
+> **Implementation update (2026-08-11):** The original workload matrix and
+> tool-routing restrictions below describe the initial rollout. CLI-backed chat
+> now supports the existing scoped `temps` and confirm-gated `temps_write`
+> virtual CLI tools through an authenticated, per-turn, in-process loopback MCP
+> bridge. Claude retains its interactive permission/question/plan transport;
+> Codex and OpenCode use the shared tool-executor loop. No bridge executable or
+> sidecar runtime is required, although the selected provider harness binary
+> must still be installed and authenticated. ADR-038 records the implementation
+> addendum.
+
 **Status:** Proposed
 **Date:** 2026-08-08
 **Author:** David Viejo
@@ -271,7 +281,7 @@ Temps server?**
 
 Operators authenticate the CLI on the Temps host machine and paste the resulting
 credential into `POST /settings/ai-providers/{provider_id}/credential` (the
-existing UI at `/settings/ai-providers`). For Claude Code subscription OAuth,
+existing UI at `/agent-sandbox/providers`). For Claude Code subscription OAuth,
 `claude setup-token` generates a paste-able token. No interactive auth runs
 inside the Temps server process. Device-code-based auth for operators without
 SSH access is deferred to Phase 4.
@@ -400,7 +410,7 @@ pub struct AiProviderStatusResponse {
     pub agent_cli_provider_id: Option<String>,
     pub configured: bool,
     pub reason: Option<String>,               // why unavailable when configured = false
-    pub setup_path: Option<String>,           // "/settings/ai-providers"
+    pub setup_path: Option<String>,           // "/agent-sandbox/providers" (agent CLI) or "/ai-gateway" (gateway)
     pub gateway_available: bool,
     pub agent_cli_status: Option<AiCliStatus>, // from AiCliProvider::get_status()
 }
@@ -510,7 +520,7 @@ autofixer provider settings page.
 4. Settings UI: add an "AI Provider Preference" section that shows the current
    `provider_type`, lets the operator pick an agent CLI provider, displays
    `AiCliStatus` from `AiCliProvider::get_status()` (installed, authenticated,
-   setup_hint), and links to `/settings/ai-providers` for credential management.
+   setup_hint), and links to `/agent-sandbox/providers` for credential management.
 5. `DispatchingAiService.resolve_provider()` queries `ai_gateway_config` for the
    project scope (falling back to instance scope), parses `provider_type` and
    `agent_cli_provider_id`.

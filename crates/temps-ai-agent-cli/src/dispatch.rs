@@ -1,61 +1,198 @@
 //! [`DispatchingAiService`]: a delegating wrapper around an existing
-//! [`AiService`] that establishes the dispatch seam for Phase 2/3.
+//! [`AiService`] that routes each call to whichever provider is active
+//! (ADR-037 Phase 2/3).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use temps_ai::{
     AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    TokenStream,
+    TokenStream, ToolExecutor,
 };
 
-/// A pass-through [`AiService`] wrapper that establishes the dispatch seam
-/// described in ADR-037.
+/// Read seam for the instance-level provider preference (`ai_gateway_config`).
+/// Defined here rather than depended on from `temps-ai-gateway` so this crate
+/// stays free of a DB dependency — `temps-ai-gateway` implements this trait
+/// for its `ProviderPreferenceService` and hands `DispatchingAiService` an
+/// `Arc<dyn ActiveProviderReader>` at construction time.
+#[async_trait]
+pub trait ActiveProviderReader: Send + Sync {
+    /// Returns the catalog id (e.g. `"claude_cli"`) of the active agent-CLI
+    /// provider when the instance-scoped preference is `"agent_cli"`, or
+    /// `None` when it's `"gateway"`, unset, or the row can't be read.
+    async fn active_agent_cli_provider(&self) -> Option<String>;
+}
+
+/// A no-op reader that never selects an agent-CLI provider — used by
+/// [`DispatchingAiService::new`] so Phase 1 callers (and every existing test)
+/// keep the original pure-passthrough-to-gateway behaviour unchanged.
+struct NeverAgentCli;
+
+#[async_trait]
+impl ActiveProviderReader for NeverAgentCli {
+    async fn active_agent_cli_provider(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Routes each [`AiService`] call to whichever provider is currently active,
+/// so a BYOK provider key and a subscription-backed agent CLI are usable the
+/// same way — whichever the operator picked in the AI Provider Preference
+/// card drives every AI feature that reads through this seam, not just AI
+/// Workflows.
 ///
-/// # Phase 1 behaviour
-///
-/// Every method delegates directly to the wrapped `gateway`. Runtime behaviour
-/// is unchanged — all requests still flow through [`temps_ai_gateway`]'s
-/// `GatewayAiService`.
-///
-/// # Why this type exists now
-///
-/// Adding the wrapper in Phase 1 lets Phases 2/3 introduce routing logic
-/// (reading `ai_gateway_config.provider_type`, constructing an
-/// [`AgentCliAiService`](crate::AgentCliAiService) per-request) **without
-/// touching the DI registration** in `temps-ai-gateway`'s `plugin.rs` again.
-/// The call site moves once; all future dispatch changes stay in this type.
+/// Multi-turn function calling follows the pinned/active provider too. Agent
+/// CLI services receive a scoped executor and register it through their native
+/// MCP configuration; gateway services retain their native tool-call loop.
 pub struct DispatchingAiService {
     gateway: Arc<dyn AiService>,
+    preference: Arc<dyn ActiveProviderReader>,
+    /// Agent-CLI-backed `AiService` per catalog id, built once at startup.
+    agent_cli_services: HashMap<String, Arc<dyn AiService>>,
 }
 
 impl DispatchingAiService {
+    /// Phase 1 constructor: pure passthrough to `gateway`. Kept for callers
+    /// (and tests) that don't need CLI routing.
     pub fn new(gateway: Arc<dyn AiService>) -> Self {
-        Self { gateway }
+        Self {
+            gateway,
+            preference: Arc::new(NeverAgentCli),
+            agent_cli_services: HashMap::new(),
+        }
+    }
+
+    /// Phase 2/3 constructor: routes to `agent_cli_services[id]` when
+    /// `preference` reports an active agent-CLI provider whose id is present
+    /// in the map, else falls back to `gateway`.
+    pub fn with_agent_cli(
+        gateway: Arc<dyn AiService>,
+        preference: Arc<dyn ActiveProviderReader>,
+        agent_cli_services: HashMap<String, Arc<dyn AiService>>,
+    ) -> Self {
+        Self {
+            gateway,
+            preference,
+            agent_cli_services,
+        }
+    }
+
+    /// The service to use for a workload an agent CLI can actually serve.
+    /// An explicit conversation pin fails closed when its service is missing;
+    /// only the instance-level preference may fall back to the gateway.
+    async fn routed(&self, requested: Option<&str>) -> Option<Arc<dyn AiService>> {
+        if let Some(id) = requested {
+            if id == "gateway" || id.starts_with("gateway_key:") {
+                return Some(self.gateway.clone());
+            }
+            return self.agent_cli_services.get(id).cloned();
+        }
+        if let Some(id) = self.preference.active_agent_cli_provider().await {
+            if let Some(svc) = self.agent_cli_services.get(&id) {
+                return Some(svc.clone());
+            }
+        }
+        Some(self.gateway.clone())
     }
 }
 
 #[async_trait]
 impl AiService for DispatchingAiService {
     async fn is_available(&self) -> bool {
-        self.gateway.is_available().await
+        match self.routed(None).await {
+            Some(service) => service.is_available().await,
+            None => false,
+        }
+    }
+
+    async fn is_available_for(&self, provider: Option<&str>) -> bool {
+        match self.routed(provider).await {
+            Some(service) => service.is_available_for(provider).await,
+            None => false,
+        }
+    }
+
+    async fn chat_capable(&self) -> bool {
+        match self.routed(None).await {
+            Some(service) => service.chat_capable().await,
+            None => false,
+        }
+    }
+
+    async fn chat_capable_for(&self, provider: Option<&str>) -> bool {
+        match self.routed(provider).await {
+            Some(service) => service.chat_capable_for(provider).await,
+            None => false,
+        }
     }
 
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {
-        self.gateway.complete(request).await
+        let service = self
+            .routed(request.provider.as_deref())
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: format!(
+                    "pinned provider '{}' is unavailable",
+                    request.provider.as_deref().unwrap_or("unknown")
+                ),
+            })?;
+        service.complete(request).await
     }
 
     async fn chat_stream(&self, request: ChatTurnRequest) -> Result<TokenStream, AiError> {
-        self.gateway.chat_stream(request).await
+        let service = self
+            .routed(request.provider.as_deref())
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "chat.stream".to_string(),
+                reason: format!(
+                    "pinned provider '{}' is unavailable",
+                    request.provider.as_deref().unwrap_or("unknown")
+                ),
+            })?;
+        service.chat_stream(request).await
     }
 
     async fn chat(&self, request: ChatTurnRequest) -> Result<ChatTurnResponse, AiError> {
-        self.gateway.chat(request).await
+        let service = self
+            .routed(request.provider.as_deref())
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: "pinned chat provider is unavailable".to_string(),
+            })?;
+        service.chat(request).await
     }
 
     async fn chat_stream_turn(&self, request: ChatTurnRequest) -> Result<ChatTurnStream, AiError> {
-        self.gateway.chat_stream_turn(request).await
+        let service = self
+            .routed(request.provider.as_deref())
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: "pinned chat provider is unavailable".to_string(),
+            })?;
+        service.chat_stream_turn(request).await
+    }
+
+    async fn chat_stream_turn_with_executor(
+        &self,
+        request: ChatTurnRequest,
+        executor: Option<ToolExecutor>,
+    ) -> Result<ChatTurnStream, AiError> {
+        let service = self
+            .routed(request.provider.as_deref())
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: "pinned chat provider is unavailable".to_string(),
+            })?;
+        service
+            .chat_stream_turn_with_executor(request, executor)
+            .await
     }
 }
 
@@ -89,6 +226,20 @@ mod tests {
         async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
             let s = futures::stream::once(async { Ok::<String, AiError>("chunk".into()) });
             Ok(Box::pin(s))
+        }
+
+        async fn chat_stream_turn_with_executor(
+            &self,
+            request: ChatTurnRequest,
+            executor: Option<ToolExecutor>,
+        ) -> Result<ChatTurnStream, AiError> {
+            let event = temps_ai::ChatStreamDelta::Text(format!(
+                "{}:{}:{}",
+                self.tag,
+                request.purpose,
+                executor.is_some()
+            ));
+            Ok(Box::pin(futures::stream::iter(vec![Ok(event)])))
         }
     }
 
@@ -131,5 +282,171 @@ mod tests {
 
         let chunk = stream.next().await.unwrap().unwrap();
         assert_eq!(chunk, "chunk");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2/3 routing tests
+    // -----------------------------------------------------------------------
+
+    struct FixedPreference(Option<&'static str>);
+
+    #[async_trait]
+    impl ActiveProviderReader for FixedPreference {
+        async fn active_agent_cli_provider(&self) -> Option<String> {
+            self.0.map(str::to_string)
+        }
+    }
+
+    fn tagged_service(tag: &'static str) -> Arc<dyn AiService> {
+        Arc::new(AlwaysOkService { tag })
+    }
+
+    #[tokio::test]
+    async fn test_with_agent_cli_routes_complete_to_active_cli_provider() {
+        let gateway = tagged_service("gateway");
+        let mut agent_cli_services = HashMap::new();
+        agent_cli_services.insert("claude_cli".to_string(), tagged_service("claude_cli"));
+
+        let dispatching = DispatchingAiService::with_agent_cli(
+            gateway,
+            Arc::new(FixedPreference(Some("claude_cli"))),
+            agent_cli_services,
+        );
+
+        let result = dispatching
+            .complete(AiRequest {
+                purpose: "test".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "claude_cli:test");
+    }
+
+    #[tokio::test]
+    async fn test_explicit_provider_pin_overrides_changed_instance_preference() {
+        let gateway = tagged_service("gateway");
+        let mut agent_cli_services = HashMap::new();
+        agent_cli_services.insert("claude_cli".to_string(), tagged_service("claude_cli"));
+        agent_cli_services.insert("codex_cli".to_string(), tagged_service("codex_cli"));
+
+        let dispatching = DispatchingAiService::with_agent_cli(
+            gateway,
+            Arc::new(FixedPreference(Some("claude_cli"))),
+            agent_cli_services,
+        );
+
+        let result = dispatching
+            .complete(AiRequest {
+                purpose: "test".into(),
+                provider: Some("codex_cli".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "codex_cli:test");
+    }
+
+    #[tokio::test]
+    async fn test_with_agent_cli_falls_back_to_gateway_for_unknown_id() {
+        let gateway = tagged_service("gateway");
+        // Preference names a provider that has no registered service (e.g. a
+        // stale/removed catalog id) — must fall back to the gateway rather
+        // than error.
+        let dispatching = DispatchingAiService::with_agent_cli(
+            gateway,
+            Arc::new(FixedPreference(Some("does_not_exist"))),
+            HashMap::new(),
+        );
+
+        let result = dispatching
+            .complete(AiRequest {
+                purpose: "test".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "gateway:test");
+    }
+
+    #[tokio::test]
+    async fn test_explicit_unknown_provider_pin_fails_closed() {
+        let dispatching = DispatchingAiService::with_agent_cli(
+            tagged_service("gateway"),
+            Arc::new(FixedPreference(None)),
+            HashMap::new(),
+        );
+
+        let error = dispatching
+            .complete(AiRequest {
+                purpose: "test".into(),
+                provider: Some("removed_cli".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AiError::Provider { reason, .. } if reason.contains("removed_cli")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_with_agent_cli_uses_gateway_when_preference_is_gateway() {
+        let gateway = tagged_service("gateway");
+        let mut agent_cli_services = HashMap::new();
+        agent_cli_services.insert("claude_cli".to_string(), tagged_service("claude_cli"));
+
+        let dispatching = DispatchingAiService::with_agent_cli(
+            gateway,
+            Arc::new(FixedPreference(None)),
+            agent_cli_services,
+        );
+
+        let result = dispatching
+            .complete(AiRequest {
+                purpose: "test".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "gateway:test");
+    }
+
+    #[tokio::test]
+    async fn test_with_agent_cli_routes_scoped_tool_executor_to_active_cli() {
+        use futures::StreamExt;
+
+        let gateway = tagged_service("gateway");
+        let mut agent_cli_services = HashMap::new();
+        agent_cli_services.insert("claude_cli".to_string(), tagged_service("claude_cli"));
+
+        let dispatching = DispatchingAiService::with_agent_cli(
+            gateway,
+            Arc::new(FixedPreference(Some("claude_cli"))),
+            agent_cli_services,
+        );
+
+        let executor: ToolExecutor = Arc::new(|_call| Box::pin(async { Ok("ok".to_string()) }));
+        let mut stream = dispatching
+            .chat_stream_turn_with_executor(
+                ChatTurnRequest {
+                    purpose: "test".into(),
+                    ..Default::default()
+                },
+                Some(executor),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(temps_ai::ChatStreamDelta::Text(text))) if text == "claude_cli:test:true"
+        ));
     }
 }

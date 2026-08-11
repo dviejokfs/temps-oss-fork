@@ -14,11 +14,38 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use temps_ai::streaming::{PermissionDecision, PermissionRequest};
+use tokio::sync::oneshot;
+
 use crate::error::AgentError;
 
 /// Callback invoked for each line of AI CLI output (for real-time streaming)
 pub type OnEventCallback =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Bridge for the `--permission-prompt-tool stdio` interactive control protocol
+/// (ADR-038 Phase 2, milestone 3+).  Wired by `ConversationService` so that
+/// `run_interactive` can register pending permissions in the in-process registry
+/// and await human decisions without knowing about the service layer.
+///
+/// `on_permission_request` is called once per `control_request` frame.  It MUST:
+/// 1. Insert a `oneshot::Sender<PermissionDecision>` keyed by `req.id` into the
+///    shared pending-permission registry (so the resolve endpoint can claim it).
+/// 2. Emit an appropriate SSE event (e.g. `ChatStreamEvent::PermissionRequested`)
+///    so the UI can render the approval card.
+/// 3. Return the matching `oneshot::Receiver` so `run_interactive` can `await`
+///    the decision and write the `control_response` back to the CLI's stdin.
+pub struct PermissionBridge {
+    pub on_permission_request:
+        Arc<dyn Fn(PermissionRequest) -> oneshot::Receiver<PermissionDecision> + Send + Sync>,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerConfig {
+    pub url: String,
+    /// Ephemeral bearer value valid only for this CLI turn.
+    pub authorization_token: String,
+}
 
 pub struct AiRunConfig {
     pub work_dir: PathBuf,
@@ -29,8 +56,25 @@ pub struct AiRunConfig {
     /// Optional preferred model name (e.g. "sonnet", "gpt-5-codex").
     /// `None` lets the CLI pick its default.
     pub model: Option<String>,
+    /// Provider-specific reasoning effort/variant selected by the caller.
+    pub thinking_level: Option<String>,
+    /// Provider-specific sandbox/approval/agent mode selected by the caller.
+    pub permission_mode: Option<String>,
     /// Optional callback for streaming each line of output in real-time
     pub on_event: Option<OnEventCallback>,
+    /// Optional bridge for the interactive control protocol.  When `Some`,
+    /// `run_interactive` will register pending permissions here and await
+    /// decisions from the resolve endpoint instead of ignoring control_request
+    /// lines (milestone 2 fallback).  `None` preserves milestone 2 behaviour.
+    pub permission_bridge: Option<Arc<PermissionBridge>>,
+    /// Resume a previous Claude CLI session by passing `--resume <session_id>`.
+    /// Used by the interactive path to continue a conversation across HTTP turns
+    /// (ADR-038 Phase 2, milestone 4, `cli_session_id` continuity).
+    /// Only meaningful for `run_interactive`; ignored by `run` and
+    /// `continue_conversation`.
+    pub resume_session_id: Option<String>,
+    /// Ephemeral loopback MCP bridge exposing only this request's scoped tools.
+    pub mcp_server: Option<McpServerConfig>,
 }
 
 pub struct AiRunResult {
@@ -61,6 +105,80 @@ pub struct AiCliStatus {
     pub subscription_type: Option<String>,
     /// Instructions for the user if not installed or not authenticated.
     pub setup_hint: Option<String>,
+}
+
+/// Model and reasoning capabilities reported by the installed provider CLI.
+/// Both provider-status UI and chat validation consume this shape so a model
+/// advertised by a harness cannot be rejected by a separate static catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiCliModelCapability {
+    pub id: String,
+    pub name: String,
+    pub reasoning_options: Vec<String>,
+    pub default_reasoning_option: Option<String>,
+}
+
+pub async fn discover_model_capabilities(provider: &str) -> Vec<AiCliModelCapability> {
+    match provider {
+        "claude_cli" => claude::discover_models()
+            .await
+            .into_iter()
+            .map(|model| {
+                let has_reasoning =
+                    !model.effort_levels.is_empty() || model.supports_adaptive_thinking;
+                let mut reasoning_options = if has_reasoning {
+                    vec!["off".to_string()]
+                } else {
+                    Vec::new()
+                };
+                reasoning_options.extend(model.effort_levels.iter().cloned());
+                if model.supports_adaptive_thinking {
+                    reasoning_options.push("auto".to_string());
+                }
+                let default_reasoning_option = model
+                    .effort_levels
+                    .iter()
+                    .find(|effort| effort.as_str() == "medium")
+                    .or_else(|| model.effort_levels.first())
+                    .cloned();
+                AiCliModelCapability {
+                    id: model.id,
+                    name: model.name,
+                    reasoning_options,
+                    default_reasoning_option,
+                }
+            })
+            .collect(),
+        "codex_cli" => codex::discover_models()
+            .await
+            .into_iter()
+            .map(|model| AiCliModelCapability {
+                id: model.id,
+                name: model.name,
+                reasoning_options: model.reasoning_efforts,
+                default_reasoning_option: model.default_reasoning_effort,
+            })
+            .collect(),
+        "opencode" => opencode::discover_models()
+            .await
+            .into_iter()
+            .map(|model| {
+                let default_reasoning_option = model
+                    .variants
+                    .iter()
+                    .find(|variant| variant.as_str() == "medium")
+                    .or_else(|| model.variants.first())
+                    .cloned();
+                AiCliModelCapability {
+                    id: model.id,
+                    name: model.name,
+                    reasoning_options: model.variants,
+                    default_reasoning_option,
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[async_trait]
@@ -100,6 +218,56 @@ pub fn parse_output(provider: &str, output: &str) -> claude::ParsedClaudeOutput 
             }
         }
         _ => claude::parse_claude_output(output),
+    }
+}
+
+/// Extract the human-readable assistant text carried by one line of a
+/// provider's structured CLI output, or `None` when the line is a
+/// system/hook/tool-call/usage-only event with nothing to show a user.
+///
+/// Every provider here is invoked with a JSON-lines output flag
+/// (`--output-format stream-json`, `--json`, `--format json`) so its stdout
+/// is NDJSON, not plain prose — a caller that forwards raw lines as if they
+/// were chat tokens ends up displaying the wire protocol (hook events, rate
+/// limit frames, tool-call deltas) instead of the answer. Each provider's
+/// schema differs, so dispatch on `provider` (an `AiCliProvider::name()`
+/// value) the same way [`parse_output`] does.
+pub fn extract_assistant_text(provider: &str, line: &str) -> Option<String> {
+    match provider {
+        "codex_cli" => codex::extract_assistant_text(line),
+        "opencode" => opencode::extract_assistant_text(line),
+        _ => claude::extract_assistant_text(line),
+    }
+}
+
+/// Extract one incremental text delta from a line, for providers whose CLI
+/// exposes real token-by-token streaming — currently only `claude_cli` (via
+/// `--include-partial-messages`; see [`claude::extract_partial_text`]).
+/// Codex's and OpenCode's `--json`/`--format json` output has no equivalent
+/// delta event today, so they always return `None` here — callers must fall
+/// back to [`extract_assistant_text`] for those providers, which still
+/// delivers the full reply, just not incrementally.
+pub fn extract_partial_text(provider: &str, line: &str) -> Option<String> {
+    match provider {
+        "codex_cli" | "opencode" => None,
+        _ => claude::extract_partial_text(line),
+    }
+}
+
+/// Name the tool/action a dropped event invoked, when `line` is a tool call
+/// or other non-text event that CLI-chat cannot bridge back to the user
+/// (ADR-038) — e.g. `AskUserQuestion`, `ExitPlanMode`, `command_execution`.
+/// Returns `None` when `line` isn't one of these (including whenever
+/// [`extract_assistant_text`] already returned text for it).
+///
+/// Callers use this only to `warn!`-log the tool name for operator
+/// diagnostics — never log the returned name's surrounding `input`/`part`
+/// data, which may carry user content or command output.
+pub fn dropped_tool_use_name(provider: &str, line: &str) -> Option<String> {
+    match provider {
+        "codex_cli" => codex::dropped_tool_use_name(line),
+        "opencode" => opencode::dropped_tool_use_name(line),
+        _ => claude::dropped_tool_use_name(line),
     }
 }
 

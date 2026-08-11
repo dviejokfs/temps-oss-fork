@@ -34,6 +34,29 @@ impl GatewayAiService {
         Self { gateway, db }
     }
 
+    fn route_override(provider: Option<&str>, purpose: &str) -> Result<ByokOverride, AiError> {
+        let Some(provider) = provider else {
+            return Ok(ByokOverride::default());
+        };
+        if provider == "gateway" {
+            return Ok(ByokOverride::default());
+        }
+        let Some(raw_id) = provider.strip_prefix("gateway_key:") else {
+            return Err(AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: format!("invalid gateway provider route '{provider}'"),
+            });
+        };
+        let key_id = raw_id.parse::<i32>().map_err(|_| AiError::Provider {
+            purpose: purpose.to_string(),
+            reason: format!("invalid gateway provider key id '{raw_id}'"),
+        })?;
+        Ok(ByokOverride {
+            system_key_id: Some(key_id),
+            ..Default::default()
+        })
+    }
+
     /// Resolve the model to use: an explicit per-call `model`, else the first
     /// entry of `allowed_models` for a `project:{id}` config if present, else the
     /// instance-scope config. `None` when nothing names a concrete model.
@@ -118,6 +141,12 @@ fn response_format_for(schema: &serde_json::Value) -> serde_json::Value {
         "type": "json_schema",
         "json_schema": { "name": "temps_response", "schema": schema, "strict": true }
     })
+}
+
+fn apply_thinking_option(body: &mut serde_json::Value, thinking_level: Option<&str>) {
+    if let Some(level) = thinking_level.filter(|level| *level != "default") {
+        body["reasoning_effort"] = serde_json::json!(level);
+    }
 }
 
 /// Pull the assistant text out of the first choice.
@@ -249,7 +278,33 @@ impl AiService for GatewayAiService {
         self.resolve_model(None, None).await.is_some()
     }
 
+    async fn is_available_for(&self, provider: Option<&str>) -> bool {
+        let Some(provider) = provider else {
+            return self.is_available().await;
+        };
+        if provider == "gateway" {
+            return self.is_available().await;
+        }
+        let Some(raw_id) = provider.strip_prefix("gateway_key:") else {
+            return false;
+        };
+        let Ok(key_id) = raw_id.parse::<i32>() else {
+            return false;
+        };
+        matches!(
+            temps_entities::ai_provider_keys::Entity::find_by_id(key_id)
+                .one(self.db.as_ref())
+                .await,
+            Ok(Some(key)) if key.is_active
+        )
+    }
+
+    async fn chat_capable_for(&self, provider: Option<&str>) -> bool {
+        self.is_available_for(provider).await
+    }
+
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {
+        let route = Self::route_override(request.provider.as_deref(), &request.purpose)?;
         let model = self
             .resolve_model(request.project_id, request.model.as_deref())
             .await
@@ -286,7 +341,7 @@ impl AiService for GatewayAiService {
 
         let (resp, _cred) = self
             .gateway
-            .chat_completion(&chat_req, &ByokOverride::default())
+            .chat_completion(&chat_req, &route)
             .await
             .map_err(|e| {
                 debug!(error = %e, purpose = request.purpose, model, "AI completion failed");
@@ -310,6 +365,7 @@ impl AiService for GatewayAiService {
     }
 
     async fn chat(&self, request: ChatTurnRequest) -> Result<ChatTurnResponse, AiError> {
+        let route = Self::route_override(request.provider.as_deref(), &request.purpose)?;
         let model = self
             .resolve_model(request.project_id, request.model.as_deref())
             .await
@@ -330,6 +386,7 @@ impl AiService for GatewayAiService {
         if let Some(t) = request.temperature {
             body["temperature"] = serde_json::json!(t);
         }
+        apply_thinking_option(&mut body, request.thinking_level.as_deref());
 
         let chat_req: ChatCompletionRequest =
             serde_json::from_value(body).map_err(|e| AiError::Provider {
@@ -339,7 +396,7 @@ impl AiService for GatewayAiService {
 
         let (resp, _cred) = self
             .gateway
-            .chat_completion(&chat_req, &ByokOverride::default())
+            .chat_completion(&chat_req, &route)
             .await
             .map_err(|e| AiError::Provider {
                 purpose: request.purpose.clone(),
@@ -374,6 +431,7 @@ impl AiService for GatewayAiService {
     }
 
     async fn chat_stream(&self, request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+        let route = Self::route_override(request.provider.as_deref(), &request.purpose)?;
         let model = self
             .resolve_model(request.project_id, request.model.as_deref())
             .await
@@ -393,6 +451,7 @@ impl AiService for GatewayAiService {
         if let Some(t) = request.temperature {
             body["temperature"] = serde_json::json!(t);
         }
+        apply_thinking_option(&mut body, request.thinking_level.as_deref());
         let chat_req: ChatCompletionRequest =
             serde_json::from_value(body).map_err(|e| AiError::Provider {
                 purpose: request.purpose.clone(),
@@ -402,7 +461,7 @@ impl AiService for GatewayAiService {
         let purpose = request.purpose.clone();
         let (byte_stream, _cred) = self
             .gateway
-            .chat_completion_stream(&chat_req, &ByokOverride::default())
+            .chat_completion_stream(&chat_req, &route)
             .await
             .map_err(|e| AiError::Provider {
                 purpose: purpose.clone(),
@@ -454,6 +513,7 @@ impl AiService for GatewayAiService {
     }
 
     async fn chat_stream_turn(&self, request: ChatTurnRequest) -> Result<ChatTurnStream, AiError> {
+        let route = Self::route_override(request.provider.as_deref(), &request.purpose)?;
         let model = self
             .resolve_model(request.project_id, request.model.as_deref())
             .await
@@ -477,6 +537,7 @@ impl AiService for GatewayAiService {
         if let Some(t) = request.temperature {
             body["temperature"] = serde_json::json!(t);
         }
+        apply_thinking_option(&mut body, request.thinking_level.as_deref());
         let chat_req: ChatCompletionRequest =
             serde_json::from_value(body).map_err(|e| AiError::Provider {
                 purpose: request.purpose.clone(),
@@ -490,7 +551,7 @@ impl AiService for GatewayAiService {
         );
         let (byte_stream, _cred) = self
             .gateway
-            .chat_completion_stream(&chat_req, &ByokOverride::default())
+            .chat_completion_stream(&chat_req, &route)
             .await
             .map_err(|e| AiError::Provider {
                 purpose: purpose.clone(),
@@ -610,6 +671,9 @@ mod tests {
             max_cost_per_month_microcents: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            provider_type: "gateway".to_string(),
+            agent_cli_provider_id: None,
+            interactive_bridge_enabled: false,
         }
     }
 
@@ -841,6 +905,49 @@ mod tests {
         assert_eq!(rf["type"], "json_schema");
         assert_eq!(rf["json_schema"]["schema"]["type"], "object");
         assert_eq!(rf["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn exact_gateway_key_route_parses_and_rejects_invalid_ids() {
+        let route = GatewayAiService::route_override(Some("gateway_key:42"), "chat.test")
+            .expect("valid exact key route");
+        assert_eq!(route.system_key_id, Some(42));
+        assert!(GatewayAiService::route_override(Some("gateway_key:nope"), "chat.test").is_err());
+        assert!(GatewayAiService::route_override(Some("openai"), "chat.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_gateway_key_availability_requires_that_key_to_be_active() {
+        let mut disabled = active_key("openai");
+        disabled.id = 42;
+        disabled.is_active = false;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![disabled]])
+            .into_connection();
+        let svc = service_over(db);
+        assert!(!svc.is_available_for(Some("gateway_key:42")).await);
+    }
+
+    #[tokio::test]
+    async fn exact_gateway_key_availability_accepts_the_pinned_active_key() {
+        let mut active = active_key("openai");
+        active.id = 42;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![active]])
+            .into_connection();
+        let svc = service_over(db);
+        assert!(svc.is_available_for(Some("gateway_key:42")).await);
+    }
+
+    #[test]
+    fn thinking_option_maps_to_upstream_reasoning_effort() {
+        let mut body = serde_json::json!({"model": "gpt-5.4"});
+        apply_thinking_option(&mut body, Some("high"));
+        assert_eq!(body["reasoning_effort"], "high");
+
+        let mut default_body = serde_json::json!({"model": "gpt-4.1"});
+        apply_thinking_option(&mut default_body, None);
+        assert!(default_body.get("reasoning_effort").is_none());
     }
 
     #[test]

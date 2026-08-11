@@ -6,14 +6,236 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::response::{IntoResponse, Response};
 use tokio::sync::Semaphore;
 
 use temps_agents::ai_cli::{scrub_and_bound, AiCliProvider, AiRunConfig, OnEventCallback};
 use temps_agents::error::AgentError;
 use temps_ai::{
-    extract_json_block, AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, ChatTurnStream,
-    TokenStream,
+    extract_json_block, AiError, AiRequest, AiResponse, AiService, ChatStreamDelta, ChatTool,
+    ChatTurnRequest, ChatTurnStream, TokenStream, ToolCall, ToolExecutor,
 };
+
+#[derive(Clone)]
+struct McpBridgeState {
+    token: String,
+    tools: Arc<Vec<ChatTool>>,
+    executor: ToolExecutor,
+    events: tokio::sync::mpsc::Sender<Result<ChatStreamDelta, AiError>>,
+    tool_slot: Arc<Semaphore>,
+    tool_timeout: Duration,
+}
+
+const MCP_EVENT_CAPACITY: usize = 32;
+const MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn mcp_bridge_handler(
+    axum::extract::State(state): axum::extract::State<McpBridgeState>,
+    headers: axum::http::HeaderMap,
+    axum::Json(request): axum::Json<serde_json::Value>,
+) -> Response {
+    let authorized = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == format!("Bearer {}", state.token));
+    if !authorized {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+
+    let id = request
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    // JSON-RPC notifications deliberately have no response. Native MCP
+    // clients send `notifications/initialized` immediately after initialize.
+    if request.get("id").is_none() {
+        return axum::http::StatusCode::ACCEPTED.into_response();
+    }
+    let response = match method {
+        "initialize" => serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "temps-chat", "version": "1"}
+            }
+        }),
+        "tools/list" => serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "result": {"tools": state.tools.iter().map(|tool| serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.parameters
+            })).collect::<Vec<_>>()}
+        }),
+        "ping" => serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "result": {}
+        }),
+        "tools/call" => {
+            let params = request.get("params").cloned().unwrap_or_default();
+            let name = params
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let known = state.tools.iter().any(|tool| tool.name == name);
+            if !known {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"content": [{"type": "text", "text": "Tool is not available for this conversation"}], "isError": true}
+                })
+            } else {
+                let _tool_permit = match state.tool_slot.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        return (
+                            axum::http::StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": {"content": [{"type": "text", "text": "Another Temps tool call is already running for this turn"}], "isError": true}
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let call = ToolCall {
+                    id: uuid::Uuid::new_v4().simple().to_string(),
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                };
+                let _ = state
+                    .events
+                    .send(Ok(ChatStreamDelta::ToolCall(call.clone())))
+                    .await;
+                match tokio::time::timeout(state.tool_timeout, (state.executor)(call.clone())).await
+                {
+                    Err(_) => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"content": [{"type": "text", "text": format!("Temps tool '{}' timed out after {}s", call.name, state.tool_timeout.as_secs_f64())}], "isError": true}
+                    }),
+                    Ok(Ok(result)) => {
+                        let _ = state
+                            .events
+                            .send(Ok(ChatStreamDelta::ToolResult {
+                                call,
+                                result: result.clone(),
+                            }))
+                            .await;
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {"content": [{"type": "text", "text": result}], "isError": false}
+                        })
+                    }
+                    Ok(Err(error)) => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"content": [{"type": "text", "text": error.to_string()}], "isError": true}
+                    }),
+                }
+            }
+        }
+        _ => serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": {"code": -32601, "message": "Method not found"}
+        }),
+    };
+    (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+}
+
+pub struct ScopedMcpBridge {
+    pub config: temps_agents::ai_cli::McpServerConfig,
+    pub events: tokio::sync::mpsc::Receiver<Result<ChatStreamDelta, AiError>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ScopedMcpBridge {
+    pub async fn start(tools: Vec<ChatTool>, executor: ToolExecutor) -> Result<Self, AiError> {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .map_err(|error| AiError::Provider {
+                purpose: "chat.tools.bridge".to_string(),
+                reason: format!("failed to bind scoped MCP bridge: {error}"),
+            })?;
+        let address = listener.local_addr().map_err(|error| AiError::Provider {
+            purpose: "chat.tools.bridge".to_string(),
+            reason: format!("failed to resolve scoped MCP bridge address: {error}"),
+        })?;
+        let path = format!("/mcp/{}", uuid::Uuid::new_v4().simple());
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let url = format!("http://{address}{path}");
+        let (events_tx, events) = tokio::sync::mpsc::channel(MCP_EVENT_CAPACITY);
+        let state = McpBridgeState {
+            token: token.clone(),
+            tools: Arc::new(tools),
+            executor,
+            events: events_tx,
+            tool_slot: Arc::new(Semaphore::new(1)),
+            tool_timeout: MCP_TOOL_TIMEOUT,
+        };
+        let router = axum::Router::new()
+            .route(&path, axum::routing::post(mcp_bridge_handler))
+            .with_state(state);
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+        Ok(Self {
+            config: temps_agents::ai_cli::McpServerConfig {
+                url,
+                authorization_token: token,
+            },
+            events,
+            shutdown: Some(shutdown),
+            task,
+        })
+    }
+
+    pub async fn shutdown(mut self) {
+        self.shutdown_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
+    }
+
+    async fn shutdown_with_timeout(&mut self, timeout: Duration) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if tokio::time::timeout(timeout, &mut self.task).await.is_err() {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+        }
+    }
+
+    pub fn take_events(&mut self) -> tokio::sync::mpsc::Receiver<Result<ChatStreamDelta, AiError>> {
+        let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+        std::mem::replace(&mut self.events, receiver)
+    }
+}
+
+impl Drop for ScopedMcpBridge {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        // A cancelled/panicked provider turn must not leave the authenticated
+        // listener alive. Normal completion uses `shutdown()` and awaits it.
+        self.task.abort();
+    }
+}
 
 /// Hard cap on the flattened prompt size sent to an agent CLI subprocess.
 /// Without this, a caller-controlled `AiRequest`/`ChatTurnRequest` could hold
@@ -32,20 +254,10 @@ const MAX_PROMPT_BYTES: usize = 32 * 1024;
 /// (`~/.claude/.credentials.json`, etc.) by the existing settings flow. This
 /// service never reads or forwards the credential (ADR-037 §4).
 ///
-/// # Not-delegatable workloads
-///
-/// Tool-calling (`chat_stream` with non-empty `tools`) returns
-/// [`AiError::NotAvailable`] immediately — agent CLIs cannot be fed an
-/// external function-calling protocol. See the workload eligibility table in
-/// ADR-037 Decision §1. `chat()` inherits the trait's default implementation
-/// (`Err(AiError::NotAvailable)`, unconditionally — agent CLIs have no
-/// non-streaming function-calling path). `chat_stream_turn()` is explicitly
-/// overridden to always return `Err(AiError::NotAvailable)` rather than
-/// inheriting the trait default (which would delegate to `chat_stream()` and
-/// — correctly, but only incidentally — execute the CLI for a *tool-less*
-/// multi-turn request). Multi-turn conversation entry points must stay on the
-/// BYOK gateway unconditionally; this keeps that guarantee a property of the
-/// type itself, not of `chat_stream()`'s gating staying correct over time.
+/// Multi-turn tool calls are delegated only when the conversation layer
+/// supplies a scoped executor. The service exposes that executor to the CLI
+/// through an authenticated, per-turn loopback MCP endpoint and never embeds
+/// project credentials in tool arguments or results.
 pub struct AgentCliAiService {
     provider: Arc<dyn AiCliProvider>,
     /// Root directory for per-invocation tempdirs. Must exist before any call.
@@ -119,6 +331,44 @@ fn build_chat_prompt(request: &ChatTurnRequest) -> String {
         .join("\n\n")
 }
 
+/// Extract the human-readable assistant reply from a CLI run's raw NDJSON
+/// stdout — every provider here is invoked with a `--output-format
+/// stream-json`/`--json`/`--format json` flag, so `raw_output` is a stream
+/// of protocol events (hooks, tool calls, rate-limit frames, a final result
+/// summary), not plain prose. Forwarding it unfiltered means the caller
+/// (the chat UI, a `complete()` consumer) displays the wire protocol instead
+/// of the answer.
+///
+/// Concatenates every line's extracted text (via
+/// [`temps_agents::ai_cli::extract_assistant_text`], dispatched by
+/// `provider_name`) and falls back to the raw trimmed output only when no
+/// line yielded anything — a defensive net for a provider/output mode that
+/// isn't JSON at all, so a real answer is never dropped just because
+/// parsing found nothing to extract.
+fn extract_final_text(provider_name: &str, raw_output: &str) -> String {
+    let mut extracted = String::new();
+    for line in raw_output.lines() {
+        if let Some(text) = temps_agents::ai_cli::extract_assistant_text(provider_name, line) {
+            extracted.push_str(&text);
+        } else if let Some(tool_name) =
+            temps_agents::ai_cli::dropped_tool_use_name(provider_name, line)
+        {
+            // ADR-038: see the matching log point in chat_stream's on_event —
+            // same rationale, `complete()`'s one-shot path hits it too.
+            tracing::warn!(
+                provider = %provider_name,
+                tool_name = %tool_name,
+                "agent CLI attempted a tool call that CLI-chat cannot bridge back to the user; dropping (see ADR-038)"
+            );
+        }
+    }
+    if extracted.is_empty() {
+        raw_output.trim().to_owned()
+    } else {
+        extracted
+    }
+}
+
 /// Map an [`AgentError`] to an [`AiError::Provider`] with the request's
 /// purpose tag and a descriptive reason.
 ///
@@ -164,6 +414,11 @@ impl AiService for AgentCliAiService {
         status.installed && status.authenticated
     }
 
+    /// CLI chat exposes scoped tools through a per-turn loopback MCP bridge.
+    async fn chat_capable(&self) -> bool {
+        self.is_available().await
+    }
+
     /// Single-pass completion through the agent CLI.
     ///
     /// Acquires one semaphore permit (non-blocking) before starting the
@@ -204,7 +459,12 @@ impl AiService for AgentCliAiService {
             max_turns: 1,
             timeout: self.timeout,
             model: request.model.clone(),
+            thinking_level: None,
+            permission_mode: None,
             on_event: None, // single-pass; no streaming overhead needed
+            permission_bridge: None,
+            resume_session_id: None,
+            mcp_server: None,
         };
 
         let result = tokio::time::timeout(self.timeout, self.provider.run(cfg))
@@ -215,7 +475,7 @@ impl AiService for AgentCliAiService {
             })?
             .map_err(|e| map_agent_error(&purpose, e))?;
 
-        let text = result.output.trim().to_owned();
+        let text = extract_final_text(self.provider.name(), &result.output);
         let json = extract_json_block(&text);
 
         Ok(AiResponse {
@@ -267,20 +527,59 @@ impl AiService for AgentCliAiService {
 
         // Channel capacity 64 provides enough buffer for a burst of lines
         // without back-pressure stalling the CLI subprocess.
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, AiError>>(64);
 
         // Build on_event: clone tx so the original can be dropped immediately,
         // making on_event the sole remaining sender. When provider.run()
         // finishes and on_event is dropped, the channel closes automatically.
+        //
+        // Each raw line is the CLI's NDJSON wire protocol, not plain text
+        // (see `extract_final_text`'s doc comment) — only forward what
+        // `extract_partial_text`/`extract_assistant_text` recognize as
+        // user-facing prose; every other event (hooks, tool calls,
+        // rate-limit frames, the terminal result summary) is dropped rather
+        // than shown to the user.
+        let provider_name = self.provider.name().to_string();
         let tx_for_event = tx.clone();
+        // Set once this turn has forwarded at least one incremental delta
+        // (claude_cli only, today — see `extract_partial_text`). When set,
+        // the later consolidated `assistant` event repeats that same text in
+        // one shot, so it's skipped rather than forwarded as a duplicate. A
+        // provider with no delta support (codex_cli, opencode) never sets
+        // this, so its final consolidated text is still forwarded exactly as
+        // before.
+        let streamed_partial = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let on_event: OnEventCallback = Arc::new(move |line: String| {
             let tx = tx_for_event.clone();
+            let provider_name = provider_name.clone();
+            let streamed_partial = streamed_partial.clone();
             Box::pin(async move {
-                let _ = tx.send(line).await;
+                if let Some(delta) =
+                    temps_agents::ai_cli::extract_partial_text(&provider_name, &line)
+                {
+                    streamed_partial.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = tx.send(Ok(delta)).await;
+                } else if let (false, Some(text)) = (
+                    streamed_partial.load(std::sync::atomic::Ordering::Relaxed),
+                    temps_agents::ai_cli::extract_assistant_text(&provider_name, &line),
+                ) {
+                    let _ = tx.send(Ok(text)).await;
+                } else if let Some(tool_name) =
+                    temps_agents::ai_cli::dropped_tool_use_name(&provider_name, &line)
+                {
+                    // ADR-038: CLI-chat has no channel to bridge this back to
+                    // the user (no open stdin, no permission UI) — the turn
+                    // silently produces less text than the model intended.
+                    // Logging the tool name (never its input) makes that
+                    // diagnosable from server logs instead of vanishing.
+                    tracing::warn!(
+                        provider = %provider_name,
+                        tool_name = %tool_name,
+                        "agent CLI attempted a tool call that CLI-chat cannot bridge back to the user; dropping (see ADR-038)"
+                    );
+                }
             })
         });
-        drop(tx);
-
         let work_dir = run_dir.path().to_owned();
         let cfg = AiRunConfig {
             work_dir,
@@ -289,11 +588,18 @@ impl AiService for AgentCliAiService {
             max_turns: 1,
             timeout: self.timeout,
             model: request.model.clone(),
+            thinking_level: request.thinking_level.clone(),
+            permission_mode: request.permission_mode.clone(),
             on_event: Some(on_event),
+            permission_bridge: None,
+            resume_session_id: None,
+            mcp_server: None,
         };
 
         let timeout = self.timeout;
         let provider = self.provider.clone();
+        let tx_for_error = tx.clone();
+        drop(tx);
 
         // Spawn the CLI subprocess. The permit is moved into this task so it
         // is held for the full CLI lifetime, not just while the stream consumer
@@ -302,15 +608,24 @@ impl AiService for AgentCliAiService {
         tokio::spawn(async move {
             let _permit = permit;
             let _tempdir = run_dir; // keep tempdir alive for the run
-            let _ = tokio::time::timeout(timeout, provider.run(cfg)).await;
+            let result = tokio::time::timeout(timeout, provider.run(cfg)).await;
+            let error = match result {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(map_agent_error(&purpose, error)),
+                Err(_) => Some(AiError::Provider {
+                    purpose,
+                    reason: format!("CLI timed out after {}s", timeout.as_secs()),
+                }),
+            };
+            if let Some(error) = error {
+                let _ = tx_for_error.send(Err(error)).await;
+            }
         });
 
         // Wrap the receiver as a TokenStream using unfold. This is Send
         // because Receiver<String>: Send.
         let stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv()
-                .await
-                .map(|line| (Ok::<String, AiError>(line), rx))
+            rx.recv().await.map(|item| (item, rx))
         });
 
         Ok(Box::pin(stream))
@@ -320,22 +635,119 @@ impl AiService for AgentCliAiService {
     // Err(AiError::NotAvailable), which is exactly right — agent CLIs have no
     // non-streaming function-calling path.
 
-    /// Always returns [`AiError::NotAvailable`], regardless of whether
-    /// `request.tools` is empty.
-    ///
-    /// This is a defensive override. The trait's default implementation of
-    /// `chat_stream_turn` delegates to [`Self::chat_stream`], which already
-    /// rejects tool-bearing requests — so relying on the default would still
-    /// be *correct* for tool-calling callers, but it would also *execute* the
-    /// CLI for a tool-less multi-turn request, since `chat_stream`'s gate
-    /// only checks `tools.is_empty()`. Multi-turn conversation entry points
-    /// (debug chat, write actions) must stay on the BYOK gateway
-    /// unconditionally (ADR-037 Decision §1 / §5 scope constraint) —
-    /// overriding this method makes that a property of `AgentCliAiService`
-    /// itself, not a side effect of `chat_stream`'s gating happening to be
-    /// correct.
+    /// Fails closed because this entry point cannot carry the conversation's
+    /// scoped tool executor. Callers that need CLI context tools must use
+    /// [`Self::chat_stream_turn_with_executor`], which exposes only the tools
+    /// authorized for that turn through the authenticated loopback MCP bridge.
     async fn chat_stream_turn(&self, _request: ChatTurnRequest) -> Result<ChatTurnStream, AiError> {
         Err(AiError::NotAvailable)
+    }
+
+    async fn chat_stream_turn_with_executor(
+        &self,
+        request: ChatTurnRequest,
+        executor: Option<ToolExecutor>,
+    ) -> Result<ChatTurnStream, AiError> {
+        use futures::StreamExt;
+
+        if request.tools.is_empty() {
+            let stream = self.chat_stream(request).await?;
+            return Ok(Box::pin(stream.map(|item| item.map(ChatStreamDelta::Text))));
+        }
+        let executor = executor.ok_or_else(|| AiError::Provider {
+            purpose: request.purpose.clone(),
+            reason: "scoped tool executor is required for CLI chat".to_string(),
+        })?;
+        let prompt = build_chat_prompt(&request);
+        check_prompt_size(&request.purpose, &prompt)?;
+        let permit = Arc::clone(&self.concurrency)
+            .try_acquire_owned()
+            .map_err(|_| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: "agent CLI concurrency limit reached — try again shortly".to_string(),
+            })?;
+        let run_dir =
+            tempfile::tempdir_in(&self.scratch_dir).map_err(|error| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: format!("failed to create isolated CLI chat directory: {error}"),
+            })?;
+
+        let mut mcp_bridge = ScopedMcpBridge::start(request.tools.clone(), executor).await?;
+        let mcp_config = mcp_bridge.config.clone();
+        let mut mcp_events = mcp_bridge.take_events();
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let bridge_events_tx = events_tx.clone();
+        let bridge_event_task = tokio::spawn(async move {
+            while let Some(event) = mcp_events.recv().await {
+                if bridge_events_tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let provider_name = self.provider.name().to_string();
+        let streamed_partial = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_tx = events_tx.clone();
+        let on_event: OnEventCallback = Arc::new(move |line: String| {
+            let provider_name = provider_name.clone();
+            let callback_tx = callback_tx.clone();
+            let streamed_partial = streamed_partial.clone();
+            Box::pin(async move {
+                if let Some(text) =
+                    temps_agents::ai_cli::extract_partial_text(&provider_name, &line)
+                {
+                    streamed_partial.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = callback_tx.send(Ok(ChatStreamDelta::Text(text)));
+                } else if !streamed_partial.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(text) =
+                        temps_agents::ai_cli::extract_assistant_text(&provider_name, &line)
+                    {
+                        let _ = callback_tx.send(Ok(ChatStreamDelta::Text(text)));
+                    }
+                }
+            })
+        });
+
+        let config = AiRunConfig {
+            work_dir: run_dir.path().to_owned(),
+            prompt,
+            api_key: String::new(),
+            max_turns: 0,
+            timeout: self.timeout,
+            model: request.model,
+            thinking_level: request.thinking_level,
+            permission_mode: request.permission_mode,
+            on_event: Some(on_event),
+            permission_bridge: None,
+            resume_session_id: None,
+            mcp_server: Some(mcp_config),
+        };
+        let provider = self.provider.clone();
+        let purpose = request.purpose;
+        let timeout = self.timeout;
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _run_dir = run_dir;
+            let outcome = tokio::time::timeout(timeout, provider.run(config)).await;
+            let error = match outcome {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(map_agent_error(&purpose, error)),
+                Err(_) => Some(AiError::Provider {
+                    purpose,
+                    reason: format!("CLI timed out after {}s", timeout.as_secs()),
+                }),
+            };
+            if let Some(error) = error {
+                let _ = events_tx.send(Err(error));
+            }
+            mcp_bridge.shutdown().await;
+            let _ = bridge_event_task.await;
+        });
+
+        let stream = futures::stream::unfold(events_rx, |mut receiver| async move {
+            receiver.recv().await.map(|event| (event, receiver))
+        });
+        Ok(Box::pin(stream))
     }
 }
 
@@ -446,6 +858,34 @@ mod tests {
         async fn run(&self, _config: AiRunConfig) -> Result<AiRunResult, AgentError> {
             tokio::time::sleep(Duration::from_secs(10)).await;
             Ok(fixed_result("", None))
+        }
+        async fn continue_conversation(
+            &self,
+            config: AiRunConfig,
+        ) -> Result<AiRunResult, AgentError> {
+            self.run(config).await
+        }
+    }
+
+    struct FailingProvider;
+
+    #[async_trait]
+    impl AiCliProvider for FailingProvider {
+        fn name(&self) -> &str {
+            "codex_cli"
+        }
+        async fn check_installed(&self) -> bool {
+            true
+        }
+        async fn get_status(&self) -> AiCliStatus {
+            available_status()
+        }
+        async fn run(&self, _config: AiRunConfig) -> Result<AiRunResult, AgentError> {
+            Err(AgentError::AiCliFailed {
+                provider: "codex_cli".to_string(),
+                exit_code: 1,
+                stderr: "not inside a trusted directory".to_string(),
+            })
         }
         async fn continue_conversation(
             &self,
@@ -612,6 +1052,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_chat_stream_surfaces_cli_failure_to_consumer() {
+        use futures::StreamExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let service = AgentCliAiService::new(
+            Arc::new(FailingProvider),
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+        let request = ChatTurnRequest {
+            purpose: "test.codex_stream".into(),
+            messages: vec![temps_ai::ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            ..Default::default()
+        };
+
+        let mut stream = service.chat_stream(request).await.unwrap();
+        let first = stream.next().await.expect("stream must report CLI failure");
+
+        match first {
+            Err(AiError::Provider { purpose, reason }) => {
+                assert_eq!(purpose, "test.codex_stream");
+                assert!(reason.contains("not inside a trusted directory"));
+            }
+            other => panic!("expected provider failure, got {other:?}"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Test 5: is_available() reflects CLI status
     // -----------------------------------------------------------------------
@@ -655,6 +1129,206 @@ mod tests {
             !service.is_available().await,
             "unauthenticated should not be available"
         );
+    }
+
+    fn test_mcp_state() -> (
+        McpBridgeState,
+        tokio::sync::mpsc::Receiver<Result<ChatStreamDelta, AiError>>,
+    ) {
+        let (events, receiver) = tokio::sync::mpsc::channel(MCP_EVENT_CAPACITY);
+        let executor: ToolExecutor = Arc::new(|call: ToolCall| {
+            Box::pin(async move { Ok(format!("scoped result from {}", call.name)) })
+        });
+        (
+            McpBridgeState {
+                token: "one-turn-token".to_string(),
+                tools: Arc::new(vec![ChatTool {
+                    name: "temps".to_string(),
+                    description: "Existing Temps virtual CLI".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }]),
+                executor,
+                events,
+                tool_slot: Arc::new(Semaphore::new(1)),
+                tool_timeout: MCP_TOOL_TIMEOUT,
+            },
+            receiver,
+        )
+    }
+
+    fn authorized_headers() -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer one-turn-token".parse().expect("valid header"),
+        );
+        headers
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("MCP response body");
+        serde_json::from_slice(&body).expect("MCP JSON response")
+    }
+
+    #[tokio::test]
+    async fn mcp_bridge_rejects_missing_turn_token() {
+        let (state, _events) = test_mcp_state();
+        let response = mcp_bridge_handler(
+            axum::extract::State(state),
+            axum::http::HeaderMap::new(),
+            axum::Json(serde_json::json!({"id": 1, "method": "initialize"})),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mcp_bridge_initializes_lists_and_executes_scoped_tool() {
+        let (state, mut events) = test_mcp_state();
+        let initialized = response_json(
+            mcp_bridge_handler(
+                axum::extract::State(state.clone()),
+                authorized_headers(),
+                axum::Json(serde_json::json!({"id": 1, "method": "initialize"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(initialized["result"]["serverInfo"]["name"], "temps-chat");
+
+        let listed = response_json(
+            mcp_bridge_handler(
+                axum::extract::State(state.clone()),
+                authorized_headers(),
+                axum::Json(serde_json::json!({"id": 2, "method": "tools/list"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(listed["result"]["tools"][0]["name"], "temps");
+
+        let called = response_json(
+            mcp_bridge_handler(
+                axum::extract::State(state),
+                authorized_headers(),
+                axum::Json(serde_json::json!({
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "temps", "arguments": {"command": "projects list"}}
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            called["result"]["content"][0]["text"],
+            "scoped result from temps"
+        );
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(ChatStreamDelta::ToolCall(_)))
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(ChatStreamDelta::ToolResult { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_bridge_initialized_notification_has_no_response_body() {
+        let (state, _events) = test_mcp_state();
+        let response = mcp_bridge_handler(
+            axum::extract::State(state),
+            authorized_headers(),
+            axum::Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("notification response body");
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_bridge_rejects_a_second_concurrent_tool_call() {
+        let (state, _events) = test_mcp_state();
+        let _active = state
+            .tool_slot
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("tool semaphore open");
+        let response = mcp_bridge_handler(
+            axum::extract::State(state),
+            authorized_headers(),
+            axum::Json(serde_json::json!({
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "temps", "arguments": {}}
+            })),
+        )
+        .await;
+        let body = response_json(response).await;
+
+        assert_eq!(body["result"]["isError"], true);
+        assert!(body["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("already running")));
+    }
+
+    #[tokio::test]
+    async fn mcp_bridge_bounds_tool_execution_time() {
+        let (mut state, mut events) = test_mcp_state();
+        state.tool_timeout = Duration::from_millis(10);
+        state.executor = Arc::new(|_call| Box::pin(std::future::pending()));
+        let response = mcp_bridge_handler(
+            axum::extract::State(state),
+            authorized_headers(),
+            axum::Json(serde_json::json!({
+                "id": 5,
+                "method": "tools/call",
+                "params": {"name": "temps", "arguments": {}}
+            })),
+        )
+        .await;
+        let body = response_json(response).await;
+
+        assert_eq!(body["result"]["isError"], true);
+        assert!(body["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("timed out")));
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(ChatStreamDelta::ToolCall(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_bridge_shutdown_aborts_a_stuck_server_task() {
+        let (shutdown, _shutdown_rx) = tokio::sync::oneshot::channel();
+        let (_events_tx, events) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let mut bridge = ScopedMcpBridge {
+            config: temps_agents::ai_cli::McpServerConfig {
+                url: "http://127.0.0.1:1/mcp/test".to_string(),
+                authorization_token: "test".to_string(),
+            },
+            events,
+            shutdown: Some(shutdown),
+            task,
+        };
+
+        bridge
+            .shutdown_with_timeout(Duration::from_millis(10))
+            .await;
+        assert!(bridge.task.is_finished());
     }
 
     // -----------------------------------------------------------------------

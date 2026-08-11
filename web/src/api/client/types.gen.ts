@@ -695,6 +695,24 @@ export type AiChatLimitsSettings = {
 };
 
 /**
+ * Mirrors `temps_agents::ai_cli::AiCliStatus` with utoipa `ToSchema` added.
+ * `AiCliStatus` itself does not derive `ToSchema`, so this local projection is
+ * used for OpenAPI generation only — the fields are identical.
+ */
+export type AiCliStatusDto = {
+    auth_method?: string | null;
+    authenticated: boolean;
+    installed: boolean;
+    provider: string;
+    /**
+     * Instructions for the operator when not installed or not authenticated.
+     */
+    setup_hint?: string | null;
+    subscription_type?: string | null;
+    version?: string | null;
+};
+
+/**
  * Global AI configuration settings. Controls the default config repo
  * containing `.claude/` directory (skills, MCP servers, plugins) that
  * gets overlaid into every agent sandbox.
@@ -722,6 +740,13 @@ export type AiDataAccessResponse = {
     service_id: number;
 };
 
+export type AiModelOptionDto = {
+    default_thinking_option_id?: string | null;
+    id: string;
+    name: string;
+    thinking_options: Array<AiSelectOptionDto>;
+};
+
 /**
  * Response wrapping the AI page breakdown rows.
  */
@@ -744,6 +769,75 @@ export type AiPageBreakdownRow = {
     last_seen?: string | null;
     path: string;
     request_count: number;
+};
+
+/**
+ * Current AI provider routing preference and availability for this instance.
+ *
+ * The `configured` field drives the UI onboarding state: when `false` the UI
+ * must show _exactly what is missing_ (`reason`) and _where to fix it_
+ * (`setup_path`), not hide the feature.
+ */
+export type AiProviderStatusResponse = {
+    /**
+     * Active preference: `"gateway"` (BYOK) or `"agent_cli"` (subscription).
+     */
+    active_provider_type: string;
+    /**
+     * Catalog id of the active agent CLI provider, or `null` when
+     * `active_provider_type` is `"gateway"`.
+     */
+    agent_cli_provider_id?: string | null;
+    agent_cli_status?: null | AiCliStatusDto;
+    /**
+     * Providers a chat user may choose for a new conversation. Authentication
+     * source is descriptive metadata only and never contains credentials.
+     */
+    available_providers: Array<AvailableAiProviderDto>;
+    /**
+     * Whether the active provider is ready to serve requests.
+     */
+    configured: boolean;
+    /**
+     * Whether at least one active BYOK provider key exists.
+     */
+    gateway_available: boolean;
+    /**
+     * Live health of the interactive bridge, when opted in.
+     *
+     * - `"healthy"`: bridge is enabled AND the Claude CLI reports
+     * `host_authenticated = true`; tool approvals will route correctly.
+     * - `"unavailable"`: bridge is enabled but the CLI is not installed or not
+     * authenticated; tool approvals cannot be bridged until auth is fixed.
+     * - `null`: the bridge is not opted in, or the active provider is not
+     * `claude_cli` — the field is not meaningful in those cases.
+     */
+    interactive_bridge_status?: string | null;
+    /**
+     * Human-readable explanation of why `configured` is `false`.
+     */
+    reason?: string | null;
+    /**
+     * Console path the operator should visit to fix the missing configuration.
+     */
+    setup_path?: string | null;
+    /**
+     * Whether the active provider path supports mid-turn interactive tools
+     * (`AskUserQuestion`, `ExitPlanMode`, tool permission prompts).
+     *
+     * Truth table (ADR-038 Phase 2):
+     * - Gateway / BYOK provider: always `true` — function-calling is native.
+     * - Agent CLI, provider != `claude_cli`: always `false` — no control protocol.
+     * - Agent CLI, `claude_cli`, `interactive_bridge_enabled = false`: `false`.
+     * - Agent CLI, `claude_cli`, `interactive_bridge_enabled = true`: `true`.
+     */
+    supports_interactive_tools: boolean;
+};
+
+export type AiSelectOptionDto = {
+    description?: string | null;
+    id: string;
+    name: string;
 };
 
 /**
@@ -1440,6 +1534,26 @@ export type AutofixerRunResponse = {
 export type AutofixerRunWithLogsResponse = {
     logs: Array<AgentRunLogResponse>;
     run: AutofixerRunResponse;
+};
+
+export type AvailableAiProviderDto = {
+    /**
+     * `configured_key` for the gateway or `host_environment` for an ambient
+     * CLI login discovered in the Temps process environment.
+     */
+    auth_source: string;
+    default_model_id?: string | null;
+    default_permission_mode_id?: string | null;
+    id: string;
+    model_discovery_error?: string | null;
+    /**
+     * `ready` when the model list was loaded, `unavailable` when the provider
+     * can still run with its own default but live discovery failed.
+     */
+    model_discovery_status: string;
+    models: Array<AiModelOptionDto>;
+    name: string;
+    permission_modes: Array<AiSelectOptionDto>;
 };
 
 /**
@@ -2964,9 +3078,14 @@ export type ConversationDetailResponse = ConversationResponse & {
      * Turns oldest-first. The `system` seed message is omitted (internal).
      */
     messages: Array<MessageResponse>;
+    pending_permission?: null | PermissionRequest;
 };
 
 export type ConversationResponse = {
+    ai_model: string;
+    ai_permission_mode: string;
+    ai_provider: string;
+    ai_thinking_level?: string | null;
     context_id: string;
     context_type: string;
     created_at: string;
@@ -3185,6 +3304,14 @@ export type CreateCloudflareProviderRequest = {
 };
 
 export type CreateConversationRequest = {
+    ai_model?: string | null;
+    ai_permission_mode?: string | null;
+    /**
+     * Provider pinned to this conversation. Omitted requests use the current
+     * instance preference.
+     */
+    ai_provider?: string | null;
+    ai_thinking_level?: string | null;
     /**
      * The entity id (ints stringified).
      */
@@ -8057,6 +8184,10 @@ export type GitSourcePlan = {
  * link back to the source.
  */
 export type GlobalConversationResponse = {
+    ai_model: string;
+    ai_permission_mode: string;
+    ai_provider: string;
+    ai_thinking_level?: string | null;
     context_id: string;
     context_type: string;
     created_at: string;
@@ -9133,7 +9264,7 @@ export type ListApiKeysQuery = {
  */
 export type ListAuditLogsQuery = {
     /**
-     * Start timestamp (milliseconds since epoch)
+     * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
      */
     from?: string | null;
     /**
@@ -9149,7 +9280,7 @@ export type ListAuditLogsQuery = {
      */
     operation_type?: string | null;
     /**
-     * End timestamp (milliseconds since epoch)
+     * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
      */
     to?: string | null;
     /**
@@ -11621,6 +11752,27 @@ export type PerformanceMetricsResponse = {
 };
 
 /**
+ * The user's decision for a pending permission request.  Serialized as a tagged
+ * JSON object and sent in the resolve endpoint body.  `DenyTool`/`RejectPlan`
+ * carry an optional human-readable reason that is forwarded to the CLI's
+ * `control_response` (never stored).
+ */
+export type PermissionDecision = {
+    type: 'allow_tool';
+} | {
+    reason?: string | null;
+    type: 'deny_tool';
+} | {
+    answers: unknown;
+    type: 'answer_question';
+} | {
+    type: 'approve_plan';
+} | {
+    feedback?: string | null;
+    type: 'reject_plan';
+};
+
+/**
  * Information about a single permission
  */
 export type PermissionInfo = {
@@ -11636,6 +11788,68 @@ export type PermissionInfo = {
      * The permission identifier (e.g., "projects:read")
      */
     name: string;
+};
+
+/**
+ * Kind of permission the Claude CLI is requesting via `--permission-prompt-tool stdio`
+ * (ADR-038 Phase 2). Used to drive the correct UI card (`ToolApproval` → allow/deny
+ * buttons; `Question` → answer form; `PlanApproval` → approve/reject-with-feedback).
+ */
+export type PermissionKind = 'tool_approval' | 'question' | 'plan_approval';
+
+/**
+ * A permission request emitted by `run_interactive` when the Claude CLI blocks
+ * on a `control_request` frame.  Passed to the UI via an SSE event so the user
+ * can respond before the subprocess continues.
+ */
+export type PermissionRequest = {
+    /**
+     * The CLI's own `request_id` (UUID); used as the key in the pending-permission
+     * registry and as `{permission_id}` in the resolve endpoint.
+     */
+    id: string;
+    /**
+     * Raw `request.input` from the CLI — passed through to the UI verbatim so
+     * each milestone's card can render the relevant fields without requiring the
+     * service layer to know about tool-specific schemas.
+     */
+    input: unknown;
+    /**
+     * What kind of interaction is required.
+     */
+    kind: PermissionKind;
+    /**
+     * The tool name from `request.tool_name` (e.g. `"Bash"`, `"AskUserQuestion"`).
+     */
+    tool_name: string;
+};
+
+/**
+ * Payload for the `permission_requested` SSE event (ADR-038 Phase 2).
+ * The interactive Claude CLI subprocess is paused waiting for the user to
+ * approve or deny a tool/question/plan.  Resolve via
+ * `POST .../permissions/{id}/resolve`.
+ */
+export type PermissionRequestedEvent = {
+    /**
+     * The CLI's `request_id` — also the `{permission_id}` in the resolve URL.
+     */
+    id: string;
+    /**
+     * Raw `input` from the CLI request. Passed through verbatim so each
+     * milestone's card can render tool-specific fields without the service
+     * layer needing to know about their schemas.
+     */
+    input: unknown;
+    /**
+     * What kind of interaction is required: `"tool_approval"`, `"question"`,
+     * or `"plan_approval"`.
+     */
+    kind: PermissionKind;
+    /**
+     * Tool name from the CLI request (e.g. `"Bash"`, `"AskUserQuestion"`).
+     */
+    tool_name: string;
 };
 
 export type PgUpgradeLogResponse = {
@@ -12578,6 +12792,31 @@ export type ProviderCatalogDto = {
      * that as "Use provider default".
      */
     default_model?: string | null;
+    /**
+     * Explains why `host_authenticated` is false (not installed vs.
+     * installed-but-not-authenticated), or `None` when it's true.
+     */
+    host_auth_hint?: string | null;
+    /**
+     * Authentication mechanism reported by the CLI running in the Temps
+     * process environment (for example `chatgpt_subscription` or
+     * `host_auth_store`). Never contains credential material.
+     */
+    host_auth_method?: string | null;
+    /**
+     * True when the CLI is installed AND authenticated on **this host** —
+     * the machine running the Temps server process. This is a completely
+     * different signal from `credential_saved`: that field is about a
+     * credential seeded into a *sandboxed autofixer container*, while this
+     * one is what actually gates whether the AI Gateway can route requests
+     * to this provider (ADR-037's `AgentCliAiService` uses only the host's
+     * ambient CLI session — ordering `claude setup-token`/`codex login` on
+     * this machine — and never reads the sandbox credential at all). A
+     * provider can show `credential_saved: true` and `host_authenticated:
+     * false` at the same time; only the latter means chat/gateway routing
+     * will actually work.
+     */
+    host_authenticated: boolean;
     id: string;
     install_command: string;
     /**
@@ -13495,6 +13734,13 @@ export type ResizeSandboxBody = {
      * New root disk size in MB. Grow-only; must exceed the current size.
      */
     disk_size_mb: number;
+};
+
+/**
+ * Body for the `POST .../permissions/{permission_id}/resolve` endpoint.
+ */
+export type ResolvePermissionRequest = {
+    decision: PermissionDecision;
 };
 
 /**
@@ -14769,6 +15015,19 @@ export type SendEmailResponseBody = {
 };
 
 export type SendMessageRequest = {
+    /**
+     * Optional next-turn model. The provider harness remains pinned, but its
+     * advertised models may be changed between turns.
+     */
+    ai_model?: string | null;
+    /**
+     * Optional next-turn permission mode for the pinned provider harness.
+     */
+    ai_permission_mode?: string | null;
+    /**
+     * Optional next-turn thinking level.
+     */
+    ai_thinking_level?: string | null;
     content: string;
     /**
      * Optional, client-supplied description of the page/entity the user is
@@ -18171,6 +18430,35 @@ export type UpdateProviderKeyRequest = {
     is_active?: boolean | null;
 };
 
+/**
+ * Request body for `PUT /api/ai/provider-preference`.
+ */
+export type UpdateProviderPreferenceRequest = {
+    /**
+     * Required when `provider_type` is `"agent_cli"`.
+     */
+    agent_cli_provider_id?: string | null;
+    /**
+     * Opt in to the interactive Claude CLI bridge (ADR-038 Phase 2).
+     *
+     * When `true`, `ConversationService` routes chat turns through
+     * `ClaudeCliProvider::run_interactive` (long-lived subprocess with
+     * `--permission-prompt-tool stdio`) instead of the one-shot
+     * `--dangerously-skip-permissions` path, enabling mid-turn tool
+     * approval, `AskUserQuestion`, and `ExitPlanMode` (milestone 3+).
+     *
+     * Setting this to `true` is only valid when `provider_type == "agent_cli"`
+     * AND `agent_cli_provider_id == "claude_cli"` — Codex and OpenCode have
+     * no equivalent interactive control protocol.  Omitting the field
+     * (`null`) preserves the existing toggle value in the database.
+     */
+    interactive_bridge_enabled?: boolean | null;
+    /**
+     * `"gateway"` or `"agent_cli"`.
+     */
+    provider_type: string;
+};
+
 export type UpdateProviderRequest = {
     config?: unknown;
     enabled?: boolean | null;
@@ -20056,6 +20344,109 @@ export type GetPricingResponses = {
 };
 
 export type GetPricingResponse = GetPricingResponses[keyof GetPricingResponses];
+
+export type UpdateAiProviderPreferenceData = {
+    body: UpdateProviderPreferenceRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/provider-preference';
+};
+
+export type UpdateAiProviderPreferenceErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateAiProviderPreferenceError = UpdateAiProviderPreferenceErrors[keyof UpdateAiProviderPreferenceErrors];
+
+export type UpdateAiProviderPreferenceResponses = {
+    /**
+     * Updated provider preference and availability
+     */
+    200: AiProviderStatusResponse;
+};
+
+export type UpdateAiProviderPreferenceResponse = UpdateAiProviderPreferenceResponses[keyof UpdateAiProviderPreferenceResponses];
+
+export type GetAiProviderStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/provider-status';
+};
+
+export type GetAiProviderStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetAiProviderStatusError = GetAiProviderStatusErrors[keyof GetAiProviderStatusErrors];
+
+export type GetAiProviderStatusResponses = {
+    /**
+     * Current provider preference and availability
+     */
+    200: AiProviderStatusResponse;
+};
+
+export type GetAiProviderStatusResponse = GetAiProviderStatusResponses[keyof GetAiProviderStatusResponses];
+
+export type RefreshAiProviderStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/provider-status/refresh';
+};
+
+export type RefreshAiProviderStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Provider refresh failed
+     */
+    500: ProblemDetails;
+};
+
+export type RefreshAiProviderStatusError = RefreshAiProviderStatusErrors[keyof RefreshAiProviderStatusErrors];
+
+export type RefreshAiProviderStatusResponses = {
+    /**
+     * Fresh provider authentication and model capability snapshot
+     */
+    200: AiProviderStatusResponse;
+};
+
+export type RefreshAiProviderStatusResponse = RefreshAiProviderStatusResponses[keyof RefreshAiProviderStatusResponses];
 
 export type ListProviderKeysData = {
     body?: never;
@@ -24285,6 +24676,10 @@ export type BlobListData = {
          * Continuation token for pagination
          */
         cursor?: string;
+        /**
+         * Project ID (required for API key/session auth, optional for deployment tokens)
+         */
+        project_id?: number;
     };
     url: '/blob';
 };
@@ -24317,7 +24712,24 @@ export type BlobPutData = {
      */
     body: string;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Path where the blob will be stored
+         */
+        pathname?: string;
+        /**
+         * Content type of the blob (optional, will be guessed from extension)
+         */
+        content_type?: string;
+        /**
+         * Add random suffix to pathname to prevent collisions
+         */
+        add_random_suffix?: boolean;
+        /**
+         * Project ID (required for API key/session auth, optional for deployment tokens)
+         */
+        project_id?: number;
+    };
     url: '/blob';
 };
 
@@ -32886,7 +33298,7 @@ export type GetUptimeHistoryData = {
          */
         monitor_id: number;
     };
-    query: {
+    query?: {
         /**
          * Number of days of history (default: 60) - ignored if start_time/end_time provided
          */
@@ -32894,11 +33306,11 @@ export type GetUptimeHistoryData = {
         /**
          * Start time (ISO 8601) - overrides days parameter
          */
-        start_time: string;
+        start_time?: string;
         /**
          * End time (ISO 8601) - defaults to now
          */
-        end_time: string;
+        end_time?: string;
     };
     url: '/monitors/{monitor_id}/uptime';
 };
@@ -37346,6 +37758,59 @@ export type ListPendingActionsResponses = {
 };
 
 export type ListPendingActionsResponse = ListPendingActionsResponses[keyof ListPendingActionsResponses];
+
+export type ResolvePermissionData = {
+    body: ResolvePermissionRequest;
+    path: {
+        project_id: number;
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * The CLI's request_id from the SSE event
+         */
+        permission_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/permissions/{permission_id}/resolve';
+};
+
+export type ResolvePermissionErrors = {
+    /**
+     * Invalid decision payload
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Unknown permission_id (may have timed out or been auto-denied)
+     */
+    404: unknown;
+    /**
+     * Permission already resolved (concurrent resolve race)
+     */
+    409: unknown;
+    /**
+     * Turn already ended (subprocess exited before decision arrived)
+     */
+    410: unknown;
+};
+
+export type ResolvePermissionResponses = {
+    /**
+     * Decision accepted; subprocess will continue
+     */
+    204: void;
+};
+
+export type ResolvePermissionResponse = ResolvePermissionResponses[keyof ResolvePermissionResponses];
 
 export type GetPendingActionData = {
     body?: never;
@@ -50342,11 +50807,11 @@ export type ListAuditLogsData = {
          */
         user_id?: number;
         /**
-         * Start timestamp (milliseconds since epoch)
+         * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
          */
         from?: string;
         /**
-         * End timestamp (milliseconds since epoch)
+         * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
          */
         to?: string;
         /**

@@ -167,6 +167,12 @@ impl ConversationContextProvider for ApiToolsProvider {
         ))
     }
 
+    fn cli_session_contract(&self, auth: &AuthContext) -> Option<String> {
+        self.handle
+            .get()
+            .map(|caller| caller.cli_read_catalog(auth))
+    }
+
     async fn tools(&self, _project_id: i32, _context_id: &str) -> Vec<ChatTool> {
         vec![ChatTool {
             name: "temps".to_string(),

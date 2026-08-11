@@ -84,6 +84,14 @@ pub trait ConversationContextProvider: Send + Sync {
         None
     }
 
+    /// Stable provider-specific catalog material that affects what a resumed
+    /// interactive CLI session believes it can do. This must exclude live
+    /// entity/page context; it is hashed solely to invalidate stale sessions
+    /// when their effective capability contract changes.
+    fn cli_session_contract(&self, _auth: &AuthContext) -> Option<String> {
+        None
+    }
+
     /// Tools the model may call while debugging this context — e.g. read a file
     /// from the project's repository via the configured Git provider. Default:
     /// none. Context-aware so a provider offers a tool only when the underlying

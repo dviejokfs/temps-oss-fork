@@ -177,6 +177,12 @@ mod m20260804_000001_add_must_change_password_to_users;
 pub mod m20260805_000001_index_normalized_managed_domains;
 mod m20260806_000001_index_permission_denied_retention;
 pub mod m20260806_000001_sandbox_workspace_lifecycle;
+mod m20260809_000001_ai_gateway_config_provider_type;
+mod m20260810_000001_add_cli_session_id_to_ai_conversations;
+mod m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config;
+mod m20260810_000003_pin_ai_provider_to_conversations;
+mod m20260810_000004_add_ai_conversation_runtime_options;
+mod m20260811_000001_add_cli_session_fingerprint;
 
 pub struct Migrator;
 
@@ -369,6 +375,16 @@ impl MigratorTrait for Migrator {
             Box::new(m20260805_000001_index_normalized_managed_domains::Migration),
             Box::new(m20260806_000001_sandbox_workspace_lifecycle::Migration),
             Box::new(m20260806_000001_index_permission_denied_retention::Migration),
+            Box::new(m20260809_000001_ai_gateway_config_provider_type::Migration),
+            Box::new(
+                m20260810_000001_add_cli_session_id_to_ai_conversations::Migration,
+            ),
+            Box::new(
+                m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config::Migration,
+            ),
+            Box::new(m20260810_000003_pin_ai_provider_to_conversations::Migration),
+            Box::new(m20260810_000004_add_ai_conversation_runtime_options::Migration),
+            Box::new(m20260811_000001_add_cli_session_fingerprint::Migration),
         ]
     }
 }

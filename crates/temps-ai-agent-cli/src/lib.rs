@@ -7,14 +7,14 @@
 //!   OpenCode). Subscription credentials are ambient on the host — no API key
 //!   is read or forwarded.
 //!
-//! - [`DispatchingAiService`]: wraps an existing `Arc<dyn AiService>` and
-//!   delegates every call through unchanged. In Phase 1 this is a pure
-//!   pass-through. Phases 2/3 will extend it to route per-scope configuration
-//!   (from `ai_gateway_config`) to either the gateway or an
-//!   `AgentCliAiService` without changing the DI registration.
+//! - [`DispatchingAiService`]: routes `is_available`/`complete`/`chat_stream`
+//!   to whichever provider is active (BYOK gateway or a subscription agent
+//!   CLI), read through the [`ActiveProviderReader`] seam so this crate stays
+//!   free of a DB dependency. Multi-turn tool-calling is exposed to agent CLIs
+//!   through a per-turn, authenticated loopback MCP bridge.
 
 pub mod dispatch;
 pub mod service;
 
-pub use dispatch::DispatchingAiService;
-pub use service::AgentCliAiService;
+pub use dispatch::{ActiveProviderReader, DispatchingAiService};
+pub use service::{AgentCliAiService, ScopedMcpBridge};

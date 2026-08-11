@@ -1382,6 +1382,10 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_container_info",
         "get_container_detail",
         "list_containers",
+        // ── Projects: current-user-filtered metadata ──
+        // The handler enforces ProjectsRead and derives hidden project ids
+        // from the AuthContext forwarded by the current private chat turn.
+        "get_projects",
         // ── Deployments: status / jobs / history ──
         "get_deployment",
         "get_last_deployment",
@@ -3608,6 +3612,25 @@ mod ai_tool_allowlist_tests {
                 "duplicate allowlist entry: {entry}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn get_projects_resolves_and_is_discoverable_in_the_read_cli() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller};
+
+        let openapi = temps_projects::handlers::ApiDoc::openapi();
+        let caller =
+            InternalApiCaller::new_allowlisted(axum::Router::new(), &openapi, ai_read_allowlist());
+        assert!(caller
+            .indexed_operation_ids()
+            .contains(&"get_projects".to_string()));
+
+        let scope = ApiCallScope {
+            auth: admin_auth(),
+            project_ids: vec![],
+        };
+        let catalog = caller.run_cli("projects --help", &scope).await;
+        assert!(catalog.contains("get_projects"), "catalog: {catalog}");
     }
 
     /// PR #265 added `DeploymentMetricsGetRange`/`DeploymentMetricsGetLatest`/
