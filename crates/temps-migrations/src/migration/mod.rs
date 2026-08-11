@@ -183,6 +183,7 @@ mod m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config;
 mod m20260810_000003_pin_ai_provider_to_conversations;
 mod m20260810_000004_add_ai_conversation_runtime_options;
 mod m20260811_000001_add_cli_session_fingerprint;
+mod m20260811_000001_create_renewal_attempts;
 
 pub struct Migrator;
 
@@ -385,6 +386,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260810_000003_pin_ai_provider_to_conversations::Migration),
             Box::new(m20260810_000004_add_ai_conversation_runtime_options::Migration),
             Box::new(m20260811_000001_add_cli_session_fingerprint::Migration),
+            Box::new(m20260811_000001_create_renewal_attempts::Migration),
         ]
     }
 }
