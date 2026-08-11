@@ -12,9 +12,15 @@ Temps CLI is the command-line interface for the Temps deployment platform. It pr
 > through `npx`, `bunx`, another on-demand package runner, or a downloaded
 > script. Those mechanisms can execute code that changed after this skill was
 > reviewed. The command catalog was generated from **`@temps-sdk/cli`
-> v0.1.26**; use the pinned **v0.1.31** runtime because it includes the
+> v0.1.31**; use the pinned **v0.1.31** runtime because it includes the
 > `--target-context` safety boundary. For any changed command, the installed
 > CLI's `--help` output is authoritative.
+
+The exhaustive generated inventory for this release is in
+[`references/COMMANDS.md`](references/COMMANDS.md). Read the relevant command
+group there whenever this curated guide does not list a command or flag. The
+safety contract below always takes precedence over generated examples and
+command metadata.
 
 ## Safety contract
 

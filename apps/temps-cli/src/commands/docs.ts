@@ -1,4 +1,5 @@
 import type { Command } from 'commander'
+import { writeFile } from 'node:fs/promises'
 import { createProgram } from '../cli.js'
 import { colors, newline, header } from '../ui/output.js'
 
@@ -109,9 +110,10 @@ function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown'
   return md
 }
 
-function generateHeader(format: 'markdown' | 'mdx' = 'markdown'): string {
-  const date = new Date().toISOString().split('T')[0]
-
+function generateHeader(
+  format: 'markdown' | 'mdx' = 'markdown',
+  version: string,
+): string {
   const mdxMetadata = `export const metadata = {
   title: 'CLI Reference',
   description: 'Complete reference for the Temps CLI - all commands, options, and usage examples.',
@@ -123,12 +125,12 @@ function generateHeader(format: 'markdown' | 'mdx' = 'markdown'): string {
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: ${date}
+> Generated from: \`@temps-sdk/cli@${version}\`
 
 ## Installation
 
 \`\`\`bash
-bunx @temps-sdk/cli [command]
+temps [command]
 \`\`\`
 
 ## Authentication
@@ -136,18 +138,19 @@ bunx @temps-sdk/cli [command]
 Before using most commands, you need to authenticate:
 
 \`\`\`bash
-# Login with API key
-bunx @temps-sdk/cli login
+# Login interactively
+temps login
 
 # Or configure with wizard
-bunx @temps-sdk/cli configure
+temps configure
 \`\`\`
 
 ## Global Options
 
 | Flag | Description |
 |------|-------------|
-| \`-v, --version\` | Display version number |
+| \`-V, --version\` | Display version number |
+| \`--target-context <name>\` | Target one configured server for this invocation |
 | \`--no-color\` | Disable colored output |
 | \`--debug\` | Enable debug output |
 | \`-h, --help\` | Display help for command |
@@ -167,48 +170,48 @@ function generateFooter(): string {
 
 \`\`\`bash
 # Login to Temps
-bunx @temps-sdk/cli login
+temps login
 
 # Create a new project
-bunx @temps-sdk/cli projects create --name my-app
+temps projects create --name my-app
 
 # Deploy to production
-bunx @temps-sdk/cli deploy --project my-app --environment production
+temps --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-bunx @temps-sdk/cli logs --project my-app --follow
+temps deployments logs --project my-app --follow
 
 # Stream runtime container logs
-bunx @temps-sdk/cli runtime-logs --project my-app
+temps runtime-logs --project my-app
 
 # List containers
-bunx @temps-sdk/cli containers list --project-id 1 --environment-id 1
+temps containers list --project-id 1 --environment-id 1
 \`\`\`
 
 ### Managing Environments
 
 \`\`\`bash
 # List environments
-bunx @temps-sdk/cli environments list --project my-app
+temps environments list --project my-app
 
 # Set environment variables
-bunx @temps-sdk/cli environments vars set --project my-app --key DATABASE_URL --value "postgres://..."
+temps environments vars set --project my-app --key DATABASE_URL
 
 # View environment variables
-bunx @temps-sdk/cli environments vars list --project my-app
+temps environments vars list --project my-app
 \`\`\`
 
 ### Managing Domains
 
 \`\`\`bash
 # Add a custom domain
-bunx @temps-sdk/cli domains add --project my-app --domain app.example.com
+temps domains add --project my-app --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli domains list --project my-app
+temps domains list --project my-app
 
 # Remove a domain
-bunx @temps-sdk/cli domains remove --project my-app --domain app.example.com
+temps domains remove --project my-app --domain app.example.com
 \`\`\`
 
 ## Environment Variables
@@ -228,7 +231,7 @@ Configuration is stored in:
 - **Config file**: \`~/.temps/config.json\`
 - **Credentials**: Stored securely in \`~/.temps/\` with restricted file permissions
 
-Use \`bunx @temps-sdk/cli configure show\` to view current configuration.
+Use \`temps configure show\` to view current configuration.
 
 ## Support
 
@@ -237,7 +240,7 @@ Use \`bunx @temps-sdk/cli configure show\` to view current configuration.
 `
 }
 
-async function generateDocs(options: DocsOptions): Promise<void> {
+export async function generateDocs(options: DocsOptions): Promise<void> {
   // Create a fresh program to extract command structure (excluding docs command)
   const program = createProgram()
 
@@ -252,13 +255,16 @@ async function generateDocs(options: DocsOptions): Promise<void> {
     output = JSON.stringify(commands, null, 2)
   } else {
     const format = options.format === 'mdx' ? 'mdx' : 'markdown'
-    output = generateHeader(format)
+    output = generateHeader(format, program.version() ?? 'unknown')
     output += generateMarkdown(commands, 2, format)
     output += generateFooter()
   }
 
   if (options.output) {
-    await Bun.write(options.output, output)
+    // The published CLI is bundled for Node. Using Bun.write here made the
+    // `temps docs --output ...` command crash for npm users even though the
+    // development and test runtime is Bun.
+    await writeFile(options.output, output, 'utf8')
     newline()
     header('Documentation Generated')
     console.log(`${colors.success('Written to:')} ${options.output}`)
