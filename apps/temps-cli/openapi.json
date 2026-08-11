@@ -11996,7 +11996,7 @@
             "type": "boolean"
           },
           "drain_complete": {
-            "description": "Whether the drain is complete (all containers migrated)",
+            "description": "Whether the source node is empty and safe to remove. Replacement\ndeployments may still be converging asynchronously on other nodes.",
             "type": "boolean"
           },
           "message": {
@@ -19885,7 +19885,7 @@
         "description": "Query parameters for listing audit logs.\n\nEvery field is optional — omitting one means \"don't filter on it\". Deriving\n`IntoParams` makes utoipa render them as optional query params with the\ncorrect types; the previous hand-written `params((\"operation_type\", Query,\n…))` tuples defaulted every param to `required: true, type: string`, which\nmisled both API clients and the AI `describe_api`/`call_api` tools into\nthinking all filters were mandatory.",
         "properties": {
           "from": {
-            "description": "Start timestamp (milliseconds since epoch)",
+            "description": "Start timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
             "format": "date-time",
             "type": [
               "string",
@@ -19916,7 +19916,7 @@
             ]
           },
           "to": {
-            "description": "End timestamp (milliseconds since epoch)",
+            "description": "End timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
             "format": "date-time",
             "type": [
               "string",
@@ -20257,6 +20257,39 @@
         "required": [
           "presets",
           "total"
+        ],
+        "type": "object"
+      },
+      "ListRenewalAttemptsResponse": {
+        "description": "Paginated renewal-attempt history for one domain, newest first.",
+        "properties": {
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/RenewalAttemptResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "attempts",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -29615,6 +29648,52 @@
         },
         "required": [
           "title"
+        ],
+        "type": "object"
+      },
+      "RenewalAttemptResponse": {
+        "description": "One row of the standard (non-on-demand) renewal-attempt audit log, backing\nthe domain detail page's renewal timeline.",
+        "properties": {
+          "created_at": {
+            "description": "When the attempt was recorded (epoch millis).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "outcome": {
+            "description": "`\"success\"` | `\"failed\"`.",
+            "type": "string"
+          },
+          "stage": {
+            "description": "`\"request_challenge\"` | `\"complete_challenge\"`.",
+            "type": "string"
+          },
+          "verification_method": {
+            "description": "`\"http-01\"` | `\"dns-01\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "stage",
+          "verification_method",
+          "outcome",
+          "created_at"
         ],
         "type": "object"
       },
@@ -51612,6 +51691,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Project ID (required for API key/session auth, optional for deployment tokens)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -51658,6 +51747,45 @@
       },
       "post": {
         "operationId": "blob_put",
+        "parameters": [
+          {
+            "description": "Path where the blob will be stored",
+            "in": "query",
+            "name": "pathname",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Content type of the blob (optional, will be guessed from extension)",
+            "in": "query",
+            "name": "content_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Add random suffix to pathname to prevent collisions",
+            "in": "query",
+            "name": "add_random_suffix",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Project ID (required for API key/session auth, optional for deployment tokens)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/octet-stream": {
@@ -54037,6 +54165,83 @@
         ]
       }
     },
+    "/domains/{domain}/renewal-attempts": {
+      "get": {
+        "description": "Returns rows from the append-only `renewal_attempts` audit log, newest\nfirst: every `request_challenge` (order creation) and `complete_challenge`\n(order finalization) attempt for this domain, successful or failed, with\nthe full error detail. Backs the domain detail page's renewal timeline —\n`domains.last_error` only ever holds the MOST RECENT failure, so this is\nthe only way to see the history behind it.",
+        "operationId": "list_renewal_attempts",
+        "parameters": [
+          {
+            "description": "Domain name",
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Number of items per page (max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListRenewalAttemptsResponse"
+                }
+              }
+            },
+            "description": "Renewal attempts retrieved successfully"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List certificate renewal attempts for a domain",
+        "tags": [
+          "Domains"
+        ]
+      }
+    },
     "/domains/{domain}/status": {
       "get": {
         "operationId": "check_domain_status",
@@ -55298,7 +55503,7 @@
           }
         ],
         "responses": {
-          "302": {
+          "307": {
             "description": "Redirect to original URL"
           },
           "404": {
@@ -60134,11 +60339,20 @@
             },
             "description": "Token updated successfully"
           },
+          "400": {
+            "description": "Invalid token configuration"
+          },
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Connection not found"
+          },
+          "429": {
+            "description": "Git provider rate limit exceeded"
           },
           "500": {
             "description": "Internal server error"
@@ -60184,8 +60398,14 @@
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Connection not found"
+          },
+          "429": {
+            "description": "Git provider rate limit exceeded"
           },
           "500": {
             "description": "Internal server error"
@@ -61184,6 +61404,9 @@
           "400": {
             "description": "Provider not supported"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Repository not found"
           },
@@ -61254,6 +61477,9 @@
           },
           "400": {
             "description": "Provider not supported"
+          },
+          "403": {
+            "description": "Git provider permission required"
           },
           "404": {
             "description": "Repository not found"
@@ -61337,6 +61563,9 @@
           },
           "400": {
             "description": "Provider not supported"
+          },
+          "403": {
+            "description": "Git provider permission required"
           },
           "404": {
             "description": "Repository or branch not found"
@@ -63995,7 +64224,7 @@
             "description": "Start time (ISO 8601) - overrides days parameter",
             "in": "query",
             "name": "start_time",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -64004,7 +64233,7 @@
             "description": "End time (ISO 8601) - defaults to now",
             "in": "query",
             "name": "end_time",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -67724,6 +67953,24 @@
             "schema": {
               "format": "int32",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by span attributes as comma-separated key=value pairs, e.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\"",
+            "in": "query",
+            "name": "attributes",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by span name pattern (ILIKE)",
+            "in": "query",
+            "name": "name_pattern",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -80833,7 +81080,7 @@
             }
           },
           {
-            "description": "Comma-separated kinds: `log,request,span,error,revenue`. Empty or\nmissing returns every kind.",
+            "description": "Comma-separated kinds: `request,span,error,revenue`. Empty or\nmissing returns every kind. There is no `log` kind — runtime logs\nintentionally never appear in this feed (see `ObservabilityEvent`'s\n\"No `Log` variant\" doc); passing `kinds=log` is rejected with 400\n`InvalidKindsFilter`, not silently ignored.",
             "in": "query",
             "name": "kinds",
             "required": false,
@@ -86411,6 +86658,9 @@
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Repository not found"
           },
@@ -86484,6 +86734,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Git provider permission required"
           },
           "404": {
             "description": "Repository not found"
@@ -86646,6 +86899,9 @@
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Repository not found"
           },
@@ -86715,6 +86971,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Git provider permission required"
           },
           "404": {
             "description": "Repository not found"
@@ -86836,6 +87095,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Git provider permission required"
           },
           "404": {
             "description": "Repository not found"
@@ -92474,8 +92736,8 @@
             }
           },
           {
-            "description": "Start timestamp (milliseconds since epoch)",
-            "example": 1,
+            "description": "Start timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
+            "example": "2024-01-15T14:30:00Z",
             "in": "query",
             "name": "from",
             "required": false,
@@ -92485,8 +92747,8 @@
             }
           },
           {
-            "description": "End timestamp (milliseconds since epoch)",
-            "example": 1,
+            "description": "End timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
+            "example": "2024-01-15T14:30:00Z",
             "in": "query",
             "name": "to",
             "required": false,

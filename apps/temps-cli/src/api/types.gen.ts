@@ -5663,7 +5663,8 @@ export type DrainStatusResponse = {
      */
     can_remove: boolean;
     /**
-     * Whether the drain is complete (all containers migrated)
+     * Whether the source node is empty and safe to remove. Replacement
+     * deployments may still be converging asynchronously on other nodes.
      */
     drain_complete: boolean;
     message: string;
@@ -9133,7 +9134,7 @@ export type ListApiKeysQuery = {
  */
 export type ListAuditLogsQuery = {
     /**
-     * Start timestamp (milliseconds since epoch)
+     * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
      */
     from?: string | null;
     /**
@@ -9149,7 +9150,7 @@ export type ListAuditLogsQuery = {
      */
     operation_type?: string | null;
     /**
-     * End timestamp (milliseconds since epoch)
+     * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
      */
     to?: string | null;
     /**
@@ -9271,6 +9272,16 @@ export type ListOrdersResponse = {
 
 export type ListPresetsResponse = {
     presets: Array<PresetResponse>;
+    total: number;
+};
+
+/**
+ * Paginated renewal-attempt history for one domain, newest first.
+ */
+export type ListRenewalAttemptsResponse = {
+    attempts: Array<RenewalAttemptResponse>;
+    page: number;
+    page_size: number;
     total: number;
 };
 
@@ -13357,6 +13368,32 @@ export type RenameConversationRequest = {
      * New human-facing title. Trimmed; must be non-empty after trimming.
      */
     title: string;
+};
+
+/**
+ * One row of the standard (non-on-demand) renewal-attempt audit log, backing
+ * the domain detail page's renewal timeline.
+ */
+export type RenewalAttemptResponse = {
+    /**
+     * When the attempt was recorded (epoch millis).
+     */
+    created_at: number;
+    error?: string | null;
+    error_type?: string | null;
+    id: number;
+    /**
+     * `"success"` | `"failed"`.
+     */
+    outcome: string;
+    /**
+     * `"request_challenge"` | `"complete_challenge"`.
+     */
+    stage: string;
+    /**
+     * `"http-01"` | `"dns-01"`.
+     */
+    verification_method: string;
 };
 
 export type RepositoryListQuery = {
@@ -24285,6 +24322,10 @@ export type BlobListData = {
          * Continuation token for pagination
          */
         cursor?: string;
+        /**
+         * Project ID (required for API key/session auth, optional for deployment tokens)
+         */
+        project_id?: number;
     };
     url: '/blob';
 };
@@ -24317,7 +24358,24 @@ export type BlobPutData = {
      */
     body: string;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Path where the blob will be stored
+         */
+        pathname?: string;
+        /**
+         * Content type of the blob (optional, will be guessed from extension)
+         */
+        content_type?: string;
+        /**
+         * Add random suffix to pathname to prevent collisions
+         */
+        add_random_suffix?: boolean;
+        /**
+         * Project ID (required for API key/session auth, optional for deployment tokens)
+         */
+        project_id?: number;
+    };
     url: '/blob';
 };
 
@@ -25920,6 +25978,51 @@ export type RenewDomainResponses = {
 };
 
 export type RenewDomainResponse = RenewDomainResponses[keyof RenewDomainResponses];
+
+export type ListRenewalAttemptsData = {
+    body?: never;
+    path: {
+        /**
+         * Domain name
+         */
+        domain: string;
+    };
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number | null;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number | null;
+    };
+    url: '/domains/{domain}/renewal-attempts';
+};
+
+export type ListRenewalAttemptsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListRenewalAttemptsResponses = {
+    /**
+     * Renewal attempts retrieved successfully
+     */
+    200: ListRenewalAttemptsResponse;
+};
+
+export type ListRenewalAttemptsResponse2 = ListRenewalAttemptsResponses[keyof ListRenewalAttemptsResponses];
 
 export type CheckDomainStatusData = {
     body?: never;
@@ -30185,13 +30288,25 @@ export type UpdateConnectionTokenData = {
 
 export type UpdateConnectionTokenErrors = {
     /**
+     * Invalid token configuration
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Connection not found
      */
     404: unknown;
+    /**
+     * Git provider rate limit exceeded
+     */
+    429: unknown;
     /**
      * Internal server error
      */
@@ -30225,9 +30340,17 @@ export type ValidateConnectionErrors = {
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Connection not found
      */
     404: unknown;
+    /**
+     * Git provider rate limit exceeded
+     */
+    429: unknown;
     /**
      * Internal server error
      */
@@ -30945,6 +31068,10 @@ export type GetPublicRepositoryErrors = {
      */
     400: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -30997,6 +31124,10 @@ export type GetPublicBranchesErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository not found
      */
@@ -31054,6 +31185,10 @@ export type DetectPublicPresetsErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository or branch not found
      */
@@ -32886,7 +33021,7 @@ export type GetUptimeHistoryData = {
          */
         monitor_id: number;
     };
-    query: {
+    query?: {
         /**
          * Number of days of history (default: 60) - ignored if start_time/end_time provided
          */
@@ -32894,11 +33029,11 @@ export type GetUptimeHistoryData = {
         /**
          * Start time (ISO 8601) - overrides days parameter
          */
-        start_time: string;
+        start_time?: string;
         /**
          * End time (ISO 8601) - defaults to now
          */
-        end_time: string;
+        end_time?: string;
     };
     url: '/monitors/{monitor_id}/uptime';
 };
@@ -34931,6 +35066,14 @@ export type QueryTracesData = {
          * Filter by deployment ID
          */
         deployment_id?: number;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string;
+        /**
+         * Filter by span name pattern (ILIKE)
+         */
+        name_pattern?: string;
         /**
          * Max spans to return (default: 100, max: 1000)
          */
@@ -43318,8 +43461,11 @@ export type ObservabilityListEventsData = {
     };
     query?: {
         /**
-         * Comma-separated kinds: `log,request,span,error,revenue`. Empty or
-         * missing returns every kind.
+         * Comma-separated kinds: `request,span,error,revenue`. Empty or
+         * missing returns every kind. There is no `log` kind — runtime logs
+         * intentionally never appear in this feed (see `ObservabilityEvent`'s
+         * "No `Log` variant" doc); passing `kinds=log` is rejected with 400
+         * `InvalidKindsFilter`, not silently ignored.
          */
         kinds?: string;
         /**
@@ -46357,6 +46503,10 @@ export type GetRepositoryBranchesErrors = {
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -46405,6 +46555,10 @@ export type GetRepositoryTagsErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository not found
      */
@@ -46528,6 +46682,10 @@ export type GetBranchesByRepositoryIdErrors = {
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -46572,6 +46730,10 @@ export type ListCommitsByRepositoryIdErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository not found
      */
@@ -46665,6 +46827,10 @@ export type GetTagsByRepositoryIdErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository not found
      */
@@ -50390,11 +50556,11 @@ export type ListAuditLogsData = {
          */
         user_id?: number;
         /**
-         * Start timestamp (milliseconds since epoch)
+         * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
          */
         from?: string;
         /**
-         * End timestamp (milliseconds since epoch)
+         * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
          */
         to?: string;
         /**
