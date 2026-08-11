@@ -10695,6 +10695,7 @@ dependencies = [
  "temps-notifications",
  "temps-observability",
  "temps-otel",
+ "temps-plugin-sdk",
  "temps-projects",
  "temps-providers",
  "temps-proxy",
@@ -10831,6 +10832,7 @@ dependencies = [
  "http-body-util",
  "mockall",
  "num_cpus",
+ "regex",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",
@@ -11290,9 +11292,11 @@ dependencies = [
 name = "temps-external-plugins"
 version = "0.1.0-beta.55"
 dependencies = [
+ "async-trait",
  "axum",
  "chrono",
  "futures",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
@@ -12059,6 +12063,7 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
+ "subtle",
  "tar",
  "temps-core",
  "thiserror 2.0.19",

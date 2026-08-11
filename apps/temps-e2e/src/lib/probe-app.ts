@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -47,6 +48,17 @@ func main() {
 	dsn := os.Getenv("POSTGRES_URL")
 	if dsn == "" {
 		log.Fatal("POSTGRES_URL not set")
+	}
+	// DNS-focused scenarios can preserve every injected credential/database
+	// field while replacing only the address with a published *.temps.local
+	// service-member record.
+	if dnsAddress := os.Getenv("POSTGRES_DNS_ADDRESS"); dnsAddress != "" {
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			log.Fatalf("parse POSTGRES_URL: %v", err)
+		}
+		parsed.Host = dnsAddress
+		dsn = parsed.String()
 	}
 	// The injected DSN carries no sslmode param, and lib/pq defaults to
 	// requiring SSL -- the managed container is plain internal Docker
@@ -93,6 +105,21 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]int{"count": count})
+	})
+	mux.HandleFunc("/database-info", func(w http.ResponseWriter, r *http.Request) {
+		parsedDSN, err := url.Parse(dsn)
+		if err != nil {
+			http.Error(w, "invalid POSTGRES_URL", http.StatusInternalServerError)
+			return
+		}
+		if err := db.PingContext(r.Context()); err != nil {
+			http.Error(w, "database ping failed", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"database_host": parsedDSN.Host,
+		})
 	})
 
 	port := os.Getenv("PORT")
@@ -143,6 +170,62 @@ export async function buildProbeImage(opts: {
   await runDocker(['build', '--load', '-t', imageRef, ctxDir], opts.onLog, `docker build ${imageRef}`)
   opts.onLog?.(`docker push ${imageRef}`)
   await runDocker(['push', imageRef], opts.onLog, `docker push ${imageRef}`)
+  return imageRef
+}
+
+/**
+ * pgx-based variant of the probe app, used ONLY by `db-ha-failover-scenario`
+ * -- NOT a drop-in replacement for `buildProbeImage` above, which every
+ * other scenario keeps using unmodified against standalone (single-host,
+ * single-port) services, where `lib/pq` works fine.
+ *
+ * Multi-host HA specifically needs a driver that actually understands
+ * `postgresql://host1:port1,host2:port2/db?target_session_attrs=read-write`.
+ * `lib/pq` -- the import in `MAIN_GO` above -- cannot: verified live
+ * (`go run` against this exact cluster's real hosts/ports) that its latest
+ * *released* version (v1.10.9, what `go get github.com/lib/pq` actually
+ * resolves to) has no multi-host or `target_session_attrs` support at all --
+ * that code exists only on lib/pq's unreleased `master` branch, and the
+ * project has been in maintenance mode since 2022, pointing new users at
+ * `github.com/jackc/pgx` instead. `pgx`'s `stdlib` driver parses the exact
+ * same connection string the platform emits and correctly routes writes to
+ * whichever host currently satisfies `target_session_attrs=read-write` --
+ * also verified live, including across a real `docker stop` of the primary.
+ */
+const MAIN_GO_PGX = MAIN_GO.replace(
+  '\t_ "github.com/lib/pq"\n',
+  '\t_ "github.com/jackc/pgx/v5/stdlib"\n',
+).replace('sql.Open("postgres", dsn)', 'sql.Open("pgx", dsn)')
+
+const GO_MOD_PGX = `module probe
+
+go 1.24
+
+require github.com/jackc/pgx/v5 v5.7.1
+`
+
+export async function buildHaProbeImage(opts: {
+  scratchRoot: string
+  registry: string
+  tag?: string
+  push?: boolean
+  onLog?: (line: string) => void
+}): Promise<string> {
+  const ctxDir = join(opts.scratchRoot, 'db-probe-ha')
+  const imageRef = opts.tag ?? `${opts.registry}/e2e-db-probe-ha:latest`
+
+  await rm(ctxDir, { recursive: true, force: true })
+  await mkdir(ctxDir, { recursive: true })
+  await writeFile(join(ctxDir, 'go.mod'), GO_MOD_PGX, 'utf8')
+  await writeFile(join(ctxDir, 'main.go'), MAIN_GO_PGX, 'utf8')
+  await writeFile(join(ctxDir, 'Dockerfile'), DOCKERFILE, 'utf8')
+
+  opts.onLog?.(`docker build -t ${imageRef} ${ctxDir}`)
+  await runDocker(['build', '--load', '-t', imageRef, ctxDir], opts.onLog, `docker build ${imageRef}`)
+  if (opts.push !== false) {
+    opts.onLog?.(`docker push ${imageRef}`)
+    await runDocker(['push', imageRef], opts.onLog, `docker push ${imageRef}`)
+  }
   return imageRef
 }
 

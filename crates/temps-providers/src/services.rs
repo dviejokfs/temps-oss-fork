@@ -8,7 +8,8 @@ use crate::externalsvc::{
     rustfs::RustfsService,
     s3::S3Service,
     AvailableContainer, ClusterMemberResult, ClusterMemberSpec, ExternalService, HealthProbeStatus,
-    ManagedS3BackendKind, ManagedS3BackendSelection, ServiceConfig, ServiceType,
+    ManagedS3BackendKind, ManagedS3BackendSelection, PgAutoFailoverState, ServiceConfig,
+    ServiceType,
 };
 use crate::parameter_strategies;
 use crate::remote_service_client::{
@@ -36,6 +37,75 @@ use temps_core::EncryptionService;
 // Add these constants at the top of the file proper key management
 #[allow(dead_code)]
 const NONCE_LENGTH: usize = 12;
+
+/// Local cluster ports are published on Docker's IPv4 loopback interface.
+/// Keep control-plane connections on the same address: `localhost` may resolve
+/// to IPv6 first on Linux even though Docker is only listening on 127.0.0.1.
+pub(crate) const LOCAL_CLUSTER_HOST: &str = "127.0.0.1";
+
+/// Whether a live pg_auto_failover state identifies a node that accepts writes.
+///
+/// Keep connection planning, backups, deletion guards, and DNS reconciliation
+/// on the typed state model. In particular, `wait_primary` is writable: it is
+/// the stable state of a promoted node that currently has no standby attached.
+fn live_state_is_writable_primary(state: Option<&str>) -> bool {
+    state
+        .and_then(|state| state.parse::<PgAutoFailoverState>().ok())
+        .is_some_and(PgAutoFailoverState::is_primary)
+}
+
+/// Return the monitor identity of the sole healthy, recently reporting writer.
+///
+/// pg_auto_failover retains a stopped node's last `reported_state`, so a stale
+/// unhealthy `primary` can coexist with the promoted healthy `wait_primary`.
+/// Selecting solely by state and member order can therefore route connections
+/// or backups to the dead node. Ambiguous reports fail closed.
+fn healthy_writable_primary_nodename(health: &ClusterHealthReport) -> Option<&str> {
+    if health.monitor_error.is_some() {
+        return None;
+    }
+    let mut candidates = health.members.iter().filter(|member| {
+        member.health == 1
+            && member.seconds_since_report < 30
+            && live_state_is_writable_primary(Some(&member.reported_state))
+    });
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(&candidate.nodename)
+}
+
+/// Select the network endpoint advertised for a managed cluster member.
+///
+/// The local application-network address is deliberately considered only for
+/// control-plane members (`node_id = None`). Docker bridge addresses are local
+/// to one daemon and must never replace a remote member's overlay/underlay
+/// address.
+fn select_member_dns_endpoint(
+    node_id: Option<i32>,
+    overlay_ip: Option<&str>,
+    local_network_ip: Option<&str>,
+    underlay_endpoint: Option<(String, i32)>,
+    container_port: u16,
+) -> Option<(String, i32)> {
+    let valid_ip = |ip: &str| {
+        let trimmed = ip.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+
+    if let Some(ip) = overlay_ip.and_then(valid_ip) {
+        return Some((ip, container_port as i32));
+    }
+
+    if node_id.is_none() {
+        return local_network_ip
+            .and_then(valid_ip)
+            .map(|ip| (ip, container_port as i32));
+    }
+
+    underlay_endpoint
+}
 
 #[derive(Error, Debug)]
 pub enum ExternalServiceError {
@@ -82,6 +152,12 @@ pub enum ExternalServiceError {
 
     #[error("Project {id} not found")]
     ProjectNotFound { id: i32 },
+
+    #[error("Environment {environment_id} not found in project {project_id}")]
+    EnvironmentNotFound {
+        environment_id: i32,
+        project_id: i32,
+    },
 
     #[error("Database error: {reason}")]
     DatabaseError { reason: String },
@@ -615,6 +691,22 @@ fn is_role_data_member(s: &str) -> bool {
     role_from_str(s).map(|r| r.is_data_member()).unwrap_or(true)
 }
 
+/// Which address a cluster member being added via `add_cluster_member`
+/// should use to reach the monitor. See
+/// `ExternalServiceManager::monitor_reachability_for_add`'s doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitorReachability {
+    /// Monitor and the new member are both local to this control-plane's
+    /// Docker host — container-name-level resolution already works.
+    SameHost,
+    /// The monitor lives on a remote node — always need its real underlay
+    /// address, regardless of where the new member lands.
+    MonitorNode(i32),
+    /// Monitor is local but the new member is remote — it needs this
+    /// control-plane host's private IP, not the monitor's container name.
+    LocalControlPlane,
+}
+
 /// Validated, fully-resolved input for the background member-creation
 /// task. Built once by `plan_add_cluster_member` and handed off to the
 /// spawned task; nothing inside it requires a DB lookup, so the task
@@ -909,6 +1001,15 @@ pub struct ResourceLimitsUpdateResponse {
     pub applied: Vec<ResourceLimitApplyResult>,
 }
 
+/// Every field is `Arc`-wrapped, so `Clone` is a cheap refcount bump that
+/// shares the SAME `reconciler_shutdowns` map with the original -- unlike
+/// `ExternalServiceManager::new(...)`, which always allocates a fresh, empty
+/// one. Background tasks spawned off a manager method (e.g. cluster
+/// initialization) must clone `self` for exactly this reason: constructing a
+/// new instance instead orphans any role reconciler that task spawns in a
+/// map nobody else can ever reach, so `stop_role_reconciler` (called on the
+/// real, shared instance) silently no-ops and the reconciler leaks forever.
+#[derive(Clone)]
 pub struct ExternalServiceManager {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
@@ -921,11 +1022,17 @@ pub struct ExternalServiceManager {
     /// trivially.
     dns_registry: Arc<temps_dns::DnsRegistry>,
     /// Per-cluster role reconciler shutdown handles, keyed by service_id.
-    /// Notify-then-await pattern: `delete_service` fires the notifier and
-    /// the task observes it on its next select. Held inside a tokio mutex
+    /// `delete_service` calls `ReconcilerShutdown::signal` and the task
+    /// observes it — either on its next `select!` wakeup, or (if the
+    /// signal lands mid-tick) on its very next loop-top check; see
+    /// `ReconcilerShutdown`'s doc comment. Held inside a tokio mutex
     /// because the reconciler-spawn path is async and we want a Send
     /// MutexGuard across awaits.
-    reconciler_shutdowns: Arc<tokio::sync::Mutex<HashMap<i32, Arc<tokio::sync::Notify>>>>,
+    reconciler_shutdowns: Arc<
+        tokio::sync::Mutex<
+            HashMap<i32, Arc<crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown>>,
+        >,
+    >,
 }
 
 impl ExternalServiceManager {
@@ -1590,20 +1697,17 @@ impl ExternalServiceManager {
             service_update.status = Set("creating".to_string());
             service_update.update(self.db.as_ref()).await?;
 
+            // `self.clone()`, not `ExternalServiceManager::new(...)`: the clone
+            // shares this instance's `reconciler_shutdowns` map, so a role
+            // reconciler spawned inside `initialize_cluster` stays reachable by
+            // `stop_role_reconciler` on the real, shared manager later. See the
+            // struct's doc comment.
+            let manager = self.clone();
             let db = self.db.clone();
-            let docker = self.docker.clone();
-            let encryption_service = self.encryption_service.clone();
-            let dns_registry = self.dns_registry.clone();
             let service_id = service.id;
             let members = request.members.clone();
 
             tokio::spawn(async move {
-                let manager = ExternalServiceManager::new(
-                    db.clone(),
-                    encryption_service,
-                    docker,
-                    dns_registry,
-                );
                 let result = manager.initialize_cluster(service_id, &members).await;
 
                 match result {
@@ -2648,7 +2752,7 @@ impl ExternalServiceManager {
         } else {
             // Local members publish their container port on the control-plane
             // host; Docker-internal names and addresses are not host-routable.
-            "localhost".to_string()
+            LOCAL_CLUSTER_HOST.to_string()
         };
 
         Ok((host, port))
@@ -2661,7 +2765,7 @@ impl ExternalServiceManager {
     ///   - the service isn't a cluster
     ///   - the monitor is unreachable (callers should treat this as
     ///     "primary unknown" rather than "no primary")
-    ///   - the monitor knows of no node in `primary | single` state
+    ///   - the monitor knows of no node in a writable-primary state
     ///
     /// Replaces the old `members.iter().find(|m| m.role == "primary")`
     /// pattern, which broke the moment we stopped storing the primary
@@ -2678,15 +2782,19 @@ impl ExternalServiceManager {
         if health.monitor_error.is_some() {
             return Ok(None);
         }
-        let primary_name = health
-            .members
-            .iter()
-            .find(|h| matches!(h.reported_state.as_str(), "primary" | "single"))
-            .map(|h| h.nodename.clone());
-        let Some(name) = primary_name else {
+        let Some(name) = healthy_writable_primary_nodename(&health) else {
             return Ok(None);
         };
-        Ok(members.iter().find(|m| m.container_name == name))
+        let mut matches = members.iter().filter(|member| {
+            is_role_data_member(&member.role)
+                && member.status == "running"
+                && member.container_name == name
+        });
+        let member = matches.next();
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        Ok(member)
     }
 
     /// Live primary check: ask the pg_auto_failover monitor whether the
@@ -2719,12 +2827,35 @@ impl ExternalServiceManager {
             // run `pg_autoctl perform failover` once the monitor recovers.
             return Ok(is_role_primary(&member.role));
         }
-        Ok(health
+        Ok(Self::primary_member_from_health(
+            &health,
+            &member.container_name,
+        ))
+    }
+
+    /// Pure decision backing `member_is_live_primary`'s live-monitor
+    /// branch: given an already-fetched health report and the container
+    /// name being checked, decide whether that member is the writable
+    /// primary right now. No I/O — kept as its own function so
+    /// `remove_cluster_member`'s delete-protection gate can be exercised
+    /// directly in tests (including `wait_primary`, which only a live
+    /// pg_auto_failover monitor would otherwise report) without needing a
+    /// real monitor connection.
+    ///
+    /// Uses `PgAutoFailoverState::is_primary` (not a hand-rolled string
+    /// match) so this gate can't drift from the DNS reconciler's
+    /// definition of "writable primary" again — that exact drift
+    /// previously let a `wait_primary` node (promotion complete, no
+    /// standby attached — genuinely writable, and the normal steady state
+    /// a 2-node cluster settles into after failover) pass this check as
+    /// "not the primary", which would have let `remove_cluster_member`
+    /// delete the cluster's only writable node.
+    fn primary_member_from_health(health: &ClusterHealthReport, container_name: &str) -> bool {
+        health
             .members
             .iter()
-            .find(|h| h.nodename == member.container_name)
-            .map(|h| matches!(h.reported_state.as_str(), "primary" | "single"))
-            .unwrap_or(false))
+            .find(|h| h.nodename == container_name)
+            .is_some_and(|h| live_state_is_writable_primary(Some(&h.reported_state)))
     }
 
     /// Same shape as `get_service_members`, but for cluster topologies
@@ -2828,7 +2959,7 @@ impl ExternalServiceManager {
         };
 
         // Resolve the monitor host: prefer overlay IP, fall back to the
-        // node's underlay address, then localhost. The monitor's host port
+        // node's underlay address, then the IPv4 loopback address. The monitor's host port
         // is `service_id * 10 + 6000` for the dev cluster; in general
         // `monitor.port` is what the lifecycle hook stored.
         let monitor_host: String = if let Some(ip) = monitor.compute_ip.as_deref() {
@@ -2847,7 +2978,7 @@ impl ExternalServiceManager {
                 }
             }
         } else {
-            "localhost".to_string()
+            LOCAL_CLUSTER_HOST.to_string()
         };
         let monitor_port = monitor.port.unwrap_or(5432);
 
@@ -3021,7 +3152,7 @@ impl ExternalServiceManager {
                 }
             }
         } else {
-            "localhost".to_string()
+            LOCAL_CLUSTER_HOST.to_string()
         };
         let monitor_port = monitor.port.unwrap_or(5432);
 
@@ -3128,7 +3259,7 @@ impl ExternalServiceManager {
             // AND the node is healthy. A stale ghost-primary
             // (`reportedstate='primary'` but `health<=0`) would otherwise
             // route us to a dead host and the panel would lose sync data.
-            if matches!(reported_state.as_str(), "primary" | "single")
+            if live_state_is_writable_primary(Some(&reported_state))
                 && health == 1
                 && seconds_since_report < 30
             {
@@ -3315,21 +3446,16 @@ impl ExternalServiceManager {
             });
         }
 
-        let members = self.get_service_members_with_live_state(service.id).await?;
-        // `live_state` is the runtime FSM state from pg_auto_failover.
-        // Backup must run against the writable primary; "single" is the
-        // single-node form pg_auto_failover uses before a replica
-        // catches up — also writable. Anything else (secondary,
-        // catchingup, report_lsn, …) is a replica.
-        let primary = members
-            .iter()
-            .find(|m| {
-                m.status == "running"
-                    && matches!(m.live_state.as_deref(), Some("primary") | Some("single"))
-            })
+        let members = self.get_service_members(service.id).await?;
+        let health = self.cluster_health(service).await;
+        // Resolve the sole healthy, fresh writer back through persisted member
+        // identity. Monitor state is authoritative for role, but never for a
+        // credential destination.
+        let primary = healthy_writable_primary_nodename(&health)
+            .and_then(|nodename| trusted_primary_member(&members, nodename))
             .ok_or(ExternalServiceError::InitializationFailed {
                 id: service.id,
-                reason: "Cannot run backup: cluster has no running primary (monitor unreachable or no node in primary state)".to_string(),
+                reason: "Cannot run backup: cluster has no unique healthy, recently reporting primary (monitor unreachable, election incomplete, or primary state ambiguous)".to_string(),
             })?;
 
         // Write the external_service_backups row up front so the UI's
@@ -4240,11 +4366,10 @@ echo "[restore] Pre-seed complete"
         // Using the stored role here would have produced the same lag
         // bug the UI hit — Browse Data and other callers would dial a
         // freshly-demoted node post-failover.
-        let members = self.get_service_members_with_live_state(service_id).await?;
-        let primary = members.iter().find(|m| {
-            m.status == "running"
-                && matches!(m.live_state.as_deref(), Some("primary") | Some("single"))
-        });
+        let members = self.get_service_members(service_id).await?;
+        let health = self.cluster_health(&service).await;
+        let primary = healthy_writable_primary_nodename(&health)
+            .and_then(|nodename| trusted_primary_member(&members, nodename));
 
         if let Some(primary) = primary {
             self.stored_member_endpoint(service_id, primary)
@@ -4253,7 +4378,7 @@ echo "[restore] Pre-seed complete"
         } else {
             Err(ExternalServiceError::InternalError {
                 reason: format!(
-                    "Cluster service {} has no running primary data node",
+                    "Cluster service {} has no unique healthy, recently reporting primary data node",
                     service_id
                 ),
             })
@@ -4456,6 +4581,26 @@ echo "[restore] Pre-seed complete"
             return Ok(Some(env_vars));
         }
 
+        // Inline per-host ports (`host1:port1,host2:port2/db`) are the
+        // standard PostgreSQL multi-host URI form (libpq connection-string
+        // docs, "Specifying Multiple Hosts") and are what real libpq,
+        // psycopg2/3, tokio-postgres/sqlx, node-postgres, and Go's
+        // actively-maintained `jackc/pgx` all parse correctly -- verified
+        // live against this exact cluster's real hosts/ports with pgx's
+        // `stdlib` driver (`target_session_attrs=read-write` correctly
+        // landed on the primary). Go's OTHER popular driver, `lib/pq`,
+        // cannot parse this (or any multi-host DSN) at all in its latest
+        // *released* version (v1.10.9) -- multi-host/`target_session_attrs`
+        // support exists only on lib/pq's unreleased `master` branch, and
+        // the project itself has been in maintenance mode since 2022,
+        // pointing new users at `pgx` instead. That's a real gap for any
+        // app still on lib/pq, but it's a limitation of that specific,
+        // now-unmaintained driver, not a malformed connection string --
+        // reformatting the URI to work around lib/pq's parser (e.g. moving
+        // ports into a `?port=` query parameter) does not actually fix
+        // lib/pq (verified live: it fails identically either way) and
+        // would make the string non-standard for every driver that DOES
+        // support this correctly today.
         let hosts: Vec<String> = data_nodes
             .iter()
             .map(|n| {
@@ -4734,6 +4879,59 @@ echo "[restore] Pre-seed complete"
     /// containers it runs are stored with `node_id = NULL`. Mirrors
     /// `CONTROL_PLANE_NODE_ID` in `temps-deployments`.
     const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+    /// Pure decision for what a freshly-created cluster member's
+    /// `service_members.hostname` should hold, given whether the cluster
+    /// (as a whole) has any remote member.
+    ///
+    /// A plain Docker container name only resolves via Docker's embedded
+    /// DNS on the *same* Docker host. The `*.temps.local` FQDN resolves
+    /// everywhere, but only once the per-host Hickory resolver is wired
+    /// into a container's `/etc/resolv.conf` — gated behind
+    /// `AppSettings.cluster_dns.enabled`, an experimental flag that
+    /// defaults OFF. Unconditionally storing the FQDN here meant every
+    /// single-host cluster (no worker nodes, one Docker daemon) injected a
+    /// `POSTGRES_URL` whose hosts could never resolve, breaking the
+    /// feature by default from a fresh install even though the cluster
+    /// itself formed correctly.
+    ///
+    /// So: only trust the FQDN once there's a remote member in the mix —
+    /// the one case where a container name can't cross the host boundary
+    /// and FQDN resolution is actually required infrastructure. Every
+    /// local (single-Docker-host) member keeps the plain container name,
+    /// which every other container on `temps-app-network` — including a
+    /// deployed app — already resolves via Docker's own embedded DNS with
+    /// zero extra infrastructure.
+    ///
+    /// No I/O — kept as its own function so this decision can be exercised
+    /// directly in tests without standing up a real cluster.
+    fn resolve_member_hostname(
+        has_remote_members: bool,
+        member_fqdn: &str,
+        container_name: &str,
+    ) -> String {
+        if has_remote_members {
+            member_fqdn.to_string()
+        } else {
+            container_name.to_string()
+        }
+    }
+
+    /// Pure decision for `add_cluster_member`: which address should the
+    /// member being added dial to reach the cluster's monitor, based on
+    /// the actual node topology of *this specific add* (not on a
+    /// previously-persisted string that can go stale — see the call
+    /// site's doc comment).
+    fn monitor_reachability_for_add(
+        monitor_node_id: Option<i32>,
+        new_member_node_id: Option<i32>,
+    ) -> MonitorReachability {
+        match (monitor_node_id, new_member_node_id) {
+            (Some(nid), _) => MonitorReachability::MonitorNode(nid),
+            (None, Some(_)) => MonitorReachability::LocalControlPlane,
+            (None, None) => MonitorReachability::SameHost,
+        }
+    }
 
     /// Normalize and validate the node placement of every requested member.
     ///
@@ -5162,48 +5360,59 @@ echo "[restore] Pre-seed complete"
                         })?;
                 }
 
-                // Compute the FQDN for this member. Always populated post
-                // ADR-011 — overrides whatever placeholder hostname (IP or
-                // container name) the spec carried. Apps will resolve this
-                // via the per-node DNS resolver.
+                // Compute the FQDN for this member (ADR-011). Registered in the
+                // internal DNS registry below regardless of topology — cheap,
+                // and useful the moment an operator later flips
+                // `AppSettings.cluster_dns.enabled` on.
                 let member_fqdn = format!(
                     "{}-{}.{}.temps.local",
                     service.name, spec.ordinal, service.name
                 );
 
+                // What we actually persist as `service_members.hostname` --
+                // and therefore what `build_cluster_env_vars_for_resource`
+                // puts in the multi-host `POSTGRES_URL` every linked app
+                // gets -- must be something a *client container* can
+                // actually resolve today, not just something registered in
+                // a DNS zone. See `resolve_member_hostname`'s doc comment
+                // for the full reasoning (FQDN only once the cluster spans
+                // hosts; plain container name otherwise).
+                let member_hostname = Self::resolve_member_hostname(
+                    has_remote_members,
+                    &member_fqdn,
+                    &result.container_name,
+                );
+
                 // Update member record with container info and "running" status,
-                // plus the FQDN hostname and overlay IP (if any).
+                // plus the resolvable hostname and overlay IP (if any).
                 let member_id = member_model.id;
                 let mut member_update: service_members::ActiveModel = member_model.into();
                 member_update.container_id = Set(Some(container_id));
                 member_update.port = Set(host_port);
                 member_update.status = Set("running".to_string());
-                member_update.hostname = Set(Some(member_fqdn.clone()));
+                member_update.hostname = Set(Some(member_hostname));
                 member_update.compute_ip = Set(compute_ip.clone());
                 member_update.updated_at = Set(Utc::now());
                 member_update.update(self.db.as_ref()).await?;
 
                 // Register the per-member A record (ADR-011, Tier 2).
                 //
-                // Prefer the overlay IP when the container is on
-                // `temps0` — that points other containers straight at
-                // each other on the multi-host bridge. If the overlay
-                // isn't attached (single-host setups, or the monitor on
-                // a control plane that's not in the allocator), fall
-                // back to the underlay address + the published host
-                // port so dialing through Docker's port forward still
-                // works. This is what makes `MONITOR_URI=<fqdn>:<port>`
-                // resolve from inside any container.
-                let (record_ip, record_port) = match compute_ip.clone() {
-                    Some(ip) => (Some(ip), member_port as i32),
-                    None => match self
-                        .resolve_member_underlay(spec.node_id, host_port, member_port)
-                        .await
-                    {
-                        Some((ip, port)) => (Some(ip), port),
-                        None => (None, member_port as i32),
-                    },
-                };
+                // Local members are directly reachable from application
+                // containers on `temps-app-network`; their loopback-only host
+                // port is intentionally *not* reachable through the node's
+                // underlay address. Remote members still prefer their overlay
+                // IP and otherwise use the underlay/host-port fallback.
+                let (record_ip, record_port) = self
+                    .resolve_member_dns_endpoint(
+                        spec.node_id,
+                        compute_ip.as_deref(),
+                        &result.container_name,
+                        host_port,
+                        member_port,
+                    )
+                    .await
+                    .map(|(ip, port)| (Some(ip), port))
+                    .unwrap_or((None, member_port as i32));
 
                 if let Some(ip) = record_ip {
                     let draft = temps_dns::EndpointDraft {
@@ -5483,7 +5692,7 @@ echo "[restore] Pre-seed complete"
             debug!(service_id, "role reconciler already running");
             return;
         }
-        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown = crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown::new();
         shutdowns.insert(service_id, shutdown.clone());
         drop(shutdowns);
 
@@ -5562,10 +5771,20 @@ echo "[restore] Pre-seed complete"
                 }
 
                 // Backoff respects shutdown so a delete_service called
-                // mid-backoff doesn't have to wait the full 30s.
+                // mid-backoff doesn't have to wait the full 30s. Also
+                // re-checks `is_stopped()` after waking in case the signal
+                // landed just before this select armed (same race the loop
+                // in `run()` guards against — see `ReconcilerShutdown`).
+                if shutdown.is_stopped() {
+                    debug!(
+                        service_id,
+                        "role reconciler shutdown during restart backoff"
+                    );
+                    return;
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(RESTART_BACKOFF) => {}
-                    _ = shutdown.notified() => {
+                    _ = shutdown.wait() => {
                         debug!(service_id, "role reconciler shutdown during restart backoff");
                         return;
                     }
@@ -5581,7 +5800,7 @@ echo "[restore] Pre-seed complete"
     async fn stop_role_reconciler(&self, service_id: i32) {
         let mut shutdowns = self.reconciler_shutdowns.lock().await;
         if let Some(notifier) = shutdowns.remove(&service_id) {
-            notifier.notify_waiters();
+            notifier.signal();
             debug!(service_id, "role reconciler shutdown signalled");
         }
     }
@@ -5712,16 +5931,16 @@ echo "[restore] Pre-seed complete"
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
 
-        // Spawn background task to re-initialize (same pattern as create)
+        // Spawn background task to re-initialize (same pattern as create).
+        // `self.clone()`, not `ExternalServiceManager::new(...)` -- see the
+        // struct's doc comment: a fresh instance would allocate its own empty
+        // `reconciler_shutdowns` map, orphaning any reconciler this retry
+        // spawns from `stop_role_reconciler` on the real, shared manager.
+        let manager = self.clone();
         let db = self.db.clone();
-        let docker = self.docker.clone();
-        let encryption_service = self.encryption_service.clone();
-        let dns_registry = self.dns_registry.clone();
         let members = effective_members;
 
         tokio::spawn(async move {
-            let manager =
-                ExternalServiceManager::new(db.clone(), encryption_service, docker, dns_registry);
             let result = manager.initialize_cluster(service_id, &members).await;
 
             match result {
@@ -5988,30 +6207,46 @@ echo "[restore] Pre-seed complete"
                 reason: "Cannot add member: cluster has no monitor".to_string(),
             })?;
 
-        // Prefer the monitor's FQDN — every container we provision now
-        // gets the per-host Hickory resolver wired into resolv.conf
-        // (`HostConfig.dns`), so `postgres-<svc>-0.<svc>.temps.local`
-        // resolves natively from inside the new container.
+        // What address should the member being added dial to reach the
+        // monitor? NOT simply "whatever's in `monitor.hostname`": that
+        // field only reflects the topology `has_remote_members` decided at
+        // the *cluster's* creation time (see `resolve_member_hostname`) and
+        // is never retroactively recomputed — for a cluster created
+        // all-local it stays the monitor's plain Docker container name
+        // forever, even after this exact call adds the cluster's first
+        // remote member. A plain container name only resolves via Docker's
+        // embedded DNS on the monitor's own host, so trusting it blindly
+        // here would hand a cross-host member an address it can never
+        // reach.
         //
-        // Fallbacks (in order) keep older clusters working:
-        //   1. monitor.hostname (FQDN, set by the lifecycle hook)
-        //   2. monitor's node private_address (underlay IP, when remote)
-        //   3. control plane's local IP (when monitor is on this host)
-        //   4. monitor container name (single-host bridge DNS resolves it)
-        let monitor_hostname: String = if let Some(h) = monitor.hostname.as_deref() {
-            h.to_string()
-        } else if let Some(nid) = monitor.node_id {
-            let node = nodes::Entity::find_by_id(nid)
-                .one(self.db.as_ref())
-                .await?
-                .ok_or(ExternalServiceError::InternalError {
-                    reason: format!("Monitor's node {} not found", nid),
-                })?;
-            node.private_address.clone()
-        } else {
-            Self::get_local_private_ip()
-                .unwrap_or_else(|_| format!("postgres-{}-monitor", service.name))
-        };
+        // Derive reachability from the actual node topology of *this* add
+        // instead — it can't go stale the way a persisted string can:
+        //   - monitor is on a remote node: always need its real underlay
+        //     address, regardless of where the new member lands.
+        //   - monitor is local but the new member is remote: the new
+        //     member needs this control-plane host's private IP, not the
+        //     monitor's container name (unreachable from another host).
+        //   - both local: same Docker host, so whatever's already
+        //     persisted (container name, or FQDN if the cluster happens to
+        //     be DNS-enabled) resolves natively.
+        let monitor_hostname: String =
+            match Self::monitor_reachability_for_add(monitor.node_id, node_id) {
+                MonitorReachability::MonitorNode(nid) => {
+                    let node = nodes::Entity::find_by_id(nid)
+                        .one(self.db.as_ref())
+                        .await?
+                        .ok_or(ExternalServiceError::InternalError {
+                            reason: format!("Monitor's node {} not found", nid),
+                        })?;
+                    node.private_address.clone()
+                }
+                MonitorReachability::LocalControlPlane => Self::get_local_private_ip()
+                    .unwrap_or_else(|_| format!("postgres-{}-monitor", service.name)),
+                MonitorReachability::SameHost => monitor
+                    .hostname
+                    .clone()
+                    .unwrap_or_else(|| format!("postgres-{}-monitor", service.name)),
+            };
         let monitor_port = monitor
             .port
             .ok_or(ExternalServiceError::InitializationFailed {
@@ -6243,21 +6478,19 @@ echo "[restore] Pre-seed complete"
             return;
         }
 
-        // Register Tier-2 DNS A record. Prefer the overlay IP; fall
-        // back to (node_underlay, host_port) so the FQDN still works
-        // when the overlay isn't attached. Best-effort: a failed
-        // registration logs loudly but doesn't mark the member as
-        // failed — the role reconciler will try again on its next tick.
-        let (record_ip, record_port) = match compute_ip.clone() {
-            Some(ip) => (Some(ip), plan.member_port as i32),
-            None => match self
-                .resolve_member_underlay(plan.spec.node_id, host_port, plan.member_port)
-                .await
-            {
-                Some((ip, port)) => (Some(ip), port),
-                None => (None, plan.member_port as i32),
-            },
-        };
+        // Register Tier-2 DNS A record using the same topology-aware
+        // selection as initial cluster creation.
+        let (record_ip, record_port) = self
+            .resolve_member_dns_endpoint(
+                plan.spec.node_id,
+                compute_ip.as_deref(),
+                &plan.container_name,
+                host_port,
+                plan.member_port,
+            )
+            .await
+            .map(|(ip, port)| (Some(ip), port))
+            .unwrap_or((None, plan.member_port as i32));
         if let Some(ip) = record_ip {
             let draft = temps_dns::EndpointDraft {
                 fqdn: plan.member_fqdn.clone(),
@@ -7000,6 +7233,88 @@ echo "[restore] Pre-seed complete"
         Some((ip, port))
     }
 
+    /// Resolve the address published for a service-member FQDN.
+    ///
+    /// Local managed-service ports bind to `127.0.0.1` for security, so the
+    /// control-plane underlay address plus host port is not reachable from an
+    /// application container. Local members instead publish their container
+    /// address on the shared application network and the container port.
+    /// Remote members retain the overlay-first, underlay-fallback behavior.
+    async fn resolve_member_dns_endpoint(
+        &self,
+        node_id: Option<i32>,
+        overlay_ip: Option<&str>,
+        container_name: &str,
+        host_port: Option<i32>,
+        container_port: u16,
+    ) -> Option<(String, i32)> {
+        if let Some(endpoint) =
+            select_member_dns_endpoint(node_id, overlay_ip, None, None, container_port)
+        {
+            return Some(endpoint);
+        }
+
+        if node_id.is_none() {
+            let local_network_ip = self
+                .lookup_container_network_ip(container_name, &temps_core::NETWORK_NAME)
+                .await;
+            if let Some(endpoint) = select_member_dns_endpoint(
+                node_id,
+                None,
+                local_network_ip.as_deref(),
+                None,
+                container_port,
+            ) {
+                return Some(endpoint);
+            }
+        }
+
+        if node_id.is_some() {
+            let underlay = self
+                .resolve_member_underlay(node_id, host_port, container_port)
+                .await;
+            return select_member_dns_endpoint(node_id, None, None, underlay, container_port);
+        }
+
+        // Publishing the control plane's underlay address here would be
+        // actively misleading: local managed-service ports bind only to
+        // 127.0.0.1, so application containers cannot reach that address.
+        None
+    }
+
+    async fn lookup_container_network_ip(
+        &self,
+        container_name: &str,
+        network_name: &str,
+    ) -> Option<String> {
+        use bollard::query_parameters::InspectContainerOptions;
+
+        match self
+            .docker
+            .inspect_container(container_name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => info
+                .network_settings
+                .as_ref()
+                .and_then(|settings| settings.networks.as_ref())
+                .and_then(|networks| networks.get(network_name))
+                .and_then(|endpoint| endpoint.ip_address.as_deref())
+                .map(str::trim)
+                .filter(|ip| !ip.is_empty())
+                .map(str::to_string),
+            Err(error) => {
+                warn!(
+                    container = container_name,
+                    network = network_name,
+                    error = %error,
+                    "Failed to inspect local cluster member network address"
+                );
+                None
+            }
+        }
+    }
+
     /// Look up the gateway IP of the multi-host overlay docker network
     /// (`temps0`). The per-host Hickory resolver listens there on :53 —
     /// every container we create gets it as `--dns` so they can resolve
@@ -7113,15 +7428,7 @@ echo "[restore] Pre-seed complete"
         // Port bindings: map the container port to the same host port.
         // Each cluster member uses a unique port assigned by the manager so
         // there are no conflicts even when multiple members run on the same host.
-        let mut port_bindings = std::collections::HashMap::new();
-        let container_port_key = format!("{}/tcp", params.container_port);
-        port_bindings.insert(
-            container_port_key.clone(),
-            Some(vec![PortBinding {
-                host_ip: Some("0.0.0.0".to_string()),
-                host_port: Some(params.container_port.to_string()),
-            }]),
-        );
+        let (exposed_ports, port_bindings) = cluster_member_port_config(params.container_port);
 
         // Wire the per-host Hickory resolver into the container's
         // resolv.conf so it can resolve `*.temps.local` natively
@@ -7151,6 +7458,14 @@ echo "[restore] Pre-seed complete"
             image: Some(params.image.clone()),
             env: Some(env),
             cmd: params.command.clone(),
+            // The postgres-ha image only declares 5432/tcp, while HA members
+            // listen on dynamically assigned ports (for example 6040-6042).
+            // Docker's create API requires the dynamic port in ExposedPorts as
+            // well as HostConfig.PortBindings. Docker Desktop happens to
+            // tolerate the binding alone, but Linux engines may leave it
+            // unpublished, producing a healthy container behind a refused
+            // localhost socket.
+            exposed_ports: Some(exposed_ports),
             host_config: Some(cluster_host_config),
             labels: Some(HashMap::from([
                 ("sh.temps.managed".to_string(), "true".to_string()),
@@ -7938,6 +8253,20 @@ echo "[restore] Pre-seed complete"
             });
         }
 
+        // Resolve the environment inside the authorized project before
+        // decrypting service configuration or provisioning any tenant
+        // resource. An environment ID is not globally sufficient proof of
+        // project ownership, and soft-deleted environments are not targets.
+        let environment = temps_entities::environments::Entity::find_by_id(environment_id)
+            .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ExternalServiceError::EnvironmentNotFound {
+                environment_id,
+                project_id,
+            })?;
+
         let parameters = self.get_service_parameters(service_id_val).await?;
 
         // Compute the per-tenant database name once — both paths use
@@ -7948,12 +8277,6 @@ echo "[restore] Pre-seed complete"
             .one(self.db.as_ref())
             .await?
             .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?;
-        let environment = temps_entities::environments::Entity::find_by_id(environment_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| ExternalServiceError::InternalError {
-                reason: format!("Environment {} not found", environment_id),
-            })?;
         let resource_name = crate::externalsvc::postgres::PostgresService::normalize_database_name(
             &format!("{}_{}", project.slug, environment.slug),
         );
@@ -9963,6 +10286,20 @@ echo "[restore] Pre-seed complete"
     }
 }
 
+/// Build the two matching pieces Docker requires to publish a cluster
+/// member's dynamically assigned port.
+fn cluster_member_port_config(
+    container_port: u16,
+) -> (
+    Vec<String>,
+    HashMap<String, Option<Vec<bollard::models::PortBinding>>>,
+) {
+    let container_port_key = format!("{container_port}/tcp");
+    let port_bindings =
+        crate::utils::local_port_binding(&container_port_key, &container_port.to_string());
+    (vec![container_port_key], port_bindings)
+}
+
 /// Map our `ServiceResourceLimits` onto a bollard `ContainerUpdateBody`.
 ///
 /// CRITICAL: Docker uses `0` (not `null`) as the special value for
@@ -10344,6 +10681,242 @@ mod tests {
         assert!(trusted_primary_member(&duplicates, "cluster-node-5").is_none());
     }
 
+    fn cluster_member_health(nodename: &str, reported_state: &str) -> ClusterMemberHealth {
+        ClusterMemberHealth {
+            nodename: nodename.to_string(),
+            nodehost: "10.0.0.2".to_string(),
+            nodeport: 5432,
+            reported_state: reported_state.to_string(),
+            goal_state: reported_state.to_string(),
+            health: 1,
+            seconds_since_report: 1,
+            candidate_priority: 100,
+            replication_quorum: true,
+            sync_state: None,
+            replay_lag_ms: None,
+        }
+    }
+
+    /// Regression for deployment environment resolution and cluster backups:
+    /// both paths used to hand-match only `primary | single`, so an application
+    /// deployment could fail with "no running primary data node" during the
+    /// normal writable `wait_primary` state even though cluster health passed.
+    #[test]
+    fn writable_primary_live_state_includes_wait_primary() {
+        for state in ["primary", "single", "wait_primary"] {
+            assert!(
+                live_state_is_writable_primary(Some(state)),
+                "{state} must be accepted as a writable primary"
+            );
+        }
+
+        for state in ["secondary", "catchingup", "demoted", "unknown"] {
+            assert!(
+                !live_state_is_writable_primary(Some(state)),
+                "{state} must not be accepted as a writable primary"
+            );
+        }
+        assert!(!live_state_is_writable_primary(None));
+    }
+
+    /// A dead node keeps its last reported `primary` state in the monitor.
+    /// Selection must ignore that stale row, choose the healthy promoted
+    /// `wait_primary`, and fail closed if two live writers are ever reported.
+    #[test]
+    fn healthy_primary_selection_ignores_stale_rows_and_rejects_ambiguity() {
+        let mut unhealthy_primary = cluster_member_health("orders-1", "primary");
+        unhealthy_primary.health = 0;
+        unhealthy_primary.seconds_since_report = 1;
+        let promoted = cluster_member_health("orders-2", "wait_primary");
+        let unhealthy_report = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members: vec![unhealthy_primary, promoted.clone()],
+        };
+        assert_eq!(
+            healthy_writable_primary_nodename(&unhealthy_report),
+            Some("orders-2")
+        );
+
+        let mut stale_primary = cluster_member_health("orders-1", "primary");
+        stale_primary.health = 1;
+        stale_primary.seconds_since_report = 30;
+        let stale_report = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members: vec![stale_primary, promoted],
+        };
+        assert_eq!(
+            healthy_writable_primary_nodename(&stale_report),
+            Some("orders-2")
+        );
+
+        let ambiguous = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members: vec![
+                cluster_member_health("orders-1", "primary"),
+                cluster_member_health("orders-2", "wait_primary"),
+            ],
+        };
+        assert!(healthy_writable_primary_nodename(&ambiguous).is_none());
+
+        let unreachable = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 0,
+            monitor_error: Some("monitor unavailable".to_string()),
+            members: vec![cluster_member_health("orders-2", "wait_primary")],
+        };
+        assert!(healthy_writable_primary_nodename(&unreachable).is_none());
+    }
+
+    /// Regression for `remove_cluster_member`'s delete-protection gate
+    /// (routed through `member_is_live_primary` -> `primary_member_from_health`):
+    /// a 2-node cluster's survivor lands in `wait_primary` after failover
+    /// (no third node left to attach as a standby) and stays there
+    /// indefinitely -- it is genuinely the writable primary, not a
+    /// transient state. Live evidence already proved a DELETE against a
+    /// `wait_primary` member returns 400; this pins the same behaviour at
+    /// the unit level so a future refactor back to a hand-rolled
+    /// `"primary" | "single"` match (which previously let an operator
+    /// delete the cluster's only writable node) fails the fast suite
+    /// immediately instead of only being caught live.
+    #[test]
+    fn primary_member_from_health_blocks_deletion_of_a_wait_primary_member() {
+        let health = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members: vec![cluster_member_health("orders-2", "wait_primary")],
+        };
+
+        assert!(
+            ExternalServiceManager::primary_member_from_health(&health, "orders-2"),
+            "a member reported as wait_primary must be treated as the live primary"
+        );
+
+        // Sanity: an unambiguous non-primary state must not be blocked,
+        // and a name absent from the health report must never match.
+        let secondary_health = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members: vec![cluster_member_health("orders-3", "secondary")],
+        };
+        assert!(!ExternalServiceManager::primary_member_from_health(
+            &secondary_health,
+            "orders-3"
+        ));
+        assert!(!ExternalServiceManager::primary_member_from_health(
+            &health,
+            "orders-does-not-exist"
+        ));
+    }
+
+    /// Regression for the FQDN-vs-container-name fix that determines every
+    /// local cluster's injected `POSTGRES_URL`: a cluster with any remote
+    /// member must use the `*.temps.local` FQDN (container names can't
+    /// cross a Docker-host boundary), while an all-local cluster must keep
+    /// the plain container name (the FQDN only resolves once the
+    /// experimental, off-by-default `cluster_dns.enabled` resolver wiring
+    /// is on, which broke every single-host cluster by default before this
+    /// fix).
+    #[test]
+    fn resolve_member_hostname_prefers_fqdn_only_when_cluster_spans_hosts() {
+        assert_eq!(
+            ExternalServiceManager::resolve_member_hostname(
+                true,
+                "orders-1.orders.temps.local",
+                "orders-postgres-1",
+            ),
+            "orders-1.orders.temps.local",
+            "a cluster with any remote member must use the FQDN"
+        );
+        assert_eq!(
+            ExternalServiceManager::resolve_member_hostname(
+                false,
+                "orders-1.orders.temps.local",
+                "orders-postgres-1",
+            ),
+            "orders-postgres-1",
+            "an all-local cluster must keep the plain container name"
+        );
+    }
+
+    /// `add_cluster_member`'s monitor-reachability decision must be driven
+    /// by the actual topology of *this* add, not by a persisted string
+    /// (`monitor.hostname`) that only reflects the cluster's topology at
+    /// *creation* time and is never retroactively recomputed. In
+    /// particular: adding the cluster's first-ever remote member to a
+    /// previously all-local cluster must not hand that new member the
+    /// monitor's plain Docker container name (unreachable cross-host).
+    #[test]
+    fn monitor_reachability_for_add_derives_from_actual_add_topology() {
+        assert_eq!(
+            ExternalServiceManager::monitor_reachability_for_add(None, None),
+            MonitorReachability::SameHost,
+            "monitor and new member both local -> same Docker host"
+        );
+        assert_eq!(
+            ExternalServiceManager::monitor_reachability_for_add(None, Some(7)),
+            MonitorReachability::LocalControlPlane,
+            "monitor local but the member being added is remote -> needs \
+             the control plane's own private IP, not the monitor's \
+             container name"
+        );
+        assert_eq!(
+            ExternalServiceManager::monitor_reachability_for_add(Some(3), None),
+            MonitorReachability::MonitorNode(3),
+            "monitor itself is remote -> always its node's private address"
+        );
+        assert_eq!(
+            ExternalServiceManager::monitor_reachability_for_add(Some(3), Some(7)),
+            MonitorReachability::MonitorNode(3),
+            "monitor remote and new member remote (possibly different \
+             nodes) -> still the monitor's own node address"
+        );
+    }
+
+    /// Regression for the `ExternalServiceManager::Clone` fix: background
+    /// tasks (create_service's cluster-init task and its retry path) must
+    /// `self.clone()` rather than `::new(...)` so a role reconciler they
+    /// spawn registers its shutdown handle where `stop_role_reconciler` --
+    /// called on the real, shared manager -- can actually find it.
+    /// `::new(...)` would silently allocate a fresh, empty
+    /// `reconciler_shutdowns` map, reintroducing the leak this PR fixed.
+    #[tokio::test]
+    async fn clone_shares_reconciler_shutdowns_with_original() {
+        let manager = mock_service_manager(vec![]);
+        let cloned = manager.clone();
+
+        let shutdown = crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown::new();
+        manager
+            .reconciler_shutdowns
+            .lock()
+            .await
+            .insert(99, shutdown.clone());
+
+        assert!(
+            cloned.reconciler_shutdowns.lock().await.contains_key(&99),
+            "Clone must share the same reconciler_shutdowns map as the \
+             original, not construct a fresh empty one -- otherwise \
+             stop_role_reconciler on the original can never see a handle \
+             registered through the clone, and the reconciler leaks forever"
+        );
+
+        // And the sharing is bidirectional / live, not a one-shot copy at
+        // clone time: something inserted through the clone must also be
+        // visible on the original.
+        cloned.reconciler_shutdowns.lock().await.insert(
+            100,
+            crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown::new(),
+        );
+        assert!(manager.reconciler_shutdowns.lock().await.contains_key(&100));
+    }
+
     #[tokio::test]
     async fn stored_member_endpoint_resolves_local_and_remote_members() {
         let remote_node = nodes::Model {
@@ -10379,7 +10952,7 @@ mod tests {
                 .stored_member_endpoint(41, &local)
                 .await
                 .expect("local persisted member should resolve"),
-            ("localhost".to_owned(), 5432)
+            (LOCAL_CLUSTER_HOST.to_owned(), 5432)
         );
 
         let mut remote = service_member_info(2, "cluster-node-2", "node", "running");
@@ -12192,6 +12765,46 @@ mod tests {
             ai_data_access: false,
             container_name: None,
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_credentials_reject_cross_project_environment_before_provisioning() {
+        let service = encrypted_service_model(
+            71,
+            serde_json::json!({
+                "username": "app",
+                "password": "secret",
+                "database": "postgres"
+            }),
+        );
+        let link = project_services::Model {
+            id: 9,
+            project_id: 10,
+            service_id: 71,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![service]])
+            .append_query_results([vec![link]])
+            // Environment 20 belongs to another project, so the combined
+            // id + project_id + deleted_at query returns no row.
+            .append_query_results([Vec::<temps_entities::environments::Model>::new()])
+            .into_connection();
+        let manager = mock_service_manager_with_db(Arc::new(db));
+
+        let error = manager
+            .get_runtime_env_vars(71, 10, 20)
+            .await
+            .expect_err("cross-project environment must be rejected");
+
+        assert!(matches!(
+            error,
+            ExternalServiceError::EnvironmentNotFound {
+                environment_id: 20,
+                project_id: 10
+            }
+        ));
     }
 
     #[tokio::test]
@@ -14236,5 +14849,66 @@ mod tests {
             "stopped member must be rejected: {}",
             msg
         );
+    }
+
+    #[test]
+    fn cluster_member_dynamic_port_is_exposed_and_bound_to_loopback() {
+        let (exposed_ports, bindings) = cluster_member_port_config(6040);
+
+        assert_eq!(exposed_ports, vec!["6040/tcp"]);
+        let binding = bindings
+            .get("6040/tcp")
+            .and_then(Option::as_ref)
+            .and_then(|entries| entries.first())
+            .expect("the exposed dynamic port must have a matching host binding");
+        assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(binding.host_port.as_deref(), Some("6040"));
+    }
+
+    #[test]
+    fn local_member_dns_uses_shared_network_ip_and_container_port() {
+        let endpoint = select_member_dns_endpoint(
+            None,
+            None,
+            Some("172.19.0.7"),
+            Some(("10.52.0.10".to_string(), 6011)),
+            5432,
+        );
+
+        assert_eq!(endpoint, Some(("172.19.0.7".to_string(), 5432)));
+    }
+
+    #[test]
+    fn local_member_dns_never_publishes_loopback_only_underlay_fallback() {
+        let endpoint = select_member_dns_endpoint(
+            None,
+            None,
+            None,
+            Some(("10.52.0.10".to_string(), 6011)),
+            5432,
+        );
+
+        assert_eq!(endpoint, None);
+    }
+
+    #[test]
+    fn remote_member_dns_preserves_overlay_then_underlay_behavior() {
+        let overlay = select_member_dns_endpoint(
+            Some(7),
+            Some("10.99.0.12"),
+            Some("172.19.0.7"),
+            Some(("10.52.0.11".to_string(), 6012)),
+            5432,
+        );
+        assert_eq!(overlay, Some(("10.99.0.12".to_string(), 5432)));
+
+        let underlay = select_member_dns_endpoint(
+            Some(7),
+            None,
+            Some("172.19.0.7"),
+            Some(("10.52.0.11".to_string(), 6012)),
+            5432,
+        );
+        assert_eq!(underlay, Some(("10.52.0.11".to_string(), 6012)));
     }
 }
