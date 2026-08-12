@@ -10150,6 +10150,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.11.0",
  "tar",
  "tempfile",
  "temps-agents-mcp-proxy",
@@ -12466,6 +12467,7 @@ dependencies = [
 name = "temps-sandbox"
 version = "0.1.0-beta.55"
 dependencies = [
+ "anyhow",
  "argon2",
  "async-stream",
  "async-trait",
@@ -13537,7 +13539,7 @@ dependencies = [
  "log",
  "rand 0.9.4",
  "sha1 0.10.6",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
