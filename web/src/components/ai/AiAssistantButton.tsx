@@ -4,9 +4,10 @@ import { Sparkles } from 'lucide-react'
 
 /**
  * Global top-bar entry point to the persistent AI assistant dock (ADR-023).
- * Always shown. When no provider is configured, the dock explains both setup
- * paths instead of hiding the feature: managed AI through Temps Cloud or a
- * self-hosted provider key.
+ * Always shown: gateway keys are only one possible runtime, and hiding this
+ * button also hid managed Cloud and host-authenticated Claude/Codex/OpenCode.
+ * When no provider is ready, the dock itself renders the setup state and direct
+ * settings link instead of making the feature undiscoverable.
  */
 export function AiAssistantButton() {
   const { open, close, isOpen } = useAiAssistant()

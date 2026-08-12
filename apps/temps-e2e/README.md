@@ -9,7 +9,7 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `git-deploy-scenario`, `otel-quota-scenario`, `deploy-lifecycle-scenario`,
 `db-ha-failover-scenario`, `pg-upgrade-scenario`, `redis-restore-scenario`,
 `mongodb-restore-scenario`, `s3-restore-scenario`, `mariadb-restore-scenario`,
-`env-vars-scenario`, `api-key-scenario`, `examples`) drive the real
+`env-vars-scenario`, `api-key-scenario`, `markdown`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -53,6 +53,50 @@ temps api-key \
   --name=e2e --role=admin --user-email=you@example.com --output-format=json
 ```
 
+## AI chat evals (Claude/Codex subscriptions)
+
+The Promptfoo suite exercises the real Temps chat HTTP/SSE boundary and runs
+the same read-only prompts through both `claude_cli` and `codex_cli`. It does
+not invoke either CLI directly and never reads, copies, or prints
+`~/.claude/*` or `~/.codex/auth.json`. Claude/Codex subscription authentication
+remains owned by the running Temps process, exactly as it is in the product.
+
+Prerequisites:
+
+- Start Temps with Claude Code and/or Codex already authenticated on that host.
+- Enable AI chat for a disposable project.
+- Mint a human-user API key with access to that project and the host-provider
+  permissions required by the selected harnesses. Codex host execution requires
+  a system administrator; the API still applies that user's project access.
+
+Run the local-only, non-destructive suite:
+
+```bash
+cd apps/temps-e2e
+export TEMPS_URL=http://localhost:3021
+export TEMPS_API_KEY=tk_...              # never put this in a tracked file
+export TEMPS_AI_EVAL_PROJECT_ID=1
+bun run ai:eval
+```
+
+The default cases only read accessible projects, managed-service inventory,
+and project environments. They do not enable write actions, approve proposals,
+or create infrastructure. Each provider/case gets an isolated temporary chat,
+which is archived after the result is collected. Set
+`TEMPS_AI_EVAL_KEEP_CONVERSATIONS=1` only when debugging a failed run.
+
+Optional model overrides are
+`TEMPS_AI_EVAL_CLAUDE_MODEL` / `TEMPS_AI_EVAL_CODEX_MODEL`; optional thinking
+overrides are `TEMPS_AI_EVAL_CLAUDE_THINKING` /
+`TEMPS_AI_EVAL_CODEX_THINKING`. When omitted, Temps uses the harness's current
+defaults. Promptfoo caching and telemetry are disabled by the package script,
+and its local result database is stored under the gitignored `.promptfoo/`
+directory. Do not use Promptfoo sharing/upload commands for these results.
+
+To intentionally evaluate a remote instance, it must use HTTPS and you must
+set `TEMPS_AI_EVAL_ALLOW_REMOTE=1`. This explicit gate prevents accidentally
+sending a Temps API key to an arbitrary URL.
+
 ## Commands
 
 ```bash
@@ -69,6 +113,13 @@ bun run src/index.ts scenario --image traefik/whoami:latest -n 2000 -c 50
 bun run src/index.ts scenario --with-db                          # also provision postgres
 bun run src/index.ts scenario --keep                            # leave resources up
 bun run src/index.ts scenario --json                            # machine-readable (CI)
+
+# Deploy a real app and verify Accept: text/markdown content negotiation
+# (Markdown for Agents) through the live proxy — not the crate's unit tests
+bun run src/index.ts markdown
+bun run src/index.ts markdown --image traefik/whoami:latest --port 80
+bun run src/index.ts markdown --keep                             # leave resources up
+bun run src/index.ts markdown --json                              # machine-readable (CI)
 
 # Build the repo's example projects (Go, Python, Node, …) and run the full
 # deploy/verify lifecycle for EACH — proves every example in examples/ actually
@@ -1638,6 +1689,30 @@ section up. Proving actual delivery end-to-end would need a real public receiver
 tunnel or hosted catcher) wired into the harness, which does not exist in
 this repo today. It was deliberately not added, and the SSRF guard was not
 weakened, for test convenience — the same call made for Slack above.
+
+### `markdown` steps
+
+1. create a project (`docker_image` source) and deploy a real HTML-serving image
+   (default `nginxinc/nginx-unprivileged:alpine` — plain `nginx:alpine` fails
+   under Temps's non-root container sandbox: it can't `chown` its cache dir)
+2. wait for the deployment, then probe HTTP until the app actually serves (not
+   the Temps console fallback)
+3. `Accept: text/markdown` -> asserts `Content-Type: text/markdown` AND a real
+   converted body — specifically that the body does **not** start with `<`,
+   which is the exact shape of the bug this guards: `response_filter` commits
+   `Content-Type: text/markdown` to the client before the body is converted
+   (Pingora sends headers before streaming the body), so a broken fallback path
+   (oversized body, conversion error) could leak raw, untouched HTML under that
+   already-sent header
+4. no `Accept` header -> stays `text/html` with an unconverted body
+5. `Accept: text/html,text/markdown;q=0.9` -> still converts (quality factors
+   on a `text/markdown` entry don't disable it)
+6. a 404 on the deployed app with `Accept: text/markdown` -> stays `text/html`
+   (the gate must cancel conversion for non-2xx responses)
+7. tear down the deployment and delete the project — even on failure, unless
+   `--keep`
+
+Exits non-zero if any step fails, so it's CI-gateable.
 
 ## Notes
 

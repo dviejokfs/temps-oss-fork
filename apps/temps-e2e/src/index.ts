@@ -34,6 +34,8 @@ import { mariadbRestoreScenarioCommand } from './commands/mariadb-restore-scenar
 import { envVarsScenarioCommand } from './commands/env-vars-scenario.ts'
 import { apiKeyScenarioCommand } from './commands/api-key-scenario.ts'
 import { multinodeJoinScenarioCommand } from './commands/multinode-join-scenario.ts'
+import { markdownCommand } from './commands/markdown.ts'
+import { aiChatPromptsCommand } from './commands/ai-chat-prompts.ts'
 
 const program = new Command()
 
@@ -68,6 +70,16 @@ program
       process.stdout.write(`OK — connected. ${data.total ?? 0} project(s) visible.\n`)
     }
   })
+
+program
+  .command('ai-chat-prompts')
+  .description(
+    'Print the provider-neutral AI chat acceptance prompts, expected tool actions, assertions, and cleanup steps',
+  )
+  .option('--category <category>', 'filter by read, service, linking, routing, domain, permissions, or runtime')
+  .option('--destructive-only', 'show only prompts that create or change infrastructure')
+  .option('--json', 'machine-readable prompt catalog')
+  .action(aiChatPromptsCommand)
 
 program
   .command('load')
@@ -509,6 +521,24 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await multinodeJoinScenarioCommand(opts)
+  })
+
+program
+  .command('markdown')
+  .description(
+    'Deploy a real app and verify Accept: text/markdown content negotiation (Markdown for Agents) through the live proxy',
+  )
+  .option(
+    '--image <ref>',
+    'public Docker image to deploy (must run as non-root; see README)',
+    'nginxinc/nginx-unprivileged:alpine',
+  )
+  .option('--port <port>', 'container port the image listens on', '80')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await markdownCommand({ ...opts, connection: connection() })
   })
 
 program.parseAsync().catch((err: unknown) => {

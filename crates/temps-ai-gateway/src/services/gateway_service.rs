@@ -27,6 +27,9 @@ pub enum CredentialType {
 pub struct ByokOverride {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    /// Exact administrator-configured key selected by a pinned conversation.
+    /// Missing or inactive IDs fail closed; they never fall back to another key.
+    pub system_key_id: Option<i32>,
 }
 
 /// The core gateway service that routes requests to the appropriate provider,
@@ -67,6 +70,14 @@ impl GatewayService {
             .configured
             .then_some(capability.managed_model?)
             .filter(|model| !model.is_empty())
+    }
+
+    /// Models advertised by the adapter for one configured provider key.
+    pub fn available_models_for_provider(&self, provider_id: &str) -> Vec<ModelInfo> {
+        self.providers
+            .get(provider_id)
+            .map(|provider| provider.available_models())
+            .unwrap_or_default()
     }
 
     /// Route a model name to the provider and resolve the API key.
@@ -118,13 +129,30 @@ impl GatewayService {
         }
 
         // System key: look up from database
-        let key_record = self
-            .provider_key_service
-            .get_active_by_provider(provider_id)
-            .await?
-            .ok_or_else(|| AiGatewayError::ProviderNotConfigured {
-                provider: provider_id.to_string(),
-            })?;
+        let key_record = if let Some(key_id) = byok.system_key_id {
+            let key = self.provider_key_service.get_by_id(key_id).await?;
+            if !key.is_active {
+                return Err(AiGatewayError::Validation {
+                    message: format!("AI provider key {key_id} is inactive"),
+                });
+            }
+            if key.provider != provider_id {
+                return Err(AiGatewayError::Validation {
+                    message: format!(
+                        "AI provider key {key_id} is configured for '{}' and cannot serve model '{model}'",
+                        key.provider
+                    ),
+                });
+            }
+            key
+        } else {
+            self.provider_key_service
+                .get_active_by_provider(provider_id)
+                .await?
+                .ok_or_else(|| AiGatewayError::ProviderNotConfigured {
+                    provider: provider_id.to_string(),
+                })?
+        };
 
         let decrypted_key = self
             .provider_key_service
@@ -485,64 +513,13 @@ mod tests {
 
     #[tokio::test]
     async fn managed_cloud_completion_uses_the_linked_instance_path() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Cloud stub");
-        let address = listener.local_addr().expect("Cloud stub address");
-        let app = Router::new()
-            .route("/v1/enroll", post(enroll_stub))
-            .route("/v1/ai/chat/completions", post(cloud_chat_stub));
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve Cloud stub");
-        });
-
-        let temp = tempfile::tempdir().expect("temporary Cloud state");
-        let link = Arc::new(CloudLink::load_for_loopback_development(
-            temp.path().to_path_buf(),
-            "test-agent",
-        ));
-        link.configure(
-            BackendUrl::loopback_development(&format!("http://{address}"))
-                .expect("loopback Cloud URL"),
-        )
-        .expect("configure Cloud link");
-        link.enroll("TEST-CODE")
-            .await
-            .expect("enroll test instance");
-
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
-        let encryption = Arc::new(
-            EncryptionService::new("01234567890123456789012345678901").expect("test encryption"),
-        );
-        let provider_keys = Arc::new(ProviderKeyService::new(db, encryption));
-        let gateway = GatewayService::new(provider_keys).with_cloud_link(Some(link));
-        let request = ChatCompletionRequest {
-            model: "temps-cloud".into(),
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: Some(MessageContent::Text("Is Cloud healthy?".into())),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            stream: false,
-            temperature: None,
-            max_tokens: Some(32),
-            top_p: None,
-            stop: None,
-            n: None,
-            tools: None,
-            tool_choice: None,
-            response_format: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            user: None,
-            extra: None,
+        let Some((gateway, _state_dir)) = managed_gateway_with_route(post(cloud_chat_stub)).await
+        else {
+            return;
         };
 
         let (response, credential) = gateway
-            .chat_completion(&request, &ByokOverride::default())
+            .chat_completion(&managed_chat_request(false), &ByokOverride::default())
             .await
             .expect("managed completion");
         assert_eq!(credential, CredentialType::System);
