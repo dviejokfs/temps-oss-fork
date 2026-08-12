@@ -39,10 +39,12 @@ import {
   validateDropEnvironmentVariables,
   type DropEnvironmentVariable,
 } from '@/lib/drop-environment-variables'
-import { prepareAndInspectDrop } from '@/lib/drop-preset-detection'
+import {
+  prepareAndInspectDrop,
+  presetConfigForDropCandidate,
+} from '@/lib/drop-preset-detection'
 import { ensureDropProjectName } from '@/lib/drop-project-name'
 import { cn } from '@/lib/utils'
-import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import {
   ArrowRight,
   Check,
@@ -89,7 +91,6 @@ function stageLabel(
 
 export function Drop() {
   const navigate = useNavigate()
-  const reduceMotion = useReducedMotion()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [files, setFiles] = useState<DropFile[]>([])
   const [projectName, setProjectName] = useState('')
@@ -135,9 +136,6 @@ export function Drop() {
   const isBusy = !['idle', 'done'].includes(stage)
   const selectedCandidate =
     inspection?.candidates[Number(selectedCandidateIndex)]
-  const transition = reduceMotion
-    ? { duration: 0 }
-    : { duration: 0.32, ease: [0.22, 1, 0.36, 1] as const }
 
   const inspectArchive = async (archive: File, signal?: AbortSignal) => {
     const response = await inspectDropArchive({
@@ -289,6 +287,7 @@ export function Drop() {
           source_type: candidate.isStatic ? 'static_files' : 'uploaded_source',
           project_type: candidate.isStatic ? 'static' : 'server',
           automatic_deploy: false,
+          preset_config: presetConfigForDropCandidate(candidate),
           storage_service_ids: [],
           environment_variables:
             serializeDropEnvironmentVariables(environmentVariables),
@@ -434,31 +433,18 @@ export function Drop() {
       </header>
 
       <div className="grid gap-6">
-        <AnimatePresence mode="wait" initial={false}>
+        <>
           {files.length === 0 ? (
-            <motion.div
-              key="drop-target"
-              initial={{ opacity: 0, scale: reduceMotion ? 1 : 0.985 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: reduceMotion ? 1 : 0.985 }}
-              transition={transition}
-            >
+            <div className="animate-in fade-in-0 zoom-in-95 motion-reduce:animate-none">
               <DropZone
                 files={files}
                 onSelect={setSelection}
                 onError={setError}
                 disabled={isBusy}
               />
-            </motion.div>
+            </div>
           ) : (
-            <motion.aside
-              key="configuration"
-              initial={{ opacity: 0, x: reduceMotion ? 0 : 18 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: reduceMotion ? 0 : -12 }}
-              transition={transition}
-              className="relative flex min-h-[28rem] flex-col rounded-[2rem] border bg-card p-6 shadow-sm sm:p-7"
-            >
+            <aside className="relative flex min-h-[28rem] animate-in flex-col rounded-[2rem] border bg-card p-6 shadow-sm fade-in-0 motion-reduce:animate-none sm:p-7">
               <button
                 type="button"
                 className="absolute right-5 top-5 z-10 rounded-full border bg-background p-2 text-muted-foreground transition-colors hover:text-foreground"
@@ -623,9 +609,9 @@ export function Drop() {
               <p className="mt-3 text-center text-xs text-muted-foreground">
                 Failed setup is rolled back automatically.
               </p>
-            </motion.aside>
+            </aside>
           )}
-        </AnimatePresence>
+        </>
       </div>
     </PageContainer>
   )

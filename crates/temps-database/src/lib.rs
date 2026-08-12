@@ -199,7 +199,7 @@ mod tests {
         let pending_after_down = get_pending_migration_names(connection.as_ref()).await?;
         assert_eq!(
             pending_after_down.last().map(String::as_str),
-            Some("m20260806_000001_index_permission_denied_retention")
+            Some("m20260811_000001_create_renewal_attempts")
         );
         Migrator::up(connection.as_ref(), Some(1)).await?;
         let index_after_round_trip = connection

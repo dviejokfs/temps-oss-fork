@@ -9,7 +9,7 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `git-deploy-scenario`, `otel-quota-scenario`, `deploy-lifecycle-scenario`,
 `db-ha-failover-scenario`, `pg-upgrade-scenario`, `redis-restore-scenario`,
 `mongodb-restore-scenario`, `s3-restore-scenario`, `mariadb-restore-scenario`,
-`env-vars-scenario`, `api-key-scenario`, `examples`) drive the real
+`env-vars-scenario`, `api-key-scenario`, `markdown`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -69,6 +69,13 @@ bun run src/index.ts scenario --image traefik/whoami:latest -n 2000 -c 50
 bun run src/index.ts scenario --with-db                          # also provision postgres
 bun run src/index.ts scenario --keep                            # leave resources up
 bun run src/index.ts scenario --json                            # machine-readable (CI)
+
+# Deploy a real app and verify Accept: text/markdown content negotiation
+# (Markdown for Agents) through the live proxy — not the crate's unit tests
+bun run src/index.ts markdown
+bun run src/index.ts markdown --image traefik/whoami:latest --port 80
+bun run src/index.ts markdown --keep                             # leave resources up
+bun run src/index.ts markdown --json                              # machine-readable (CI)
 
 # Build the repo's example projects (Go, Python, Node, …) and run the full
 # deploy/verify lifecycle for EACH — proves every example in examples/ actually
@@ -1247,15 +1254,24 @@ tears the whole thing down at the end. It does NOT accept `--url`/
     control-plane's proxy (`localhost:18180`) with the app's `Host` header
     and assert the actual `traefik/whoami` response body, not just a
     healthy status field.
-11. drain the worker (`POST /internal/nodes/{id}/drain`), poll
+11. deploy `nginxinc/nginx-unprivileged:alpine` as a second worker-pinned
+    application, then `docker exec` into it and `wget`
+    `http://production.<project>.temps.local`. The response must be the real
+    `whoami` body, proving app-to-app DNS from inside an application container.
+12. provision a real 1-monitor + 2-data-node Postgres HA service, link it to a
+    control-plane probe application, and replace only the injected DSN address
+    with the service member's published `.temps.local` FQDN. The probe must
+    report that DNS host and complete a real INSERT + SELECT. This catches DNS
+    records that resolve but advertise an unreachable IP/port pair.
+13. drain the worker (`POST /internal/nodes/{id}/drain`), poll
     `GET /internal/nodes/{id}/drain` until `drain_complete`, then re-run the
     same `docker ps` side-channel check on both containers to confirm the
     container migrated off the worker. In this 2-node cluster it has
     nowhere to go but the control plane, so this step also implicitly
     re-tests the `Local` scheduling fallback path.
-12. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
+14. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
     gone from `GET /internal/nodes`.
-13. teardown (in a `finally`, same discipline as every other scenario):
+15. teardown (in a `finally`, same discipline as every other scenario):
     `docker compose down` (no `-v`, so the cargo-registry/cargo-git/
     workspace-target cache volumes survive for a near-instant re-run), then
     explicitly `docker volume rm` the identity/state volumes (postgres
@@ -1629,6 +1645,30 @@ section up. Proving actual delivery end-to-end would need a real public receiver
 tunnel or hosted catcher) wired into the harness, which does not exist in
 this repo today. It was deliberately not added, and the SSRF guard was not
 weakened, for test convenience — the same call made for Slack above.
+
+### `markdown` steps
+
+1. create a project (`docker_image` source) and deploy a real HTML-serving image
+   (default `nginxinc/nginx-unprivileged:alpine` — plain `nginx:alpine` fails
+   under Temps's non-root container sandbox: it can't `chown` its cache dir)
+2. wait for the deployment, then probe HTTP until the app actually serves (not
+   the Temps console fallback)
+3. `Accept: text/markdown` -> asserts `Content-Type: text/markdown` AND a real
+   converted body — specifically that the body does **not** start with `<`,
+   which is the exact shape of the bug this guards: `response_filter` commits
+   `Content-Type: text/markdown` to the client before the body is converted
+   (Pingora sends headers before streaming the body), so a broken fallback path
+   (oversized body, conversion error) could leak raw, untouched HTML under that
+   already-sent header
+4. no `Accept` header -> stays `text/html` with an unconverted body
+5. `Accept: text/html,text/markdown;q=0.9` -> still converts (quality factors
+   on a `text/markdown` entry don't disable it)
+6. a 404 on the deployed app with `Accept: text/markdown` -> stays `text/html`
+   (the gate must cancel conversion for non-2xx responses)
+7. tear down the deployment and delete the project — even on failure, unless
+   `--keep`
+
+Exits non-zero if any step fails, so it's CI-gateable.
 
 ## Notes
 

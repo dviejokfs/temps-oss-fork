@@ -34,6 +34,7 @@ import { mariadbRestoreScenarioCommand } from './commands/mariadb-restore-scenar
 import { envVarsScenarioCommand } from './commands/env-vars-scenario.ts'
 import { apiKeyScenarioCommand } from './commands/api-key-scenario.ts'
 import { multinodeJoinScenarioCommand } from './commands/multinode-join-scenario.ts'
+import { markdownCommand } from './commands/markdown.ts'
 
 const program = new Command()
 
@@ -498,7 +499,8 @@ program
       '(tools/e2e-multinode-cluster/, not the shared instance -- no --url/--api-key), waits for a real ' +
       'worker to register via POST /internal/nodes/register, pins a deployment to it via target_nodes, ' +
       'proves the container actually landed on the worker (not the control plane) via a docker-exec side ' +
-      'channel, drains the worker, and removes it from the cluster -- the first e2e coverage this feature ' +
+      'channel, proves app-to-app and managed-Postgres *.temps.local DNS from deployed containers, drains ' +
+      'the worker, and removes it from the cluster -- the first e2e coverage this feature ' +
       'has ever had. First run compiles the temps binary from source TWICE (once per node) inside Docker, ' +
       'so budget 15-20+ minutes; subsequent runs are fast (cargo/target caches persist across runs).',
   )
@@ -508,6 +510,24 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await multinodeJoinScenarioCommand(opts)
+  })
+
+program
+  .command('markdown')
+  .description(
+    'Deploy a real app and verify Accept: text/markdown content negotiation (Markdown for Agents) through the live proxy',
+  )
+  .option(
+    '--image <ref>',
+    'public Docker image to deploy (must run as non-root; see README)',
+    'nginxinc/nginx-unprivileged:alpine',
+  )
+  .option('--port <port>', 'container port the image listens on', '80')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await markdownCommand({ ...opts, connection: connection() })
   })
 
 program.parseAsync().catch((err: unknown) => {
