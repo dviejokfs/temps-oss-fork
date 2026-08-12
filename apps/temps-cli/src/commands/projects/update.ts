@@ -378,6 +378,9 @@ export async function updateConfigAction(
     cpuLimit?: string
     memoryLimit?: string
     autoDeploy?: boolean
+    publicReadinessTimeout?: string
+    enablePublicReadinessCheck?: boolean
+    disablePublicReadinessCheck?: boolean
     json?: boolean
     yes?: boolean
   }
@@ -424,6 +427,17 @@ export async function updateConfigAction(
   let cpuLimit = options.cpuLimit ? parseFloat(options.cpuLimit) : undefined
   let memoryLimit = options.memoryLimit ? parseInt(options.memoryLimit, 10) : undefined
   let autoDeploy = options.autoDeploy
+  const publicReadinessTimeoutSecs = options.publicReadinessTimeout
+    ? parseInt(options.publicReadinessTimeout, 10)
+    : undefined
+  if (options.enablePublicReadinessCheck && options.disablePublicReadinessCheck) {
+    throw new Error('Pass only one of --enable-public-readiness-check / --disable-public-readiness-check')
+  }
+  const publicReadinessCheckEnabled = options.disablePublicReadinessCheck
+    ? false
+    : options.enablePublicReadinessCheck
+      ? true
+      : undefined
 
   // Only prompt if no flags provided AND not in automation mode
   if (replicas === undefined && cpuLimit === undefined && memoryLimit === undefined && autoDeploy === undefined && !options.yes) {
@@ -465,6 +479,8 @@ export async function updateConfigAction(
         cpuLimit: cpuLimit ?? undefined,
         memoryLimit: memoryLimit ?? undefined,
         automaticDeploy: autoDeploy ?? undefined,
+        publicReadinessTimeoutSecs: publicReadinessTimeoutSecs ?? undefined,
+        publicReadinessCheckEnabled: publicReadinessCheckEnabled ?? undefined,
       },
     })
     if (error) {
@@ -483,4 +499,6 @@ export async function updateConfigAction(
   if (cpuLimit !== undefined) keyValue('CPU Limit', `${cpuLimit} cores`)
   if (memoryLimit !== undefined) keyValue('Memory Limit', `${memoryLimit} MB`)
   if (autoDeploy !== undefined) keyValue('Auto Deploy', autoDeploy ? colors.success('Enabled') : colors.muted('Disabled'))
+  if (publicReadinessTimeoutSecs !== undefined) keyValue('Public Readiness Timeout', `${publicReadinessTimeoutSecs}s`)
+  if (publicReadinessCheckEnabled !== undefined) keyValue('Public Readiness Check', publicReadinessCheckEnabled ? colors.success('Enabled') : colors.muted('Disabled'))
 }

@@ -434,6 +434,9 @@ Update deployment configuration (resources, replicas)
 | `--memory-limit <limit>` | Memory limit in MB | - | Yes |
 | `--auto-deploy` | Enable automatic deployments | - | No |
 | `--no-auto-deploy` | Disable automatic deployments | - | No |
+| `--public-readiness-timeout <seconds>` | Seconds to wait for the public URL to respond before reverting a deployment (10-900). Raise this for apps that do real work after the container starts (e.g. compiling/bundling source on boot) before they are reachable | - | Yes |
+| `--enable-public-readiness-check` | Require the public URL to respond before a deployment is marked complete (platform default) | - | No |
+| `--disable-public-readiness-check` | Skip the post-deploy public URL check entirely — for apps that do not serve plain HTTP even when healthy | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts (for automation) | - | No |
 

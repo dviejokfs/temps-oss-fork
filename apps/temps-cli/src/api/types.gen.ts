@@ -4594,6 +4594,28 @@ export type DeploymentConfig = {
      */
     performanceMetricsEnabled?: boolean;
     /**
+     * Whether `MarkDeploymentCompleteJob` must prove the public URL actually
+     * serves before marking a deployment complete (see the "Phase 2.75"
+     * gate). `None` inherits the parent level; the platform default when
+     * nothing sets it is `true`.
+     *
+     * Turn this off for apps that don't serve plain HTTP at their health
+     * path even when healthy (e.g. a raw TCP protocol behind the published
+     * port), or as a last resort for an app whose true startup time the
+     * timeout below still can't accommodate.
+     */
+    publicReadinessCheckEnabled?: boolean | null;
+    /**
+     * How long `MarkDeploymentCompleteJob` waits for the public URL to
+     * start responding before reverting the deployment. `None` inherits the
+     * parent level; the platform default when nothing sets it is 60s.
+     *
+     * Raise this for apps that do real work after the container starts
+     * before they're reachable — e.g. compiling/bundling source on boot
+     * instead of at image-build time. Min: 10, Max: 900 (15m).
+     */
+    publicReadinessTimeoutSecs?: number | null;
+    /**
      * Number of replicas/instances to run
      * Defaults to 1 replica
      */
@@ -14979,6 +15001,17 @@ export type SelfUpdateAttempt = {
      */
     from_version: string;
     /**
+     * Number of database migrations that were successfully applied during
+     * this attempt. Set at completion (success or migration failure). `None`
+     * if migrations were never reached (pre-swap failure).
+     */
+    migrations_applied?: number | null;
+    /**
+     * Total number of database migrations that were planned. Set at the same
+     * time as `migrations_applied`. `None` if migrations were never reached.
+     */
+    migrations_total?: number | null;
+    /**
      * Where the replaced binary was kept, so a bad release can be reverted by
      * hand (`mv <path> <binary>`). Set once the swap completes.
      */
@@ -15006,7 +15039,7 @@ export type SelfUpdateBlocker = 'disabled_by_flag' | 'disabled_by_setting' | 'no
  * Where an in-flight update has got to. Polled by the console so a long
  * download shows progress instead of an indefinite spinner.
  */
-export type SelfUpdatePhase = 'idle' | 'resolving' | 'downloading' | 'verifying' | 'installing' | 'restarting' | 'pending_restart' | 'failed';
+export type SelfUpdatePhase = 'idle' | 'resolving' | 'downloading' | 'verifying' | 'installing' | 'migrating' | 'restarting' | 'pending_restart' | 'failed';
 
 /**
  * What happens to the running process once the new binary is in place.
@@ -17915,6 +17948,11 @@ export type UpdateCapabilityResponse = {
      */
     channel_is_pinned: boolean;
     /**
+     * Name of the migration currently running. `Some` while `phase` is
+     * `migrating` and a migration step is in flight.
+     */
+    current_migration_name?: string | null;
+    /**
      * Version tag of the running binary. Always present — the version page
      * needs it whether or not an update exists.
      */
@@ -17924,6 +17962,15 @@ export type UpdateCapabilityResponse = {
      * The equivalent command to run by hand. Always present.
      */
     manual_command: string;
+    /**
+     * Number of migrations applied so far. `Some` while `phase` is `migrating`.
+     */
+    migrations_applied?: number | null;
+    /**
+     * Total migrations to be applied. `Some` once the migrate child has
+     * reported its first `started` event.
+     */
+    migrations_total?: number | null;
     /**
      * Phase of an in-flight attempt: `idle` when none is running.
      */
@@ -17990,6 +18037,22 @@ export type UpdateDeploymentConfigRequest = {
     memoryLimit?: number | null;
     memoryRequest?: number | null;
     performanceMetricsEnabled?: boolean | null;
+    /**
+     * Whether a deployment must prove its public URL actually serves before
+     * being marked complete. Absent leaves it unset (inherits the platform
+     * default of `true`); an explicit value — including `false` — pins it
+     * for every environment that doesn't override it. Turn off for apps
+     * that don't serve plain HTTP even when healthy.
+     */
+    publicReadinessCheckEnabled?: boolean | null;
+    /**
+     * How long (seconds, 10..=900) the public-readiness check waits for the
+     * public URL to start responding before reverting the deployment.
+     * Absent leaves it unset (inherits the platform default of 60s). Raise
+     * this for apps that do real work after the container starts — e.g.
+     * compiling/bundling source on boot — before they're reachable.
+     */
+    publicReadinessTimeoutSecs?: number | null;
     replicas?: number | null;
     security?: null | SecurityConfig;
     sessionRecordingEnabled?: boolean | null;
@@ -18139,6 +18202,21 @@ export type UpdateEnvironmentSettingsRequest = {
      * Deployments must be promoted from another environment.
      */
     protected?: boolean | null;
+    /**
+     * Whether a deployment to this environment must prove its public URL
+     * actually serves before being marked complete (overrides the
+     * project-level setting). Turn off for apps that don't serve plain
+     * HTTP even when healthy.
+     */
+    public_readiness_check_enabled?: boolean | null;
+    /**
+     * How long (seconds, 10..=900) the public-readiness check waits for
+     * this environment's public URL to start responding before reverting
+     * the deployment (overrides the project-level setting). Raise for apps
+     * that do real work after the container starts — e.g. compiling or
+     * bundling source on boot — before they're reachable.
+     */
+    public_readiness_timeout_secs?: number | null;
     replicas?: number | null;
     security?: null | SecurityConfig;
     /**

@@ -9418,6 +9418,21 @@
             "description": "Enable performance metrics collection (speed insights)",
             "type": "boolean"
           },
+          "publicReadinessCheckEnabled": {
+            "description": "Whether `MarkDeploymentCompleteJob` must prove the public URL actually\nserves before marking a deployment complete (see the \"Phase 2.75\"\ngate). `None` inherits the parent level; the platform default when\nnothing sets it is `true`.\n\nTurn this off for apps that don't serve plain HTTP at their health\npath even when healthy (e.g. a raw TCP protocol behind the published\nport), or as a last resort for an app whose true startup time the\ntimeout below still can't accommodate.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "publicReadinessTimeoutSecs": {
+            "description": "How long `MarkDeploymentCompleteJob` waits for the public URL to\nstart responding before reverting the deployment. `None` inherits the\nparent level; the platform default when nothing sets it is 60s.\n\nRaise this for apps that do real work after the container starts\nbefore they're reachable — e.g. compiling/bundling source on boot\ninstead of at image-build time. Min: 10, Max: 900 (15m).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "replicas": {
             "description": "Number of replicas/instances to run\nDefaults to 1 replica",
             "format": "int32",
@@ -33038,6 +33053,24 @@
             "description": "Version the attempt started from.",
             "type": "string"
           },
+          "migrations_applied": {
+            "description": "Number of database migrations that were successfully applied during\nthis attempt. Set at completion (success or migration failure). `None`\nif migrations were never reached (pre-swap failure).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "migrations_total": {
+            "description": "Total number of database migrations that were planned. Set at the same\ntime as `migrations_applied`. `None` if migrations were never reached.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "previous_binary_path": {
             "description": "Where the replaced binary was kept, so a bad release can be reverted by\nhand (`mv <path> <binary>`). Set once the swap completes.",
             "type": [
@@ -33096,6 +33129,7 @@
           "downloading",
           "verifying",
           "installing",
+          "migrating",
           "restarting",
           "pending_restart",
           "failed"
@@ -39570,6 +39604,13 @@
             "description": "True when `channel` was set explicitly in settings rather than inferred.",
             "type": "boolean"
           },
+          "current_migration_name": {
+            "description": "Name of the migration currently running. `Some` while `phase` is\n`migrating` and a migration step is in flight.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "current_version": {
             "description": "Version tag of the running binary. Always present — the version page\nneeds it whether or not an update exists.",
             "type": "string"
@@ -39588,6 +39629,24 @@
           "manual_command": {
             "description": "The equivalent command to run by hand. Always present.",
             "type": "string"
+          },
+          "migrations_applied": {
+            "description": "Number of migrations applied so far. `Some` while `phase` is `migrating`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "migrations_total": {
+            "description": "Total migrations to be applied. `Some` once the migrate child has\nreported its first `started` event.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "phase": {
             "$ref": "#/components/schemas/SelfUpdatePhase",
@@ -39787,6 +39846,21 @@
           "performanceMetricsEnabled": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "publicReadinessCheckEnabled": {
+            "description": "Whether a deployment must prove its public URL actually serves before\nbeing marked complete. Absent leaves it unset (inherits the platform\ndefault of `true`); an explicit value — including `false` — pins it\nfor every environment that doesn't override it. Turn off for apps\nthat don't serve plain HTTP even when healthy.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "publicReadinessTimeoutSecs": {
+            "description": "How long (seconds, 10..=900) the public-readiness check waits for the\npublic URL to start responding before reverting the deployment.\nAbsent leaves it unset (inherits the platform default of 60s). Raise\nthis for apps that do real work after the container starts — e.g.\ncompiling/bundling source on boot — before they're reachable.",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -40072,6 +40146,21 @@
             "description": "When true, git pushes do NOT auto-deploy to this environment.\nDeployments must be promoted from another environment.",
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "public_readiness_check_enabled": {
+            "description": "Whether a deployment to this environment must prove its public URL\nactually serves before being marked complete (overrides the\nproject-level setting). Turn off for apps that don't serve plain\nHTTP even when healthy.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "public_readiness_timeout_secs": {
+            "description": "How long (seconds, 10..=900) the public-readiness check waits for\nthis environment's public URL to start responding before reverting\nthe deployment (overrides the project-level setting). Raise for apps\nthat do real work after the container starts — e.g. compiling or\nbundling source on boot — before they're reachable.",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
