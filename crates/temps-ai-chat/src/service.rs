@@ -193,11 +193,11 @@ Reply with ONLY the title: 3–6 words, Title Case, no quotes, no surrounding pu
 /// Maximum stored title length (chars). Long titles are truncated, not rejected.
 const TITLE_MAX_CHARS: usize = 60;
 
-struct ConversationRuntime {
-    provider: String,
-    model: String,
-    thinking_level: Option<String>,
-    permission_mode: String,
+pub(crate) struct ConversationRuntime {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) thinking_level: Option<String>,
+    pub(crate) permission_mode: String,
 }
 
 /// `default` is a UI/protocol sentinel meaning "let the harness choose". It
@@ -792,6 +792,43 @@ impl ConversationService {
                 .await?;
         }
         Ok(conv)
+    }
+
+    /// Resolve the exact runtime that `get_or_create` would use without
+    /// mutating conversation or message storage. Existing conversations keep
+    /// their pinned runtime; new conversations resolve instance defaults and
+    /// validate provider capabilities. HTTP authorization uses this preflight
+    /// before permitting `get_or_create` to perform its first insert.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn resolve_get_or_create_runtime(
+        &self,
+        project_id: i32,
+        context_type: &str,
+        context_id: &str,
+        user_id: i32,
+        requested_provider: Option<&str>,
+        requested_model: Option<&str>,
+        requested_thinking_level: Option<&str>,
+        requested_permission_mode: Option<&str>,
+    ) -> Result<ConversationRuntime, ChatError> {
+        if let Some(existing) = self
+            .find_by_context(project_id, user_id, context_type, context_id)
+            .await?
+        {
+            return Ok(ConversationRuntime {
+                provider: existing.ai_provider,
+                model: existing.ai_model,
+                thinking_level: existing.ai_thinking_level,
+                permission_mode: existing.ai_permission_mode,
+            });
+        }
+        self.resolve_conversation_runtime(
+            requested_provider,
+            requested_model,
+            requested_thinking_level,
+            requested_permission_mode,
+        )
+        .await
     }
 
     async fn resolve_conversation_runtime(
@@ -2841,18 +2878,41 @@ mod tests {
                 id: provider.unwrap_or("gateway_key:1").to_string(),
                 name: "Test provider".to_string(),
                 auth_source: temps_ai::ProviderAuthSource::ConfiguredKey,
-                models: vec![temps_ai::ModelCapability {
-                    id: "gpt-4o-mini".to_string(),
-                    name: "GPT-4o mini".to_string(),
-                    thinking_modes: Vec::new(),
-                    default_thinking_mode_id: None,
-                }],
+                models: vec![
+                    temps_ai::ModelCapability {
+                        id: "gpt-4o-mini".to_string(),
+                        name: "GPT-4o mini".to_string(),
+                        thinking_modes: vec![temps_ai::SelectOption {
+                            id: "high".to_string(),
+                            name: "High".to_string(),
+                            description: None,
+                        }],
+                        default_thinking_mode_id: None,
+                    },
+                    temps_ai::ModelCapability {
+                        id: "gpt-4.1".to_string(),
+                        name: "GPT-4.1".to_string(),
+                        thinking_modes: vec![temps_ai::SelectOption {
+                            id: "low".to_string(),
+                            name: "Low".to_string(),
+                            description: None,
+                        }],
+                        default_thinking_mode_id: Some("low".to_string()),
+                    },
+                ],
                 default_model_id: Some("gpt-4o-mini".to_string()),
-                permission_modes: vec![temps_ai::SelectOption {
-                    id: "confirm-actions".to_string(),
-                    name: "Confirm actions".to_string(),
-                    description: None,
-                }],
+                permission_modes: vec![
+                    temps_ai::SelectOption {
+                        id: "confirm-actions".to_string(),
+                        name: "Confirm actions".to_string(),
+                        description: None,
+                    },
+                    temps_ai::SelectOption {
+                        id: "full-access".to_string(),
+                        name: "Full access".to_string(),
+                        description: None,
+                    },
+                ],
                 default_permission_mode_id: Some("confirm-actions".to_string()),
                 realtime: temps_ai::RealtimeCapabilities {
                     text_streaming: true,
@@ -3521,6 +3581,103 @@ mod tests {
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    #[tokio::test]
+    async fn update_runtime_options_changes_model_without_switching_provider_and_resets_session() {
+        let mut conversation = test_conversation();
+        conversation.ai_provider = "codex_cli".to_string();
+        conversation.cli_session_id = Some("session-1".to_string());
+        conversation.cli_session_fingerprint = Some("v1:fingerprint".to_string());
+
+        let mut updated = conversation.clone();
+        updated.ai_model = "gpt-4.1".to_string();
+        updated.ai_thinking_level = Some("low".to_string());
+        updated.ai_permission_mode = "full-access".to_string();
+        updated.cli_session_id = None;
+        updated.cli_session_fingerprint = None;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[updated]])
+            .into_connection();
+
+        let result = db_service(db)
+            .update_runtime_options(
+                &conversation,
+                Some("gpt-4.1"),
+                Some("low"),
+                Some("full-access"),
+            )
+            .await
+            .expect("valid runtime options should persist");
+
+        assert_eq!(result.ai_provider, "codex_cli");
+        assert_eq!(result.ai_model, "gpt-4.1");
+        assert_eq!(result.ai_thinking_level.as_deref(), Some("low"));
+        assert_eq!(result.ai_permission_mode, "full-access");
+        assert_eq!(result.cli_session_id, None);
+        assert_eq!(result.cli_session_fingerprint, None);
+    }
+
+    #[tokio::test]
+    async fn update_runtime_options_retains_session_when_only_thinking_and_permission_change() {
+        let mut conversation = test_conversation();
+        conversation.ai_provider = "codex_cli".to_string();
+        conversation.cli_session_id = Some("session-1".to_string());
+        conversation.cli_session_fingerprint = Some("v1:fingerprint".to_string());
+
+        let mut updated = conversation.clone();
+        updated.ai_thinking_level = Some("high".to_string());
+        updated.ai_permission_mode = "full-access".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[updated]])
+            .into_connection();
+
+        let result = db_service(db)
+            .update_runtime_options(&conversation, None, Some("high"), Some("full-access"))
+            .await
+            .expect("turn-level options should persist");
+
+        assert_eq!(result.ai_provider, "codex_cli");
+        assert_eq!(result.ai_model, conversation.ai_model);
+        assert_eq!(result.cli_session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            result.cli_session_fingerprint.as_deref(),
+            Some("v1:fingerprint")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_runtime_options_rejects_options_outside_pinned_provider_capabilities() {
+        let mut conversation = test_conversation();
+        conversation.ai_provider = "codex_cli".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+
+        let error = db_service(db)
+            .update_runtime_options(&conversation, Some("claude-opus"), None, None)
+            .await
+            .expect_err("a model outside the pinned harness must fail closed");
+
+        assert!(matches!(error, ChatError::Ai(message) if
+            message.contains("claude-opus") && message.contains("codex_cli")));
+    }
+
+    #[tokio::test]
+    async fn update_runtime_options_preserves_database_failure() {
+        let mut conversation = test_conversation();
+        conversation.ai_provider = "codex_cli".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("write failed".to_string())])
+            .into_connection();
+
+        let error = db_service(db)
+            .update_runtime_options(&conversation, None, Some("high"), None)
+            .await
+            .expect_err("database failures must not look like successful updates");
+
+        assert!(
+            matches!(error, ChatError::Db(sea_orm::DbErr::Custom(message)) if
+            message == "write failed")
+        );
     }
 
     /// Build a conversation row for a given project, with controllable public_id.

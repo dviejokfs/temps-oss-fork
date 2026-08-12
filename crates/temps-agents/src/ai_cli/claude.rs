@@ -34,6 +34,17 @@ fn cancellation_safe_command(program: &str) -> Command {
 }
 
 async fn configure_chat_mcp(cmd: &mut Command, config: &AiRunConfig) -> Result<(), AgentError> {
+    // A chat turn must never inherit Claude Code's host shell/filesystem
+    // tools, even when no Temps MCP server is configured. Interactive mode
+    // additionally needs the two protocol tools that produce question/plan
+    // control requests.
+    cmd.arg("--tools")
+        .arg(if config.permission_bridge.is_some() {
+            "AskUserQuestion,ExitPlanMode"
+        } else {
+            ""
+        });
+
     let Some(server) = &config.mcp_server else {
         return Ok(());
     };
@@ -62,16 +73,6 @@ async fn configure_chat_mcp(cmd: &mut Command, config: &AiRunConfig) -> Result<(
     }
     cmd.arg("--mcp-config")
         .arg(path)
-        // A chat turn must not inherit Claude Code's host shell/filesystem
-        // tools. The authenticated, project-scoped MCP bridge is the only
-        // application tool surface. Interactive mode additionally needs the
-        // two protocol tools that produce question/plan control requests.
-        .arg("--tools")
-        .arg(if config.permission_bridge.is_some() {
-            "AskUserQuestion,ExitPlanMode"
-        } else {
-            ""
-        })
         // The bridge itself is already authorization/project scoped, and
         // `temps_write` only stages confirm-gated proposals. Let Claude invoke
         // these MCP tools without an unrelated terminal permission prompt.
@@ -1606,6 +1607,77 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--tools", "AskUserQuestion,ExitPlanMode"]));
+    }
+
+    #[tokio::test]
+    async fn noninteractive_claude_denies_native_tools_without_mcp() {
+        let scratch = tempfile::tempdir().expect("create scratch directory");
+        let config = super::super::AiRunConfig {
+            work_dir: scratch.path().to_owned(),
+            prompt: "hello".to_string(),
+            api_key: String::new(),
+            max_turns: 1,
+            timeout: std::time::Duration::from_secs(30),
+            model: None,
+            thinking_level: None,
+            permission_mode: Some("default".to_string()),
+            on_event: None,
+            permission_bridge: None,
+            resume_session_id: None,
+            mcp_server: None,
+        };
+        let mut command = cancellation_safe_command("claude");
+        configure_chat_mcp(&mut command, &config)
+            .await
+            .expect("configure tool restrictions");
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(args.windows(2).any(|pair| pair == ["--tools", ""]));
+        assert!(!args.iter().any(|arg| arg == "--mcp-config"));
+        assert!(!args.iter().any(|arg| arg == "--allowedTools"));
+    }
+
+    #[tokio::test]
+    async fn interactive_claude_only_exposes_protocol_tools_without_mcp() {
+        let scratch = tempfile::tempdir().expect("create scratch directory");
+        let config = super::super::AiRunConfig {
+            work_dir: scratch.path().to_owned(),
+            prompt: "hello".to_string(),
+            api_key: String::new(),
+            max_turns: 1,
+            timeout: std::time::Duration::from_secs(30),
+            model: None,
+            thinking_level: None,
+            permission_mode: Some("default".to_string()),
+            on_event: None,
+            permission_bridge: Some(std::sync::Arc::new(super::super::PermissionBridge {
+                on_permission_request: std::sync::Arc::new(|_| {
+                    let (_tx, rx) = tokio::sync::oneshot::channel();
+                    rx
+                }),
+            })),
+            resume_session_id: None,
+            mcp_server: None,
+        };
+        let mut command = cancellation_safe_command("claude");
+        configure_chat_mcp(&mut command, &config)
+            .await
+            .expect("configure tool restrictions");
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--tools", "AskUserQuestion,ExitPlanMode"]));
+        assert!(!args.iter().any(|arg| arg == "--mcp-config"));
+        assert!(!args.iter().any(|arg| arg == "--allowedTools"));
     }
 
     #[test]

@@ -599,6 +599,16 @@ fn can_read_context(auth: &AuthContext, context_type: &str) -> bool {
     context_type != "alert_suggest" || auth.has_permission(&Permission::OtelRead)
 }
 
+fn ensure_conversation_read_permission(
+    auth: &AuthContext,
+    conversation: &ai_conversations::Model,
+) -> Result<(), Problem> {
+    // Persisted history is project/context data. Host-provider administration
+    // is an execution boundary and must not make stored chat content disappear
+    // when that separate permission is later revoked.
+    ensure_context_read_permission(auth, &conversation.context_type)
+}
+
 async fn hidden_conversation_project_ids(
     auth: &AuthContext,
     checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
@@ -768,16 +778,11 @@ pub async fn create_conversation(
     if req.context_id.len() > MAX_CONTEXT_ID_LEN {
         return Err(too_long("context_id", MAX_CONTEXT_ID_LEN));
     }
-    ensure_runtime_permission(
-        &auth,
-        req.ai_provider.as_deref(),
-        req.ai_permission_mode.as_deref(),
-    )?;
     ensure_context_read_permission(&auth, &req.context_type)?;
     ensure_enabled(&state, project_id).await?;
-    let conv = state
+    let runtime = state
         .service
-        .get_or_create(
+        .resolve_get_or_create_runtime(
             project_id,
             &req.context_type,
             &req.context_id,
@@ -786,6 +791,24 @@ pub async fn create_conversation(
             req.ai_model.as_deref(),
             req.ai_thinking_level.as_deref(),
             req.ai_permission_mode.as_deref(),
+        )
+        .await?;
+    ensure_runtime_permission(
+        &auth,
+        Some(&runtime.provider),
+        Some(&runtime.permission_mode),
+    )?;
+    let conv = state
+        .service
+        .get_or_create(
+            project_id,
+            &req.context_type,
+            &req.context_id,
+            auth.user_id(),
+            Some(&runtime.provider),
+            Some(&runtime.model),
+            runtime.thinking_level.as_deref(),
+            Some(&runtime.permission_mode),
         )
         .await?;
     state
@@ -824,12 +847,7 @@ pub async fn get_conversation(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
-    ensure_runtime_permission(
-        &auth,
-        Some(&conv.ai_provider),
-        Some(&conv.ai_permission_mode),
-    )?;
-    ensure_context_read_permission(&auth, &conv.context_type)?;
+    ensure_conversation_read_permission(&auth, &conv)?;
     let messages = state
         .service
         .messages(conv.id)
@@ -871,12 +889,7 @@ pub async fn conversation_stream(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
-    ensure_runtime_permission(
-        &auth,
-        Some(&conv.ai_provider),
-        Some(&conv.ai_permission_mode),
-    )?;
-    ensure_context_read_permission(&auth, &conv.context_type)?;
+    ensure_conversation_read_permission(&auth, &conv)?;
 
     let rx = state.service.subscribe_conversation(conv.id);
     Ok(ws.on_upgrade(move |socket| forward_conversation_events(socket, rx)))
@@ -1116,12 +1129,7 @@ pub async fn archive_conversation(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
-    ensure_runtime_permission(
-        &auth,
-        Some(&conv.ai_provider),
-        Some(&conv.ai_permission_mode),
-    )?;
-    ensure_context_read_permission(&auth, &conv.context_type)?;
+    ensure_conversation_read_permission(&auth, &conv)?;
     state.service.archive(&conv).await?;
     state
         .audit(&ConversationArchivedAudit {
@@ -1891,6 +1899,29 @@ mod tests {
         )
     }
 
+    fn conversation_with_runtime(provider: &str, permission_mode: &str) -> ai_conversations::Model {
+        let now = chrono::Utc::now();
+        ai_conversations::Model {
+            id: 1,
+            public_id: "conversation-1".to_string(),
+            project_id: 1,
+            context_type: "project".to_string(),
+            context_id: "1".to_string(),
+            title: None,
+            status: "active".to_string(),
+            created_by: Some(1),
+            metadata: None,
+            created_at: now,
+            last_activity_at: now,
+            ai_provider: provider.to_string(),
+            ai_model: "default".to_string(),
+            ai_thinking_level: None,
+            ai_permission_mode: permission_mode.to_string(),
+            cli_session_id: None,
+            cli_session_fingerprint: None,
+        }
+    }
+
     enum HiddenProjectsOutcome {
         Hidden(Vec<i32>),
         Error,
@@ -1969,6 +2000,151 @@ mod tests {
         ]);
         ensure_runtime_permission(&system_admin, Some("codex_cli"), Some("auto"))
             .expect("system administrator may opt into the Codex host boundary");
+    }
+
+    #[test]
+    fn resolved_conversation_provider_is_authorized_after_default_resolution() {
+        let project_writer = custom_auth(vec![Permission::ProjectsWrite]);
+        let resolved = conversation_with_runtime("claude_cli", "default");
+
+        let denied = ensure_runtime_permission(
+            &project_writer,
+            Some(&resolved.ai_provider),
+            Some(&resolved.ai_permission_mode),
+        )
+        .expect_err("resolved host provider must be authorized even when request omitted it");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+
+        let provider_admin =
+            custom_auth(vec![Permission::ProjectsWrite, Permission::AiGatewayWrite]);
+        ensure_runtime_permission(
+            &provider_admin,
+            Some(&resolved.ai_provider),
+            Some(&resolved.ai_permission_mode),
+        )
+        .expect("provider administrator may use the resolved Claude provider");
+    }
+
+    #[test]
+    fn stored_host_conversation_remains_readable_without_runtime_permission() {
+        let project_reader = custom_auth(vec![Permission::ProjectsRead]);
+        let stored = conversation_with_runtime("claude_cli", "full-access");
+
+        ensure_conversation_read_permission(&project_reader, &stored)
+            .expect("stored project history must not require host-provider execution access");
+        assert!(ensure_runtime_permission(
+            &project_reader,
+            Some(&stored.ai_provider),
+            Some(&stored.ai_permission_mode),
+        )
+        .is_err());
+    }
+
+    struct DefaultClaudeAi;
+
+    #[async_trait::async_trait]
+    impl temps_ai::AiService for DefaultClaudeAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn capabilities_for(
+            &self,
+            provider: Option<&str>,
+            _refresh: temps_ai::RefreshPolicy,
+        ) -> Result<temps_ai::ProviderCapabilities, temps_ai::AiError> {
+            Ok(temps_ai::ProviderCapabilities {
+                id: provider.unwrap_or("claude_cli").to_string(),
+                name: "Claude Code".to_string(),
+                auth_source: temps_ai::ProviderAuthSource::HostEnvironment,
+                models: vec![temps_ai::ModelCapability {
+                    id: "sonnet".to_string(),
+                    name: "Sonnet".to_string(),
+                    thinking_modes: Vec::new(),
+                    default_thinking_mode_id: None,
+                }],
+                default_model_id: Some("sonnet".to_string()),
+                permission_modes: vec![temps_ai::SelectOption {
+                    id: "default".to_string(),
+                    name: "Default".to_string(),
+                    description: None,
+                }],
+                default_permission_mode_id: Some("default".to_string()),
+                realtime: temps_ai::RealtimeCapabilities {
+                    text_streaming: true,
+                    reasoning_streaming: true,
+                    tool_events: true,
+                    user_interactions: true,
+                    cancellation: true,
+                },
+            })
+        }
+
+        async fn complete(
+            &self,
+            _request: temps_ai::AiRequest,
+        ) -> Result<temps_ai::AiResponse, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::TokenStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_omitted_host_provider_performs_no_conversation_insert() {
+        let now = chrono::Utc::now();
+        let preference = temps_entities::ai_gateway_config::Model {
+            id: 1,
+            scope: "instance".to_string(),
+            allowed_models: None,
+            max_requests_per_minute: None,
+            max_cost_per_month_microcents: None,
+            created_at: now,
+            updated_at: now,
+            provider_type: "agent_cli".to_string(),
+            agent_cli_provider_id: Some("claude_cli".to_string()),
+            interactive_bridge_enabled: false,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_conversations::Model>::new()])
+                .append_query_results([[preference]])
+                .into_connection(),
+        );
+        let service = ConversationService::new(db.clone(), Arc::new(DefaultClaudeAi), Vec::new());
+        let runtime = service
+            .resolve_get_or_create_runtime(1, "project", "1", 1, None, None, None, None)
+            .await
+            .expect("omitted runtime resolves to the active host provider");
+        assert_eq!(runtime.provider, "claude_cli");
+
+        let project_writer = custom_auth(vec![Permission::ProjectsWrite]);
+        let denied = ensure_runtime_permission(
+            &project_writer,
+            Some(&runtime.provider),
+            Some(&runtime.permission_mode),
+        )
+        .expect_err("host provider must be denied before get_or_create can insert");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("release mock database");
+        let statements = db
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.to_ascii_uppercase())
+            .collect::<Vec<_>>();
+        assert_eq!(statements.len(), 2, "preflight should perform only reads");
+        assert!(
+            statements.iter().all(|sql| sql.starts_with("SELECT")),
+            "denial must happen before any insert; got {statements:?}"
+        );
     }
 
     #[test]

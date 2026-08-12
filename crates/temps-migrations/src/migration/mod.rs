@@ -391,8 +391,55 @@ impl MigratorTrait for Migrator {
             ),
             Box::new(m20260810_000003_pin_ai_provider_to_conversations::Migration),
             Box::new(m20260810_000004_add_ai_conversation_runtime_options::Migration),
-            Box::new(m20260811_000001_add_cli_session_fingerprint::Migration),
+            // Main shipped the renewal-attempts migration first. Preserve
+            // that upgrade history before this branch's independently named
+            // migration with the same date and sequence stamp.
             Box::new(m20260811_000001_create_renewal_attempts::Migration),
+            Box::new(m20260811_000001_add_cli_session_fingerprint::Migration),
         ]
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn migration_names_are_unique_and_same_stamp_upgrade_history_stays_main_first() {
+        let names = Migrator::migrations()
+            .into_iter()
+            .map(|migration| migration.name().to_string())
+            .collect::<Vec<_>>();
+        let unique = names.iter().collect::<HashSet<_>>();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "every registry entry must have a unique persisted migration name"
+        );
+
+        for (shipped, added) in [
+            (
+                "m20260810_000001_create_sandbox_snapshots",
+                "m20260810_000001_add_cli_session_id_to_ai_conversations",
+            ),
+            (
+                "m20260811_000001_create_renewal_attempts",
+                "m20260811_000001_add_cli_session_fingerprint",
+            ),
+        ] {
+            let shipped_position = names
+                .iter()
+                .position(|name| name == shipped)
+                .unwrap_or_else(|| panic!("shipped migration '{shipped}' is missing"));
+            let added_position = names
+                .iter()
+                .position(|name| name == added)
+                .unwrap_or_else(|| panic!("added migration '{added}' is missing"));
+            assert!(
+                shipped_position < added_position,
+                "shipped migration '{shipped}' must precede '{added}'"
+            );
+        }
     }
 }
