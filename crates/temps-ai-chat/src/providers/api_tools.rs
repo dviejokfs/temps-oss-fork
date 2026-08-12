@@ -119,14 +119,17 @@ Temps API fields such as `timestamp`, `*_timestamp`, `*_at`, and \
 `last_deployment` may contain Unix epoch milliseconds. Interpret those values \
 as dates before answering. In user-facing prose, show a human-readable date \
 (UTC ISO-8601 is the safe default, optionally with a relative time) rather than \
-the raw millisecond number. Preserve and report the raw value only when the \
-user explicitly asks for it or it is needed for debugging. Do not change, \
+the raw millisecond number. Do not append, quote, parenthesize, or otherwise \
+include the raw epoch-millisecond value anywhere in the answer unless the user \
+explicitly asks for it or it is needed for debugging. Do not change, \
 round, or reinterpret ordinary numeric IDs, counts, durations, or byte values.";
 
 fn build_system_appendix(root_help: &str) -> String {
     format!(
-        "## The `temps` read-only API CLI\n\
-         You have a `temps` tool: a read-only command line over the platform API. Discover \
+        "## The `temps` read-only API tool\n\
+         You have a registered MCP tool named `temps`. Its `command` argument emulates a \
+         CLI grammar over the platform API, but it is not a local executable. Invoke the \
+         `temps` tool directly; never use Bash, a terminal, or a locally installed binary. Discover \
          with `--help` (`<section> --help` → operations; `<section> <operation> --help` → \
          flags), then run `<section> <operation> --flag value …`. Below is `temps --help` \
          (the sections). Drill into the relevant one rather than guessing.\n\n```\n{root_help}```\
@@ -194,12 +197,15 @@ impl ConversationContextProvider for ApiToolsProvider {
     async fn tools(&self, _project_id: i32, _context_id: &str) -> Vec<ChatTool> {
         vec![ChatTool {
             name: "temps".to_string(),
-            description: "Read-only Temps CLI over the platform API. Use `--help` to discover \
+            description: "Read-only Temps MCP tool over the platform API. Invoke this registered \
+                tool directly; never run Bash, a terminal, or a local `temps` binary. \
+                The `command` argument uses a CLI-like grammar. Use `--help` to discover \
                 (sections → operations → flags), then run `<section> <operation> --flag value …`. \
                 project_id is auto-filled — never pass it. Returns help text or the endpoint's \
                 JSON body. Numeric timestamp fields may be Unix epoch milliseconds: interpret \
-                them and present human-readable dates in the final answer instead of raw \
-                millisecond values. If a call errors, read the message and adjust; don't repeat \
+                them and present human-readable dates in the final answer. Never include raw \
+                epoch-millisecond values unless the user explicitly requests them. If a call \
+                errors, read the message and adjust; don't repeat \
                 it unchanged."
                 .to_string(),
             parameters: temps_schema(),
@@ -294,6 +300,8 @@ mod tests {
         assert!(appendix.contains("Unix epoch milliseconds"));
         assert!(appendix.contains("show a human-readable date"));
         assert!(appendix.contains("rather than the raw millisecond number"));
+        assert!(appendix.contains("Do not append, quote, parenthesize"));
+        assert!(appendix.contains("not a local executable"));
         assert!(appendix.contains("Do not change, round, or reinterpret ordinary numeric IDs"));
     }
 
@@ -305,7 +313,8 @@ mod tests {
 
         assert!(description.contains("Unix epoch milliseconds"));
         assert!(description.contains("human-readable dates"));
-        assert!(description.contains("instead of raw millisecond values"));
+        assert!(description.contains("Never include raw epoch-millisecond values"));
+        assert!(description.contains("never run Bash"));
     }
 }
 

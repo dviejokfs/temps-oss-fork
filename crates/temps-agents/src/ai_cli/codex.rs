@@ -71,6 +71,14 @@ fn build_run_command(config: &AiRunConfig) -> Command {
     cmd.arg("exec")
         .arg(&config.prompt)
         .arg("--json")
+        // Chat turns must be governed solely by Temps' normalized prompt and
+        // ephemeral MCP bridge. Ambient Codex skills/rules can redefine
+        // `temps` as a local binary and divert the model away from the scoped
+        // MCP tool. Authentication still comes from CODEX_HOME, and explicit
+        // command-line MCP settings below remain active.
+        .arg("--ignore-user-config")
+        .arg("--ignore-rules")
+        .arg("--ephemeral")
         // Agent CLI chat deliberately runs in an empty, isolated scratch
         // directory. Codex otherwise rejects the invocation because that
         // directory is not a trusted Git repository.
@@ -642,6 +650,9 @@ mod tests {
             args.iter().any(|arg| arg == "--skip-git-repo-check"),
             "Codex must accept Temps' isolated non-Git scratch directory: {args:?}"
         );
+        assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(args.iter().any(|arg| arg == "--ignore-rules"));
+        assert!(args.iter().any(|arg| arg == "--ephemeral"));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--model", "gpt-5.6-sol"]));
