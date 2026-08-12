@@ -1448,18 +1448,6 @@ pub async fn update_project_deployment_config(
             "updated".to_string(),
         );
     }
-    if config.public_readiness_check_enabled.is_some() {
-        updated_fields.insert(
-            "public_readiness_check_enabled".to_string(),
-            "updated".to_string(),
-        );
-    }
-    if config.public_readiness_timeout_secs.is_some() {
-        updated_fields.insert(
-            "public_readiness_timeout_secs".to_string(),
-            "updated".to_string(),
-        );
-    }
 
     let audit_event = super::audit::DeploymentConfigUpdatedAudit {
         context: audit_context,

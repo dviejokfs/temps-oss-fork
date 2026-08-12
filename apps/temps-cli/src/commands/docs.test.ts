@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { generateDocs } from './docs.js'
 
 const tempDirs: string[] = []
+const execFileAsync = promisify(execFile)
 
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((path) => rm(path, { recursive: true, force: true })))
@@ -69,5 +72,43 @@ describe('generateDocs', () => {
     expect(commandReference).toContain(
       'bunx @temps-sdk/cli@0.1.31 --target-context production domains remove --project my-app --domain app.example.com',
     )
+    expect(commandReference).toContain('| `-n, --limit <number>` | Limit results | `10` | No |')
+  })
+
+  test('keeps the routed Temps command references synchronized', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'temps-skill-docs-'))
+    tempDirs.push(directory)
+    const source = join(directory, 'COMMANDS.md')
+    const destination = join(directory, 'commands')
+    const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), '../../../..')
+
+    await generateDocs({ format: 'markdown', output: source })
+    await execFileAsync('python3', [
+      join(repositoryRoot, 'skills/temps/scripts/generate_command_references.py'),
+      '--source',
+      source,
+      '--destination',
+      destination,
+    ])
+
+    const committed = join(repositoryRoot, 'skills/temps/references/commands')
+    const generatedFiles = (await readdir(destination)).sort()
+    expect(generatedFiles).toEqual((await readdir(committed)).sort())
+    for (const filename of generatedFiles) {
+      expect(await readFile(join(destination, filename), 'utf8')).toBe(
+        await readFile(join(committed, filename), 'utf8'),
+      )
+    }
+  })
+
+  test('keeps the Temps router concise and focused', async () => {
+    const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), '../../../..')
+    const skill = await readFile(join(repositoryRoot, 'skills/temps/SKILL.md'), 'utf8')
+
+    expect(skill.split('\n').length).toBeLessThanOrEqual(500)
+    expect(skill).toContain('[references/commands/INDEX.md](references/commands/INDEX.md)')
+    expect(skill).toContain('[howtos/observability-onboarding.md](howtos/observability-onboarding.md)')
+    expect(skill).toContain('bunx @temps-sdk/cli@0.1.31')
+    expect(skill).not.toContain('npm install --global')
   })
 })

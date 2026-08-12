@@ -413,19 +413,6 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// opted into per environment rather than triggered by cluster topology.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cross_architecture_builds: Option<bool>,
-    /// Whether a deployment to this environment must prove its public URL
-    /// actually serves before being marked complete (overrides the
-    /// project-level setting). Turn off for apps that don't serve plain
-    /// HTTP even when healthy.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub public_readiness_check_enabled: Option<bool>,
-    /// How long (seconds, 10..=900) the public-readiness check waits for
-    /// this environment's public URL to start responding before reverting
-    /// the deployment (overrides the project-level setting). Raise for apps
-    /// that do real work after the container starts — e.g. compiling or
-    /// bundling source on boot — before they're reachable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub public_readiness_timeout_secs: Option<i32>,
     /// When true, git pushes do NOT auto-deploy to this environment.
     /// Deployments must be promoted from another environment.
     #[serde(skip_serializing_if = "Option::is_none")]

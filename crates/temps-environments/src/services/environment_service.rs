@@ -692,12 +692,6 @@ impl EnvironmentService {
         if let Some(wake_timeout_seconds) = settings.wake_timeout_seconds {
             deployment_config.wake_timeout_seconds = wake_timeout_seconds;
         }
-        if let Some(public_readiness_check_enabled) = settings.public_readiness_check_enabled {
-            deployment_config.public_readiness_check_enabled = Some(public_readiness_check_enabled);
-        }
-        if let Some(public_readiness_timeout_secs) = settings.public_readiness_timeout_secs {
-            deployment_config.public_readiness_timeout_secs = Some(public_readiness_timeout_secs);
-        }
 
         // Validate the deployment config
         deployment_config.validate().map_err(|e| {
@@ -1338,8 +1332,6 @@ mod tests {
                     target_labels: None,
                     anti_affinity: None,
                     cross_architecture_builds: None,
-                    public_readiness_check_enabled: None,
-                    public_readiness_timeout_secs: None,
                     protected: None,
                     attack_mode: None,
                     force_https: None,

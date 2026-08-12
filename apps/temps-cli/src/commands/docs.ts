@@ -41,7 +41,10 @@ function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
     flags: opt.flags,
     description: opt.description || '',
     defaultValue: opt.defaultValue !== undefined ? String(opt.defaultValue) : undefined,
-    required: opt.required || opt.flags.includes('<'),
+    // Commander uses `<value>` to mean the value is required *when the option
+    // is supplied*. It does not make the option itself mandatory. Only
+    // `.makeOptionMandatory()` sets the `mandatory` flag.
+    required: opt.mandatory === true,
   }))
 
   const subcommands: CommandInfo[] = cmd.commands
