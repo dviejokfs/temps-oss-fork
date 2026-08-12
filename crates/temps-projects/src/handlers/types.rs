@@ -473,6 +473,14 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.cross_architecture_builds),
+                public_readiness_check_enabled: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.public_readiness_check_enabled),
+                public_readiness_timeout_secs: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.public_readiness_timeout_secs),
             },
         }
     }
@@ -595,6 +603,18 @@ pub struct UpdateDeploymentConfigRequest {
     /// are emulated on the control plane and substantially slower, so they are
     /// opted into rather than triggered by cluster topology.
     pub cross_architecture_builds: Option<bool>,
+    /// Whether a deployment must prove its public URL actually serves before
+    /// being marked complete. Absent leaves it unset (inherits the platform
+    /// default of `true`); an explicit value — including `false` — pins it
+    /// for every environment that doesn't override it. Turn off for apps
+    /// that don't serve plain HTTP even when healthy.
+    pub public_readiness_check_enabled: Option<bool>,
+    /// How long (seconds, 10..=900) the public-readiness check waits for the
+    /// public URL to start responding before reverting the deployment.
+    /// Absent leaves it unset (inherits the platform default of 60s). Raise
+    /// this for apps that do real work after the container starts — e.g.
+    /// compiling/bundling source on boot — before they're reachable.
+    pub public_readiness_timeout_secs: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]

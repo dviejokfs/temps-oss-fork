@@ -2917,6 +2917,12 @@ impl ProjectService {
         if let Some(cross_architecture_builds) = config.cross_architecture_builds {
             deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
         }
+        if let Some(public_readiness_check_enabled) = config.public_readiness_check_enabled {
+            deployment_config.public_readiness_check_enabled = Some(public_readiness_check_enabled);
+        }
+        if let Some(public_readiness_timeout_secs) = config.public_readiness_timeout_secs {
+            deployment_config.public_readiness_timeout_secs = Some(public_readiness_timeout_secs);
+        }
 
         // Validate the deployment config
         deployment_config

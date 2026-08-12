@@ -55,6 +55,13 @@ const PUBLIC_READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration:
 const PUBLIC_READINESS_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const PUBLIC_READINESS_REQUIRED_SUCCESSES: u8 = 2;
 
+/// Bounds for `DeploymentConfig.public_readiness_timeout_secs`. An app that
+/// genuinely needs longer (e.g. compiling/bundling source on boot instead of
+/// at image-build time) can raise this per project/environment; the ceiling
+/// still keeps a misconfigured value from blocking a deployment indefinitely.
+const PUBLIC_READINESS_TIMEOUT_MIN_SECS: i32 = 10;
+const PUBLIC_READINESS_TIMEOUT_MAX_SECS: i32 = 900;
+
 /// Output from MarkDeploymentCompleteJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkCompleteOutput {
@@ -863,6 +870,42 @@ impl MarkDeploymentCompleteJob {
                 })
             });
 
+        // Resolve the effective public-readiness settings (Environment >
+        // Project > platform default) once, alongside health_check_path
+        // above, so Phase 2.75 below can honor a per-project/environment
+        // override — e.g. an app that compiles/bundles source on boot needs
+        // longer than the 60s default before it's actually reachable.
+        let project_for_readiness_config = projects::Entity::find_by_id(deployment.project_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!("Failed to find project: {}", e))
+            })?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Project {} not found",
+                    deployment.project_id
+                ))
+            })?;
+        let effective_deployment_config = environment.get_effective_deployment_config(
+            &project_for_readiness_config
+                .deployment_config
+                .clone()
+                .unwrap_or_default(),
+        );
+        let public_readiness_check_enabled = effective_deployment_config
+            .public_readiness_check_enabled
+            .unwrap_or(true);
+        let public_readiness_timeout_secs = effective_deployment_config
+            .public_readiness_timeout_secs
+            .map(|secs| {
+                secs.clamp(
+                    PUBLIC_READINESS_TIMEOUT_MIN_SECS,
+                    PUBLIC_READINESS_TIMEOUT_MAX_SECS,
+                ) as u64
+            })
+            .unwrap_or(PUBLIC_READINESS_TIMEOUT_SECS);
+
         // Find the last *successful* deployment for this environment so we can
         // roll back to it if the route-table update fails. We query for
         // "completed" or "deployed" state (both represent a deployment that was
@@ -1041,14 +1084,74 @@ impl MarkDeploymentCompleteJob {
         // Container state and route-table propagation are necessary but not
         // sufficient. Request the same public URL the uptime monitor uses and
         // require two consecutive usable responses before writing completed.
-        let public_readiness_url = match self
-            .public_readiness_url(&environment, health_check_path.as_deref())
+        //
+        // Skippable per project/environment (public_readiness_check_enabled)
+        // for apps that don't serve plain HTTP even when healthy. The
+        // timeout is likewise configurable (public_readiness_timeout_secs)
+        // for apps that do real work after the container starts — e.g.
+        // compiling/bundling source on boot — before they're reachable.
+        if !public_readiness_check_enabled {
+            self.log(
+                "Public readiness check disabled for this project/environment — skipping"
+                    .to_string(),
+            )
+            .await?;
+        } else {
+            let public_readiness_url = match self
+                .public_readiness_url(&environment, health_check_path.as_deref())
+                .await
+            {
+                Ok(url) => url,
+                Err(reason) => {
+                    self.log(format!(
+                        "Public readiness URL could not be resolved ({reason}) — reverting to the last usable deployment"
+                    ))
+                    .await?;
+                    self.reject_unusable_deployment(
+                        environment_id,
+                        last_successful_deployment_id,
+                        &reason,
+                    )
+                    .await?;
+                    return Err(WorkflowError::JobExecutionFailed(format!(
+                        "{reason} — deployment rolled back"
+                    )));
+                }
+            };
+
+            let public_readiness_diagnostic_url =
+                Self::readiness_url_for_diagnostics(&public_readiness_url);
+            self.log(format!(
+                "Route propagated — verifying public readiness at {public_readiness_diagnostic_url}..."
+            ))
+            .await?;
+            if let Err(reason) = Self::wait_for_public_url_ready(
+                &public_readiness_url,
+                self.config_service
+                    .as_ref()
+                    .map(|service| service.proxy_port())
+                    .ok_or_else(|| {
+                        WorkflowError::JobExecutionFailed(format!(
+                            "Cannot verify public readiness for deployment {}: config service is unavailable",
+                            self.deployment_id
+                        ))
+                    })?,
+                std::time::Duration::from_secs(public_readiness_timeout_secs),
+                PUBLIC_READINESS_POLL_INTERVAL,
+                PUBLIC_READINESS_REQUEST_TIMEOUT,
+                PUBLIC_READINESS_REQUIRED_SUCCESSES,
+            )
             .await
-        {
-            Ok(url) => url,
-            Err(reason) => {
+            {
+                tracing::error!(
+                    deployment_id = self.deployment_id,
+                    environment_id,
+                    url = %public_readiness_diagnostic_url,
+                    reason = %reason,
+                    "Public readiness gate failed"
+                );
                 self.log(format!(
-                    "Public readiness URL could not be resolved ({reason}) — reverting to the last usable deployment"
+                    "Public readiness failed ({reason}) — reverting to the last usable deployment"
                 ))
                 .await?;
                 self.reject_unusable_deployment(
@@ -1061,51 +1164,11 @@ impl MarkDeploymentCompleteJob {
                     "{reason} — deployment rolled back"
                 )));
             }
-        };
-
-        let public_readiness_diagnostic_url =
-            Self::readiness_url_for_diagnostics(&public_readiness_url);
-        self.log(format!(
-            "Route propagated — verifying public readiness at {public_readiness_diagnostic_url}..."
-        ))
-        .await?;
-        if let Err(reason) = Self::wait_for_public_url_ready(
-            &public_readiness_url,
-            self.config_service
-                .as_ref()
-                .map(|service| service.proxy_port())
-                .ok_or_else(|| {
-                    WorkflowError::JobExecutionFailed(format!(
-                        "Cannot verify public readiness for deployment {}: config service is unavailable",
-                        self.deployment_id
-                    ))
-                })?,
-            std::time::Duration::from_secs(PUBLIC_READINESS_TIMEOUT_SECS),
-            PUBLIC_READINESS_POLL_INTERVAL,
-            PUBLIC_READINESS_REQUEST_TIMEOUT,
-            PUBLIC_READINESS_REQUIRED_SUCCESSES,
-        )
-        .await
-        {
-            tracing::error!(
-                deployment_id = self.deployment_id,
-                environment_id,
-                url = %public_readiness_diagnostic_url,
-                reason = %reason,
-                "Public readiness gate failed"
-            );
-            self.log(format!(
-                "Public readiness failed ({reason}) — reverting to the last usable deployment"
-            ))
+            self.log(
+                "Public readiness confirmed with two consecutive successful requests".to_string(),
+            )
             .await?;
-            self.reject_unusable_deployment(environment_id, last_successful_deployment_id, &reason)
-                .await?;
-            return Err(WorkflowError::JobExecutionFailed(format!(
-                "{reason} — deployment rolled back"
-            )));
         }
-        self.log("Public readiness confirmed with two consecutive successful requests".to_string())
-            .await?;
 
         // ── Phase 3: Mark deployment as completed ────────────────────────
         let now = chrono::Utc::now();

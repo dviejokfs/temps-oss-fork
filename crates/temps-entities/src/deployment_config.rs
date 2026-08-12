@@ -374,6 +374,28 @@ pub struct DeploymentConfig {
     /// Requests return 503 if exceeded. Default: 30.
     #[serde(default = "default_wake_timeout")]
     pub wake_timeout_seconds: i32,
+
+    /// Whether `MarkDeploymentCompleteJob` must prove the public URL actually
+    /// serves before marking a deployment complete (see the "Phase 2.75"
+    /// gate). `None` inherits the parent level; the platform default when
+    /// nothing sets it is `true`.
+    ///
+    /// Turn this off for apps that don't serve plain HTTP at their health
+    /// path even when healthy (e.g. a raw TCP protocol behind the published
+    /// port), or as a last resort for an app whose true startup time the
+    /// timeout below still can't accommodate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_readiness_check_enabled: Option<bool>,
+
+    /// How long `MarkDeploymentCompleteJob` waits for the public URL to
+    /// start responding before reverting the deployment. `None` inherits the
+    /// parent level; the platform default when nothing sets it is 60s.
+    ///
+    /// Raise this for apps that do real work after the container starts
+    /// before they're reachable — e.g. compiling/bundling source on boot
+    /// instead of at image-build time. Min: 10, Max: 900 (15m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_readiness_timeout_secs: Option<i32>,
 }
 
 /// Deployment configuration snapshot for deployments
@@ -465,6 +487,8 @@ impl Default for DeploymentConfig {
             on_demand: false,
             idle_timeout_seconds: 300,
             wake_timeout_seconds: 30,
+            public_readiness_check_enabled: None,
+            public_readiness_timeout_secs: None,
         }
     }
 }
@@ -554,6 +578,12 @@ impl DeploymentConfig {
             } else {
                 self.wake_timeout_seconds
             },
+            public_readiness_check_enabled: other
+                .public_readiness_check_enabled
+                .or(self.public_readiness_check_enabled),
+            public_readiness_timeout_secs: other
+                .public_readiness_timeout_secs
+                .or(self.public_readiness_timeout_secs),
         }
     }
 
@@ -602,6 +632,16 @@ impl DeploymentConfig {
                 return Err(format!(
                     "Wake timeout {} is not in valid range (5-120 seconds)",
                     self.wake_timeout_seconds
+                ));
+            }
+        }
+
+        // Public readiness timeout should be in valid range when set
+        if let Some(timeout) = self.public_readiness_timeout_secs {
+            if !(10..=900).contains(&timeout) {
+                return Err(format!(
+                    "Public readiness timeout {} is not in valid range (10-900 seconds)",
+                    timeout
                 ));
             }
         }
@@ -702,6 +742,62 @@ mod tests {
                 .cross_architecture_builds,
             None
         );
+    }
+
+    /// Same env-wins-over-unset semantics as cross_architecture_builds: an
+    /// environment must be able to both inherit the project's setting and
+    /// explicitly override it (including back to the platform default),
+    /// which is why these are `Option<T>` rather than plain booleans/ints
+    /// with an `||`/`max` merge.
+    #[test]
+    fn test_public_readiness_merge_semantics() {
+        let project_disabled = DeploymentConfig {
+            public_readiness_check_enabled: Some(false),
+            public_readiness_timeout_secs: Some(180),
+            ..Default::default()
+        };
+        let env_unset = DeploymentConfig::default();
+        let env_override = DeploymentConfig {
+            public_readiness_check_enabled: Some(true),
+            public_readiness_timeout_secs: Some(300),
+            ..Default::default()
+        };
+
+        // Nothing set anywhere resolves to None, i.e. the read site's
+        // platform defaults (enabled, 60s) apply.
+        assert_eq!(env_unset.public_readiness_check_enabled, None);
+        assert_eq!(env_unset.public_readiness_timeout_secs, None);
+
+        // An environment that says nothing inherits the project.
+        let inherited = project_disabled.merge(&env_unset);
+        assert_eq!(inherited.public_readiness_check_enabled, Some(false));
+        assert_eq!(inherited.public_readiness_timeout_secs, Some(180));
+
+        // ...and one with an explicit value overrides the project's.
+        let overridden = project_disabled.merge(&env_override);
+        assert_eq!(overridden.public_readiness_check_enabled, Some(true));
+        assert_eq!(overridden.public_readiness_timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn test_public_readiness_timeout_validation_bounds() {
+        let mut config = DeploymentConfig {
+            public_readiness_timeout_secs: Some(9),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.public_readiness_timeout_secs = Some(901);
+        assert!(config.validate().is_err());
+
+        config.public_readiness_timeout_secs = Some(10);
+        assert!(config.validate().is_ok());
+
+        config.public_readiness_timeout_secs = Some(900);
+        assert!(config.validate().is_ok());
+
+        config.public_readiness_timeout_secs = None;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
