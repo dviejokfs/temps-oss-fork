@@ -250,6 +250,15 @@ impl MarkDeploymentCompleteJob {
             .port()
             .map_or_else(|| hostname.to_string(), |port| format!("{hostname}:{port}"));
         let mut probe_url = parsed_url.clone();
+        // `proxy_port` is the plaintext Pingora listener. TLS is terminated at
+        // the public edge (or on the separate TLS listener), so carrying an
+        // external `https` scheme into this pinned local request attempts a TLS
+        // handshake against an HTTP socket and can never succeed. Probe the
+        // same host and path over the local HTTP listener; redirects are usable
+        // responses and the public certificate is covered independently.
+        probe_url.set_scheme("http").map_err(|_| {
+            format!("Public readiness URL '{diagnostic_url}' has an unsupported scheme")
+        })?;
         if is_ip_literal {
             probe_url.set_host(Some("127.0.0.1")).map_err(|_| {
                 format!("Public readiness URL '{diagnostic_url}' has an invalid hostname")
@@ -2718,6 +2727,28 @@ mod teardown_tests {
 
         server.abort();
         assert!(result.is_ok(), "probe must use local proxy: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_https_public_readiness_uses_plaintext_local_proxy_listener() {
+        let (local_url, server) = spawn_status_server(vec![200, 200]).await;
+        let proxy_port = local_url.parse::<reqwest::Url>().unwrap().port().unwrap();
+
+        let result = MarkDeploymentCompleteJob::wait_for_public_url_ready(
+            "https://app.example.test/health",
+            proxy_port,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(100),
+            2,
+        )
+        .await;
+
+        server.abort();
+        assert!(
+            result.is_ok(),
+            "HTTPS public URLs must probe the local HTTP listener: {result:?}"
+        );
     }
 
     #[tokio::test]
