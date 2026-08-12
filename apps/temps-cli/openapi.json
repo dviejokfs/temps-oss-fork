@@ -2557,6 +2557,20 @@
               }
             ]
           },
+          "request_timeouts": {
+            "default": {
+              "default_http_timeout_seconds": 0,
+              "default_sse_idle_timeout_seconds": 0,
+              "default_websocket_idle_timeout_seconds": 0,
+              "max_request_timeout_seconds": 600
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RequestTimeoutSettings",
+                "description": "Upstream request/connection timeouts applied by the proxy to customer\napp traffic. Provides a global hard ceiling plus global defaults for\nregular HTTP, SSE, and WebSocket traffic; projects and environments\nmay set a shorter value but never exceed the ceiling here."
+              }
+            ]
+          },
           "require_mfa_for_admins": {
             "default": false,
             "description": "When `true`, any user holding the `Admin` role must have MFA enrolled\n(`users.mfa_enabled = true`) to complete a **password** login. Users\nwithout MFA enrolled are rejected with a typed error instructing them\nto enroll before retrying. This only gates the password-login path\n(`AuthService::login`) -- SSO/OIDC logins are handled by a separate\ncode path (`OidcService::resolve_user` + `oidc_handler`) and are\nintentionally unaffected, since federating identity to a\nproperly-hardened IdP is itself an acceptable alternative to local\nTOTP MFA. Modeled as a settings row (not an env var) per CLAUDE.md so\nan operator can flip it at runtime via the Settings API without\nrestarting the binary.",
@@ -2716,6 +2730,10 @@
           "rate_limiting": {
             "$ref": "#/components/schemas/RateLimitSettings"
           },
+          "request_timeouts": {
+            "$ref": "#/components/schemas/RequestTimeoutSettings",
+            "description": "Upstream request/connection timeouts (hard ceiling + defaults) applied\nby the proxy to customer app traffic. No sensitive content."
+          },
           "require_mfa_for_admins": {
             "description": "When enabled, Admin-role accounts without MFA enrolled are rejected\nat password login (bherila/temps#32). SSO/OIDC logins are unaffected.",
             "type": "boolean"
@@ -2761,6 +2779,7 @@
           "cluster_dns",
           "build_limits",
           "ai_chat_limits",
+          "request_timeouts",
           "self_update"
         ],
         "type": "object"
@@ -9723,6 +9742,14 @@
             "format": "int32",
             "type": "integer"
           },
+          "requestTimeoutSeconds": {
+            "description": "Override for the proxy's upstream timeout on regular (non-streaming)\nHTTP requests to this project/environment, in seconds.\n`None` = inherit the global `request_timeouts.default_http_timeout_seconds`\n(which itself defaults to \"no timeout\"). `Some(0)` explicitly forces\n\"no timeout\" for this project/environment, overriding a nonzero\nglobal default. `Some(n)` for `n > 0` sets an explicit timeout,\nalways clamped to the global hard ceiling\n(`request_timeouts.max_request_timeout_seconds`) at resolution time.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "security": {
             "oneOf": [
               {
@@ -9737,6 +9764,14 @@
           "sessionRecordingEnabled": {
             "description": "Enable session recording for analytics",
             "type": "boolean"
+          },
+          "sseIdleTimeoutSeconds": {
+            "description": "Override for the proxy's idle timeout on Server-Sent Events streams to\nthis project/environment, in seconds. `None` = inherit the global\n`request_timeouts.default_sse_idle_timeout_seconds`. `Some(0)`\nexplicitly forces \"no timeout\". `Some(n)` for `n > 0` is clamped to\nthe global hard ceiling at resolution time.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "targetLabels": {
             "description": "Label selector for node-based scheduling. Replicas are only deployed to\nnodes whose labels match the selector.\n\nMatching rules:\n- **Same key, array value** → OR: node must match any value\n- **Different keys** → AND: node must satisfy all keys\n\nExample: `{\"region\": [\"us\", \"asia\"], \"gpu\": \"true\"}`\n→ (region=us OR region=asia) AND gpu=true\n\nApplied after `target_nodes` filtering (they stack)."
@@ -9756,6 +9791,14 @@
             "description": "Max seconds to wait for containers to start when waking from on-demand sleep.\nRequests return 503 if exceeded. Default: 30.",
             "format": "int32",
             "type": "integer"
+          },
+          "websocketIdleTimeoutSeconds": {
+            "description": "Override for the proxy's idle timeout on WebSocket connections to this\nproject/environment, in seconds. `None` = inherit the global\n`request_timeouts.default_websocket_idle_timeout_seconds`. `Some(0)`\nexplicitly forces \"no timeout\". `Some(n)` for `n > 0` is clamped to\nthe global hard ceiling at resolution time.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -31064,6 +31107,45 @@
         ],
         "type": "object"
       },
+      "RequestTimeoutSettings": {
+        "description": "Upstream request/connection timeouts for customer app traffic.\n\nBy default, no timeout is applied to customer app traffic at all — an\nexisting app that happens to have a slow endpoint, a long-polling\nrequest, or an unusually long response must keep working exactly as it\ndid before this setting existed. Timeouts here are opt-in: an operator\ncan set a global default, and/or a project/environment can set its own\noverride (`DeploymentConfig::request_timeout_seconds` /\n`sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`), but until\none of those is explicitly configured, the proxy holds the connection\nopen indefinitely (bounded only by TCP/OS-level limits).\n\n`default_*_timeout_seconds` of `0` means \"no timeout\" — this is the\nout-of-the-box value for all three. `max_request_timeout_seconds` is a\nhard ceiling that only comes into play once a timeout is actually\nconfigured (globally or per project/environment): whatever value is\nresolved is always clamped to it, so lowering the ceiling here takes\neffect immediately without needing every environment row re-saved. It\nnever *creates* a timeout for traffic that has none.",
+        "properties": {
+          "default_http_timeout_seconds": {
+            "default": 0,
+            "description": "Default timeout for regular (non-streaming) HTTP requests, in\nseconds. Used when a project/environment hasn't set\n`request_timeout_seconds`. `0` (the default) means no timeout.",
+            "example": 0,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "default_sse_idle_timeout_seconds": {
+            "default": 0,
+            "description": "Default idle timeout for Server-Sent Events streams, in seconds. Used\nwhen a project/environment hasn't set `sse_idle_timeout_seconds`. `0`\n(the default) means no timeout.",
+            "example": 0,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "default_websocket_idle_timeout_seconds": {
+            "default": 0,
+            "description": "Default idle timeout for WebSocket connections, in seconds. Used when\na project/environment hasn't set `websocket_idle_timeout_seconds`.\n`0` (the default) means no timeout.",
+            "example": 0,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_request_timeout_seconds": {
+            "default": 600,
+            "description": "Hard ceiling, in seconds, applied once a timeout is configured (via a\nglobal default above or a project/environment override). Has no\neffect on traffic with no timeout configured at all.",
+            "example": 600,
+            "format": "int32",
+            "maximum": 86400,
+            "minimum": 5,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "RequiredPasswordChangeRequest": {
         "properties": {
           "new_password": {
@@ -40506,6 +40588,14 @@
               "null"
             ]
           },
+          "requestTimeoutSeconds": {
+            "description": "Project-level default timeout for regular (non-streaming) HTTP\nrequests, in seconds (1-86400). Environments may override this; always\nclamped to the operator's global hard ceiling regardless of what's set\nhere. Absent leaves the current value unchanged.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "security": {
             "oneOf": [
               {
@@ -40519,6 +40609,22 @@
           "sessionRecordingEnabled": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "sseIdleTimeoutSeconds": {
+            "description": "Project-level default idle timeout for Server-Sent Events streams, in\nseconds (1-86400). Environments may override this; always clamped to\nthe operator's global hard ceiling. Absent leaves the current value\nunchanged.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "websocketIdleTimeoutSeconds": {
+            "description": "Project-level default idle timeout for WebSocket connections, in\nseconds (1-86400). Environments may override this; always clamped to\nthe operator's global hard ceiling. Absent leaves the current value\nunchanged.",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           }
@@ -40791,6 +40897,14 @@
               "null"
             ]
           },
+          "request_timeout_seconds": {
+            "description": "Override the proxy's timeout for regular (non-streaming) HTTP requests\nto this environment, in seconds (1-86400). Always clamped to the\noperator's global hard ceiling regardless of what's set here.\nAbsent leaves the current value unchanged. Send JSON `null` to clear\nthe override (inherit the project/global default).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "security": {
             "oneOf": [
               {
@@ -40806,6 +40920,14 @@
             "description": "Enable/disable session recording",
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "sse_idle_timeout_seconds": {
+            "description": "Override the proxy's idle timeout for Server-Sent Events streams to\nthis environment, in seconds (1-86400). Always clamped to the\noperator's global hard ceiling. Absent leaves the current value\nunchanged. Send JSON `null` to clear the override.",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -40825,6 +40947,14 @@
           },
           "wake_timeout_seconds": {
             "description": "Max seconds to wait for containers to start on wake (5-120). Default: 30.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "websocket_idle_timeout_seconds": {
+            "description": "Override the proxy's idle timeout for WebSocket connections to this\nenvironment, in seconds (1-86400). Always clamped to the operator's\nglobal hard ceiling. Absent leaves the current value unchanged. Send\nJSON `null` to clear the override.",
             "format": "int32",
             "type": [
               "integer",
