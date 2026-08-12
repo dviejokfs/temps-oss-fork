@@ -62,10 +62,15 @@ Filter the exact URL pathname before its server span is created or exported. Do 
 For Node.js auto-instrumentation, use the HTTP instrumentation's `ignoreIncomingRequestHook`. The zero-code `@opentelemetry/auto-instrumentations-node/register` preload cannot accept programmatic instrumentation options, so use a small preload file when health filtering is required. Add dependencies through the application's reviewed dependency workflow, commit the lockfile, and use exact versions; disable lifecycle scripts where compatible:
 
 ```bash
-npm install --ignore-scripts --save-exact @opentelemetry/sdk-node \
-  @opentelemetry/exporter-trace-otlp-proto \
-  @opentelemetry/auto-instrumentations-node
+npm install --ignore-scripts --save-exact \
+  @opentelemetry/sdk-node@<reviewed-version> \
+  @opentelemetry/exporter-trace-otlp-proto@<reviewed-version> \
+  @opentelemetry/auto-instrumentations-node@<reviewed-version>
 ```
+
+Replace every `<reviewed-version>` placeholder, including the first package, with an exact
+version selected through the application's dependency-review process before running the
+command. The placeholders intentionally make the example non-executable as copied.
 
 ```js
 // tracing.cjs — load before the application
@@ -135,12 +140,19 @@ Apply [hygiene.md](hygiene.md) before enabling production export:
 
 Every OpenTelemetry SDK reads the three env vars above and needs no Temps-specific code — set them, run the app, and spans land in **Observe → Traces**. These are the same setup patterns from the [add-error-tracking](../../../add-error-tracking/SKILL.md) skill's platform list, applied to traces instead of Sentry.
 
+The install snippets below deliberately contain `<reviewed-version>` and, where applicable,
+`<reviewed-sha256>` placeholders. Resolve exact versions through the repository's normal
+dependency-review tooling, inspect the resulting diff, and commit its lockfile or hashed
+constraints. Never replace a placeholder with `latest`, a floating range, or an unreviewed
+auto-installer. Do not run a snippet until every placeholder has been replaced.
+
 ### Node.js (and Next.js server/API routes)
 
 For a quick local smoke test, the zero-code OpenTelemetry auto-instrumentation agent needs no source changes:
 
 ```bash
-npm install --save-dev @opentelemetry/auto-instrumentations-node
+npm install --ignore-scripts --save-dev --save-exact \
+  @opentelemetry/auto-instrumentations-node@<reviewed-version>
 node --require @opentelemetry/auto-instrumentations-node/register app.js
 ```
 
@@ -151,7 +163,7 @@ For a Temps deployment, replace this zero-code preload with the configurable `tr
 For Next.js specifically, use the built-in `instrumentation.ts` hook instead:
 
 ```bash
-npm install @vercel/otel
+npm install --ignore-scripts --save-exact @vercel/otel@<reviewed-version>
 ```
 
 ```ts
@@ -185,17 +197,22 @@ This is a real, previously-hit bug, not a hypothetical: a Temps example app went
 Zero-code via `opentelemetry-instrument`:
 
 ```bash
-pip install opentelemetry-distro opentelemetry-exporter-otlp
-opentelemetry-bootstrap -a install
+python -m pip install --require-hashes -r requirements-otel.txt
 opentelemetry-instrument --service_name your-app python app.py
 ```
+
+Generate and review `requirements-otel.txt` with exact versions and hashes using the
+project's existing Python lock/constraints tool. Do not use `opentelemetry-bootstrap -a
+install`: it installs dynamically discovered packages outside that reviewed set.
 
 ### Go
 
 Go has no stable zero-code agent — initialize the SDK manually and read the standard env vars via `autoexport`:
 
 ```bash
-go get go.opentelemetry.io/otel go.opentelemetry.io/contrib/exporters/autoexport go.opentelemetry.io/otel/sdk
+go get go.opentelemetry.io/otel@<reviewed-version> \
+  go.opentelemetry.io/contrib/exporters/autoexport@<reviewed-version> \
+  go.opentelemetry.io/otel/sdk@<reviewed-version>
 ```
 
 ```go
@@ -226,7 +243,10 @@ func main() {
 ### Rust
 
 ```bash
-cargo add opentelemetry opentelemetry-otlp opentelemetry_sdk --features opentelemetry-otlp/http-proto,opentelemetry-otlp/reqwest-client
+cargo add opentelemetry@<reviewed-version> \
+  opentelemetry-otlp@<reviewed-version> \
+  opentelemetry_sdk@<reviewed-version> \
+  --features opentelemetry-otlp/http-proto,opentelemetry-otlp/reqwest-client
 ```
 
 ```rust
@@ -253,7 +273,9 @@ fn main() {
 Zero-code via the instrumentation-all gem:
 
 ```bash
-bundle add opentelemetry-sdk opentelemetry-exporter-otlp opentelemetry-instrumentation-all
+bundle add opentelemetry-sdk --version <reviewed-version>
+bundle add opentelemetry-exporter-otlp --version <reviewed-version>
+bundle add opentelemetry-instrumentation-all --version <reviewed-version>
 ```
 
 ```ruby
@@ -273,17 +295,24 @@ end
 Zero-code via the OpenTelemetry Java agent — no source changes:
 
 ```bash
-curl -L -o opentelemetry-javaagent.jar \
-  https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar
+curl --fail --location --proto '=https' -o opentelemetry-javaagent.jar \
+  https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/download/v<reviewed-version>/opentelemetry-javaagent.jar
+printf '%s  %s\n' '<reviewed-sha256>' opentelemetry-javaagent.jar | sha256sum --check --strict
 java -javaagent:opentelemetry-javaagent.jar -Dotel.service.name=your-app -jar app.jar
 ```
 
-The agent reads the same `OTEL_EXPORTER_OTLP_*` env vars.
+Obtain the checksum from the selected release's signed provenance or checksums and compare
+it through a separately authenticated channel before running the agent. On macOS, use
+`shasum -a 256 opentelemetry-javaagent.jar` and compare the full value manually. The agent
+reads the same `OTEL_EXPORTER_OTLP_*` env vars.
 
 ### PHP
 
 ```bash
-composer require open-telemetry/opentelemetry open-telemetry/exporter-otlp open-telemetry/transport-grpc
+composer require --no-scripts \
+  open-telemetry/opentelemetry:<reviewed-version> \
+  open-telemetry/exporter-otlp:<reviewed-version> \
+  open-telemetry/transport-grpc:<reviewed-version>
 ```
 
 ```php
@@ -298,8 +327,8 @@ $tracerProvider = (new TracerProviderFactory())->create(); // reads OTEL_EXPORTE
 ### .NET
 
 ```bash
-dotnet add package OpenTelemetry.Extensions.Hosting
-dotnet add package OpenTelemetry.Exporter.OpenTelemetryProtocol
+dotnet add package OpenTelemetry.Extensions.Hosting --version <reviewed-version>
+dotnet add package OpenTelemetry.Exporter.OpenTelemetryProtocol --version <reviewed-version>
 ```
 
 ```csharp
