@@ -207,7 +207,6 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("{} not found in migration list", target))?;
         let after_count = all_migrations.len() - target_pos - 1;
         let steps = (after_count + 1) as u32;
-
         Migrator::down(connection.as_ref(), Some(steps)).await?;
         let pending_after_down = get_pending_migration_names(connection.as_ref()).await?;
         // Pending migrations are returned in ascending (chronological) order —

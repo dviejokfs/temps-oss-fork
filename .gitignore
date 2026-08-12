@@ -39,6 +39,11 @@ target_old
 .env.local
 /secrets/
 
+# Promptfoo eval results may contain project metadata and AI transcripts.
+.promptfoo/
+promptfoo.db
+promptfoo-output/
+
 # Content / blog drafts
 content/
 
