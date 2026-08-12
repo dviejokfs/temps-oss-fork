@@ -179,6 +179,7 @@ mod m20260806_000001_index_permission_denied_retention;
 pub mod m20260806_000001_sandbox_workspace_lifecycle;
 mod m20260809_000001_ai_gateway_config_provider_type;
 mod m20260810_000001_add_cli_session_id_to_ai_conversations;
+pub mod m20260810_000001_create_sandbox_snapshots;
 mod m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config;
 mod m20260810_000003_pin_ai_provider_to_conversations;
 mod m20260810_000004_add_ai_conversation_runtime_options;
@@ -377,6 +378,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260806_000001_sandbox_workspace_lifecycle::Migration),
             Box::new(m20260806_000001_index_permission_denied_retention::Migration),
             Box::new(m20260809_000001_ai_gateway_config_provider_type::Migration),
+            // Main shipped the sandbox migration first. Keep it ahead of this
+            // branch's independently authored migration with the same date and
+            // sequence stamp; DeriveMigrationName uses the full module name, so
+            // the two records remain distinct in seaql_migrations.
+            Box::new(m20260810_000001_create_sandbox_snapshots::Migration),
             Box::new(
                 m20260810_000001_add_cli_session_id_to_ai_conversations::Migration,
             ),

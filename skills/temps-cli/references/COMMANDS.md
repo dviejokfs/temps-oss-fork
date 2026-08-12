@@ -128,8 +128,8 @@ Authenticate with a Temps server. Opens the browser for interactive logins; use 
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-k, --api-key <key>` | Use a pre-minted API key (Settings → API Keys) instead of opening the browser. Required for headless / CI. | - | Yes |
-| `--context <name>` | Save the credentials under this context name (defaults to URL host) | - | Yes |
+| `-k, --api-key <key>` | Use a pre-minted API key (Settings → API Keys) instead of opening the browser. Required for headless / CI. | - | No |
+| `--context <name>` | Save the credentials under this context name (defaults to URL host) | - | No |
 | `--debug` | Print every request/response (URL, status, headers, raw body) to stderr. Also enabled via TEMPS_DEBUG=1. | - | No |
 
 ## `logout`
@@ -140,7 +140,7 @@ Revoke the active context's API key on the server and forget it locally
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--context <name>` | Log out of a specific context (defaults to active) | - | Yes |
+| `--context <name>` | Log out of a specific context (defaults to active) | - | No |
 | `--local-only` | Skip server-side revocation; only clear local credentials | - | No |
 
 ## `whoami`
@@ -205,9 +205,9 @@ Configure CLI settings (AWS-style wizard)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--api-url <url>` | API URL | - | Yes |
-| `--api-token <token>` | API token for authentication | - | Yes |
-| `--output-format <format>` | Output format (table, json, minimal) | - | Yes |
+| `--api-url <url>` | API URL | - | No |
+| `--api-token <token>` | API token for authentication | - | No |
+| `--output-format <format>` | Output format (table, json, minimal) | - | No |
 | `--enable-colors` | Enable colored output in config | - | No |
 | `--disable-colors` | Disable colored output in config | - | No |
 | `-i, --interactive` | Force interactive mode even in non-TTY | - | No |
@@ -282,8 +282,8 @@ List secrets for a project (values are never returned)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <name>` | Filter to one environment | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Filter to one environment | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `projects secrets create` (alias: `add`)
@@ -294,10 +294,10 @@ Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-k, --key <key>` | Secret key — becomes the filename at /run/secrets/<KEY>. Letters, digits, underscore; must start with a letter or underscore. | - | Yes |
 | `-v, --value <value>` | Secret value (<=1 MiB). Prefix with @ to read from a local file, e.g. @./auth.json — never touches shell history. | - | Yes |
-| `-e, --environment <name>` | Scope to one environment (repeatable; default: all) | `` | Yes |
+| `-e, --environment <name>` | Scope to one environment (repeatable; default: all) | `` | No |
 | `--include-in-preview` | Also mount this secret in preview environments | - | No |
 
 #### `projects secrets update`
@@ -308,10 +308,10 @@ Update a project secret (a redeploy is required for running containers to pick i
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-k, --key <key>` | Key of the secret to update | - | Yes |
-| `-v, --value <value>` | New value (<=1 MiB). Prefix with @ to read from a local file. Omit to keep the existing value. | - | Yes |
-| `-e, --environment <name>` | Replace environment scoping (repeatable) | `` | Yes |
+| `-v, --value <value>` | New value (<=1 MiB). Prefix with @ to read from a local file. Omit to keep the existing value. | - | No |
+| `-e, --environment <name>` | Replace environment scoping (repeatable) | `` | No |
 | `--include-in-preview` | Include in preview environments | - | No |
 | `--no-include-in-preview` | Exclude from preview environments | - | No |
 
@@ -323,7 +323,7 @@ Delete a project secret
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
@@ -336,8 +336,8 @@ List all projects
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--page <n>` | Page number | - | Yes |
-| `--per-page <n>` | Items per page | - | Yes |
+| `--page <n>` | Page number | - | No |
+| `--per-page <n>` | Items per page | - | No |
 
 ### `projects create` (alias: `new`)
 
@@ -347,17 +347,17 @@ Create a new project (git-based or manual deployment)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Project name | - | Yes |
-| `-d, --description <description>` | Project description | - | Yes |
-| `--repo <repository>` | Repository in owner/name format (nested groups supported: group/subgroup/name) | - | Yes |
-| `--branch <branch>` | Git branch | - | Yes |
-| `--directory <directory>` | Root directory (relative to repo) | - | Yes |
-| `--preset <preset>` | Build preset (e.g., nextjs, nodejs, static, docker) | - | Yes |
-| `--connection <id>` | Git connection ID | - | Yes |
+| `-n, --name <name>` | Project name | - | No |
+| `-d, --description <description>` | Project description | - | No |
+| `--repo <repository>` | Repository in owner/name format (nested groups supported: group/subgroup/name) | - | No |
+| `--branch <branch>` | Git branch | - | No |
+| `--directory <directory>` | Root directory (relative to repo) | - | No |
+| `--preset <preset>` | Build preset (e.g., nextjs, nodejs, static, docker) | - | No |
+| `--connection <id>` | Git connection ID | - | No |
 | `--manual` | Create a manual (non-git) project - deploy via Docker image or static files | - | No |
-| `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | Yes |
-| `--image <image>` | Docker image for the first deployment (manual mode) | - | Yes |
-| `--port <port>` | Application/container port (manual mode, default: 3000) | - | Yes |
+| `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | No |
+| `--image <image>` | Docker image for the first deployment (manual mode) | - | No |
+| `--port <port>` | Application/container port (manual mode, default: 3000) | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
 
 ### `projects show` (alias: `get`)
@@ -368,7 +368,7 @@ Show project details
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `projects update` (alias: `edit`)
@@ -379,9 +379,9 @@ Update project name and description
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-n, --name <name>` | New project name | - | Yes |
-| `-d, --description <description>` | New project description | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | New project name | - | No |
+| `-d, --description <description>` | New project description | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts, use provided values (for automation) | - | No |
 
@@ -393,8 +393,8 @@ Update project settings (slug, attack mode, preview environments)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--slug <slug>` | Project URL slug | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--slug <slug>` | Project URL slug | - | No |
 | `--attack-mode` | Enable attack mode (CAPTCHA protection) | - | No |
 | `--no-attack-mode` | Disable attack mode | - | No |
 | `--preview-envs` | Enable preview environments | - | No |
@@ -410,13 +410,13 @@ Update git repository settings
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--owner <owner>` | Repository owner | - | Yes |
-| `--repo <repo>` | Repository name | - | Yes |
-| `--branch <branch>` | Main branch | - | Yes |
-| `--directory <directory>` | App directory path | - | Yes |
-| `--preset <preset>` | Build preset (auto, nextjs, nodejs, static, docker, rust, go, python) | - | Yes |
-| `--connection <id>` | Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged) | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--owner <owner>` | Repository owner | - | No |
+| `--repo <repo>` | Repository name | - | No |
+| `--branch <branch>` | Main branch | - | No |
+| `--directory <directory>` | App directory path | - | No |
+| `--preset <preset>` | Build preset (auto, nextjs, nodejs, static, docker, rust, go, python) | - | No |
+| `--connection <id>` | Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts, use provided/existing values (for automation) | - | No |
 
@@ -428,10 +428,10 @@ Update deployment configuration (resources, replicas)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--replicas <n>` | Number of container replicas | - | Yes |
-| `--cpu-limit <limit>` | CPU limit in cores (e.g., 0.5, 1, 2) | - | Yes |
-| `--memory-limit <limit>` | Memory limit in MB | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--replicas <n>` | Number of container replicas | - | No |
+| `--cpu-limit <limit>` | CPU limit in cores (e.g., 0.5, 1, 2) | - | No |
+| `--memory-limit <limit>` | Memory limit in MB | - | No |
 | `--auto-deploy` | Enable automatic deployments | - | No |
 | `--no-auto-deploy` | Disable automatic deployments | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -445,7 +445,7 @@ Delete a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
@@ -457,11 +457,11 @@ Detect and deploy a local source directory or ZIP without Git
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--name <name>` | Project name (slugified automatically) | - | Yes |
-| `--preset <preset>` | Select a detected preset | - | Yes |
-| `--directory <directory>` | Select a detected project root | - | Yes |
+| `--name <name>` | Project name (slugified automatically) | - | No |
+| `--preset <preset>` | Select a detected preset | - | No |
+| `--directory <directory>` | Select a detected project root | - | No |
 | `--no-wait` | Do not wait for deployment to complete | - | No |
-| `--timeout <seconds>` | Deployment timeout | `600` | Yes |
+| `--timeout <seconds>` | Deployment timeout | `600` | No |
 
 ## `deploy`
 
@@ -471,11 +471,11 @@ Deploy a project from git
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <env>` | Target environment name | - | Yes |
-| `--environment-id <id>` | Target environment ID | - | Yes |
-| `-b, --branch <branch>` | Git branch to deploy | - | Yes |
-| `-c, --commit <sha>` | Specific commit SHA to deploy | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <env>` | Target environment name | - | No |
+| `--environment-id <id>` | Target environment ID | - | No |
+| `-b, --branch <branch>` | Git branch to deploy | - | No |
+| `-c, --commit <sha>` | Specific commit SHA to deploy | - | No |
 | `--no-wait` | Do not wait for deployment to complete | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
@@ -488,14 +488,14 @@ Deploy static files (tar.gz, zip, or directory)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--path <path>` | Path to static files archive or directory | - | Yes |
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <env>` | Target environment name | `production` | Yes |
-| `--environment-id <id>` | Target environment ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <env>` | Target environment name | `production` | No |
+| `--environment-id <id>` | Target environment ID | - | No |
 | `--no-wait` | Do not wait for deployment to complete | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
-| `--metadata <json>` | Additional metadata (JSON format) | - | Yes |
-| `--health-check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor. | - | Yes |
-| `--timeout <seconds>` | Timeout in seconds for --wait | `300` | Yes |
+| `--metadata <json>` | Additional metadata (JSON format) | - | No |
+| `--health-check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor. | - | No |
+| `--timeout <seconds>` | Timeout in seconds for --wait | `300` | No |
 
 ## `deploy:image` (alias: `deploy-image`)
 
@@ -506,14 +506,14 @@ Deploy a pre-built Docker image
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--image <image>` | Docker image reference (e.g., ghcr.io/org/app:v1.0) | - | Yes |
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <env>` | Target environment name | `production` | Yes |
-| `--environment-id <id>` | Target environment ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <env>` | Target environment name | `production` | No |
+| `--environment-id <id>` | Target environment ID | - | No |
 | `--no-wait` | Do not wait for deployment to complete | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
-| `--metadata <json>` | Additional metadata (JSON format) | - | Yes |
-| `--health-check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor. | - | Yes |
-| `--timeout <seconds>` | Timeout in seconds for --wait | `300` | Yes |
+| `--metadata <json>` | Additional metadata (JSON format) | - | No |
+| `--health-check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor. | - | No |
+| `--timeout <seconds>` | Timeout in seconds for --wait | `300` | No |
 
 ## `deploy:local-image` (alias: `deploy-local-image`)
 
@@ -523,20 +523,20 @@ Build and deploy a local Docker image (or deploy existing image with --image)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--image <image>` | Use existing local image instead of building (skips build) | - | Yes |
-| `-f, --dockerfile <path>` | Path to Dockerfile | `Dockerfile` | Yes |
-| `-c, --context <path>` | Build context directory | `.` | Yes |
-| `--build-arg <arg...>` | Build arguments (can be specified multiple times) | - | Yes |
+| `--image <image>` | Use existing local image instead of building (skips build) | - | No |
+| `-f, --dockerfile <path>` | Path to Dockerfile | `Dockerfile` | No |
+| `-c, --context <path>` | Build context directory | `.` | No |
+| `--build-arg <arg...>` | Build arguments (can be specified multiple times) | - | No |
 | `--no-build` | Skip building, requires --image | - | No |
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <env>` | Target environment name | `production` | Yes |
-| `--environment-id <id>` | Target environment ID | - | Yes |
-| `-t, --tag <tag>` | Tag for the built/uploaded image | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <env>` | Target environment name | `production` | No |
+| `--environment-id <id>` | Target environment ID | - | No |
+| `-t, --tag <tag>` | Tag for the built/uploaded image | - | No |
 | `--no-wait` | Do not wait for deployment to complete | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
-| `--metadata <json>` | Additional metadata (JSON format) | - | Yes |
-| `--health-check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor. | - | Yes |
-| `--timeout <seconds>` | Timeout in seconds for --wait | `600` | Yes |
+| `--metadata <json>` | Additional metadata (JSON format) | - | No |
+| `--health-check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor. | - | No |
+| `--timeout <seconds>` | Timeout in seconds for --wait | `600` | No |
 
 ## `deployments` (alias: `deploys`)
 
@@ -561,12 +561,12 @@ List deployments
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <env>` | Filter by environment name (client-side) | - | Yes |
-| `--environment-id <id>` | Filter by environment ID (server-side) | - | Yes |
-| `-n, --limit <number>` | Limit results | `10` | Yes |
-| `--page <n>` | Page number | - | Yes |
-| `--per-page <n>` | Items per page | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <env>` | Filter by environment name (client-side) | - | No |
+| `--environment-id <id>` | Filter by environment ID (server-side) | - | No |
+| `-n, --limit <number>` | Limit results | `10` | No |
+| `--page <n>` | Page number | - | No |
+| `--per-page <n>` | Items per page | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `deployments status`
@@ -577,8 +577,8 @@ Show deployment status
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID (required) | - | Yes |
-| `-d, --deployment-id <id>` | Deployment ID (required) | - | Yes |
+| `-p, --project <project>` | Project slug or ID (required) | - | No |
+| `-d, --deployment-id <id>` | Deployment ID (required) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `deployments rollback`
@@ -589,9 +589,9 @@ Rollback to previous deployment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID (required) | - | Yes |
-| `-e, --environment <env>` | Target environment | `production` | Yes |
-| `--to <deployment>` | Rollback to specific deployment ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID (required) | - | No |
+| `-e, --environment <env>` | Target environment | `production` | No |
+| `--to <deployment>` | Rollback to specific deployment ID | - | No |
 
 ### `deployments cancel`
 
@@ -647,11 +647,11 @@ Show deployment build logs
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <env>` | Environment | `production` | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <env>` | Environment | `production` | No |
 | `-f, --follow` | Follow log output | - | No |
-| `-n, --lines <number>` | Number of lines to show | `100` | Yes |
-| `-d, --deployment <id>` | Specific deployment ID | - | Yes |
+| `-n, --lines <number>` | Number of lines to show | `100` | No |
+| `-d, --deployment <id>` | Specific deployment ID | - | No |
 
 ## `domains` (alias: `domain`)
 
@@ -689,7 +689,7 @@ Add a custom domain
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name | - | Yes |
-| `-c, --challenge <type>` | Challenge type (http-01 or dns-01) | `http-01` | Yes |
+| `-c, --challenge <type>` | Challenge type (http-01 or dns-01) | `http-01` | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
 ### `domains verify`
@@ -744,8 +744,8 @@ Show the certificate renewal-attempt history for a domain
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name | - | Yes |
-| `--page <page>` | Page number (1-indexed) | `1` | Yes |
-| `--page-size <pageSize>` | Items per page (max 100) | `20` | Yes |
+| `--page <page>` | Page number (1-indexed) | `1` | No |
+| `--page-size <pageSize>` | Items per page (max 100) | `20` | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `domains orders` (alias: `order`)
@@ -858,7 +858,7 @@ List environments for a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments create`
@@ -869,9 +869,9 @@ Create a new environment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-n, --name <name>` | Environment name | - | Yes |
-| `-b, --branch <branch>` | Git branch | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | Environment name | - | No |
+| `-b, --branch <branch>` | Git branch | - | No |
 | `--preview` | Set as preview environment | - | No |
 
 ### `environments delete` (alias: `rm`)
@@ -882,7 +882,7 @@ Delete an environment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 
 ### `environments vars`
@@ -893,7 +893,7 @@ Manage environment variables
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 
 **Subcommands:**
 
@@ -912,7 +912,7 @@ List environment variables
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-e, --environment <name>` | Filter by environment name | - | Yes |
+| `-e, --environment <name>` | Filter by environment name | - | No |
 | `--show-values` | Show actual values (hidden by default) | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -924,7 +924,7 @@ Get a specific environment variable
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-e, --environment <name>` | Specify environment (if variable exists in multiple) | - | Yes |
+| `-e, --environment <name>` | Specify environment (if variable exists in multiple) | - | No |
 
 #### `environments vars set`
 
@@ -934,7 +934,7 @@ Set an environment variable
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | - | Yes |
+| `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | - | No |
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
@@ -947,7 +947,7 @@ Delete an environment variable
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-e, --environment <name>` | Delete only from specific environment | - | Yes |
+| `-e, --environment <name>` | Delete only from specific environment | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 
 #### `environments vars import`
@@ -958,7 +958,7 @@ Import environment variables from a .env file
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-e, --environments <names>` | Comma-separated environment names | - | Yes |
+| `-e, --environments <names>` | Comma-separated environment names | - | No |
 | `--overwrite` | Overwrite existing variables | - | No |
 
 #### `environments vars export`
@@ -969,8 +969,8 @@ Export environment variables to .env format
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-e, --environment <name>` | Export from specific environment | - | Yes |
-| `-o, --output <file>` | Write to file instead of stdout | - | Yes |
+| `-e, --environment <name>` | Export from specific environment | - | No |
+| `-o, --output <file>` | Write to file instead of stdout | - | No |
 
 ### `environments resources`
 
@@ -980,11 +980,11 @@ View or set CPU/memory resources for an environment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--cpu <millicores>` | CPU limit in millicores (e.g., 500 = 0.5 CPU) | - | Yes |
-| `--memory <mb>` | Memory limit in MB (e.g., 512) | - | Yes |
-| `--cpu-request <millicores>` | CPU request in millicores (guaranteed minimum) | - | Yes |
-| `--memory-request <mb>` | Memory request in MB (guaranteed minimum) | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--cpu <millicores>` | CPU limit in millicores (e.g., 500 = 0.5 CPU) | - | No |
+| `--memory <mb>` | Memory limit in MB (e.g., 512) | - | No |
+| `--cpu-request <millicores>` | CPU request in millicores (guaranteed minimum) | - | No |
+| `--memory-request <mb>` | Memory request in MB (guaranteed minimum) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments force-https`
@@ -995,7 +995,7 @@ View or set the HTTP to HTTPS redirect override for an environment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--enable` | Always redirect plain HTTP to HTTPS, even without a local certificate | - | No |
 | `--disable` | Never redirect: keep serving this environment over plain HTTP | - | No |
 | `--inherit` | Clear the override and follow the proxy default | - | No |
@@ -1009,9 +1009,9 @@ View or set the number of replicas for an environment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <env>` | Environment name or slug | `production` | Yes |
-| `-r, --replicas <count>` | Number of replicas to set | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <env>` | Environment name or slug | `production` | No |
+| `-r, --replicas <count>` | Number of replicas to set | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments crons`
@@ -1022,7 +1022,7 @@ Manage cron jobs
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Environment name or slug | - | Yes |
 
 **Subcommands:**
@@ -1061,8 +1061,8 @@ Show cron job execution history
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Cron job ID | - | Yes |
-| `--page <page>` | Page number | `1` | Yes |
-| `--per-page <count>` | Items per page | `20` | Yes |
+| `--page <page>` | Page number | `1` | No |
+| `--per-page <count>` | Items per page | `20` | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `providers` (alias: `provider`)
@@ -1100,14 +1100,14 @@ Add a new Git provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --provider <provider>` | Provider type (github, gitlab, bitbucket, gitea, generic) | - | Yes |
-| `-n, --name <name>` | Provider name | - | Yes |
-| `-t, --token <token>` | Personal access token (or Bitbucket access token / app password) | - | Yes |
-| `--base-url <url>` | Instance base URL (GitLab/Gitea self-hosted; required for gitea) | - | Yes |
-| `--username <username>` | Bitbucket username (selects app-password auth) | - | Yes |
-| `--password <password>` | Bitbucket app password (used with --username) | - | Yes |
-| `--clone-url <url>` | HTTPS clone URL (generic provider) | - | Yes |
-| `--token-username <username>` | HTTP Basic username for the token (generic; default x-access-token) | - | Yes |
+| `-p, --provider <provider>` | Provider type (github, gitlab, bitbucket, gitea, generic) | - | No |
+| `-n, --name <name>` | Provider name | - | No |
+| `-t, --token <token>` | Personal access token (or Bitbucket access token / app password) | - | No |
+| `--base-url <url>` | Instance base URL (GitLab/Gitea self-hosted; required for gitea) | - | No |
+| `--username <username>` | Bitbucket username (selects app-password auth) | - | No |
+| `--password <password>` | Bitbucket app password (used with --username) | - | No |
+| `--clone-url <url>` | HTTPS clone URL (generic provider) | - | No |
+| `--token-username <username>` | HTTP Basic username for the token (generic; default x-access-token) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `providers remove` (alias: `rm`)
@@ -1194,13 +1194,13 @@ Connect a Git provider (github, gitlab, bitbucket, gitea, generic)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --provider <provider>` | Provider type (github, gitlab, bitbucket, gitea, generic) | - | Yes |
-| `-n, --name <name>` | Provider name | - | Yes |
-| `-t, --token <token>` | Personal access token (or Bitbucket access token / app password) | - | Yes |
-| `--base-url <url>` | Instance base URL (GitLab/Gitea self-hosted; required for gitea) | - | Yes |
-| `--username <username>` | Bitbucket username (selects app-password auth) | - | Yes |
-| `--password <password>` | Bitbucket app password (used with --username) | - | Yes |
-| `--clone-url <url>` | HTTPS clone URL (generic provider) | - | Yes |
-| `--token-username <username>` | HTTP Basic username for the token (generic; default x-access-token) | - | Yes |
+| `-n, --name <name>` | Provider name | - | No |
+| `-t, --token <token>` | Personal access token (or Bitbucket access token / app password) | - | No |
+| `--base-url <url>` | Instance base URL (GitLab/Gitea self-hosted; required for gitea) | - | No |
+| `--username <username>` | Bitbucket username (selects app-password auth) | - | No |
+| `--password <password>` | Bitbucket app password (used with --username) | - | No |
+| `--clone-url <url>` | HTTPS clone URL (generic provider) | - | No |
+| `--token-username <username>` | HTTP Basic username for the token (generic; default x-access-token) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 #### `providers git repos`
@@ -1211,15 +1211,15 @@ List available repositories
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--id <id>` | Provider ID (optional, lists all if not provided) | - | Yes |
+| `--id <id>` | Provider ID (optional, lists all if not provided) | - | No |
 | `--json` | Output in JSON format | - | No |
-| `--search <term>` | Search repositories by name | - | Yes |
-| `--page <n>` | Page number | - | Yes |
-| `--per-page <n>` | Items per page (max: 100) | - | Yes |
-| `--sort <field>` | Sort by field (name, created_at, updated_at, stars) | - | Yes |
-| `--direction <dir>` | Sort direction: asc or desc | - | Yes |
-| `--language <lang>` | Filter by programming language | - | Yes |
-| `--owner <owner>` | Filter by repository owner | - | Yes |
+| `--search <term>` | Search repositories by name | - | No |
+| `--page <n>` | Page number | - | No |
+| `--per-page <n>` | Items per page (max: 100) | - | No |
+| `--sort <field>` | Sort by field (name, created_at, updated_at, stars) | - | No |
+| `--direction <dir>` | Sort direction: asc or desc | - | No |
+| `--language <lang>` | Filter by programming language | - | No |
+| `--owner <owner>` | Filter by repository owner | - | No |
 
 ### `providers connections` (alias: `conn`)
 
@@ -1245,10 +1245,10 @@ List all Git connections
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--page <n>` | Page number | - | Yes |
-| `--per-page <n>` | Items per page (default: 30, max: 100) | - | Yes |
-| `--sort <field>` | Sort by field (created_at, updated_at, account_name) | - | Yes |
-| `--direction <dir>` | Sort direction: asc or desc (default: desc) | - | Yes |
+| `--page <n>` | Page number | - | No |
+| `--per-page <n>` | Items per page (default: 30, max: 100) | - | No |
+| `--sort <field>` | Sort by field (created_at, updated_at, account_name) | - | No |
+| `--direction <dir>` | Sort direction: asc or desc (default: desc) | - | No |
 
 #### `providers connections show`
 
@@ -1370,12 +1370,12 @@ Create a backup schedule
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Schedule name | - | Yes |
-| `-t, --type <type>` | Backup type (full, incremental) | - | Yes |
-| `-s, --schedule <cron>` | Schedule expression (cron format) | - | Yes |
-| `-r, --retention <days>` | Retention period in days | - | Yes |
-| `-d, --description <desc>` | Description | - | Yes |
-| `--s3-source-id <id>` | S3 Source ID | - | Yes |
+| `-n, --name <name>` | Schedule name | - | No |
+| `-t, --type <type>` | Backup type (full, incremental) | - | No |
+| `-s, --schedule <cron>` | Schedule expression (cron format) | - | No |
+| `-r, --retention <days>` | Retention period in days | - | No |
+| `-d, --description <desc>` | Description | - | No |
+| `--s3-source-id <id>` | S3 Source ID | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 #### `backups schedules show`
@@ -1453,13 +1453,13 @@ Create an S3 source
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Source name | - | Yes |
-| `--bucket <bucket>` | S3 bucket name | - | Yes |
-| `--region <region>` | S3 region | - | Yes |
-| `--endpoint <endpoint>` | S3 endpoint (for S3-compatible services) | - | Yes |
-| `--access-key <key>` | Access key ID | - | Yes |
-| `--secret-key <key>` | Secret access key | - | Yes |
-| `--prefix <prefix>` | Bucket path/prefix | - | Yes |
+| `-n, --name <name>` | Source name | - | No |
+| `--bucket <bucket>` | S3 bucket name | - | No |
+| `--region <region>` | S3 region | - | No |
+| `--endpoint <endpoint>` | S3 endpoint (for S3-compatible services) | - | No |
+| `--access-key <key>` | Access key ID | - | No |
+| `--secret-key <key>` | Secret access key | - | No |
+| `--prefix <prefix>` | Bucket path/prefix | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 #### `backups sources show`
@@ -1482,13 +1482,13 @@ Update an S3 source
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | S3 source ID | - | Yes |
-| `-n, --name <name>` | New source name | - | Yes |
-| `--bucket <bucket>` | New S3 bucket name | - | Yes |
-| `--region <region>` | New S3 region | - | Yes |
-| `--endpoint <endpoint>` | New S3 endpoint | - | Yes |
-| `--access-key <key>` | New access key ID | - | Yes |
-| `--secret-key <key>` | New secret access key | - | Yes |
-| `--prefix <prefix>` | New bucket path/prefix | - | Yes |
+| `-n, --name <name>` | New source name | - | No |
+| `--bucket <bucket>` | New S3 bucket name | - | No |
+| `--region <region>` | New S3 region | - | No |
+| `--endpoint <endpoint>` | New S3 endpoint | - | No |
+| `--access-key <key>` | New access key ID | - | No |
+| `--secret-key <key>` | New secret access key | - | No |
+| `--prefix <prefix>` | New bucket path/prefix | - | No |
 
 #### `backups sources remove` (alias: `rm`)
 
@@ -1566,7 +1566,7 @@ Delete backups expired by their schedule retention policy
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--dry-run` | Preview expired backups without deleting them | - | No |
-| `--schedule-id <id>` | Limit cleanup to one schedule | - | Yes |
+| `--schedule-id <id>` | Limit cleanup to one schedule | - | No |
 | `-y, --yes` | Skip confirmation prompt | - | No |
 | `--json` | Output the cleanup report as JSON | - | No |
 
@@ -1580,7 +1580,7 @@ Run a backup for an external service
 |------|-------------|---------|----------|
 | `--id <id>` | External service ID | - | Yes |
 | `--s3-source-id <id>` | S3 source ID to store the backup | - | Yes |
-| `-t, --type <type>` | Backup type (e.g., full, incremental) | - | Yes |
+| `-t, --type <type>` | Backup type (e.g., full, incremental) | - | No |
 
 ## `runtime-logs` (alias: `rlogs`)
 
@@ -1590,10 +1590,10 @@ View runtime container logs (use -f to follow in real-time)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <env>` | Environment name | `production` | Yes |
-| `-c, --container <id>` | Container ID (partial match supported) | - | Yes |
-| `-n, --tail <lines>` | Number of lines to tail | `1000` | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <env>` | Environment name | `production` | No |
+| `-c, --container <id>` | Container ID (partial match supported) | - | No |
+| `-n, --tail <lines>` | Number of lines to tail | `1000` | No |
 | `-t, --timestamps` | Show timestamps | - | No |
 | `-f, --follow` | Follow log output (stream in real-time) | - | No |
 
@@ -1630,19 +1630,19 @@ Add a new notification provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (slack, email, webhook) | - | Yes |
-| `-n, --name <name>` | Provider name | - | Yes |
-| `-w, --webhook-url <url>` | Webhook URL (for slack) | - | Yes |
-| `-c, --channel <channel>` | Channel name (for slack, optional) | - | Yes |
-| `--smtp-host <host>` | SMTP host (for email) | - | Yes |
-| `--smtp-port <port>` | SMTP port (for email) | - | Yes |
-| `--username <username>` | SMTP username (for email) | - | Yes |
-| `--password <password>` | SMTP password (for email) | - | Yes |
-| `--from-address <address>` | From email address (for email) | - | Yes |
-| `--from-name <name>` | From display name (for email, optional) | - | Yes |
-| `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | Yes |
-| `--url <url>` | Webhook URL (for webhook) | - | Yes |
-| `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook, default: POST) | - | Yes |
+| `-t, --type <type>` | Provider type (slack, email, webhook) | - | No |
+| `-n, --name <name>` | Provider name | - | No |
+| `-w, --webhook-url <url>` | Webhook URL (for slack) | - | No |
+| `-c, --channel <channel>` | Channel name (for slack, optional) | - | No |
+| `--smtp-host <host>` | SMTP host (for email) | - | No |
+| `--smtp-port <port>` | SMTP port (for email) | - | No |
+| `--username <username>` | SMTP username (for email) | - | No |
+| `--password <password>` | SMTP password (for email) | - | No |
+| `--from-address <address>` | From email address (for email) | - | No |
+| `--from-name <name>` | From display name (for email, optional) | - | No |
+| `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | No |
+| `--url <url>` | Webhook URL (for webhook) | - | No |
+| `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook, default: POST) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `notifications update`
@@ -1654,19 +1654,19 @@ Update a notification provider
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Provider ID | - | Yes |
-| `-n, --name <name>` | New provider name | - | Yes |
-| `--enabled <enabled>` | Enable or disable (true/false) | - | Yes |
-| `-w, --webhook-url <url>` | Webhook URL (for slack) | - | Yes |
-| `-c, --channel <channel>` | Channel name (for slack) | - | Yes |
-| `--smtp-host <host>` | SMTP host (for email) | - | Yes |
-| `--smtp-port <port>` | SMTP port (for email) | - | Yes |
-| `--username <username>` | SMTP username (for email) | - | Yes |
-| `--password <password>` | SMTP password (for email) | - | Yes |
-| `--from-address <address>` | From email address (for email) | - | Yes |
-| `--from-name <name>` | From display name (for email) | - | Yes |
-| `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | Yes |
-| `--url <url>` | Webhook URL (for webhook) | - | Yes |
-| `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook) | - | Yes |
+| `-n, --name <name>` | New provider name | - | No |
+| `--enabled <enabled>` | Enable or disable (true/false) | - | No |
+| `-w, --webhook-url <url>` | Webhook URL (for slack) | - | No |
+| `-c, --channel <channel>` | Channel name (for slack) | - | No |
+| `--smtp-host <host>` | SMTP host (for email) | - | No |
+| `--smtp-port <port>` | SMTP port (for email) | - | No |
+| `--username <username>` | SMTP username (for email) | - | No |
+| `--password <password>` | SMTP password (for email) | - | No |
+| `--from-address <address>` | From email address (for email) | - | No |
+| `--from-name <name>` | From display name (for email) | - | No |
+| `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | No |
+| `--url <url>` | Webhook URL (for webhook) | - | No |
+| `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
@@ -1756,27 +1756,27 @@ Add a new DNS provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual) | - | Yes |
-| `-n, --name <name>` | Provider name | - | Yes |
-| `-d, --description <description>` | Provider description | - | Yes |
-| `--api-token <token>` | Cloudflare API token | - | Yes |
-| `--account-id <id>` | Cloudflare account ID (optional) | - | Yes |
-| `--access-key-id <key>` | AWS access key ID | - | Yes |
-| `--secret-access-key <secret>` | AWS secret access key | - | Yes |
-| `--region <region>` | AWS region | - | Yes |
-| `--api-user <user>` | Namecheap API user | - | Yes |
-| `--api-key <key>` | Namecheap API key | - | Yes |
-| `--username <username>` | Namecheap username | - | Yes |
-| `--client-ip <ip>` | Namecheap whitelisted client IP | - | Yes |
-| `--project-id <id>` | GCP project ID | - | Yes |
-| `--service-account-email <email>` | GCP service account email | - | Yes |
-| `--private-key-id <id>` | GCP private key ID | - | Yes |
-| `--private-key <key>` | GCP private key | - | Yes |
-| `--tenant-id <id>` | Azure tenant ID | - | Yes |
-| `--client-id <id>` | Azure client ID | - | Yes |
-| `--client-secret <secret>` | Azure client secret | - | Yes |
-| `--subscription-id <id>` | Azure subscription ID | - | Yes |
-| `--resource-group <name>` | Azure resource group | - | Yes |
+| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual) | - | No |
+| `-n, --name <name>` | Provider name | - | No |
+| `-d, --description <description>` | Provider description | - | No |
+| `--api-token <token>` | Cloudflare API token | - | No |
+| `--account-id <id>` | Cloudflare account ID (optional) | - | No |
+| `--access-key-id <key>` | AWS access key ID | - | No |
+| `--secret-access-key <secret>` | AWS secret access key | - | No |
+| `--region <region>` | AWS region | - | No |
+| `--api-user <user>` | Namecheap API user | - | No |
+| `--api-key <key>` | Namecheap API key | - | No |
+| `--username <username>` | Namecheap username | - | No |
+| `--client-ip <ip>` | Namecheap whitelisted client IP | - | No |
+| `--project-id <id>` | GCP project ID | - | No |
+| `--service-account-email <email>` | GCP service account email | - | No |
+| `--private-key-id <id>` | GCP private key ID | - | No |
+| `--private-key <key>` | GCP private key | - | No |
+| `--tenant-id <id>` | Azure tenant ID | - | No |
+| `--client-id <id>` | Azure client ID | - | No |
+| `--client-secret <secret>` | Azure client secret | - | No |
+| `--subscription-id <id>` | Azure subscription ID | - | No |
+| `--resource-group <name>` | Azure resource group | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `dns show`
@@ -1872,9 +1872,9 @@ Create a new external service
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Service type (postgres, mongodb, redis, s3) | - | Yes |
-| `-n, --name <name>` | Service name | - | Yes |
-| `-s, --set <key=value>` | Set a parameter (repeatable) | `` | Yes |
+| `-t, --type <type>` | Service type (postgres, mongodb, redis, s3) | - | No |
+| `-n, --name <name>` | Service name | - | No |
+| `-s, --set <key=value>` | Set a parameter (repeatable) | `` | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `services show`
@@ -1964,8 +1964,8 @@ Update a service
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
-| `-n, --name <name>` | Docker image name (e.g., postgres:18-alpine) | - | Yes |
-| `-s, --set <key=value>` | Set a parameter (repeatable) | `` | Yes |
+| `-n, --name <name>` | Docker image name (e.g., postgres:18-alpine) | - | No |
+| `-s, --set <key=value>` | Set a parameter (repeatable) | `` | No |
 
 ### `services upgrade`
 
@@ -1976,7 +1976,7 @@ Upgrade a service to a newer version
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
-| `-v, --version <version>` | Docker image to upgrade to (e.g., postgres:18-alpine) | - | Yes |
+| `-v, --version <version>` | Docker image to upgrade to (e.g., postgres:18-alpine) | - | No |
 
 ### `services import`
 
@@ -1986,11 +1986,11 @@ Import an existing external service
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Service type (postgres, mongodb, redis, s3) | - | Yes |
-| `-n, --name <name>` | Service name | - | Yes |
-| `--container-id <id>` | Container ID or name to import | - | Yes |
-| `-s, --set <key=value>` | Set a parameter (repeatable) | `` | Yes |
-| `--version <version>` | Optional version override | - | Yes |
+| `-t, --type <type>` | Service type (postgres, mongodb, redis, s3) | - | No |
+| `-n, --name <name>` | Service name | - | No |
+| `--container-id <id>` | Container ID or name to import | - | No |
+| `-s, --set <key=value>` | Set a parameter (repeatable) | `` | No |
+| `--version <version>` | Optional version override | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `services link`
@@ -2002,7 +2002,7 @@ Link a service to a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
-| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | No |
 
 ### `services unlink`
 
@@ -2013,7 +2013,7 @@ Unlink a service from a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
-| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
@@ -2025,7 +2025,7 @@ Get connection info for a service by name or slug
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `services env`
@@ -2037,7 +2037,7 @@ Show environment variables for a linked service
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
-| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `services env-var`
@@ -2049,7 +2049,7 @@ Get a specific environment variable
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
-| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | No |
 | `--var <name>` | Environment variable name | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
@@ -2062,11 +2062,11 @@ View persisted logs for an external service
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
-| `--from <datetime>` | Start of time range. ISO 8601 timestamp or a relative duration like "1h", "24h", "7d" (default: 24h ago) | - | Yes |
-| `--to <datetime>` | End of time range. ISO 8601 timestamp (default: now) | - | Yes |
-| `-l, --level <levels>` | Comma-separated log levels to include: ERROR,WARN,INFO,DEBUG,TRACE | - | Yes |
-| `-n, --tail <lines>` | Maximum number of log lines to fetch (default: 200, max: 1000) | `200` | Yes |
-| `-t, --text <query>` | Filter log lines by text (case-insensitive) | - | Yes |
+| `--from <datetime>` | Start of time range. ISO 8601 timestamp or a relative duration like "1h", "24h", "7d" (default: 24h ago) | - | No |
+| `--to <datetime>` | End of time range. ISO 8601 timestamp (default: now) | - | No |
+| `-l, --level <levels>` | Comma-separated log levels to include: ERROR,WARN,INFO,DEBUG,TRACE | - | No |
+| `-n, --tail <lines>` | Maximum number of log lines to fetch (default: 200, max: 1000) | `200` | No |
+| `-t, --text <query>` | Filter log lines by text (case-insensitive) | - | No |
 | `--json` | Output raw JSON instead of formatted lines | - | No |
 
 ### `services slow-queries`
@@ -2078,10 +2078,10 @@ Show slowest PostgreSQL queries from pg_stat_statements
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
-| `--page <n>` | Page number (1-based, default: 1) | `1` | Yes |
-| `--page-size <n>` | Rows per page (1–100, default: 20) | `20` | Yes |
-| `--sort-by <column>` | Sort column: calls, total_exec_time_ms, mean_exec_time_ms, rows, cache_hit_ratio (default: mean_exec_time_ms) | - | Yes |
-| `--sort-order <order>` | Sort direction: asc or desc (default: desc) | - | Yes |
+| `--page <n>` | Page number (1-based, default: 1) | `1` | No |
+| `--page-size <n>` | Rows per page (1–100, default: 20) | `20` | No |
+| `--sort-by <column>` | Sort column: calls, total_exec_time_ms, mean_exec_time_ms, rows, cache_hit_ratio (default: mean_exec_time_ms) | - | No |
+| `--sort-order <order>` | Sort direction: asc or desc (default: desc) | - | No |
 | `--json` | Output raw JSON instead of a formatted table | - | No |
 
 ### `services enable-pg-stat-statements`
@@ -2128,7 +2128,7 @@ Restore a service from a backup (in-place, new service, or PITR)
 | `--id <id>` | Source service ID (the service the backup came from) | - | Yes |
 | `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | Yes |
 | `--new-service [name]` | Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name. | - | No |
-| `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires WAL-G backup). Combine with --new-service to route PITR into a new service. | - | Yes |
+| `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires WAL-G backup). Combine with --new-service to route PITR into a new service. | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--no-wait` | Return immediately without polling run status | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -2184,15 +2184,15 @@ Update platform settings
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-s, --setting <setting>` | Setting to update (external_url, preview_domain, letsencrypt, rate_limiting, security_headers, screenshots) | - | Yes |
-| `-v, --value <value>` | Value for the setting | - | Yes |
-| `--external-url <url>` | External URL for the platform | - | Yes |
-| `--preview-domain <domain>` | Preview domain pattern | - | Yes |
-| `--letsencrypt-email <email>` | Let's Encrypt email | - | Yes |
-| `--letsencrypt-mode <mode>` | Let's Encrypt mode (staging, production) | - | Yes |
-| `--rate-limiting-enabled <enabled>` | Enable rate limiting (true/false) | - | Yes |
-| `--rate-limiting-rpm <rpm>` | Requests per minute | - | Yes |
-| `--screenshots-enabled <enabled>` | Enable screenshots (true/false) | - | Yes |
+| `-s, --setting <setting>` | Setting to update (external_url, preview_domain, letsencrypt, rate_limiting, security_headers, screenshots) | - | No |
+| `-v, --value <value>` | Value for the setting | - | No |
+| `--external-url <url>` | External URL for the platform | - | No |
+| `--preview-domain <domain>` | Preview domain pattern | - | No |
+| `--letsencrypt-email <email>` | Let's Encrypt email | - | No |
+| `--letsencrypt-mode <mode>` | Let's Encrypt mode (staging, production) | - | No |
+| `--rate-limiting-enabled <enabled>` | Enable rate limiting (true/false) | - | No |
+| `--rate-limiting-rpm <rpm>` | Requests per minute | - | No |
+| `--screenshots-enabled <enabled>` | Enable screenshots (true/false) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `settings set-external-url`
@@ -2246,10 +2246,10 @@ Create a new user
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-u, --username <username>` | Username | - | Yes |
-| `-e, --email <email>` | Email address | - | Yes |
-| `-p, --password <password>` | Password (if not provided, invite email will be sent) | - | Yes |
-| `-r, --roles <roles>` | Comma-separated roles (admin, user) | - | Yes |
+| `-u, --username <username>` | Username | - | No |
+| `-e, --email <email>` | Email address | - | No |
+| `-p, --password <password>` | Password (if not provided, invite email will be sent) | - | No |
+| `-r, --roles <roles>` | Comma-separated roles (admin, user) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `users me`
@@ -2293,8 +2293,8 @@ Manage user roles
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | User ID | - | Yes |
-| `--add <role>` | Add a role to user | - | Yes |
-| `--remove <role>` | Remove a role from user | - | Yes |
+| `--add <role>` | Add a role to user | - | No |
+| `--remove <role>` | Remove a role from user | - | No |
 
 ## `teams`
 
@@ -2327,9 +2327,9 @@ Create a new team
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Team name | - | Yes |
-| `-s, --slug <slug>` | URL-safe slug ([a-z0-9-]+) | - | Yes |
-| `-d, --description <description>` | Team description | - | Yes |
+| `-n, --name <name>` | Team name | - | No |
+| `-s, --slug <slug>` | URL-safe slug ([a-z0-9-]+) | - | No |
+| `-d, --description <description>` | Team description | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `teams show`
@@ -2350,8 +2350,8 @@ Update a team name or description
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | New team name | - | Yes |
-| `-d, --description <description>` | New description | - | Yes |
+| `-n, --name <name>` | New team name | - | No |
+| `-d, --description <description>` | New description | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `teams delete` (alias: `rm`)
@@ -2393,8 +2393,8 @@ Add a user to a team
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-u, --user <user>` | User id or email | - | Yes |
-| `-r, --role <role>` | Team role (owner\|admin\|deployer\|viewer) | - | Yes |
+| `-u, --user <user>` | User id or email | - | No |
+| `-r, --role <role>` | Team role (owner\|admin\|deployer\|viewer) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `teams members set-role`
@@ -2405,8 +2405,8 @@ Change a member's role in the team
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-u, --user <user>` | User id or email | - | Yes |
-| `-r, --role <role>` | Team role (owner\|admin\|deployer\|viewer) | - | Yes |
+| `-u, --user <user>` | User id or email | - | No |
+| `-r, --role <role>` | Team role (owner\|admin\|deployer\|viewer) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `teams members remove` (alias: `rm`)
@@ -2417,7 +2417,7 @@ Remove a user from a team
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-u, --user <user>` | User id or email | - | Yes |
+| `-u, --user <user>` | User id or email | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 
 ## `access`
@@ -2438,7 +2438,7 @@ List the teams granted access to a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `access grant`
@@ -2449,8 +2449,8 @@ Grant a team access to a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-r, --role <role>` | Role the team holds on the project (owner\|admin\|deployer\|viewer) | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-r, --role <role>` | Role the team holds on the project (owner\|admin\|deployer\|viewer) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `access revoke`
@@ -2461,7 +2461,7 @@ Revoke a team's access to a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 
 ## `apikeys` (alias: `keys`)
@@ -2496,10 +2496,10 @@ Create a new API key
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | API key name | - | Yes |
-| `-r, --role <role>` | Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest) | - | Yes |
-| `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365) | - | Yes |
-| `-p, --permissions <permissions>` | Comma-separated list of permissions | - | Yes |
+| `-n, --name <name>` | API key name | - | No |
+| `-r, --role <role>` | Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest) | - | No |
+| `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365) | - | No |
+| `-p, --permissions <permissions>` | Comma-separated list of permissions | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `apikeys show`
@@ -2588,11 +2588,11 @@ Create a new monitor for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `-n, --name <name>` | Monitor name | - | Yes |
-| `-t, --type <type>` | Monitor type (http, tcp, ping) | - | Yes |
-| `-i, --interval <seconds>` | Check interval in seconds (60, 300, 600, 900, 1800) | - | Yes |
-| `--check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Defaults to "/" for HTTP monitors. | - | Yes |
-| `--environment-id <id>` | Environment ID (default: 0 for production) | - | Yes |
+| `-n, --name <name>` | Monitor name | - | No |
+| `-t, --type <type>` | Monitor type (http, tcp, ping) | - | No |
+| `-i, --interval <seconds>` | Check interval in seconds (60, 300, 600, 900, 1800) | - | No |
+| `--check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Defaults to "/" for HTTP monitors. | - | No |
+| `--environment-id <id>` | Environment ID (default: 0 for production) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `monitors show`
@@ -2626,8 +2626,8 @@ Get current status — all monitors for a project, or a single monitor by ID
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--id <id>` | Monitor ID (omit to show all monitors for the project) | - | Yes |
-| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json or TEMPS_PROJECT) | - | Yes |
+| `--id <id>` | Monitor ID (omit to show all monitors for the project) | - | No |
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json or TEMPS_PROJECT) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `monitors history`
@@ -2640,7 +2640,7 @@ Get monitor uptime history
 |------|-------------|---------|----------|
 | `--id <id>` | Monitor ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
-| `--days <days>` | Number of days to show | `7` | Yes |
+| `--days <days>` | Number of days to show | `7` | No |
 
 ## `webhooks` (alias: `hooks`)
 
@@ -2678,9 +2678,9 @@ Create a new webhook for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `-u, --url <url>` | Webhook URL | - | Yes |
-| `-e, --events <events>` | Comma-separated event types (or "all" for all events) | - | Yes |
-| `-s, --secret <secret>` | Webhook secret for signature verification | - | Yes |
+| `-u, --url <url>` | Webhook URL | - | No |
+| `-e, --events <events>` | Comma-separated event types (or "all" for all events) | - | No |
+| `-s, --secret <secret>` | Webhook secret for signature verification | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `webhooks show`
@@ -2705,9 +2705,9 @@ Update a webhook
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--webhook-id <id>` | Webhook ID | - | Yes |
-| `-u, --url <url>` | New webhook URL | - | Yes |
-| `-e, --events <events>` | Comma-separated event types (or "all" for all events) | - | Yes |
-| `-s, --secret <secret>` | New webhook secret for signature verification | - | Yes |
+| `-u, --url <url>` | New webhook URL | - | No |
+| `-e, --events <events>` | Comma-separated event types (or "all" for all events) | - | No |
+| `-s, --secret <secret>` | New webhook secret for signature verification | - | No |
 
 ### `webhooks remove` (alias: `rm`)
 
@@ -2774,7 +2774,7 @@ List deliveries for a webhook
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--webhook-id <id>` | Webhook ID | - | Yes |
-| `--limit <n>` | Number of deliveries to return (default: 50) | - | Yes |
+| `--limit <n>` | Number of deliveries to return (default: 50) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `webhooks deliveries show`
@@ -2824,7 +2824,7 @@ List containers in an environment, or across all environments if -e omitted
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project-id <id>` | Project ID | - | Yes |
-| `-e, --environment-id <id>` | Environment ID (optional - lists all environments if omitted) | - | Yes |
+| `-e, --environment-id <id>` | Environment ID (optional - lists all environments if omitted) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `containers show`
@@ -2887,10 +2887,10 @@ Get container resource metrics (all containers if no container ID specified)
 |------|-------------|---------|----------|
 | `-p, --project-id <id>` | Project ID | - | Yes |
 | `-e, --environment-id <id>` | Environment ID | - | Yes |
-| `-c, --container-id <id>` | Container ID (optional - shows all if not specified) | - | Yes |
+| `-c, --container-id <id>` | Container ID (optional - shows all if not specified) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-w, --watch` | Watch mode - continuously update metrics | - | No |
-| `-i, --interval <seconds>` | Refresh interval in seconds (default: 2) | `2` | Yes |
+| `-i, --interval <seconds>` | Refresh interval in seconds (default: 2) | `2` | No |
 
 ## `tokens` (alias: `token`)
 
@@ -2912,7 +2912,7 @@ List deployment tokens for a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `tokens create` (alias: `add`)
@@ -2923,10 +2923,10 @@ Create a new deployment token
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-n, --name <name>` | Token name | - | Yes |
-| `--permissions <permissions>` | Comma-separated permissions (e.g., "visitors:enrich,emails:send" or "*" for full access) | - | Yes |
-| `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365, or "never") | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | Token name | - | No |
+| `--permissions <permissions>` | Comma-separated permissions (e.g., "visitors:enrich,emails:send" or "*" for full access) | - | No |
+| `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365, or "never") | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `tokens show` (alias: `get`)
@@ -2937,7 +2937,7 @@ Show deployment token details
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--id <id>` | Token ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
@@ -2949,7 +2949,7 @@ Delete a deployment token
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--id <id>` | Token ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
@@ -2990,14 +2990,14 @@ List error groups for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `--status <status>` | Filter by status (unresolved, resolved, ignored) | - | Yes |
-| `--page <page>` | Page number | - | Yes |
-| `--page-size <size>` | Page size | - | Yes |
-| `--environment-id <id>` | Filter by environment ID | - | Yes |
-| `--start-date <date>` | Filter by start date (ISO 8601) | - | Yes |
-| `--end-date <date>` | Filter by end date (ISO 8601) | - | Yes |
-| `--sort-by <field>` | Sort by field (e.g., total_count, last_seen, first_seen) | - | Yes |
-| `--sort-order <order>` | Sort order: asc or desc | - | Yes |
+| `--status <status>` | Filter by status (unresolved, resolved, ignored) | - | No |
+| `--page <page>` | Page number | - | No |
+| `--page-size <size>` | Page size | - | No |
+| `--environment-id <id>` | Filter by environment ID | - | No |
+| `--start-date <date>` | Filter by start date (ISO 8601) | - | No |
+| `--end-date <date>` | Filter by end date (ISO 8601) | - | No |
+| `--sort-by <field>` | Sort by field (e.g., total_count, last_seen, first_seen) | - | No |
+| `--sort-order <order>` | Sort order: asc or desc | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `errors show`
@@ -3023,7 +3023,7 @@ Update error group status
 | `--project-id <id>` | Project ID | - | Yes |
 | `--group-id <id>` | Error group ID | - | Yes |
 | `--status <status>` | New status (unresolved, resolved, ignored) | - | Yes |
-| `--assigned-to <user>` | Assign to user | - | Yes |
+| `--assigned-to <user>` | Assign to user | - | No |
 
 ### `errors events`
 
@@ -3035,8 +3035,8 @@ List events in an error group
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--group-id <id>` | Error group ID | - | Yes |
-| `--page <page>` | Page number | - | Yes |
-| `--page-size <size>` | Page size | - | Yes |
+| `--page <page>` | Page number | - | No |
+| `--page-size <size>` | Page size | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `errors event`
@@ -3072,8 +3072,8 @@ Get error time series data
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `--days <days>` | Number of days to show | `7` | Yes |
-| `--bucket <bucket>` | Time bucket size (e.g., "1h", "15m", "1d") | `1h` | Yes |
+| `--days <days>` | Number of days to show | `7` | No |
+| `--bucket <bucket>` | Time bucket size (e.g., "1h", "15m", "1d") | `1h` | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `errors dashboard`
@@ -3085,7 +3085,7 @@ Get error dashboard statistics
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `--days <days>` | Number of days to show | `7` | Yes |
+| `--days <days>` | Number of days to show | `7` | No |
 | `--compare` | Compare to previous period | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -3112,8 +3112,8 @@ Upload a source map file for a release
 | `--project-id <id>` | Project ID | - | Yes |
 | `--release <version>` | Release version (e.g. commit SHA) | - | Yes |
 | `--file <path>` | Path to the .map file | - | Yes |
-| `--file-path <urlpath>` | URL path in stack traces (e.g. ~/assets/main.js) | - | Yes |
-| `--dist <dist>` | Distribution identifier | - | Yes |
+| `--file-path <urlpath>` | URL path in stack traces (e.g. ~/assets/main.js) | - | No |
+| `--dist <dist>` | Distribution identifier | - | No |
 
 #### `errors sourcemaps list` (alias: `ls`)
 
@@ -3180,10 +3180,10 @@ Upload source file(s) for a release (single --file or a --dir tree)
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--release <version>` | Release version (must match the app's SENTRY_RELEASE, e.g. the deployed commit SHA) | - | Yes |
-| `--file <path>` | Path to a single source file | - | Yes |
-| `--file-path <path>` | Path as it appears in stack frames (e.g. internal/gateway/main.go); defaults to the file name | - | Yes |
-| `--dir <root>` | Upload every source file under this directory, recursively | - | Yes |
-| `--ext <csv>` | Comma-separated extensions to include with --dir (default: go,rs,py,rb,js,jsx,ts,tsx,java,kt,c,h,cpp,cc,hpp,cs,php,swift,scala,ex,exs) | - | Yes |
+| `--file <path>` | Path to a single source file | - | No |
+| `--file-path <path>` | Path as it appears in stack frames (e.g. internal/gateway/main.go); defaults to the file name | - | No |
+| `--dir <root>` | Upload every source file under this directory, recursively | - | No |
+| `--ext <csv>` | Comma-separated extensions to include with --dir (default: go,rs,py,rb,js,jsx,ts,tsx,java,kt,c,h,cpp,cc,hpp,cs,php,swift,scala,ex,exs) | - | No |
 
 #### `errors source-files list` (alias: `ls`)
 
@@ -3224,25 +3224,25 @@ Rank operations by time spent, latency percentiles, or inconsistency
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--project-ids <ids>` | Comma-separated project IDs to rank across, e.g. 4,5,6 (max 50) | - | Yes |
-| `--since <duration>` | Relative window: 30m, 24h, 7d (max 31d) | `24h` | Yes |
-| `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | Yes |
-| `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | Yes |
-| `--service <name>` | Only this service | - | Yes |
-| `--operation <name>` | Only this operation (exact span name) | - | Yes |
-| `--search <text>` | Only operations whose name contains this text | - | Yes |
-| `--kind <kind>` | Span kind (server, client, internal, producer, consumer, unspecified) | - | Yes |
-| `--status <status>` | Span status (ok, error, unset) | - | Yes |
-| `--environment-id <id>` | Only this environment | - | Yes |
-| `--deployment-id <id>` | Only this deployment | - | Yes |
-| `--attributes <pairs>` | Span attribute filters, e.g. db.system=postgresql | - | Yes |
-| `--min-duration-ms <ms>` | Ignore spans faster than this | - | Yes |
-| `--min-count <n>` | Drop operations with fewer samples than this | - | Yes |
-| `--sort-by <field>` | Ranking (total_time, p50, p95, p99, max, avg, stddev, count, errors, error_rate, variability, tail_ratio) | `total_time` | Yes |
-| `--sort-order <order>` | asc or desc | `desc` | Yes |
-| `--limit <n>` | Rows to show (max 100) | `20` | Yes |
-| `--offset <n>` | Page offset | - | Yes |
+| `--project-id <id>` | Project ID | - | No |
+| `--project-ids <ids>` | Comma-separated project IDs to rank across, e.g. 4,5,6 (max 50) | - | No |
+| `--since <duration>` | Relative window: 30m, 24h, 7d (max 31d) | `24h` | No |
+| `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
+| `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
+| `--service <name>` | Only this service | - | No |
+| `--operation <name>` | Only this operation (exact span name) | - | No |
+| `--search <text>` | Only operations whose name contains this text | - | No |
+| `--kind <kind>` | Span kind (server, client, internal, producer, consumer, unspecified) | - | No |
+| `--status <status>` | Span status (ok, error, unset) | - | No |
+| `--environment-id <id>` | Only this environment | - | No |
+| `--deployment-id <id>` | Only this deployment | - | No |
+| `--attributes <pairs>` | Span attribute filters, e.g. db.system=postgresql | - | No |
+| `--min-duration-ms <ms>` | Ignore spans faster than this | - | No |
+| `--min-count <n>` | Drop operations with fewer samples than this | - | No |
+| `--sort-by <field>` | Ranking (total_time, p50, p95, p99, max, avg, stddev, count, errors, error_rate, variability, tail_ratio) | `total_time` | No |
+| `--sort-order <order>` | asc or desc | `desc` | No |
+| `--limit <n>` | Rows to show (max 100) | `20` | No |
+| `--offset <n>` | Page offset | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `otel-forward`
@@ -3282,7 +3282,7 @@ Create a new OTel forwarding destination
 | `--name <name>` | Destination name | - | Yes |
 | `--vendor <preset>` | Vendor preset (datadog, honeycomb, new_relic, grafana_cloud, generic_otlp) | - | Yes |
 | `--endpoint-url <url>` | OTLP-compatible collector endpoint URL | - | Yes |
-| `--header-env <k=env>` | HTTP header sourced from an environment variable (repeatable) | `` | Yes |
+| `--header-env <k=env>` | HTTP header sourced from an environment variable (repeatable) | `` | No |
 | `--traces` | Forward traces (default: true) | - | No |
 | `--no-traces` | Do not forward traces | - | No |
 | `--metrics` | Forward metrics (default: true) | - | No |
@@ -3312,10 +3312,10 @@ Update an OTel forwarding destination
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--name <name>` | Destination name | - | Yes |
-| `--vendor <preset>` | Vendor preset (datadog, honeycomb, new_relic, grafana_cloud, generic_otlp) | - | Yes |
-| `--endpoint-url <url>` | OTLP-compatible collector endpoint URL | - | Yes |
-| `--header-env <k=env>` | HTTP header sourced from an environment variable (repeatable) | `` | Yes |
+| `--name <name>` | Destination name | - | No |
+| `--vendor <preset>` | Vendor preset (datadog, honeycomb, new_relic, grafana_cloud, generic_otlp) | - | No |
+| `--endpoint-url <url>` | OTLP-compatible collector endpoint URL | - | No |
+| `--header-env <k=env>` | HTTP header sourced from an environment variable (repeatable) | `` | No |
 | `--traces` | Forward traces | - | No |
 | `--no-traces` | Do not forward traces | - | No |
 | `--metrics` | Forward metrics | - | No |
@@ -3383,7 +3383,7 @@ Create a new instance-wide default forwarding destination
 | `--name <name>` | Destination name | - | Yes |
 | `--vendor <preset>` | Vendor preset (datadog, honeycomb, new_relic, grafana_cloud, generic_otlp) | - | Yes |
 | `--endpoint-url <url>` | OTLP-compatible collector endpoint URL | - | Yes |
-| `--header-env <k=env>` | HTTP header sourced from an environment variable (repeatable) | `` | Yes |
+| `--header-env <k=env>` | HTTP header sourced from an environment variable (repeatable) | `` | No |
 | `--traces` | Forward traces (default: true) | - | No |
 | `--no-traces` | Do not forward traces | - | No |
 | `--metrics` | Forward metrics (default: true) | - | No |
@@ -3413,10 +3413,10 @@ Update an instance default forwarding destination
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--name <name>` | Destination name | - | Yes |
-| `--vendor <preset>` | Vendor preset (datadog, honeycomb, new_relic, grafana_cloud, generic_otlp) | - | Yes |
-| `--endpoint-url <url>` | OTLP-compatible collector endpoint URL | - | Yes |
-| `--header-env <k=env>` | HTTP header sourced from an environment variable (repeatable) | `` | Yes |
+| `--name <name>` | Destination name | - | No |
+| `--vendor <preset>` | Vendor preset (datadog, honeycomb, new_relic, grafana_cloud, generic_otlp) | - | No |
+| `--endpoint-url <url>` | OTLP-compatible collector endpoint URL | - | No |
+| `--header-env <k=env>` | HTTP header sourced from an environment variable (repeatable) | `` | No |
 | `--traces` | Forward traces | - | No |
 | `--no-traces` | Do not forward traces | - | No |
 | `--metrics` | Forward metrics | - | No |
@@ -3489,7 +3489,7 @@ Set a key-value pair
 | `--project-id <id>` | Project ID | - | Yes |
 | `--key <key>` | Key to set | - | Yes |
 | `--value <value>` | Value to set | - | Yes |
-| `--ttl <seconds>` | Time-to-live in seconds | - | Yes |
+| `--ttl <seconds>` | Time-to-live in seconds | - | No |
 
 ### `kv del` (alias: `delete`)
 
@@ -3511,7 +3511,7 @@ List keys
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `--pattern <pattern>` | Key pattern to filter by (e.g., "user:*") | - | Yes |
+| `--pattern <pattern>` | Key pattern to filter by (e.g., "user:*") | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `kv ttl`
@@ -3604,11 +3604,11 @@ List feature flags
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <name>` | Show values for this environment | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Show values for this environment | - | No |
 | `--include-archived` | Include archived flags | - | No |
-| `--page <n>` | Page number (default: 1) | - | Yes |
-| `--page-size <n>` | Items per page (default: 20, max: 100) | - | Yes |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `flags get`
@@ -3619,7 +3619,7 @@ Show a feature flag and its per-environment values
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `flags create`
@@ -3630,10 +3630,10 @@ Create a feature flag
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-t, --type <type>` | Value type: bool, string, number, or json | - | Yes |
 | `-d, --default <value>` | Default value, served when nothing more specific applies | - | Yes |
-| `--description <text>` | What this flag controls | - | Yes |
+| `--description <text>` | What this flag controls | - | No |
 | `--client-visible` | Allow this flag to be exposed to browsers (default: server-only) | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -3645,9 +3645,9 @@ Update a flag definition (default value, description, visibility)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-d, --default <value>` | New default value | - | Yes |
-| `--description <text>` | New description | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-d, --default <value>` | New default value | - | No |
+| `--description <text>` | New description | - | No |
 | `--client-visible` | Expose this flag to browsers | - | No |
 | `--no-client-visible` | Make this flag server-only | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -3660,7 +3660,7 @@ Set a flag value in one environment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <name>` | Environment name or slug | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
@@ -3672,7 +3672,7 @@ Clear a flag override so the environment inherits the default
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <name>` | Environment name or slug | - | Yes |
 
 ### `flags disable`
@@ -3683,7 +3683,7 @@ Kill switch: serve the default in this environment, ignoring any override
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <name>` | Environment name or slug | - | Yes |
 
 ### `flags enable`
@@ -3694,7 +3694,7 @@ Re-enable a flag in this environment after a kill switch
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <name>` | Environment name or slug | - | Yes |
 
 ### `flags restore`
@@ -3705,7 +3705,7 @@ Restore an archived flag
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 
 ### `flags archive`
 
@@ -3715,7 +3715,7 @@ Archive a flag (callers fall back to their own default)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
 
 ## `data`
 
@@ -3748,7 +3748,7 @@ List top-level containers (databases, or buckets for S3)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--path <path>` | List containers nested under this path instead of the root | - | Yes |
+| `--path <path>` | List containers nested under this path instead of the root | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `data tables` (alias: `entities`)
@@ -3760,7 +3760,7 @@ List tables, collections, keys or objects in a container
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--path <path>` | Container path, slash-separated (e.g. mydb/public) | - | Yes |
-| `--limit <n>` | Maximum entities to return (default: 100) | - | Yes |
+| `--limit <n>` | Maximum entities to return (default: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `data schema` (alias: `columns`)
@@ -3783,11 +3783,11 @@ Read rows from an entity
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--path <path>` | Container path, slash-separated (e.g. mydb/public) | - | Yes |
-| `--filter <json>` | Backend-specific filter as JSON (SQL: '{"where":"id > 5"}'). See: temps data info <service> | - | Yes |
-| `--limit <n>` | Maximum rows to return (default: 20) | - | Yes |
-| `--offset <n>` | Rows to skip (default: 0) | - | Yes |
-| `--sort-by <field>` | Field to sort by | - | Yes |
-| `--sort-order <order>` | asc or desc (default: asc) | - | Yes |
+| `--filter <json>` | Backend-specific filter as JSON (SQL: '{"where":"id > 5"}'). See: temps data info <service> | - | No |
+| `--limit <n>` | Maximum rows to return (default: 20) | - | No |
+| `--offset <n>` | Rows to skip (default: 0) | - | No |
+| `--sort-by <field>` | Field to sort by | - | No |
+| `--sort-order <order>` | asc or desc (default: asc) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `data ai-access`
@@ -3827,7 +3827,7 @@ List blobs in a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `--prefix <prefix>` | Filter by key prefix | - | Yes |
+| `--prefix <prefix>` | Filter by key prefix | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `blob upload` (alias: `put`)
@@ -3954,10 +3954,10 @@ Create a new DSN for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `-n, --name <name>` | DSN name | - | Yes |
-| `--environment-id <id>` | Environment ID | - | Yes |
-| `--deployment-id <id>` | Deployment ID | - | Yes |
-| `--base-url <url>` | Base URL for the DSN | - | Yes |
+| `-n, --name <name>` | DSN name | - | No |
+| `--environment-id <id>` | Environment ID | - | No |
+| `--deployment-id <id>` | Deployment ID | - | No |
+| `--base-url <url>` | Base URL for the DSN | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `dsn get-or-create`
@@ -3969,9 +3969,9 @@ Get an existing DSN or create one if none exists
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `--environment-id <id>` | Environment ID | - | Yes |
-| `--deployment-id <id>` | Deployment ID | - | Yes |
-| `--base-url <url>` | Base URL for the DSN | - | Yes |
+| `--environment-id <id>` | Environment ID | - | No |
+| `--deployment-id <id>` | Deployment ID | - | No |
+| `--base-url <url>` | Base URL for the DSN | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `dsn regenerate`
@@ -3984,7 +3984,7 @@ Regenerate DSN keys (rotate keys)
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--dsn-id <id>` | DSN ID | - | Yes |
-| `--base-url <url>` | New base URL for the DSN | - | Yes |
+| `--base-url <url>` | New base URL for the DSN | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
@@ -4025,8 +4025,8 @@ List vulnerability scans for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `--page <n>` | Page number | - | Yes |
-| `--page-size <n>` | Items per page (default: 20, max: 100) | - | Yes |
+| `--page <n>` | Page number | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `scans trigger`
@@ -4049,7 +4049,7 @@ Get the latest scan for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `--environment-id <id>` | Filter by environment ID | - | Yes |
+| `--environment-id <id>` | Filter by environment ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `scans environments` (alias: `envs`)
@@ -4083,7 +4083,7 @@ List vulnerabilities found in a scan
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Scan ID | - | Yes |
-| `--severity <level>` | Filter by severity (CRITICAL, HIGH, MEDIUM, LOW) | - | Yes |
+| `--severity <level>` | Filter by severity (CRITICAL, HIGH, MEDIUM, LOW) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `scans remove` (alias: `rm`)
@@ -4142,11 +4142,11 @@ Create a custom domain for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `-d, --domain <domain>` | Domain name | - | Yes |
-| `--environment-id <id>` | Environment ID | `0` | Yes |
-| `--branch <branch>` | Branch name | - | Yes |
-| `--redirect-to <url>` | Redirect target URL | - | Yes |
-| `--status-code <code>` | HTTP status code for redirects | - | Yes |
+| `-d, --domain <domain>` | Domain name | - | No |
+| `--environment-id <id>` | Environment ID | `0` | No |
+| `--branch <branch>` | Branch name | - | No |
+| `--redirect-to <url>` | Redirect target URL | - | No |
+| `--status-code <code>` | HTTP status code for redirects | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `custom-domains show`
@@ -4171,11 +4171,11 @@ Update a custom domain
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--domain-id <id>` | Custom domain ID | - | Yes |
-| `-d, --domain <domain>` | New domain name | - | Yes |
-| `--environment-id <id>` | New environment ID | - | Yes |
-| `--branch <branch>` | New branch name | - | Yes |
-| `--redirect-to <url>` | New redirect target URL | - | Yes |
-| `--status-code <code>` | New HTTP status code for redirects | - | Yes |
+| `-d, --domain <domain>` | New domain name | - | No |
+| `--environment-id <id>` | New environment ID | - | No |
+| `--branch <branch>` | New branch name | - | No |
+| `--redirect-to <url>` | New redirect target URL | - | No |
+| `--status-code <code>` | New HTTP status code for redirects | - | No |
 
 ### `custom-domains remove` (alias: `rm`)
 
@@ -4236,28 +4236,28 @@ Create a new DNS provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Provider name | - | Yes |
-| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual, pebble) | - | Yes |
-| `-d, --description <description>` | Provider description | - | Yes |
-| `--api-token <token>` | API token (Cloudflare, DigitalOcean) | - | Yes |
-| `--account-id <id>` | Cloudflare account ID (optional) | - | Yes |
-| `--access-key-id <key>` | AWS access key ID | - | Yes |
-| `--secret-access-key <secret>` | AWS secret access key | - | Yes |
-| `--region <region>` | AWS region | - | Yes |
-| `--api-user <user>` | Namecheap API user | - | Yes |
-| `--api-key <key>` | Namecheap API key | - | Yes |
-| `--username <username>` | Namecheap username | - | Yes |
-| `--client-ip <ip>` | Namecheap whitelisted client IP | - | Yes |
-| `--project-id <id>` | GCP project ID | - | Yes |
-| `--service-account-email <email>` | GCP service account email | - | Yes |
-| `--private-key-id <id>` | GCP private key ID | - | Yes |
-| `--private-key <key>` | GCP private key | - | Yes |
-| `--tenant-id <id>` | Azure tenant ID | - | Yes |
-| `--client-id <id>` | Azure client ID | - | Yes |
-| `--client-secret <secret>` | Azure client secret | - | Yes |
-| `--subscription-id <id>` | Azure subscription ID | - | Yes |
-| `--resource-group <name>` | Azure resource group | - | Yes |
-| `--management-url <url>` | pebble-challtestsrv management API URL (local ACME test server only) | - | Yes |
+| `-n, --name <name>` | Provider name | - | No |
+| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual, pebble) | - | No |
+| `-d, --description <description>` | Provider description | - | No |
+| `--api-token <token>` | API token (Cloudflare, DigitalOcean) | - | No |
+| `--account-id <id>` | Cloudflare account ID (optional) | - | No |
+| `--access-key-id <key>` | AWS access key ID | - | No |
+| `--secret-access-key <secret>` | AWS secret access key | - | No |
+| `--region <region>` | AWS region | - | No |
+| `--api-user <user>` | Namecheap API user | - | No |
+| `--api-key <key>` | Namecheap API key | - | No |
+| `--username <username>` | Namecheap username | - | No |
+| `--client-ip <ip>` | Namecheap whitelisted client IP | - | No |
+| `--project-id <id>` | GCP project ID | - | No |
+| `--service-account-email <email>` | GCP service account email | - | No |
+| `--private-key-id <id>` | GCP private key ID | - | No |
+| `--private-key <key>` | GCP private key | - | No |
+| `--tenant-id <id>` | Azure tenant ID | - | No |
+| `--client-id <id>` | Azure client ID | - | No |
+| `--client-secret <secret>` | Azure client secret | - | No |
+| `--subscription-id <id>` | Azure subscription ID | - | No |
+| `--resource-group <name>` | Azure resource group | - | No |
+| `--management-url <url>` | pebble-challtestsrv management API URL (local ACME test server only) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `dns-provider show`
@@ -4280,10 +4280,10 @@ Update a DNS provider
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Provider ID | - | Yes |
-| `-n, --name <name>` | New provider name | - | Yes |
-| `-d, --description <description>` | New description | - | Yes |
-| `--api-key <key>` | New API key/token | - | Yes |
-| `--active <boolean>` | Set active status (true/false) | - | Yes |
+| `-n, --name <name>` | New provider name | - | No |
+| `-d, --description <description>` | New description | - | No |
+| `--api-key <key>` | New API key/token | - | No |
+| `--active <boolean>` | Set active status (true/false) | - | No |
 
 ### `dns-provider remove` (alias: `rm`)
 
@@ -4418,9 +4418,9 @@ Create a new IP access control rule
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--ip <ip_or_cidr>` | IP address or CIDR range (e.g., "192.168.1.1" or "10.0.0.0/24") | - | Yes |
-| `--action <action>` | Action to take: "allow" or "deny" | - | Yes |
-| `--description <desc>` | Optional description/reason for the rule | - | Yes |
+| `--ip <ip_or_cidr>` | IP address or CIDR range (e.g., "192.168.1.1" or "10.0.0.0/24") | - | No |
+| `--action <action>` | Action to take: "allow" or "deny" | - | No |
+| `--description <desc>` | Optional description/reason for the rule | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `ip-access show`
@@ -4443,9 +4443,9 @@ Update an IP access control rule
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Rule ID | - | Yes |
-| `--ip <ip>` | New IP address or CIDR range | - | Yes |
-| `--action <action>` | New action: "allow" or "deny" | - | Yes |
-| `--description <desc>` | New description/reason | - | Yes |
+| `--ip <ip>` | New IP address or CIDR range | - | No |
+| `--action <action>` | New action: "allow" or "deny" | - | No |
+| `--description <desc>` | New description/reason | - | No |
 
 ### `ip-access remove` (alias: `rm`)
 
@@ -4467,7 +4467,7 @@ Check if an IP address is blocked
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--ip <ip>` | IP address to check | - | Yes |
+| `--ip <ip>` | IP address to check | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `audit`
@@ -4488,12 +4488,12 @@ List audit logs
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--limit <n>` | Maximum number of logs to return | `50` | Yes |
-| `--offset <n>` | Number of logs to skip | - | Yes |
-| `--operation-type <type>` | Filter by operation type | - | Yes |
-| `--user-id <id>` | Filter by user ID | - | Yes |
-| `--from <timestamp>` | Start timestamp (ISO 8601 or epoch ms) | - | Yes |
-| `--to <timestamp>` | End timestamp (ISO 8601 or epoch ms) | - | Yes |
+| `--limit <n>` | Maximum number of logs to return | `50` | No |
+| `--offset <n>` | Number of logs to skip | - | No |
+| `--operation-type <type>` | Filter by operation type | - | No |
+| `--user-id <id>` | Filter by user ID | - | No |
+| `--from <timestamp>` | Start timestamp (ISO 8601 or epoch ms) | - | No |
+| `--to <timestamp>` | End timestamp (ISO 8601 or epoch ms) | - | No |
 
 ### `audit show`
 
@@ -4527,18 +4527,18 @@ List proxy logs
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--limit <n>` | Items per page (default: 20, max: 100) | - | Yes |
-| `--page <n>` | Page number | - | Yes |
-| `--project-id <id>` | Filter by project ID | - | Yes |
-| `--environment-id <id>` | Filter by environment ID | - | Yes |
-| `--method <method>` | Filter by HTTP method (GET, POST, etc.) | - | Yes |
-| `--status-code <code>` | Filter by HTTP status code | - | Yes |
-| `--host <host>` | Filter by host | - | Yes |
-| `--path <path>` | Filter by path (partial match) | - | Yes |
-| `--start-date <date>` | Start date (ISO 8601) | - | Yes |
-| `--end-date <date>` | End date (ISO 8601) | - | Yes |
-| `--sort-by <field>` | Sort by field (default: timestamp) | - | Yes |
-| `--sort-order <order>` | Sort order: asc or desc (default: desc) | - | Yes |
+| `--limit <n>` | Items per page (default: 20, max: 100) | - | No |
+| `--page <n>` | Page number | - | No |
+| `--project-id <id>` | Filter by project ID | - | No |
+| `--environment-id <id>` | Filter by environment ID | - | No |
+| `--method <method>` | Filter by HTTP method (GET, POST, etc.) | - | No |
+| `--status-code <code>` | Filter by HTTP status code | - | No |
+| `--host <host>` | Filter by host | - | No |
+| `--path <path>` | Filter by path (partial match) | - | No |
+| `--start-date <date>` | Start date (ISO 8601) | - | No |
+| `--end-date <date>` | End date (ISO 8601) | - | No |
+| `--sort-by <field>` | Sort by field (default: timestamp) | - | No |
+| `--sort-order <order>` | Sort order: asc or desc (default: desc) | - | No |
 | `--is-bot` | Filter for bot requests only | - | No |
 | `--has-error` | Filter for requests with errors only | - | No |
 
@@ -4561,7 +4561,7 @@ Get proxy log by request ID
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--request-id <id>` | Request ID | - | Yes |
+| `--request-id <id>` | Request ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `proxy-logs stats`
@@ -4617,8 +4617,8 @@ Create a new email domain
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-d, --domain <domain>` | Domain name (e.g., mail.example.com) | - | Yes |
-| `--provider-id <id>` | Email provider ID | - | Yes |
+| `-d, --domain <domain>` | Domain name (e.g., mail.example.com) | - | No |
+| `--provider-id <id>` | Email provider ID | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `email-domains show`
@@ -4675,7 +4675,7 @@ Setup DNS records using a configured DNS provider
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Email domain ID | - | Yes |
-| `--dns-provider-id <id>` | DNS provider ID to use | - | Yes |
+| `--dns-provider-id <id>` | DNS provider ID to use | - | No |
 
 ### `email-domains verify`
 
@@ -4717,13 +4717,13 @@ Create a new email provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Provider name | - | Yes |
-| `-t, --type <type>` | Provider type (ses, scaleway) | - | Yes |
-| `-r, --region <region>` | Cloud region | - | Yes |
-| `--access-key-id <key>` | AWS access key ID (for SES) | - | Yes |
-| `--secret-access-key <secret>` | AWS secret access key (for SES) | - | Yes |
-| `--api-key <key>` | Scaleway API key | - | Yes |
-| `--project-id <id>` | Scaleway project ID | - | Yes |
+| `-n, --name <name>` | Provider name | - | No |
+| `-t, --type <type>` | Provider type (ses, scaleway) | - | No |
+| `-r, --region <region>` | Cloud region | - | No |
+| `--access-key-id <key>` | AWS access key ID (for SES) | - | No |
+| `--secret-access-key <secret>` | AWS secret access key (for SES) | - | No |
+| `--api-key <key>` | Scaleway API key | - | No |
+| `--project-id <id>` | Scaleway project ID | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `email-providers show`
@@ -4758,8 +4758,8 @@ Test an email provider by sending a test email
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Provider ID | - | Yes |
-| `--from <email>` | Sender email address (must be verified) | - | Yes |
-| `--from-name <name>` | Sender display name | - | Yes |
+| `--from <email>` | Sender email address (must be verified) | - | No |
+| `--from-name <name>` | Sender display name | - | No |
 
 ## `incidents` (alias: `incident`)
 
@@ -4783,10 +4783,10 @@ List incidents for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `--status <status>` | Filter by status (investigating, identified, monitoring, resolved) | - | Yes |
-| `--environment-id <id>` | Filter by environment ID | - | Yes |
-| `--page <n>` | Page number | - | Yes |
-| `--page-size <n>` | Items per page | - | Yes |
+| `--status <status>` | Filter by status (investigating, identified, monitoring, resolved) | - | No |
+| `--environment-id <id>` | Filter by environment ID | - | No |
+| `--page <n>` | Page number | - | No |
+| `--page-size <n>` | Items per page | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `incidents create` (alias: `add`)
@@ -4798,9 +4798,9 @@ Create a new incident
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `-t, --title <title>` | Incident title | - | Yes |
-| `-d, --description <description>` | Incident description | - | Yes |
-| `-s, --severity <severity>` | Severity level (critical, major, minor) | - | Yes |
+| `-t, --title <title>` | Incident title | - | No |
+| `-d, --description <description>` | Incident description | - | No |
+| `-s, --severity <severity>` | Severity level (critical, major, minor) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `incidents show`
@@ -4823,8 +4823,8 @@ Update an incident status
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Incident ID | - | Yes |
-| `-s, --status <status>` | New status (investigating, identified, monitoring, resolved) | - | Yes |
-| `-m, --message <message>` | Status update message | - | Yes |
+| `-s, --status <status>` | New status (investigating, identified, monitoring, resolved) | - | No |
+| `-m, --message <message>` | Status update message | - | No |
 
 ### `incidents updates`
 
@@ -4846,10 +4846,10 @@ Get bucketed incident data for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `-i, --interval <interval>` | Bucket interval: 5min, hourly, daily (default: hourly) | - | Yes |
-| `--start-time <time>` | Start time (ISO 8601) | - | Yes |
-| `--end-time <time>` | End time (ISO 8601) | - | Yes |
-| `--environment-id <id>` | Filter by environment ID | - | Yes |
+| `-i, --interval <interval>` | Bucket interval: 5min, hourly, daily (default: hourly) | - | No |
+| `--start-time <time>` | Start time (ISO 8601) | - | No |
+| `--end-time <time>` | End time (ISO 8601) | - | No |
+| `--environment-id <id>` | Filter by environment ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `emails` (alias: `email`)
@@ -4873,12 +4873,12 @@ List sent emails
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--page <n>` | Page number | - | Yes |
-| `--page-size <n>` | Items per page | - | Yes |
-| `--status <status>` | Filter by status (sent, delivered, failed) | - | Yes |
-| `--domain-id <id>` | Filter by domain ID | - | Yes |
-| `--project-id <id>` | Filter by project ID | - | Yes |
-| `--from-address <email>` | Filter by sender address | - | Yes |
+| `--page <n>` | Page number | - | No |
+| `--page-size <n>` | Items per page | - | No |
+| `--status <status>` | Filter by status (sent, delivered, failed) | - | No |
+| `--domain-id <id>` | Filter by domain ID | - | No |
+| `--project-id <id>` | Filter by project ID | - | No |
+| `--from-address <email>` | Filter by sender address | - | No |
 
 ### `emails send`
 
@@ -4888,10 +4888,10 @@ Send an email
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--to <email>` | Recipient email address | - | Yes |
-| `--subject <subject>` | Email subject | - | Yes |
-| `--body <body>` | Email body | - | Yes |
-| `--from <email>` | Sender email address | - | Yes |
+| `--to <email>` | Recipient email address | - | No |
+| `--subject <subject>` | Email subject | - | No |
+| `--body <body>` | Email body | - | No |
+| `--from <email>` | Sender email address | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `emails show`
@@ -4923,7 +4923,7 @@ Validate an email address
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--email <email>` | Email address to validate | - | Yes |
+| `--email <email>` | Email address to validate | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `load-balancer` (alias: `lb`)
@@ -4956,8 +4956,8 @@ Create a load balancer route
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-d, --domain <domain>` | Domain for the route | - | Yes |
-| `-t, --target <target>` | Target upstream URL | - | Yes |
+| `-d, --domain <domain>` | Domain for the route | - | No |
+| `-t, --target <target>` | Target upstream URL | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `load-balancer show`
@@ -4980,7 +4980,7 @@ Update a load balancer route
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain of the route | - | Yes |
-| `-t, --target <target>` | New target upstream URL | - | Yes |
+| `-t, --target <target>` | New target upstream URL | - | No |
 
 ### `load-balancer remove` (alias: `rm`)
 
@@ -5025,12 +5025,12 @@ Discover workloads from a source
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-s, --source <source>` | Import source (coolify, dokploy, caprover, portainer, kubernetes, kamal, docker) | - | Yes |
-| `--token <token>` | API token / admin password for the source instance | - | Yes |
-| `--base-url <url>` | Base URL of the source instance | - | Yes |
-| `--username <name>` | Admin username (portainer source, defaults to "admin") | - | Yes |
-| `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | Yes |
-| `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | Yes |
+| `-s, --source <source>` | Import source (coolify, dokploy, caprover, portainer, kubernetes, kamal, docker) | - | No |
+| `--token <token>` | API token / admin password for the source instance | - | No |
+| `--base-url <url>` | Base URL of the source instance | - | No |
+| `--username <name>` | Admin username (portainer source, defaults to "admin") | - | No |
+| `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | No |
+| `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `migrate plan`
@@ -5041,13 +5041,13 @@ Discover a source, pick a workload, and show the import plan
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-s, --source <source>` | Import source | - | Yes |
-| `-w, --workload <workload>` | Workload ID to import (skips the picker) | - | Yes |
-| `--token <token>` | API token / admin password for the source instance | - | Yes |
-| `--base-url <url>` | Base URL of the source instance | - | Yes |
-| `--username <name>` | Admin username (portainer source, defaults to "admin") | - | Yes |
-| `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | Yes |
-| `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | Yes |
+| `-s, --source <source>` | Import source | - | No |
+| `-w, --workload <workload>` | Workload ID to import (skips the picker) | - | No |
+| `--token <token>` | API token / admin password for the source instance | - | No |
+| `--base-url <url>` | Base URL of the source instance | - | No |
+| `--username <name>` | Admin username (portainer source, defaults to "admin") | - | No |
+| `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | No |
+| `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | No |
 
 ### `migrate run`
 
@@ -5057,17 +5057,17 @@ Guided end-to-end migration: discover, plan, review, and execute
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-s, --source <source>` | Import source (vercel, coolify, dokploy, caprover, portainer, kubernetes, kamal, docker) | - | Yes |
-| `-w, --workload <workload>` | Workload ID to import (skips the picker) | - | Yes |
-| `--token <token>` | API token / admin password for the source instance | - | Yes |
-| `--base-url <url>` | Base URL of the source instance | - | Yes |
-| `--username <name>` | Admin username (portainer source, defaults to "admin") | - | Yes |
-| `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | Yes |
-| `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | Yes |
-| `--project-name <name>` | Name for the new temps project (defaults to the source project name) | - | Yes |
-| `--preset <preset>` | Build preset (defaults to "nixpacks" for git sources, "dockerfile" otherwise) | - | Yes |
-| `--directory <dir>` | Project subdirectory | `.` | Yes |
-| `--branch <branch>` | Branch to deploy | `main` | Yes |
+| `-s, --source <source>` | Import source (vercel, coolify, dokploy, caprover, portainer, kubernetes, kamal, docker) | - | No |
+| `-w, --workload <workload>` | Workload ID to import (skips the picker) | - | No |
+| `--token <token>` | API token / admin password for the source instance | - | No |
+| `--base-url <url>` | Base URL of the source instance | - | No |
+| `--username <name>` | Admin username (portainer source, defaults to "admin") | - | No |
+| `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | No |
+| `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | No |
+| `--project-name <name>` | Name for the new temps project (defaults to the source project name) | - | No |
+| `--preset <preset>` | Build preset (defaults to "nixpacks" for git sources, "dockerfile" otherwise) | - | No |
+| `--directory <dir>` | Project subdirectory | `.` | No |
+| `--branch <branch>` | Branch to deploy | `main` | No |
 | `--dry-run` | Plan only — do not create or deploy anything | - | No |
 | `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
 
@@ -5080,10 +5080,10 @@ Execute a previously created import plan by session ID
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--session-id <id>` | Import session ID (from `imports plan`) | - | Yes |
-| `--project-name <name>` | Name for the new temps project | - | Yes |
-| `--preset <preset>` | Build preset | `nixpacks` | Yes |
-| `--directory <dir>` | Project subdirectory | `.` | Yes |
-| `--branch <branch>` | Branch to deploy | `main` | Yes |
+| `--project-name <name>` | Name for the new temps project | - | No |
+| `--preset <preset>` | Build preset | `nixpacks` | No |
+| `--directory <dir>` | Project subdirectory | `.` | No |
+| `--branch <branch>` | Branch to deploy | `main` | No |
 | `--dry-run` | Plan only — do not create or deploy anything | - | No |
 | `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
 
@@ -5115,7 +5115,7 @@ List available templates
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--type <type>` | Filter by project type (server, static) | - | Yes |
+| `--type <type>` | Filter by project type (server, static) | - | No |
 
 ## `platform` (alias: `plat`)
 
@@ -5206,7 +5206,7 @@ Install a release on the server and restart it
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--version <version>` | Release tag to install (default: newest on this channel) | - | Yes |
+| `--version <version>` | Release tag to install (default: newest on this channel) | - | No |
 | `-y, --yes` | Skip the confirmation prompt | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -5228,7 +5228,7 @@ List available presets
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--type <type>` | Filter by project type (server, static) | - | Yes |
+| `--type <type>` | Filter by project type (server, static) | - | No |
 
 ### `presets show` (alias: `get`)
 
@@ -5261,8 +5261,8 @@ Show analytics dashboard overview
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `analytics top`
@@ -5273,9 +5273,9 @@ Show breakdown by dimension: pages, referrers, browsers, os, devices, countries,
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
-| `--limit <n>` | Number of results (default: 20, max: 100) | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `analytics funnels`
@@ -5286,8 +5286,8 @@ Show funnel conversion metrics for all funnels
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `analytics ai-agents`
@@ -5298,11 +5298,11 @@ Show AI crawler / provider breakdown (web /analytics/ai-agents)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | Yes |
-| `--limit <n>` | Number of rows to fetch (default: 20, max: 100) | - | Yes |
-| `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | Yes |
-| `--path <path>` | Restrict to one URL path (e.g. /docs) | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | No |
+| `--limit <n>` | Number of rows to fetch (default: 20, max: 100) | - | No |
+| `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | No |
+| `--path <path>` | Restrict to one URL path (e.g. /docs) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `analytics ai-pages`
@@ -5313,10 +5313,10 @@ Show pages crawled by AI agents, with distinct-agent counts
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | Yes |
-| `--limit <n>` | Number of pages to fetch (default: 20, max: 100) | - | Yes |
-| `--path <path>` | Restrict to one URL path (returns just that row) | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | No |
+| `--limit <n>` | Number of pages to fetch (default: 20, max: 100) | - | No |
+| `--path <path>` | Restrict to one URL path (returns just that row) | - | No |
 | `--with-agents` | Also fetch and render the per-agent split for each page (slower) | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -5328,10 +5328,10 @@ Show which agents/providers crawled a single page (e.g. /docs)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | Yes |
-| `--limit <n>` | Number of rows to fetch (default: 50, max: 100) | - | Yes |
-| `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | No |
+| `--limit <n>` | Number of rows to fetch (default: 50, max: 100) | - | No |
+| `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `funnels` (alias: `funnel`)
@@ -5367,8 +5367,8 @@ Create a new funnel for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
-| `-n, --name <name>` | Funnel name | - | Yes |
-| `-s, --steps <json>` | Funnel steps as JSON array (e.g. '[{"event_name":"page_view"},{"event_name":"signup"}]') | - | Yes |
+| `-n, --name <name>` | Funnel name | - | No |
+| `-s, --steps <json>` | Funnel steps as JSON array (e.g. '[{"event_name":"page_view"},{"event_name":"signup"}]') | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `funnels update`
@@ -5381,8 +5381,8 @@ Update a funnel
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--funnel-id <id>` | Funnel ID | - | Yes |
-| `-n, --name <name>` | New funnel name | - | Yes |
-| `-s, --steps <json>` | New funnel steps as JSON array | - | Yes |
+| `-n, --name <name>` | New funnel name | - | No |
+| `-s, --steps <json>` | New funnel steps as JSON array | - | No |
 
 ### `funnels remove` (alias: `rm`)
 
@@ -5484,7 +5484,7 @@ List skill definitions
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--global` | List global (platform-wide) skills | - | No |
-| `--project <slug>` | List skills for a specific project | - | Yes |
+| `--project <slug>` | List skills for a specific project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `skills create` (alias: `add`)
@@ -5497,10 +5497,10 @@ Create a new skill definition. Use @path for content from a file, directory, or 
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Skill name | - | Yes |
 | `-s, --slug <slug>` | Skill slug (URL-safe identifier) | - | Yes |
-| `-c, --content <content>` | Skill content (markdown), @file, @directory, or @archive.tar.gz | - | Yes |
-| `-d, --description <description>` | Skill description | - | Yes |
+| `-c, --content <content>` | Skill content (markdown), @file, @directory, or @archive.tar.gz | - | No |
+| `-d, --description <description>` | Skill description | - | No |
 | `--global` | Create as global (platform-wide) skill | - | No |
-| `--project <slug>` | Create skill for a specific project | - | Yes |
+| `--project <slug>` | Create skill for a specific project | - | No |
 
 ### `skills update`
 
@@ -5510,11 +5510,11 @@ Update an existing skill definition
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | New name | - | Yes |
-| `-c, --content <content>` | New content. Prefix with @ to read from file | - | Yes |
-| `-d, --description <description>` | New description | - | Yes |
+| `-n, --name <name>` | New name | - | No |
+| `-c, --content <content>` | New content. Prefix with @ to read from file | - | No |
+| `-d, --description <description>` | New description | - | No |
 | `--global` | Update a global skill | - | No |
-| `--project <slug>` | Update a project-scoped skill | - | Yes |
+| `--project <slug>` | Update a project-scoped skill | - | No |
 
 ### `skills delete` (alias: `rm`)
 
@@ -5525,7 +5525,7 @@ Delete a skill definition
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--global` | Delete a global skill | - | No |
-| `--project <slug>` | Delete a project-scoped skill | - | Yes |
+| `--project <slug>` | Delete a project-scoped skill | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
@@ -5537,12 +5537,12 @@ Import a skill from a public GitHub repository (skills.sh-compatible). Source: <
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-b, --branch <branch>` | Git branch to fetch from | `main` | Yes |
-| `-s, --slug <slug>` | Override slug (defaults to skill directory name) | - | Yes |
-| `-n, --name <name>` | Override skill name (defaults to SKILL.md frontmatter) | - | Yes |
-| `-d, --description <description>` | Override description | - | Yes |
+| `-b, --branch <branch>` | Git branch to fetch from | `main` | No |
+| `-s, --slug <slug>` | Override slug (defaults to skill directory name) | - | No |
+| `-n, --name <name>` | Override skill name (defaults to SKILL.md frontmatter) | - | No |
+| `-d, --description <description>` | Override description | - | No |
 | `--global` | Install as a global (platform-wide) skill | - | No |
-| `--project <slug>` | Install for a specific project | - | Yes |
+| `--project <slug>` | Install for a specific project | - | No |
 | `-f, --force` | Overwrite if a skill with the same slug already exists | - | No |
 
 ## `mcp-servers` (alias: `mcp`)
@@ -5565,7 +5565,7 @@ List MCP server definitions
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--global` | List global (platform-wide) MCP servers | - | No |
-| `--project <slug>` | List MCP servers for a specific project | - | Yes |
+| `--project <slug>` | List MCP servers for a specific project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `mcp-servers create` (alias: `add`)
@@ -5579,9 +5579,9 @@ Create a new MCP server definition
 | `-n, --name <name>` | MCP server name | - | Yes |
 | `-s, --slug <slug>` | MCP server slug (URL-safe identifier) | - | Yes |
 | `-c, --config <config>` | MCP server config (JSON). Prefix with @ to read from file (e.g. @./mcp.json) | - | Yes |
-| `-d, --description <description>` | MCP server description | - | Yes |
+| `-d, --description <description>` | MCP server description | - | No |
 | `--global` | Create as global (platform-wide) MCP server | - | No |
-| `--project <slug>` | Create MCP server for a specific project | - | Yes |
+| `--project <slug>` | Create MCP server for a specific project | - | No |
 
 ### `mcp-servers update`
 
@@ -5591,11 +5591,11 @@ Update an existing MCP server definition
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | New name | - | Yes |
-| `-c, --config <config>` | New config (JSON). Prefix with @ to read from file | - | Yes |
-| `-d, --description <description>` | New description | - | Yes |
+| `-n, --name <name>` | New name | - | No |
+| `-c, --config <config>` | New config (JSON). Prefix with @ to read from file | - | No |
+| `-d, --description <description>` | New description | - | No |
 | `--global` | Update a global MCP server | - | No |
-| `--project <slug>` | Update a project-scoped MCP server | - | Yes |
+| `--project <slug>` | Update a project-scoped MCP server | - | No |
 
 ### `mcp-servers delete` (alias: `rm`)
 
@@ -5606,7 +5606,7 @@ Delete an MCP server definition
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--global` | Delete a global MCP server | - | No |
-| `--project <slug>` | Delete a project-scoped MCP server | - | Yes |
+| `--project <slug>` | Delete a project-scoped MCP server | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
@@ -5641,9 +5641,9 @@ Create or update a secret (upsert by name)
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Secret name | - | Yes |
 | `-v, --value <value>` | Secret value. Prefix with @ to read from file (e.g. @./creds.json) | - | Yes |
-| `-t, --type <type>` | Secret type: "env" (default) or "file" | `env` | Yes |
-| `-m, --mount-path <path>` | Absolute path inside sandbox where file-type secret is written (required for --type file) | - | Yes |
-| `-d, --description <description>` | Human-readable description | - | Yes |
+| `-t, --type <type>` | Secret type: "env" (default) or "file" | `env` | No |
+| `-m, --mount-path <path>` | Absolute path inside sandbox where file-type secret is written (required for --type file) | - | No |
+| `-d, --description <description>` | Human-readable description | - | No |
 
 ### `secrets update`
 
@@ -5654,10 +5654,10 @@ Update an existing secret (alias for create — upserts)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Secret name | - | Yes |
-| `-v, --value <value>` | New value. Prefix with @ to read from file | - | Yes |
-| `-t, --type <type>` | Secret type: "env" or "file" | - | Yes |
-| `-m, --mount-path <path>` | New mount path (file type only) | - | Yes |
-| `-d, --description <description>` | New description | - | Yes |
+| `-v, --value <value>` | New value. Prefix with @ to read from file | - | No |
+| `-t, --type <type>` | Secret type: "env" or "file" | - | No |
+| `-m, --mount-path <path>` | New mount path (file type only) | - | No |
+| `-d, --description <description>` | New description | - | No |
 
 ### `secrets delete` (alias: `rm`)
 
@@ -5700,26 +5700,26 @@ Create a new sandbox
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--image <image>` | Docker image override (uses platform default when omitted) | - | Yes |
-| `--name <name>` | Display name for the sandbox | - | Yes |
-| `--timeout <seconds>` | Idle timeout in seconds (clamped to [60, 86400]) | - | Yes |
-| `-e, --env <KEY=VAL>` | Env var baked into the container (repeatable) | - | Yes |
-| `--cpu-limit <cpu>` | CPU limit (e.g., 0.5 for half a core) | - | Yes |
-| `--memory-mb <mb>` | Memory limit in megabytes | - | Yes |
-| `--git-url <url>` | Git repo URL to clone into the work dir | - | Yes |
-| `--git-rev <revision>` | Git revision to check out (requires --git-url) | - | Yes |
-| `--git-depth <n>` | Shallow clone depth (requires --git-url) | - | Yes |
-| `--git-connection <id>` | ID of a stored git provider connection; temps injects the token server-side | - | Yes |
-| `--git-username <user>` | HTTP Basic username for private repo clone (requires --git-password) | - | Yes |
-| `--git-password <token>` | HTTP Basic password/token (paired with --git-username; injected via GIT_ASKPASS) | - | Yes |
-| `--tarball-url <url>` | Tarball URL to download and extract | - | Yes |
+| `--image <image>` | Docker image override (uses platform default when omitted) | - | No |
+| `--name <name>` | Display name for the sandbox | - | No |
+| `--timeout <seconds>` | Idle timeout in seconds (clamped to [60, 86400]) | - | No |
+| `-e, --env <KEY=VAL>` | Env var baked into the container (repeatable) | - | No |
+| `--cpu-limit <cpu>` | CPU limit (e.g., 0.5 for half a core) | - | No |
+| `--memory-mb <mb>` | Memory limit in megabytes | - | No |
+| `--git-url <url>` | Git repo URL to clone into the work dir | - | No |
+| `--git-rev <revision>` | Git revision to check out (requires --git-url) | - | No |
+| `--git-depth <n>` | Shallow clone depth (requires --git-url) | - | No |
+| `--git-connection <id>` | ID of a stored git provider connection; temps injects the token server-side | - | No |
+| `--git-username <user>` | HTTP Basic username for private repo clone (requires --git-password) | - | No |
+| `--git-password <token>` | HTTP Basic password/token (paired with --git-username; injected via GIT_ASKPASS) | - | No |
+| `--tarball-url <url>` | Tarball URL to download and extract | - | No |
 | `--workspace` | Create a persistent workspace: suspends when idle, wakes automatically on the next command, and is never destroyed for you | - | No |
-| `--project <slug>` | Seed from a temps project's connected repo (and attribute the sandbox to it). Defaults to the linked project in .temps/config.json | - | Yes |
-| `--repo <owner/name>` | Seed from a repo on one of your git connections that has no temps project | - | Yes |
-| `--branch <ref>` | Branch, tag, or SHA to check out (alias of --git-rev) | - | Yes |
-| `--new-branch <name>` | Create and switch to a new branch after cloning, based on whatever was checked out | - | Yes |
+| `--project <slug>` | Seed from a temps project's connected repo (and attribute the sandbox to it). Defaults to the linked project in .temps/config.json | - | No |
+| `--repo <owner/name>` | Seed from a repo on one of your git connections that has no temps project | - | No |
+| `--branch <ref>` | Branch, tag, or SHA to check out (alias of --git-rev) | - | No |
+| `--new-branch <name>` | Create and switch to a new branch after cloning, based on whatever was checked out | - | No |
 | `--preview-password` | Generate a random preview-URL password and print it once on stdout | - | No |
-| `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | Yes |
+| `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox list` (alias: `ls`)
@@ -5730,11 +5730,11 @@ List your sandboxes
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--page <n>` | Page (1-indexed) | - | Yes |
-| `--page-size <n>` | Items per page (default 20, max 100) | - | Yes |
+| `--page <n>` | Page (1-indexed) | - | No |
+| `--page-size <n>` | Items per page (default 20, max 100) | - | No |
 | `--workspace` | Show only persistent workspaces | - | No |
-| `--lifecycle <class>` | Filter by lifecycle class: ephemeral \| workspace | - | Yes |
-| `--project <slug>` | Show only sandboxes created from this project | - | Yes |
+| `--lifecycle <class>` | Filter by lifecycle class: ephemeral \| workspace | - | No |
+| `--project <slug>` | Show only sandboxes created from this project | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox show`
@@ -5777,13 +5777,13 @@ Clone a git repo or extract a tarball into a running sandbox
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--git-url <url>` | Git repo URL to clone | - | Yes |
-| `--git-rev <revision>` | Git revision (branch/tag/SHA) to check out | - | Yes |
-| `--git-depth <n>` | Shallow clone depth | - | Yes |
-| `--git-connection <id>` | ID of a stored git provider connection; temps injects the token server-side | - | Yes |
-| `--git-username <user>` | HTTP Basic username (pairs with --git-password) | - | Yes |
-| `--git-password <token>` | HTTP Basic password/token (injected via GIT_ASKPASS) | - | Yes |
-| `--tarball-url <url>` | Tarball URL to download and extract | - | Yes |
+| `--git-url <url>` | Git repo URL to clone | - | No |
+| `--git-rev <revision>` | Git revision (branch/tag/SHA) to check out | - | No |
+| `--git-depth <n>` | Shallow clone depth | - | No |
+| `--git-connection <id>` | ID of a stored git provider connection; temps injects the token server-side | - | No |
+| `--git-username <user>` | HTTP Basic username (pairs with --git-password) | - | No |
+| `--git-password <token>` | HTTP Basic password/token (injected via GIT_ASKPASS) | - | No |
+| `--tarball-url <url>` | Tarball URL to download and extract | - | No |
 
 ### `sandbox shell` (alias: `attach`)
 
@@ -5793,8 +5793,8 @@ Open an interactive terminal in a sandbox. Detach with Ctrl-P Ctrl-Q to leave th
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--tab <name>` | Tab to attach to; reusing a name reattaches to the program already running in it | `main` | Yes |
-| `--cmd <command>` | Program to start when the tab is created, e.g. "claude" (default: login shell) | - | Yes |
+| `--tab <name>` | Tab to attach to; reusing a name reattaches to the program already running in it | `main` | No |
+| `--cmd <command>` | Program to start when the tab is created, e.g. "claude" (default: login shell) | - | No |
 
 ### `sandbox extend`
 
@@ -5815,8 +5815,8 @@ Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--detach` | Start in background and print a job ID instead of waiting | - | No |
-| `--cwd <path>` | Working directory inside the sandbox | - | Yes |
-| `-e, --env <KEY=VAL>` | Env var for this exec (repeatable) | - | Yes |
+| `--cwd <path>` | Working directory inside the sandbox | - | No |
+| `-e, --env <KEY=VAL>` | Env var for this exec (repeatable) | - | No |
 
 ### `sandbox logs`
 
@@ -5841,7 +5841,7 @@ Generate, rotate, or clear the preview-URL password for a sandbox
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--rotate` | Generate a new random password and set it (default when no flag is given) | - | No |
-| `--length <n>` | Length of the generated password (8..=256, default 24) | - | Yes |
+| `--length <n>` | Length of the generated password (8..=256, default 24) | - | No |
 | `--clear` | Remove the preview password — preview URLs become open again | - | No |
 
 ### `sandbox fs`
@@ -5864,7 +5864,7 @@ Read a file from the sandbox
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--path <path>` | Absolute file path inside the sandbox | - | Yes |
-| `--out <localPath>` | Write to this local file (stdout when omitted) | - | Yes |
+| `--out <localPath>` | Write to this local file (stdout when omitted) | - | No |
 
 #### `sandbox fs write`
 
@@ -5875,9 +5875,9 @@ Write a file to the sandbox
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--path <path>` | Absolute target path inside the sandbox | - | Yes |
-| `--file <localPath>` | Local source file to upload (mutually exclusive with --content) | - | Yes |
-| `--content <string>` | Inline string content to write | - | Yes |
-| `--mode <octal>` | Unix permission mask (default: 0644) | - | Yes |
+| `--file <localPath>` | Local source file to upload (mutually exclusive with --content) | - | No |
+| `--content <string>` | Inline string content to write | - | No |
+| `--mode <octal>` | Unix permission mask (default: 0644) | - | No |
 
 #### `sandbox fs stat`
 
@@ -5917,7 +5917,7 @@ List workflows/agents available on this project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <slug>` | Project slug (auto-detect from .temps/config.json) | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detect from .temps/config.json) | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `workflow run`
@@ -5928,12 +5928,12 @@ Trigger a workflow and stream its output
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <slug>` | Project slug (auto-detect from .temps/config.json) | - | Yes |
-| `-c, --context <text>` | Free-form user context passed to the workflow (e.g. a bug description) | - | Yes |
-| `-f, --from-file <path>` | Run an ephemeral workflow from a local YAML file (no server-side persistence). Mutually exclusive with <slug>. | - | Yes |
-| `-e, --error-group <id>` | Link this run to an error group id. The workflow will see the error type, message, and stack trace via the usual {{error_type}} / {{error_message}} template fields. Works with both committed slugs and --from-file. | - | Yes |
-| `--cpu <cores>` | CPU cores for the ephemeral sandbox (0.1–4.0). Overrides the YAML value. Only applies with --from-file. | - | Yes |
-| `--memory <mb>` | Memory limit in MB for the ephemeral sandbox (128–8192). Overrides the YAML value. Only applies with --from-file. | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detect from .temps/config.json) | - | No |
+| `-c, --context <text>` | Free-form user context passed to the workflow (e.g. a bug description) | - | No |
+| `-f, --from-file <path>` | Run an ephemeral workflow from a local YAML file (no server-side persistence). Mutually exclusive with <slug>. | - | No |
+| `-e, --error-group <id>` | Link this run to an error group id. The workflow will see the error type, message, and stack trace via the usual {{error_type}} / {{error_message}} template fields. Works with both committed slugs and --from-file. | - | No |
+| `--cpu <cores>` | CPU cores for the ephemeral sandbox (0.1–4.0). Overrides the YAML value. Only applies with --from-file. | - | No |
+| `--memory <mb>` | Memory limit in MB for the ephemeral sandbox (128–8192). Overrides the YAML value. Only applies with --from-file. | - | No |
 | `--no-follow` | Return immediately after queueing instead of streaming logs | - | No |
 | `--json` | Print the run record as JSON when it terminates | - | No |
 
@@ -5962,9 +5962,9 @@ Import current subscriptions CSV (e.g., Stripe → Subscriptions → Export)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <slug>` | Project slug (defaults to linked project) | - | Yes |
-| `--integration-id <id>` | Target integration ID (auto-detected if only one exists) | - | Yes |
-| `--provider <name>` | Target provider name (e.g., stripe) | - | Yes |
+| `-p, --project <slug>` | Project slug (defaults to linked project) | - | No |
+| `--integration-id <id>` | Target integration ID (auto-detected if only one exists) | - | No |
+| `--provider <name>` | Target provider name (e.g., stripe) | - | No |
 | `--json` | Output the import outcome as JSON (suppresses spinners) | - | No |
 
 #### `revenue import invoices`
@@ -5975,9 +5975,9 @@ Import paid invoices CSV to backfill the revenue chart
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <slug>` | Project slug (defaults to linked project) | - | Yes |
-| `--integration-id <id>` | Target integration ID (auto-detected if only one exists) | - | Yes |
-| `--provider <name>` | Target provider name (e.g., stripe) | - | Yes |
+| `-p, --project <slug>` | Project slug (defaults to linked project) | - | No |
+| `--integration-id <id>` | Target integration ID (auto-detected if only one exists) | - | No |
+| `--provider <name>` | Target provider name (e.g., stripe) | - | No |
 | `--json` | Output the import outcome as JSON (suppresses spinners) | - | No |
 
 ## `session-replay` (alias: `sessions`, `replay`)
@@ -6000,10 +6000,10 @@ List session replays for a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--environment-id <id>` | Filter by environment ID | - | Yes |
-| `--page <n>` | Page number (default: 1) | `1` | Yes |
-| `--per-page <n>` | Sessions per page (default: 25, max: 100) | `25` | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Filter by environment ID | - | No |
+| `--page <n>` | Page number (default: 1) | `1` | No |
+| `--per-page <n>` | Sessions per page (default: 25, max: 100) | `25` | No |
 | `--json` | Output raw JSON | - | No |
 
 ### `session-replay visitor`
@@ -6014,8 +6014,8 @@ List session replays for a specific visitor
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--page <n>` | Page number (default: 1) | `1` | Yes |
-| `--per-page <n>` | Sessions per page (default: 25) | `25` | Yes |
+| `--page <n>` | Page number (default: 1) | `1` | No |
+| `--per-page <n>` | Sessions per page (default: 25) | `25` | No |
 | `--json` | Output raw JSON | - | No |
 
 ### `session-replay show`
@@ -6036,9 +6036,9 @@ Download or page through all rrweb events for a session
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--page <n>` | Page of events to display (default: 1) | `1` | Yes |
-| `--limit <n>` | Events per page (default: 50) | `50` | Yes |
-| `--output <file>` | Write all events as JSON to a file (skips paged display) | - | Yes |
+| `--page <n>` | Page of events to display (default: 1) | `1` | No |
+| `--limit <n>` | Events per page (default: 50) | `50` | No |
+| `--output <file>` | Write all events as JSON to a file (skips paged display) | - | No |
 | `--json` | Print all events as JSON to stdout | - | No |
 
 ### `session-replay delete` (alias: `rm`)
@@ -6059,7 +6059,7 @@ Initialize a Temps project in the current directory
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Project name (for new projects) | - | Yes |
+| `-n, --name <name>` | Project name (for new projects) | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
 ## `link`
@@ -6070,7 +6070,7 @@ Link current directory to a Temps project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-e, --environment <name>` | Set default environment | - | Yes |
+| `-e, --environment <name>` | Set default environment | - | No |
 
 ## `up`
 
@@ -6080,14 +6080,14 @@ Deploy the current project (runs setup wizard if not linked)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <env>` | Target environment name | - | Yes |
-| `-b, --branch <branch>` | Git branch to deploy (auto-detected from cwd) | - | Yes |
-| `-n, --name <name>` | Project name (for new projects) | - | Yes |
-| `--preset <preset>` | Framework preset slug (skip auto-detection) | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <env>` | Target environment name | - | No |
+| `-b, --branch <branch>` | Git branch to deploy (auto-detected from cwd) | - | No |
+| `-n, --name <name>` | Project name (for new projects) | - | No |
+| `--preset <preset>` | Framework preset slug (skip auto-detection) | - | No |
 | `--manual` | Use manual deployment mode (no git) | - | No |
 | `--static` | Deploy a pre-built static folder (no Docker, no git) | - | No |
-| `--static-dir <dir>` | Folder to upload for static deploys (auto-detected by default) | - | Yes |
+| `--static-dir <dir>` | Folder to upload for static deploys (auto-detected by default) | - | No |
 | `--no-services` | Skip external service setup | - | No |
 | `--no-wait` | Do not wait for deployment to complete | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
@@ -6100,8 +6100,8 @@ Show project deployment status
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | Yes |
-| `-e, --environment <env>` | Filter by environment | - | Yes |
+| `-p, --project <project>` | Project slug | - | No |
+| `-e, --environment <env>` | Filter by environment | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `ai`
@@ -6120,7 +6120,7 @@ Show which AI prerequisites this project meets, and how to fix the rest
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | Yes |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `instances` (alias: `instance`)
@@ -6153,8 +6153,8 @@ Add a new instance
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Instance name | - | Yes |
-| `-u, --url <url>` | Instance URL | - | Yes |
+| `-n, --name <name>` | Instance name | - | No |
+| `-u, --url <url>` | Instance URL | - | No |
 
 ### `instances remove` (alias: `rm`)
 
@@ -6182,8 +6182,8 @@ Pull environment variables to a .env file
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-e, --environment <name>` | Pull from specific environment | - | Yes |
-| `-p, --project <project>` | Project slug | - | Yes |
+| `-e, --environment <name>` | Pull from specific environment | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 
 ## `env:push`
 
@@ -6193,8 +6193,8 @@ Push environment variables from a .env file
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-e, --environment <names>` | Comma-separated environment names | - | Yes |
-| `-p, --project <project>` | Project slug | - | Yes |
+| `-e, --environment <names>` | Comma-separated environment names | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--overwrite` | Overwrite existing variables | - | No |
 
 ## `rollback`
@@ -6205,9 +6205,9 @@ Rollback to a previous deployment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | Yes |
-| `-e, --environment <env>` | Target environment | `production` | Yes |
-| `--to <id>` | Rollback to specific deployment ID | - | Yes |
+| `-p, --project <project>` | Project slug | - | No |
+| `-e, --environment <env>` | Target environment | `production` | No |
+| `--to <id>` | Rollback to specific deployment ID | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 
 ## `open`
@@ -6218,8 +6218,8 @@ Open project URL in browser
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | Yes |
-| `-e, --environment <env>` | Open specific environment | - | Yes |
+| `-p, --project <project>` | Project slug | - | No |
+| `-e, --environment <env>` | Open specific environment | - | No |
 | `--dashboard` | Open the dashboard instead of the project URL | - | No |
 
 ## `exec` (alias: `ssh`)
@@ -6230,8 +6230,8 @@ Execute a command in a running container (coming soon)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | Yes |
-| `-e, --environment <env>` | Target environment | - | Yes |
+| `-p, --project <project>` | Project slug | - | No |
+| `-e, --environment <env>` | Target environment | - | No |
 
 ## `dev`
 
@@ -6241,8 +6241,8 @@ Start a local development tunnel (coming soon)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | Yes |
-| `--port <port>` | Local port to expose | `3000` | Yes |
+| `-p, --project <project>` | Project slug | - | No |
+| `--port <port>` | Local port to expose | `3000` | No |
 
 ## `cloud`
 
@@ -6302,9 +6302,9 @@ Provision a new VPS instance
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--image <image>` | OS image ID | - | Yes |
-| `--location <location>` | Datacenter location ID | - | Yes |
-| `--type <type>` | Server type ID | - | Yes |
+| `--image <image>` | OS image ID | - | No |
+| `--location <location>` | Datacenter location ID | - | No |
+| `--type <type>` | Server type ID | - | No |
 | `--json` | Output as JSON | - | No |
 
 #### `cloud vps show`
@@ -6363,7 +6363,7 @@ List available server types with pricing
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--location <location>` | Filter by datacenter location | - | Yes |
+| `--location <location>` | Filter by datacenter location | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `cloud billing`
