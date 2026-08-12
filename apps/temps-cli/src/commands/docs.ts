@@ -195,8 +195,8 @@ function generateFooter(version: string): string {
 # Login to Temps
 bunx @temps-sdk/cli@${version} login
 
-# Create a new project
-bunx @temps-sdk/cli@${version} projects create --name my-app
+# Create a new project on the intended server
+bunx @temps-sdk/cli@${version} --target-context production projects create --name my-app
 
 # Deploy to production
 bunx @temps-sdk/cli@${version} --target-context production deploy --project my-app --environment production
@@ -217,8 +217,8 @@ bunx @temps-sdk/cli@${version} containers list --project-id 1 --environment-id 1
 # List environments
 bunx @temps-sdk/cli@${version} environments list --project my-app
 
-# Set environment variables
-bunx @temps-sdk/cli@${version} environments vars set --project my-app --key DATABASE_URL
+# Set environment variables on the intended server
+bunx @temps-sdk/cli@${version} --target-context production environments vars set --project my-app --key DATABASE_URL
 
 # View environment variables
 bunx @temps-sdk/cli@${version} environments vars list --project my-app
@@ -227,14 +227,14 @@ bunx @temps-sdk/cli@${version} environments vars list --project my-app
 ### Managing Domains
 
 \`\`\`bash
-# Add a custom domain
-bunx @temps-sdk/cli@${version} domains add --project my-app --domain app.example.com
+# Add a custom domain on the intended server
+bunx @temps-sdk/cli@${version} --target-context production domains add --project my-app --domain app.example.com
 
 # List domains
 bunx @temps-sdk/cli@${version} domains list --project my-app
 
-# Remove a domain
-bunx @temps-sdk/cli@${version} domains remove --project my-app --domain app.example.com
+# Remove a domain from the intended server
+bunx @temps-sdk/cli@${version} --target-context production domains remove --project my-app --domain app.example.com
 \`\`\`
 
 ## Environment Variables

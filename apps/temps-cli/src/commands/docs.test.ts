@@ -57,5 +57,17 @@ describe('generateDocs', () => {
     expect(commandReference).toContain('bunx @temps-sdk/cli@0.1.31 [command]')
     expect(commandReference).toContain('[`backups`](#backups)')
     expect(commandReference).toContain('[`otel-forward`](#otel-forward)')
+    expect(commandReference).toContain(
+      'bunx @temps-sdk/cli@0.1.31 --target-context production projects create --name my-app',
+    )
+    expect(commandReference).toContain(
+      'bunx @temps-sdk/cli@0.1.31 --target-context production environments vars set --project my-app --key DATABASE_URL',
+    )
+    expect(commandReference).toContain(
+      'bunx @temps-sdk/cli@0.1.31 --target-context production domains add --project my-app --domain app.example.com',
+    )
+    expect(commandReference).toContain(
+      'bunx @temps-sdk/cli@0.1.31 --target-context production domains remove --project my-app --domain app.example.com',
+    )
   })
 })

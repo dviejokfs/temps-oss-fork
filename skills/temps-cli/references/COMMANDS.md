@@ -6418,8 +6418,8 @@ Upgrade your plan
 # Login to Temps
 bunx @temps-sdk/cli@0.1.31 login
 
-# Create a new project
-bunx @temps-sdk/cli@0.1.31 projects create --name my-app
+# Create a new project on the intended server
+bunx @temps-sdk/cli@0.1.31 --target-context production projects create --name my-app
 
 # Deploy to production
 bunx @temps-sdk/cli@0.1.31 --target-context production deploy --project my-app --environment production
@@ -6440,8 +6440,8 @@ bunx @temps-sdk/cli@0.1.31 containers list --project-id 1 --environment-id 1
 # List environments
 bunx @temps-sdk/cli@0.1.31 environments list --project my-app
 
-# Set environment variables
-bunx @temps-sdk/cli@0.1.31 environments vars set --project my-app --key DATABASE_URL
+# Set environment variables on the intended server
+bunx @temps-sdk/cli@0.1.31 --target-context production environments vars set --project my-app --key DATABASE_URL
 
 # View environment variables
 bunx @temps-sdk/cli@0.1.31 environments vars list --project my-app
@@ -6450,14 +6450,14 @@ bunx @temps-sdk/cli@0.1.31 environments vars list --project my-app
 ### Managing Domains
 
 ```bash
-# Add a custom domain
-bunx @temps-sdk/cli@0.1.31 domains add --project my-app --domain app.example.com
+# Add a custom domain on the intended server
+bunx @temps-sdk/cli@0.1.31 --target-context production domains add --project my-app --domain app.example.com
 
 # List domains
 bunx @temps-sdk/cli@0.1.31 domains list --project my-app
 
-# Remove a domain
-bunx @temps-sdk/cli@0.1.31 domains remove --project my-app --domain app.example.com
+# Remove a domain from the intended server
+bunx @temps-sdk/cli@0.1.31 --target-context production domains remove --project my-app --domain app.example.com
 ```
 
 ## Environment Variables
