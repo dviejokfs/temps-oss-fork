@@ -5691,6 +5691,8 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `domain` - Resolve the preview URL for a port inside a sandbox
 - `password` - Generate, rotate, or clear the preview-URL password for a sandbox
 - `fs` - Filesystem operations inside a sandbox
+- `snapshots` - Manage sandbox snapshots (ADR-037)
+- `snapshot` - Take a snapshot of a sandbox
 
 ### `sandbox create`
 
@@ -5720,6 +5722,7 @@ Create a new sandbox
 | `--new-branch <name>` | Create and switch to a new branch after cloning, based on whatever was checked out | - | No |
 | `--preview-password` | Generate a random preview-URL password and print it once on stdout | - | No |
 | `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
+| `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox list` (alias: `ls`)
@@ -5899,6 +5902,73 @@ Create a directory inside the sandbox (mkdir -p)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--path <path>` | Absolute path inside the sandbox | - | Yes |
+
+### `sandbox snapshots`
+
+Manage sandbox snapshots (ADR-037)
+
+**Subcommands:**
+
+- `list` (`ls`) - List your snapshots
+- `show` - Show details for a snapshot
+- `delete` (`rm`) - Delete a snapshot permanently
+- `storage` - Show snapshot storage usage and quota
+
+#### `sandbox snapshots list` (alias: `ls`)
+
+List your snapshots
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <id>` | Filter by project ID | - | No |
+| `--status <status>` | Filter by status: creating \| ready \| failed \| deleted | - | No |
+| `--page <n>` | Page number (1-indexed) | - | No |
+| `--page-size <n>` | Items per page (default 20, max 100) | - | No |
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox snapshots show`
+
+Show details for a snapshot
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox snapshots delete` (alias: `rm`)
+
+Delete a snapshot permanently
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation prompt | - | No |
+
+#### `sandbox snapshots storage`
+
+Show snapshot storage usage and quota
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+### `sandbox snapshot`
+
+Take a snapshot of a sandbox
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--label <label>` | Human-readable label for the snapshot | - | No |
+| `--wait` | Wait until the snapshot reaches ready or failed status | - | No |
+| `--json` | Output as JSON | - | No |
 
 ## `workflow` (alias: `wf`)
 
