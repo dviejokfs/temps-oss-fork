@@ -58,6 +58,39 @@ class CapabilityDetectorTests(unittest.TestCase):
 
             self.assertIn("dotnet", [item["name"] for item in result["frameworks"]])
 
+    def test_symlinked_file_outside_root_is_not_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            root = workspace / "project"
+            root.mkdir()
+            outside = workspace / "outside.ts"
+            outside.write_text("Sentry.init({});", encoding="utf-8")
+            (root / "instrumentation.ts").symlink_to(outside)
+
+            result = detect(root)
+
+            self.assertEqual(result["capabilities"]["error_tracking"]["status"], "missing")
+            self.assertEqual(
+                result["capabilities"]["error_tracking"]["initialization_evidence"],
+                [],
+            )
+
+    def test_symlinked_directory_outside_root_is_not_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            root = workspace / "project"
+            root.mkdir()
+            outside = workspace / "outside"
+            outside.mkdir()
+            (outside / "package.json").write_text(
+                '{"dependencies":{"@sentry/nextjs":"1.0.0"}}', encoding="utf-8"
+            )
+            (root / "linked").symlink_to(outside, target_is_directory=True)
+
+            result = detect(root)
+
+            self.assertEqual(result["capabilities"]["error_tracking"]["status"], "missing")
+
 
 if __name__ == "__main__":
     unittest.main()

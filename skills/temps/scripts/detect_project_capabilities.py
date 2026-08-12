@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 from pathlib import Path
 
 
@@ -109,26 +111,56 @@ CAPABILITY_MARKERS = {
 
 
 def candidate_files(root: Path):
+    resolved_root = root.resolve()
     for path in root.rglob("*"):
         if any(part in IGNORED_DIRS for part in path.parts):
             continue
-        if not path.is_file():
+        if not (
+            path.name in MANIFEST_NAMES
+            or path.suffix in TEXT_SUFFIXES
+            or path.suffix == ".csproj"
+        ):
             continue
-        if path.name in MANIFEST_NAMES or path.suffix in TEXT_SUFFIXES or path.suffix == ".csproj":
-            try:
-                if path.stat().st_size <= MAX_FILE_BYTES:
-                    yield path
-            except OSError:
+        try:
+            relative = path.relative_to(root)
+            current = root
+            if any((current := current / part).is_symlink() for part in relative.parts):
                 continue
+            resolved_path = path.resolve(strict=True)
+            if not resolved_path.is_relative_to(resolved_root):
+                continue
+        except (OSError, RuntimeError, ValueError):
+            continue
+        yield path
+
+
+def read_candidate(path: Path) -> str | None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_FILE_BYTES:
+            return None
+        with os.fdopen(descriptor, "rb", closefd=False) as file:
+            contents = file.read(MAX_FILE_BYTES + 1)
+        if len(contents) > MAX_FILE_BYTES:
+            return None
+        return contents.decode("utf-8", errors="ignore")
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
 
 
 def detect(root: Path) -> dict[str, object]:
     files: list[tuple[Path, str]] = []
     for path in candidate_files(root):
-        try:
-            files.append((path, path.read_text(encoding="utf-8", errors="ignore")))
-        except OSError:
-            continue
+        text = read_candidate(path)
+        if text is not None:
+            files.append((path, text))
 
     frameworks: list[dict[str, str]] = []
     package_manifests = [(path, text) for path, text in files if path.name == "package.json"]
