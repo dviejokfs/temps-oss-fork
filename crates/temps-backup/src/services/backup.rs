@@ -4954,6 +4954,22 @@ impl BackupService {
             )));
         }
 
+        // Completed and failed backup records are retained as recovery evidence.
+        // Deleting their source would cascade into `backups`, which is deliberately
+        // prevented once a restore run references a backup. Check the direct
+        // dependency up front so callers receive a stable validation error instead
+        // of leaking a database foreign-key violation as HTTP 500.
+        let backup_count = temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::S3SourceId.eq(id))
+            .count(self.db.as_ref())
+            .await?;
+        if backup_count > 0 {
+            return Err(BackupError::Validation(format!(
+                "Cannot delete S3 source '{}': still referenced by {} backup record(s)",
+                source.name, backup_count
+            )));
+        }
+
         let result = temps_entities::s3_sources::Entity::delete_by_id(id)
             .exec(self.db.as_ref())
             .await?;
@@ -8281,6 +8297,56 @@ mod tests {
             "selected-backup"
         ));
         assert!(!json_contains_backup_identity(&repository, "missing"));
+    }
+
+    #[tokio::test]
+    async fn delete_s3_source_refuses_retained_backup_records_before_delete() {
+        let source = s3_sources::Model {
+            id: 17,
+            name: "recovery-evidence".to_string(),
+            bucket_name: "backups".to_string(),
+            bucket_path: "tenant".to_string(),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: Some(true),
+            is_default: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let count_row = |count: i64| {
+            let mut row = std::collections::BTreeMap::new();
+            row.insert("num_items".to_string(), sea_orm::Value::BigInt(Some(count)));
+            row
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source]])
+                .append_query_results(vec![vec![count_row(0)]])
+                .append_query_results(vec![vec![count_row(2)]])
+                .into_connection(),
+        );
+        let service = build_service_for_mock(db.clone()).expect("mock service should construct");
+
+        let error = service
+            .delete_s3_source(17)
+            .await
+            .expect_err("retained backups must block source deletion");
+
+        assert!(matches!(
+            error,
+            BackupError::Validation(message)
+                if message.contains("recovery-evidence")
+                    && message.contains("2 backup record(s)")
+        ));
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        assert_eq!(
+            db.into_transaction_log().len(),
+            3,
+            "validation must stop after source lookup and the two reference counts, before DELETE"
+        );
     }
 
     #[tokio::test]
