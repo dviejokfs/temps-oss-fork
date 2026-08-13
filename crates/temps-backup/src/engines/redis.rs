@@ -39,7 +39,13 @@ const ENGINE_KEY: &str = "redis";
 const DUMP_FILE_SUFFIX: &str = "dump.rdb.gz";
 const REDIS_SIDECAR_IMAGE: &str =
     "redis:7.4.10-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2";
-const WALG_STREAM_CREATE_COMMAND: &str = "bash -c 'error=$(mktemp); redis-cli --rdb - 2>$error; code=$?; cat $error >&2; if [ $code -ne 0 ] && grep -q \"Fail to fsync.*Invalid argument\" $error; then code=0; fi; rm -f $error; exit $code'";
+// `redis-cli --rdb -` negotiates Redis diskless replication and writes the
+// valid RDB followed by Redis's 40-byte hexadecimal EOF marker. The standalone
+// `redis-check-rdb` command accepts that trailing marker, but Redis rejects the
+// same bytes when the snapshot is used as an AOF base file during restore.
+// `head -c -40` keeps only a 40-byte tail buffer, so this remains a true stream
+// from Redis to WAL-G without creating a database-sized local file.
+const WALG_STREAM_CREATE_COMMAND: &str = "bash -c 'error=$(mktemp); redis-cli --rdb - 2>$error | head -c -40; statuses=(\"${PIPESTATUS[@]}\"); code=${statuses[0]}; if [ ${statuses[1]} -ne 0 ]; then code=${statuses[1]}; fi; cat $error >&2; if [ $code -ne 0 ] && grep -q \"Fail to fsync.*Invalid argument\" $error; then code=0; fi; rm -f $error; exit $code'";
 const WALG_STREAM_RESTORE_COMMAND: &str = "cat > /data/dump.rdb";
 
 pub struct RedisDeps {
@@ -448,6 +454,8 @@ mod tests {
     #[test]
     fn walg_stream_commands_match_cloud_restore_contract() {
         assert!(WALG_STREAM_CREATE_COMMAND.contains("redis-cli --rdb -"));
+        assert!(WALG_STREAM_CREATE_COMMAND.contains("head -c -40"));
+        assert!(WALG_STREAM_CREATE_COMMAND.contains("PIPESTATUS"));
         assert_eq!(WALG_STREAM_RESTORE_COMMAND, "cat > /data/dump.rdb");
     }
 
