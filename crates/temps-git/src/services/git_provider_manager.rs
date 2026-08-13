@@ -24,6 +24,8 @@ use octocrab::params::apps::CreateInstallationAccessToken;
 use octocrab::Octocrab;
 use reqwest::Url;
 
+use super::github::create_github_app_jwt;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProjectPresetDomain {
     pub path: String,
@@ -2190,7 +2192,7 @@ impl GitProviderManager {
                 })?;
 
             let app_id_param = AppId(app_id as u64);
-            let jwt_token = octocrab::auth::create_jwt(app_id_param, &key).map_err(|e| {
+            let jwt_token = create_github_app_jwt(app_id_param.0, &key).map_err(|e| {
                 GitProviderManagerError::InvalidConfiguration(format!(
                     "Failed to create JWT: {}",
                     e
