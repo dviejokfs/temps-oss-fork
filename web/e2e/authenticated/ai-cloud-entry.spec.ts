@@ -108,9 +108,9 @@ test.describe('AI entry and Cloud onboarding', () => {
     await page.goto('/projects')
     await entry.click()
     await page.getByRole('link', { name: 'Use my own AI provider' }).click()
-    await expect(page).toHaveURL(/\/settings\/ai-providers(?:[?#]|$)/)
+    await expect(page).toHaveURL(/\/ai-gateway(?:[?#]|$)/)
     await expect(
-      page.getByRole('heading', { name: /AI Providers/i })
+      page.getByRole('heading', { name: 'AI Gateway', exact: true })
     ).toBeVisible()
 
     expect(consoleErrors).toEqual([])

@@ -11,6 +11,18 @@ use tracing::{debug, info};
 
 use temps_backup_core::engine_v2::BackupError;
 
+fn create_image_options(image_reference: &str) -> bollard::query_parameters::CreateImageOptions {
+    use bollard::query_parameters::CreateImageOptionsBuilder;
+
+    // Docker accepts the complete reference in `fromImage`, including tags,
+    // registry ports, and digest pins. Splitting on `:` corrupts both
+    // `registry.example:5000/image:tag` and `image:tag@sha256:...`; setting a
+    // separate `tag` also overrides the tag embedded in `fromImage`.
+    CreateImageOptionsBuilder::new()
+        .from_image(image_reference)
+        .build()
+}
+
 /// Ensure `image_tag` is pulled and available locally. No-op if Docker
 /// already has the image cached; otherwise streams a pull and returns
 /// after the daemon reports completion.
@@ -38,15 +50,7 @@ pub async fn ensure_image_pulled_v2(image_tag: &str, engine: &str) -> Result<(),
         engine, "ensure_image_pulled_v2: image not cached, pulling"
     );
 
-    use bollard::query_parameters::CreateImageOptionsBuilder;
-    let (image, tag) = match image_tag.split_once(':') {
-        Some((i, t)) => (i, t),
-        None => (image_tag, "latest"),
-    };
-    let options = CreateImageOptionsBuilder::new()
-        .from_image(image)
-        .tag(tag)
-        .build();
+    let options = create_image_options(image_tag);
 
     let mut stream = docker.create_image(Some(options), None, None);
     while let Some(result) = FuturesStreamExt::next(&mut stream).await {
@@ -66,4 +70,27 @@ pub async fn ensure_image_pulled_v2(image_tag: &str, engine: &str) -> Result<(),
 
     info!(image_tag, engine, "ensure_image_pulled_v2: pull complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_image_options;
+
+    #[test]
+    fn digest_pinned_reference_is_passed_to_docker_intact() {
+        let reference = "mongo:7.0.39-jammy@sha256:04582c3a144d088f841c446abfc19f79a";
+        let options = create_image_options(reference);
+
+        assert_eq!(options.from_image.as_deref(), Some(reference));
+        assert_eq!(options.tag, None);
+    }
+
+    #[test]
+    fn registry_port_and_tag_are_passed_to_docker_intact() {
+        let reference = "registry.example.com:5000/team/image:v1";
+        let options = create_image_options(reference);
+
+        assert_eq!(options.from_image.as_deref(), Some(reference));
+        assert_eq!(options.tag, None);
+    }
 }

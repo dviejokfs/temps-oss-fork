@@ -123,7 +123,7 @@ function AiCapabilityError({
             Check again
           </Button>
           <Button asChild variant="outline">
-            <Link to="/settings/ai-providers" onClick={onClose}>
+            <Link to="/ai-gateway" onClick={onClose}>
               Configure my own provider
             </Link>
           </Button>
@@ -199,7 +199,7 @@ export function CloudAiEmptyState({
               variant="ghost"
               className="w-full text-muted-foreground"
             >
-              <Link to="/settings/ai-providers" onClick={onClose}>
+              <Link to="/ai-gateway" onClick={onClose}>
                 Use my own AI provider
               </Link>
             </Button>
