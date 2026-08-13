@@ -86,10 +86,10 @@ function BackupWarning({
         </p>
         <p className="text-xs text-amber-700 dark:text-amber-300">
           This image does not include WAL-G. Logical backups must stage a
-          complete database dump on local disk before uploading to S3. For large databases
-          this can exhaust disk space and interrupt backup jobs.
-          Use the default image or a <code className="font-mono">gotempsh/</code> image
-          for streaming backups with constant memory usage.
+          complete database dump on local disk before uploading to S3. For large
+          databases this can exhaust disk space and interrupt backup jobs. Use
+          the default image or a <code className="font-mono">gotempsh/</code>{' '}
+          image for streaming backups with constant memory usage.
         </p>
       </div>
     </div>
@@ -137,7 +137,9 @@ function ParamField({
                 onValueChange={field.onChange}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder={paramObj.default_value || 'Select value'} />
+                  <SelectValue
+                    placeholder={paramObj.default_value || 'Select value'}
+                  />
                 </SelectTrigger>
                 <SelectContent>
                   {paramObj.enum_values.map((value) => (
@@ -426,13 +428,13 @@ export function CreateServiceForm({
             }
             const valid = (parameters as unknown[]).filter(
               (p): p is ParamObj =>
-                !!p && typeof p === 'object' && 'name' in (p as object),
+                !!p && typeof p === 'object' && 'name' in (p as object)
             )
             const basic = valid.filter(
-              (p) => !ADVANCED_PARAM_NAMES.has(p.name.toLowerCase()),
+              (p) => !ADVANCED_PARAM_NAMES.has(p.name.toLowerCase())
             )
             const advanced = valid.filter((p) =>
-              ADVANCED_PARAM_NAMES.has(p.name.toLowerCase()),
+              ADVANCED_PARAM_NAMES.has(p.name.toLowerCase())
             )
             return (
               <>

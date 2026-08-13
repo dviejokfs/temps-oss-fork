@@ -6,13 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { useQuery } from '@tanstack/react-query'
-import {
-  ArrowRight,
-  Cloud,
-  ShieldCheck,
-  Sparkles,
-  X,
-} from 'lucide-react'
+import { ArrowRight, Cloud, ShieldCheck, Sparkles, X } from 'lucide-react'
 import { type ReactNode } from 'react'
 import { Link } from 'react-router'
 

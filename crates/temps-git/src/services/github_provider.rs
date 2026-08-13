@@ -3,6 +3,7 @@ use super::git_provider::{
     GitProviderType, PullRequest, RepoDirEntry, Repository, ScopedTokenGrant, ScopedTokenOp, User,
     WebhookConfig,
 };
+use super::github::create_github_app_jwt;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
@@ -680,7 +681,7 @@ impl GitHubProvider {
                     },
                 )?;
 
-                let jwt = octocrab::auth::create_jwt(app_id_param, &key).map_err(|e| {
+                let jwt = create_github_app_jwt(app_id_param.0, &key).map_err(|e| {
                     error!(
                         installation_id,
                         app_id = *app_id,

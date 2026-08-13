@@ -123,9 +123,7 @@ test.describe('command palette', () => {
 
   test('finds Temps Cloud by name and by what it does', async ({ page }) => {
     const search = page.getByPlaceholder('Type a command or search...')
-    const entry = page
-      .locator('[cmdk-item]')
-      .filter({ hasText: 'Temps Cloud' })
+    const entry = page.locator('[cmdk-item]').filter({ hasText: 'Temps Cloud' })
 
     await search.fill('temps cloud')
     await expect(entry).toBeVisible()
