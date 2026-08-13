@@ -2941,6 +2941,19 @@ mod tests {
                         }),
                         ..Default::default()
                     }),
+                    // Keep the fixture in Docker's STARTING state during the
+                    // brief window before `sh` exits. Without an explicit
+                    // healthcheck, the production helper intentionally treats
+                    // a running imported container as ready, which makes this
+                    // crash-loop assertion depend on scheduler timing.
+                    healthcheck: Some(bollard::models::HealthConfig {
+                        test: Some(vec!["CMD-SHELL".to_string(), "exit 1".to_string()]),
+                        interval: Some(100_000_000),
+                        timeout: Some(100_000_000),
+                        retries: Some(1),
+                        start_period: Some(5_000_000_000),
+                        start_interval: Some(100_000_000),
+                    }),
                     ..Default::default()
                 },
             )
