@@ -56,8 +56,21 @@ use sea_orm::*;
 use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
 use temps_migrations::Migrator;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::{Mutex, OnceCell};
+
+/// The postgres/timescaledb entrypoint starts a temporary server to run
+/// initdb + init scripts, shuts it down, then starts the real server --
+/// "database system is ready to accept connections" is logged once for
+/// each. This waits for the first (temporary-server) occurrence -- same
+/// wait condition already proven reliable elsewhere in this workspace
+/// (temps-providers/src/pg_stat_statements.rs,
+/// temps-metrics/tests/postgres_checkpoint_stats_integration.rs) -- and
+/// callers add a short buffer sleep afterward to clear the temp-server
+/// shutdown/real-server restart window before connecting.
+fn postgres_ready_wait_for() -> WaitFor {
+    WaitFor::message_on_stderr("database system is ready to accept connections")
+}
 
 /// Returns true only for errors that indicate the container runtime itself
 /// cannot be reached. Test callers may skip on these infrastructure errors,
@@ -139,11 +152,18 @@ impl SharedContainer {
 
         // Start TimescaleDB container
         let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+            .with_wait_for(postgres_ready_wait_for())
             .with_env_var("POSTGRES_DB", db_name)
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
             .with_cmd(TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD)
+            // testcontainers' default is 60s. CI and dev boxes here routinely run
+            // many Docker-based integration tests concurrently (this repo's own
+            // convention), so the container can legitimately take longer than
+            // that to become ready under contention -- give it real headroom
+            // instead of racing the default.
+            .with_startup_timeout(std::time::Duration::from_secs(120))
             .start()
             .await?;
 
@@ -154,8 +174,10 @@ impl SharedContainer {
             username, password, port, db_name
         );
 
-        // Wait for the database to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        // The wait strategy fires on the temp-server's "ready" line, but
+        // postgres shuts that server down and restarts a second one right
+        // after -- a short buffer clears that window before we connect.
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
         Ok(Self {
             container: postgres_container,
@@ -530,11 +552,18 @@ impl TestDatabase {
     ) -> anyhow::Result<Self> {
         // Start TimescaleDB container
         let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+            .with_wait_for(postgres_ready_wait_for())
             .with_env_var("POSTGRES_DB", db_name)
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
             .with_cmd(TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD)
+            // testcontainers' default is 60s. CI and dev boxes here routinely run
+            // many Docker-based integration tests concurrently (this repo's own
+            // convention), so the container can legitimately take longer than
+            // that to become ready under contention -- give it real headroom
+            // instead of racing the default.
+            .with_startup_timeout(std::time::Duration::from_secs(120))
             .start()
             .await?;
 
@@ -545,10 +574,12 @@ impl TestDatabase {
             username, password, port, db_name
         );
 
-        // Wait for the database to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        // The wait strategy fires on the temp-server's "ready" line, but
+        // postgres shuts that server down and restarts a second one right
+        // after -- a short buffer clears that window before we connect.
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        // Connect with retries
+        // Connect with retries as a safety net on top of the buffer above.
         let db = Self::connect_with_retry(&database_url, 10).await?;
 
         let test_db = TestDatabase {
