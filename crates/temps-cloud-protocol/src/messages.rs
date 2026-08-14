@@ -555,6 +555,16 @@ pub struct Heartbeat {
     /// with dynamic addresses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_ip: Option<String>,
+    /// Best-effort ISO 3166-1 alpha-2 country inferred for the public address.
+    /// This is display metadata only and is never used for authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_code: Option<String>,
+    /// Best-effort region/state name associated with the public address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Best-effort city associated with the public address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
     /// Local spool depth. A growing value is the signal that the instance is
     /// buffering because we are failing it.
     pub pending_spool_bytes: u64,
@@ -578,11 +588,29 @@ mod tests {
         let hb = Heartbeat {
             instance_id: Uuid::nil(),
             public_ip: None,
+            country_code: None,
+            region: None,
+            city: None,
             pending_spool_bytes: 42,
         };
         let env = Envelope::new("heartbeat", &hb).unwrap();
         let back: Heartbeat = env.decode("heartbeat").unwrap();
         assert_eq!(back.pending_spool_bytes, 42);
+    }
+
+    #[test]
+    fn heartbeat_location_fields_are_additive() {
+        let heartbeat: Heartbeat = serde_json::from_value(serde_json::json!({
+            "instance_id": Uuid::nil(),
+            "public_ip": "203.0.113.1",
+            "pending_spool_bytes": 0
+        }))
+        .unwrap();
+
+        assert_eq!(heartbeat.public_ip.as_deref(), Some("203.0.113.1"));
+        assert!(heartbeat.country_code.is_none());
+        assert!(heartbeat.region.is_none());
+        assert!(heartbeat.city.is_none());
     }
 
     #[test]
