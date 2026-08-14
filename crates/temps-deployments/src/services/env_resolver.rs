@@ -21,6 +21,20 @@ use tracing::{debug, info};
 use super::deployment_token_service::DeploymentTokenService;
 use super::workflow_planner::{public_sentry_dsn_var, public_sentry_tunnel_var};
 
+/// Build the OpenTelemetry SDK header-list value for a deployed project.
+///
+/// Header values in `OTEL_EXPORTER_OTLP_HEADERS` use URL encoding, so the
+/// space in the Bearer scheme must be encoded. The slug is diagnostic context
+/// only; ingest authentication continues to rely exclusively on the token.
+pub(super) fn otel_exporter_headers(token: Option<&str>, project_slug: &str) -> String {
+    match token {
+        Some(token) => {
+            format!("Authorization=Bearer%20{token},X-Temps-Project-Slug={project_slug}")
+        }
+        None => format!("X-Temps-Project-Slug={project_slug}"),
+    }
+}
+
 /// Resolves the full environment-variable map for a `(project, environment,
 /// deployment)`. Holds the six services the resolution needs; cheap to clone
 /// (every field is an `Arc`).
@@ -326,13 +340,14 @@ impl DeploymentEnvResolver {
                 "http/protobuf".to_string(),
             );
 
-            // Auth header using the deployment token (already in TEMPS_API_TOKEN)
-            if let Some(token) = env_vars_map.get("TEMPS_API_TOKEN").cloned() {
-                env_vars_map.insert(
-                    "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
-                    format!("Authorization=Bearer {}", token),
-                );
-            }
+            // Always include the project slug so authentication failures retain
+            // project context. Authorization is added when token provisioning
+            // succeeded (the token is already in TEMPS_API_TOKEN).
+            let token = env_vars_map.get("TEMPS_API_TOKEN").map(String::as_str);
+            env_vars_map.insert(
+                "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
+                otel_exporter_headers(token, &project.slug),
+            );
 
             env_vars_map.insert("OTEL_SERVICE_NAME".to_string(), project.name.clone());
 
@@ -353,5 +368,26 @@ impl DeploymentEnvResolver {
             env_vars_map.keys().cloned().collect::<Vec<_>>().join(", ")
         );
         Ok(env_vars_map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::otel_exporter_headers;
+
+    #[test]
+    fn otel_headers_include_encoded_token_and_project_slug() {
+        assert_eq!(
+            otel_exporter_headers(Some("dt_example"), "example-project"),
+            "Authorization=Bearer%20dt_example,X-Temps-Project-Slug=example-project"
+        );
+    }
+
+    #[test]
+    fn otel_headers_preserve_project_slug_without_token() {
+        assert_eq!(
+            otel_exporter_headers(None, "example-project"),
+            "X-Temps-Project-Slug=example-project"
+        );
     }
 }

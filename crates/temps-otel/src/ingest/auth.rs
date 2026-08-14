@@ -73,6 +73,9 @@ impl From<OtelError> for CachedAuthError {
         match error {
             OtelError::InvalidApiKey => Self::InvalidApiKey,
             OtelError::AuthFailed { reason } => Self::AuthFailed(reason),
+            OtelError::MissingAuthToken { project_slug } => Self::AuthFailed(format!(
+                "Missing token in Authorization or X-Temps-Api-Key header for project '{project_slug}'"
+            )),
             OtelError::Storage { message } => Self::Storage(message),
             other => Self::Storage(other.to_string()),
         }
