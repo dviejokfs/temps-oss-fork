@@ -3,6 +3,8 @@ import {
   getProjectBySlugOptions,
   getActiveVisitorsOptions,
   getRepositoryByNameOptions,
+  listConnectionsOptions,
+  listGitProvidersOptions,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import NotFound from '@/components/global/NotFound'
@@ -67,6 +69,7 @@ import {
   Navigate,
   Route,
   Routes,
+  useNavigate,
   useParams,
   useSearchParams,
 } from 'react-router'
@@ -78,6 +81,7 @@ import { toast } from 'sonner'
 
 export function ProjectDetail() {
   const { slug } = useParams()
+  const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -155,6 +159,21 @@ export function ProjectDetail() {
       !!project?.repo_name &&
       !!project?.git_provider_connection_id,
   })
+
+  const { data: connectionsData } = useQuery({
+    ...listConnectionsOptions({ query: { per_page: 100 } }),
+    enabled: !!project?.git_provider_connection_id,
+  })
+  const { data: gitProviders } = useQuery({
+    ...listGitProvidersOptions(),
+    enabled: !!project?.git_provider_connection_id,
+  })
+  const repositoryConnection = connectionsData?.connections.find(
+    (connection) => connection.id === project?.git_provider_connection_id
+  )
+  const repositoryProviderType = gitProviders?.find(
+    (provider) => provider.id === repositoryConnection?.provider_id
+  )?.provider_type
 
   // Mutation to disable attack mode
   const queryClient = useQueryClient()
@@ -314,15 +333,20 @@ export function ProjectDetail() {
           project={project}
           activeVisitorsCount={activeVisitorsCount}
           repositoryCloneUrl={
-            repository?.clone_url ||
-            (project?.repo_owner && project?.repo_name
-              ? `https://github.com/${project.repo_owner}/${project.repo_name}`
-              : undefined)
+            repository?.clone_url || project.git_url || undefined
           }
+          repositoryProviderType={repositoryProviderType}
           lastDeploymentUrl={
             lastDeployment ? resolveStableUrl(lastDeployment) : null
           }
           isLoadingLastDeployment={isLoadingLastDeployment}
+          onDeploy={() => {
+            if (project.source_type === 'uploaded_source') {
+              navigate(`/projects/${project.slug}/drop`)
+              return
+            }
+            navigate(`/projects/${project.slug}/deployments?deploy=true`)
+          }}
         />
         <div className="flex-1 overflow-y-auto overflow-x-hidden p-4">
           {/* Attack Mode Banner */}

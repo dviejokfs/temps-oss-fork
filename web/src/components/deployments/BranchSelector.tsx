@@ -48,7 +48,7 @@ function detectProviderFromUrl(gitUrl: string): 'github' | 'gitlab' | null {
 }
 
 /** Normalized branch shape the combobox renders, regardless of source. */
-interface ResolvedBranch {
+export interface ResolvedBranch {
   name: string
   commit_sha?: string
   protected?: boolean
@@ -67,6 +67,7 @@ interface BranchSelectorProps {
   onChange: (branch: string) => void
   onError?: (error: string | null) => void
   onBranchesLoaded?: (branches: string[]) => void
+  onBranchDetailsLoaded?: (branches: ResolvedBranch[]) => void
   disabled?: boolean
   /** Pre-loaded branches (for public repos or when already fetched) */
   branches?: Array<{ name: string; is_default?: boolean }>
@@ -83,6 +84,7 @@ export function BranchSelector({
   onChange,
   onError,
   onBranchesLoaded,
+  onBranchDetailsLoaded,
   disabled = false,
   branches: providedBranches,
   gitUrl,
@@ -259,9 +261,9 @@ export function BranchSelector({
 
   // Notify parent when branches are loaded
   useEffect(() => {
-    if (sortedBranches.length > 0 && onBranchesLoaded) {
-      onBranchesLoaded(sortedBranches.map((b) => b.name))
-    }
+    if (sortedBranches.length === 0) return
+    onBranchesLoaded?.(sortedBranches.map((b) => b.name))
+    onBranchDetailsLoaded?.(sortedBranches)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sortedBranches])
 
@@ -430,6 +432,9 @@ function BranchCombobox({
   const firstItemValue =
     (pinned[0] ?? rest[0])?.name ?? (showCustom ? customValue : '')
   useEffect(() => {
+    // cmdk keeps its own active-item state; synchronize it when our manually
+    // ranked result head changes so Enter follows the visible highlight.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setActiveValue(firstItemValue)
   }, [firstItemValue])
 

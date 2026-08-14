@@ -31,16 +31,18 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { hashKey, useQuery } from '@tanstack/react-query'
 import { useMemo, useState, useEffect } from 'react'
 import { toast } from 'sonner'
+import { branchCommitSha } from '@/lib/project-header-actions'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   AlertTriangle,
   CheckCircle2,
   GitCommitHorizontal,
+  GitBranch,
   Loader2,
   RefreshCw,
   Tag as TagIcon,
 } from 'lucide-react'
-import { BranchSelector } from './BranchSelector'
+import { BranchSelector, type ResolvedBranch } from './BranchSelector'
 
 const COMMIT_SHA_PATTERN = /^[0-9a-f]{7,40}$/i
 
@@ -62,10 +64,12 @@ function CommitDetailsCard({
   commit,
   label,
   reference,
+  referenceType = 'tag',
 }: {
   commit: CommitInfo
   label: string
   reference?: string
+  referenceType?: 'branch' | 'tag'
 }) {
   return (
     <div className="overflow-hidden rounded-md border bg-muted/20">
@@ -77,7 +81,11 @@ function CommitDetailsCard({
         <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
           {reference && (
             <span className="flex min-w-0 items-center gap-1 font-medium text-foreground">
-              <TagIcon className="h-3.5 w-3.5 shrink-0" />
+              {referenceType === 'branch' ? (
+                <GitBranch className="h-3.5 w-3.5 shrink-0" />
+              ) : (
+                <TagIcon className="h-3.5 w-3.5 shrink-0" />
+              )}
               <span className="max-w-40 truncate" title={reference}>
                 {reference}
               </span>
@@ -188,6 +196,9 @@ export function RedeploymentModal({
     'branch' | 'commit' | 'tag'
   >(defaultType || 'branch')
   const [availableBranches, setAvailableBranches] = useState<string[]>([])
+  const [availableBranchDetails, setAvailableBranchDetails] = useState<
+    ResolvedBranch[]
+  >([])
   const [commitToCheck, setCommitToCheck] = useState('')
   const [tagToCheck, setTagToCheck] = useState('')
 
@@ -224,6 +235,7 @@ export function RedeploymentModal({
       isOpen &&
       mode === 'new' &&
       (deploymentType === 'commit' ||
+        deploymentType === 'branch' ||
         (deploymentType === 'tag' && tagHasValue)) &&
       shouldLookUpGitReference,
   })
@@ -248,6 +260,25 @@ export function RedeploymentModal({
   const commitIsVerified = Boolean(
     checkedCurrentCommit && commitQuery.data?.exists && commitQuery.data.commit
   )
+
+  const selectedBranchCommitSha = branchCommitSha(
+    availableBranchDetails,
+    effectiveBranch
+  )
+  const branchCommitQuery = useQuery({
+    ...checkCommitExistsOptions({
+      path: {
+        repository_id: repositoryQuery.data?.id || 0,
+        commit_sha: selectedBranchCommitSha || '',
+      },
+    }),
+    enabled:
+      isOpen &&
+      deploymentType === 'branch' &&
+      !!repositoryQuery.data?.id &&
+      !!selectedBranchCommitSha,
+    retry: false,
+  })
 
   const tagsQueryOptions = getTagsByRepositoryIdOptions({
     path: { repository_id: repositoryQuery.data?.id || 0 },
@@ -677,9 +708,79 @@ export function RedeploymentModal({
                         onBranchesLoaded={(branches) =>
                           setAvailableBranches(branches)
                         }
+                        onBranchDetailsLoaded={setAvailableBranchDetails}
                         disabled={isLoading}
                       />
                     )}
+                    <div id="branch-lookup-status" aria-live="polite">
+                      {selectedBranchCommitSha && shouldLookUpGitReference && (
+                        <>
+                          {(repositoryQuery.isLoading ||
+                            branchCommitQuery.isLoading) &&
+                            !repositoryQuery.isError && (
+                              <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2.5 text-sm text-muted-foreground">
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                                Loading the branch head commit…
+                              </div>
+                            )}
+
+                          {(repositoryQuery.isError ||
+                            branchCommitQuery.isError) && (
+                            <Alert variant="destructive">
+                              <AlertTriangle className="h-4 w-4" />
+                              <AlertDescription className="flex items-center justify-between gap-3">
+                                <span>
+                                  Commit details could not be loaded. Check the
+                                  Git provider connection and try again.
+                                </span>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="shrink-0"
+                                  onClick={() => {
+                                    if (repositoryQuery.isError) {
+                                      void repositoryQuery.refetch()
+                                    } else {
+                                      void branchCommitQuery.refetch()
+                                    }
+                                  }}
+                                >
+                                  <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                                  Retry
+                                </Button>
+                              </AlertDescription>
+                            </Alert>
+                          )}
+
+                          {branchCommitQuery.data &&
+                            !branchCommitQuery.data.exists && (
+                              <Alert variant="destructive">
+                                <AlertTriangle className="h-4 w-4" />
+                                <AlertDescription>
+                                  The head commit for “{effectiveBranch}” was
+                                  not found in{' '}
+                                  <span className="font-medium">
+                                    {projectDetails.repo_owner}/
+                                    {projectDetails.repo_name}
+                                  </span>
+                                  . Refresh the branches and try again.
+                                </AlertDescription>
+                              </Alert>
+                            )}
+
+                          {branchCommitQuery.data?.exists &&
+                            branchCommitQuery.data.commit && (
+                              <CommitDetailsCard
+                                commit={branchCommitQuery.data.commit}
+                                label="Commit to deploy"
+                                reference={effectiveBranch}
+                                referenceType="branch"
+                              />
+                            )}
+                        </>
+                      )}
+                    </div>
                   </TabsContent>
                   <TabsContent value="commit" className="space-y-3">
                     <div className="space-y-1.5">
