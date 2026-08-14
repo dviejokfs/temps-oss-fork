@@ -29,6 +29,14 @@ describe('repositoryWebUrl', () => {
       repositoryWebUrl('ssh://git@gitlab.example.com/acme/widget.git')
     ).toBe('https://gitlab.example.com/acme/widget')
   })
+
+  test('removes credentials and token-bearing URL parts', () => {
+    expect(
+      repositoryWebUrl(
+        'https://deploy-user:secret@github.com/acme/widget.git?token=hidden#readme'
+      )
+    ).toBe('https://github.com/acme/widget')
+  })
 })
 
 describe('gitProviderFromUrl', () => {
@@ -42,15 +50,21 @@ describe('gitProviderFromUrl', () => {
     expect(gitProviderFromUrl('https://bitbucket.org/acme/widget.git')).toBe(
       'bitbucket'
     )
-    expect(gitProviderFromUrl('https://gitea.example/acme/widget.git')).toBe(
+    expect(gitProviderFromUrl('https://gitea.com/acme/widget.git')).toBe(
       'gitea'
     )
   })
 
-  test('returns null for an unknown self-hosted provider', () => {
+  test('does not trust provider names embedded in an arbitrary hostname', () => {
     expect(gitProviderFromUrl('https://git.example.com/acme/widget.git')).toBe(
       null
     )
+    expect(
+      gitProviderFromUrl('https://github.evil.example/acme/widget.git')
+    ).toBeNull()
+    expect(
+      gitProviderFromUrl('https://evilgithub.com/acme/widget.git')
+    ).toBeNull()
   })
 })
 

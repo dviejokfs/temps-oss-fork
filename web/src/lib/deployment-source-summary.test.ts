@@ -71,7 +71,40 @@ describe('deploymentSourceSummary', () => {
     expect(deploymentSourceSummary(deployment(), 'static_files')).toEqual({
       kind: 'static_files',
       label: 'Static bundle',
-      detail: undefined,
+    })
+  })
+
+  test('keeps historical Git deployments Git-labelled after a source change', () => {
+    expect(
+      deploymentSourceSummary(
+        deployment({
+          branch: 'main',
+          commit_hash: 'abcdef1234567890',
+          commit_message: 'Initial deployment',
+        }),
+        'docker_image'
+      )
+    ).toEqual({
+      kind: 'git',
+      branch: 'main',
+      commit: 'abcdef1234567890',
+      message: 'Initial deployment',
+    })
+  })
+
+  test('does not expose internal static bundle paths', () => {
+    expect(
+      deploymentSourceSummary(
+        deployment({
+          metadata: {
+            deploymentSourceType: 'static_files',
+            staticBundlePath: 'internal/blobs/project-42/site.tar.gz',
+          },
+        })
+      )
+    ).toEqual({
+      kind: 'static_files',
+      label: 'Static bundle (tar.gz)',
     })
   })
 })

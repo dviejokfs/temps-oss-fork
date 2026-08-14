@@ -153,6 +153,9 @@ export function ProjectDetail() {
         owner: project?.repo_owner || '',
         name: project?.repo_name || '',
       },
+      query: {
+        connection_id: project?.git_provider_connection_id || 0,
+      },
     }),
     enabled:
       !!project?.repo_owner &&

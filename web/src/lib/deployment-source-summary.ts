@@ -20,7 +20,11 @@ function archiveLabel(
 ): string {
   const format = `${contentType ?? ''} ${path ?? ''}`.toLowerCase()
   if (format.includes('zip')) return `${prefix} (ZIP)`
-  if (format.includes('gzip') || format.includes('.tgz')) {
+  if (
+    format.includes('gzip') ||
+    format.includes('.tgz') ||
+    format.includes('.tar.gz')
+  ) {
     return `${prefix} (tar.gz)`
   }
   return prefix
@@ -31,12 +35,13 @@ export function deploymentSourceSummary(
   projectSourceType?: SourceType
 ): DeploymentSourceSummary {
   const metadata = deployment.metadata
-  const sourceType = metadata?.deploymentSourceType ?? projectSourceType
   const hasGitData = Boolean(
     deployment.branch || deployment.commit_hash || deployment.commit_message
   )
+  const sourceType =
+    metadata?.deploymentSourceType ?? (hasGitData ? 'git' : projectSourceType)
 
-  if (sourceType === 'git' || (!sourceType && hasGitData)) {
+  if (sourceType === 'git') {
     return {
       kind: 'git',
       branch: deployment.branch || undefined,
@@ -62,7 +67,6 @@ export function deploymentSourceSummary(
         metadata?.staticBundleContentType,
         metadata?.staticBundlePath
       ),
-      detail: metadata?.staticBundlePath || undefined,
     }
   }
 

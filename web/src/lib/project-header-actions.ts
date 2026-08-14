@@ -17,6 +17,13 @@ export function repositoryWebUrl(url: string): string | null {
         : sourceUrl
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
 
+    // Clone URLs are link inputs, not credential transports. Legacy/provider
+    // records may still contain userinfo or token-like query parameters; never
+    // expose those in the DOM, browser history, referrers, or destination logs.
+    parsed.username = ''
+    parsed.password = ''
+    parsed.search = ''
+    parsed.hash = ''
     parsed.pathname = parsed.pathname.replace(/\.git\/?$/, '')
     return parsed.toString().replace(/\/$/, '')
   } catch {
@@ -29,10 +36,10 @@ export function gitProviderFromUrl(url: string): GitProviderKind | null {
   if (!repositoryUrl) return null
 
   const hostname = new URL(repositoryUrl).hostname.toLowerCase()
-  if (hostname.includes('github')) return 'github'
-  if (hostname.includes('gitlab')) return 'gitlab'
-  if (hostname.includes('bitbucket')) return 'bitbucket'
-  if (hostname.includes('gitea')) return 'gitea'
+  if (hostname === 'github.com') return 'github'
+  if (hostname === 'gitlab.com') return 'gitlab'
+  if (hostname === 'bitbucket.org') return 'bitbucket'
+  if (hostname === 'gitea.com') return 'gitea'
 
   return null
 }
