@@ -1114,6 +1114,11 @@ export type AppSettings = {
      */
     cluster_dns?: ClusterDnsSettings;
     /**
+     * Per-upstream concurrent-connection cap applied by the proxy to
+     * customer app traffic. `0` (the default) is unlimited. See issue #646.
+     */
+    connection_limits?: ConnectionLimitSettings;
+    /**
      * Binary version tag (e.g. "v0.1.0") of the *console* process
      * (`temps serve`, role=all or role=console) that last started. Written
      * on console startup; read by the standalone `temps proxy` to detect
@@ -1234,6 +1239,11 @@ export type AppSettingsResponse = {
      * through as-is so the settings UI can read and toggle the flag.
      */
     cluster_dns: ClusterDnsSettings;
+    /**
+     * Per-upstream concurrent-connection cap applied by the proxy to
+     * customer app traffic. No sensitive content. See issue #646.
+     */
+    connection_limits: ConnectionLimitSettings;
     container_logs: ContainerLogSettings;
     disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;
@@ -2687,6 +2697,25 @@ export type ComposeServicePreviewResponse = {
      * is only the optional host-side Docker port.
      */
     ports: Array<ComposePortMapping>;
+};
+
+/**
+ * Per-upstream concurrent-connection limiting. Protects the proxy's own
+ * connection/file-descriptor budget from a single slow or malicious
+ * customer upstream — independent of the request/idle timeouts in
+ * `RequestTimeoutSettings`, which bound how long a connection may stay
+ * open, not how many may exist at once. See issue #646.
+ */
+export type ConnectionLimitSettings = {
+    /**
+     * Default max concurrent in-flight requests to a single
+     * project/environment's upstream, used when the project/environment
+     * hasn't set its own `max_concurrent_connections` override. `0` (the
+     * default) means unlimited — matches the "opt-in, never breaks an
+     * existing app on upgrade" philosophy already established for
+     * `RequestTimeoutSettings`.
+     */
+    default_max_concurrent_connections?: number;
 };
 
 export type ConnectionListQuery = {
@@ -4777,6 +4806,18 @@ export type DeploymentConfig = {
      * Default: 300 (5 minutes).
      */
     idleTimeoutSeconds?: number;
+    /**
+     * Override for the proxy's cap on concurrent in-flight requests to this
+     * project/environment's upstream, independent of the timeout overrides
+     * above. `None` = inherit the global
+     * `connection_limits.default_max_concurrent_connections`. `Some(0)`
+     * explicitly forces "unlimited" for this project/environment, overriding
+     * a nonzero global default. `Some(n)` for `n > 0` sets an explicit cap —
+     * there is no global ceiling clamp here (unlike the timeout settings):
+     * an operator who has explicitly set a per-project value has made a
+     * deliberate choice and the platform should respect it.
+     */
+    maxConcurrentConnections?: number | null;
     /**
      * Memory limit in megabytes. Three-state semantics:
      * - `None`     → inherit the parent layer (env inherits project, project
@@ -10189,6 +10230,10 @@ export type MetricsQuery = {
  */
 export type MetricsRangeQuery = {
     /**
+     * Explicit window end (ISO 8601). Must be paired with `start_time`.
+     */
+    end_time?: string | null;
+    /**
      * Metric name, e.g. `"pg.connections_active"`.
      */
     metric: string;
@@ -10199,8 +10244,13 @@ export type MetricsRangeQuery = {
     percentile?: number | null;
     /**
      * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+     * Ignored when `start_time` and `end_time` are both set.
      */
     range?: string;
+    /**
+     * Explicit window start (ISO 8601). Must be paired with `end_time`.
+     */
+    start_time?: string | null;
 };
 
 /**
@@ -17797,6 +17847,18 @@ export type TimeBucketStats = {
      */
     error_count: number;
     /**
+     * p50 response time in milliseconds (0 when the bucket has no timings)
+     */
+    p50_response_time_ms: number;
+    /**
+     * p95 response time in milliseconds (0 when the bucket has no timings)
+     */
+    p95_response_time_ms: number;
+    /**
+     * p99 response time in milliseconds (0 when the bucket has no timings)
+     */
+    p99_response_time_ms: number;
+    /**
      * Total number of requests in this bucket
      */
     request_count: number;
@@ -18538,6 +18600,13 @@ export type UpdateDeploymentConfigRequest = {
      */
     crossArchitectureBuilds?: boolean | null;
     exposedPort?: number | null;
+    /**
+     * Project-level default cap on concurrent in-flight requests to a
+     * single environment's upstream (0 = unlimited). Environments may
+     * override this. Absent leaves the current value unchanged. See
+     * issue #646.
+     */
+    maxConcurrentConnections?: number | null;
     memoryLimit?: number | null;
     memoryRequest?: number | null;
     performanceMetricsEnabled?: boolean | null;
@@ -18681,6 +18750,13 @@ export type UpdateEnvironmentSettingsRequest = {
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */
     idle_timeout_seconds?: number | null;
+    /**
+     * Override the proxy's cap on concurrent in-flight requests to this
+     * environment's upstream (0 = unlimited). Absent leaves the current
+     * value unchanged. Send JSON `null` to clear the override (inherit
+     * the project/global default). See issue #646.
+     */
+    max_concurrent_connections?: number | null;
     /**
      * Maximum (limit) memory in MB. Send JSON `null` to clear → "no limit".
      * Absent leaves the current value unchanged.
@@ -25957,6 +26033,7 @@ export type DeploymentMetricsGetRangeData = {
         metric: string;
         /**
          * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
         /**
@@ -25964,6 +26041,14 @@ export type DeploymentMetricsGetRangeData = {
          * fetches histogram buckets and computes the requested quantile.
          */
         percentile?: number | null;
+        /**
+         * Explicit window start (ISO 8601). Must be paired with `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Explicit window end (ISO 8601). Must be paired with `start_time`.
+         */
+        end_time?: string | null;
     };
     url: '/deployments/{id}/metrics';
 };
@@ -29101,6 +29186,7 @@ export type ExternalServiceMetricsGetRangeData = {
         metric: string;
         /**
          * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
         /**
@@ -29108,6 +29194,14 @@ export type ExternalServiceMetricsGetRangeData = {
          * fetches histogram buckets and computes the requested quantile.
          */
         percentile?: number | null;
+        /**
+         * Explicit window start (ISO 8601). Must be paired with `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Explicit window end (ISO 8601). Must be paired with `start_time`.
+         */
+        end_time?: string | null;
     };
     url: '/external-services/{id}/metrics';
 };
@@ -34512,6 +34606,7 @@ export type NodeMetricsGetRangeData = {
         metric: string;
         /**
          * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
         /**
@@ -34519,6 +34614,14 @@ export type NodeMetricsGetRangeData = {
          * fetches histogram buckets and computes the requested quantile.
          */
         percentile?: number | null;
+        /**
+         * Explicit window start (ISO 8601). Must be paired with `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Explicit window end (ISO 8601). Must be paired with `start_time`.
+         */
+        end_time?: string | null;
     };
     url: '/nodes/{id}/metrics';
 };
@@ -47668,7 +47771,8 @@ export type GetTimeBucketStatsData = {
          */
         end_time: string;
         /**
-         * Bucket interval (e.g., "1 hour", "1 day", "5 minutes")
+         * Bucket interval (e.g., "1 hour", "1 day", "5 minutes").
+         * Must keep `span / interval` ≤ 1000 buckets (7 days at 1 minute is rejected).
          */
         bucket_interval?: string;
         /**

@@ -2367,6 +2367,17 @@
               }
             ]
           },
+          "connection_limits": {
+            "default": {
+              "default_max_concurrent_connections": 0
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConnectionLimitSettings",
+                "description": "Per-upstream concurrent-connection cap applied by the proxy to\ncustomer app traffic. `0` (the default) is unlimited. See issue #646."
+              }
+            ]
+          },
           "console_version": {
             "default": null,
             "description": "Binary version tag (e.g. \"v0.1.0\") of the *console* process\n(`temps serve`, role=all or role=console) that last started. Written\non console startup; read by the standalone `temps proxy` to detect\nversion skew during a rolling upgrade (ADR-017 Phase 3). `None` on\ninstalls that never ran a console build carrying this field.\n\nThis is informational state written by the binary itself — NOT an\noperator-tunable setting. It is intentionally absent from\n`AppSettingsResponse` and the PATCH path so an operator cannot\naccidentally overwrite the self-recorded value.",
@@ -2665,6 +2676,10 @@
             "$ref": "#/components/schemas/ClusterDnsSettings",
             "description": "Cluster-DNS resolver settings (ADR-024, experimental beta). No masking\nneeded — `enabled` is a plain bool with no sensitive content. Passed\nthrough as-is so the settings UI can read and toggle the flag."
           },
+          "connection_limits": {
+            "$ref": "#/components/schemas/ConnectionLimitSettings",
+            "description": "Per-upstream concurrent-connection cap applied by the proxy to\ncustomer app traffic. No sensitive content. See issue #646."
+          },
           "container_logs": {
             "$ref": "#/components/schemas/ContainerLogSettings"
           },
@@ -2799,6 +2814,7 @@
           "build_limits",
           "ai_chat_limits",
           "request_timeouts",
+          "connection_limits",
           "self_update"
         ],
         "type": "object"
@@ -5624,6 +5640,20 @@
           "looksLikeDatabase",
           "ports"
         ],
+        "type": "object"
+      },
+      "ConnectionLimitSettings": {
+        "description": "Per-upstream concurrent-connection limiting. Protects the proxy's own\nconnection/file-descriptor budget from a single slow or malicious\ncustomer upstream — independent of the request/idle timeouts in\n`RequestTimeoutSettings`, which bound how long a connection may stay\nopen, not how many may exist at once. See issue #646.",
+        "properties": {
+          "default_max_concurrent_connections": {
+            "default": 0,
+            "description": "Default max concurrent in-flight requests to a single\nproject/environment's upstream, used when the project/environment\nhasn't set its own `max_concurrent_connections` override. `0` (the\ndefault) means unlimited — matches the \"opt-in, never breaks an\nexisting app on upgrade\" philosophy already established for\n`RequestTimeoutSettings`.",
+            "example": 200,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "ConnectionListQuery": {
@@ -9880,6 +9910,14 @@
             "description": "Seconds of inactivity before containers are stopped in on-demand mode.\nOnly used when `on_demand` is true. Min: 60, Max: 86400 (24h).\nDefault: 300 (5 minutes).",
             "format": "int32",
             "type": "integer"
+          },
+          "maxConcurrentConnections": {
+            "description": "Override for the proxy's cap on concurrent in-flight requests to this\nproject/environment's upstream, independent of the timeout overrides\nabove. `None` = inherit the global\n`connection_limits.default_max_concurrent_connections`. `Some(0)`\nexplicitly forces \"unlimited\" for this project/environment, overriding\na nonzero global default. `Some(n)` for `n > 0` sets an explicit cap —\nthere is no global ceiling clamp here (unlike the timeout settings):\nan operator who has explicitly set a per-project value has made a\ndeliberate choice and the platform should respect it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "memoryLimit": {
             "description": "Memory limit in megabytes. Three-state semantics:\n- `None`     → inherit the parent layer (env inherits project, project\n  inherits the seeded default); used by the settings UI's \"Use default\".\n- `Some(0)`  → explicit **uncapped**: stop inheriting and run with no\n  memory limit. This is the deliberate escape hatch for dedicated\n  workloads, distinct from `None`.\n- `Some(n)`  → hard cap of `n` MB.\n\n`merge`/resolution keep `Some(0)` as a present value (it wins precedence\nover a parent cap), and the deployer collapses it to \"no limit\" before\ntalking to Docker.",
@@ -22604,6 +22642,13 @@
       "MetricsRangeQuery": {
         "description": "Query params for range metric queries.",
         "properties": {
+          "end_time": {
+            "description": "Explicit window end (ISO 8601). Must be paired with `start_time`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "metric": {
             "description": "Metric name, e.g. `\"pg.connections_active\"`.",
             "type": "string"
@@ -22617,8 +22662,15 @@
             ]
           },
           "range": {
-            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.",
+            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
             "type": "string"
+          },
+          "start_time": {
+            "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -39290,6 +39342,21 @@
             "format": "int64",
             "type": "integer"
           },
+          "p50_response_time_ms": {
+            "description": "p50 response time in milliseconds (0 when the bucket has no timings)",
+            "format": "double",
+            "type": "number"
+          },
+          "p95_response_time_ms": {
+            "description": "p95 response time in milliseconds (0 when the bucket has no timings)",
+            "format": "double",
+            "type": "number"
+          },
+          "p99_response_time_ms": {
+            "description": "p99 response time in milliseconds (0 when the bucket has no timings)",
+            "format": "double",
+            "type": "number"
+          },
           "request_count": {
             "description": "Total number of requests in this bucket",
             "format": "int64",
@@ -39310,6 +39377,9 @@
           "bucket",
           "request_count",
           "avg_response_time_ms",
+          "p50_response_time_ms",
+          "p95_response_time_ms",
+          "p99_response_time_ms",
           "error_count",
           "total_request_bytes",
           "total_response_bytes"
@@ -40837,6 +40907,14 @@
               "null"
             ]
           },
+          "maxConcurrentConnections": {
+            "description": "Project-level default cap on concurrent in-flight requests to a\nsingle environment's upstream (0 = unlimited). Environments may\noverride this. Absent leaves the current value unchanged. See\nissue #646.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "memoryLimit": {
             "format": "int32",
             "type": [
@@ -41116,6 +41194,14 @@
           },
           "idle_timeout_seconds": {
             "description": "Seconds of inactivity before stopping containers (60-86400). Default: 300.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_concurrent_connections": {
+            "description": "Override the proxy's cap on concurrent in-flight requests to this\nenvironment's upstream (0 = unlimited). Absent leaves the current\nvalue unchanged. Send JSON `null` to clear the override (inherit\nthe project/global default). See issue #646.",
             "format": "int32",
             "type": [
               "integer",
@@ -54561,7 +54647,7 @@
             }
           },
           {
-            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.",
+            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
             "in": "query",
             "name": "range",
             "required": false,
@@ -54578,6 +54664,32 @@
               "format": "double",
               "type": [
                 "number",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
+            "example": "2026-08-13T00:00:00Z",
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window end (ISO 8601). Must be paired with `start_time`.",
+            "example": "2026-08-13T12:00:00Z",
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
                 "null"
               ]
             }
@@ -58977,7 +59089,7 @@
             }
           },
           {
-            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.",
+            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
             "in": "query",
             "name": "range",
             "required": false,
@@ -58994,6 +59106,32 @@
               "format": "double",
               "type": [
                 "number",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
+            "example": "2026-08-13T00:00:00Z",
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window end (ISO 8601). Must be paired with `start_time`.",
+            "example": "2026-08-13T12:00:00Z",
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
                 "null"
               ]
             }
@@ -66783,7 +66921,7 @@
             }
           },
           {
-            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.",
+            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
             "in": "query",
             "name": "range",
             "required": false,
@@ -66800,6 +66938,32 @@
               "format": "double",
               "type": [
                 "number",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
+            "example": "2026-08-13T00:00:00Z",
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window end (ISO 8601). Must be paired with `start_time`.",
+            "example": "2026-08-13T12:00:00Z",
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
                 "null"
               ]
             }
@@ -88569,7 +88733,7 @@
             }
           },
           {
-            "description": "Bucket interval (e.g., \"1 hour\", \"1 day\", \"5 minutes\")",
+            "description": "Bucket interval (e.g., \"1 hour\", \"1 day\", \"5 minutes\").\nMust keep `span / interval` ≤ 1000 buckets (7 days at 1 minute is rejected).",
             "in": "query",
             "name": "bucket_interval",
             "required": false,

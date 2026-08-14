@@ -99,9 +99,9 @@ pub use utils::*;
 pub use anyhow;
 pub use app_settings::{
     AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AppSettings, BuildLimitsSettings,
-    CloudSettings, ClusterDnsSettings, ContainerLogSettings, DiskSpaceAlertSettings,
-    DnsProviderSettings, DockerRegistrySettings, LetsEncryptSettings, MetricsStoreKind,
-    MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
+    CloudSettings, ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings,
+    DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, LetsEncryptSettings,
+    MetricsStoreKind, MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
     ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
     RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
 };
