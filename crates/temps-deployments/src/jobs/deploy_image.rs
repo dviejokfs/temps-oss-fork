@@ -274,6 +274,15 @@ pub struct DeploymentJobConfig {
     pub exclude_node_ids: Vec<i32>,
 }
 
+fn has_explicit_placement_constraints(
+    target_node_ids: Option<&[i32]>,
+    target_labels: Option<&serde_json::Value>,
+) -> bool {
+    target_node_ids.is_some()
+        || target_labels
+            .is_some_and(|labels| !labels.as_object().is_some_and(serde_json::Map::is_empty))
+}
+
 impl Default for DeploymentJobConfig {
     fn default() -> Self {
         Self {
@@ -1004,6 +1013,8 @@ impl DeployImageJob {
         let node_assignments = if let Some(ref scheduler) = self.node_scheduler {
             let target_ids = self.config.target_nodes.as_deref();
             let target_labels = self.config.target_labels.as_ref();
+            let has_explicit_constraints =
+                has_explicit_placement_constraints(target_ids, target_labels);
             // Which architectures do we actually have an image for? Nodes that
             // match none of them are excluded from the pool instead of being
             // handed a container that cannot start.
@@ -1089,6 +1100,14 @@ impl DeployImageJob {
                     self.log(context, format!("ERROR: {}", msg)).await?;
                     return Err(WorkflowError::JobExecutionFailed(msg));
                 }
+                Err(e) if has_explicit_constraints => {
+                    let msg = format!(
+                        "Cannot enforce this deployment's placement constraints: {}",
+                        e
+                    );
+                    self.log(context, format!("ERROR: {}", msg)).await?;
+                    return Err(WorkflowError::JobExecutionFailed(msg));
+                }
                 // Any other scheduling error (a transient database failure,
                 // say) historically degrades to a local deployment. That is
                 // still the right call — but only when the control plane can
@@ -1111,8 +1130,20 @@ impl DeployImageJob {
                 }
             }
         } else {
-            // No scheduler injected — pure single-node mode. Same guard: an
-            // image built for another architecture cannot run here either.
+            // A worker-only placement policy cannot be honoured without a
+            // scheduler. Failing closed also protects tests/custom embeddings
+            // that omit the scheduler even though production normally injects it.
+            if has_explicit_placement_constraints(
+                self.config.target_nodes.as_deref(),
+                self.config.target_labels.as_ref(),
+            ) {
+                let msg = "Cannot enforce placement constraints: no node scheduler is configured"
+                    .to_string();
+                self.log(context, format!("ERROR: {}", msg)).await?;
+                return Err(WorkflowError::JobExecutionFailed(msg));
+            }
+            // Pure single-node mode. Same architecture guard: an image built
+            // for another architecture cannot run here either.
             let image_platforms = self.available_image_platforms(image_output).await;
             self.ensure_local_can_run(&image_platforms, context, "no node scheduler is configured")
                 .await?;
@@ -3293,6 +3324,24 @@ mod tests {
     fn test_deployment_job_config_target_nodes_default() {
         let config = DeploymentJobConfig::default();
         assert_eq!(config.target_nodes, None);
+    }
+
+    #[test]
+    fn explicit_placement_constraints_are_fail_closed_for_every_scheduler_error() {
+        assert!(!has_explicit_placement_constraints(None, None));
+        assert!(!has_explicit_placement_constraints(
+            None,
+            Some(&serde_json::json!({}))
+        ));
+        assert!(has_explicit_placement_constraints(Some(&[]), None));
+        assert!(has_explicit_placement_constraints(
+            None,
+            Some(&serde_json::json!({"region": "eu"}))
+        ));
+        assert!(has_explicit_placement_constraints(
+            None,
+            Some(&serde_json::json!(["malformed"]))
+        ));
     }
 
     /// Test that node scheduling produces correct assignments when integrated with DeployImageJob.
