@@ -104,19 +104,43 @@ interface PlatformNavItem {
   activeWhen?: (pathname: string) => boolean
 }
 
-// The fresh-install sidebar stays focused on daily work. Every secondary
-// capability remains visible on /tools and in Cmd+K.
-const primaryPlatformNav: PlatformNavItem[] = [
-  { title: 'Projects', url: '/projects', icon: Folder },
-  { title: 'Domains', url: '/domains', icon: Globe },
-  { title: 'Databases', url: '/storage', icon: Database },
-  { title: 'Backups', url: '/backups', icon: DatabaseBackup },
-  { title: 'Proxy', url: '/proxy', icon: Activity },
+interface PlatformNavGroup {
+  label: string
+  items: PlatformNavItem[]
+}
+
+// The fresh-install sidebar stays focused on daily work, grouped by intent so
+// the short list is easy to scan. Every secondary capability remains visible
+// on /tools and in Cmd+K.
+const primaryPlatformGroups: PlatformNavGroup[] = [
   {
-    title: 'All platform tools',
-    url: '/tools',
-    icon: Boxes,
-    activeWhen: isPlatformToolsRoute,
+    label: 'Build & deliver',
+    items: [
+      { title: 'Projects', url: '/projects', icon: Folder },
+      { title: 'Domains', url: '/domains', icon: Globe },
+    ],
+  },
+  {
+    label: 'Data',
+    items: [
+      { title: 'Databases', url: '/storage', icon: Database },
+      { title: 'Backups', url: '/backups', icon: DatabaseBackup },
+    ],
+  },
+  {
+    label: 'Observe',
+    items: [{ title: 'Proxy', url: '/proxy', icon: Activity }],
+  },
+  {
+    label: 'More',
+    items: [
+      {
+        title: 'All platform tools',
+        url: '/tools',
+        icon: Boxes,
+        activeWhen: isPlatformToolsRoute,
+      },
+    ],
   },
 ]
 
@@ -727,7 +751,7 @@ function NavUser() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Default workspace nav (root /, /sandboxes, /monitoring, plugins, …).
+// Default workspace nav (root /, /sandboxes, /proxy, plugins, …).
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface NavProps {
@@ -809,6 +833,13 @@ function DefaultNav({
   const compact = isMinimal && !isMobile
 
   const { navItems: extraNavItems } = useConsoleExtensions()
+  const platformUrls = useMemo(
+    () =>
+      primaryPlatformGroups.flatMap((group) =>
+        group.items.map((item) => item.url)
+      ),
+    []
+  )
 
   return (
     <>
@@ -818,7 +849,16 @@ function DefaultNav({
           onReturn={onReturnToProject}
         />
       )}
-      <NavSection label="Platform" items={primaryPlatformNav} />
+      {primaryPlatformGroups.map((group) => (
+        <NavSection
+          key={group.label}
+          label={group.label}
+          items={group.items}
+          siblingUrls={platformUrls.filter(
+            (url) => !group.items.some((item) => item.url === url)
+          )}
+        />
+      ))}
       <NavPlugins items={pluginItems} />
       <ExtensionNav items={extraNavItems} />
       <SidebarGroup className="mt-auto">
