@@ -31,8 +31,11 @@ use temps_metrics::{
 impl From<OtelError> for Problem {
     fn from(error: OtelError) -> Self {
         match error {
-            OtelError::MissingAuthToken { ref project_slug } => {
-                warn!(project_slug = %project_slug, error = %error, "OTel ingest auth failed");
+            OtelError::MissingAuthToken { .. } => {
+                // The slug is carried in the error message for diagnostics but
+                // deliberately not emitted as a structured project dimension:
+                // authentication has not established that the caller owns it.
+                warn!(error = %error, "OTel ingest auth failed");
                 problemdetails::new(StatusCode::UNAUTHORIZED)
                     .with_title("Authentication Failed")
                     .with_detail(error.to_string())
@@ -114,29 +117,46 @@ impl From<OtelError> for Problem {
 /// Checks `Authorization: Bearer <token>` and `X-Temps-Api-Key: <token>`.
 /// Works for `tk_`, `dt_`, and `si_` token prefixes. Handles both plain
 /// `Bearer <token>` and percent-encoded `Bearer%20<token>` from OTLP SDKs.
+fn authorization_scheme(value: &str) -> &'static str {
+    if value.starts_with("Bearer ") || value.starts_with("Bearer%20") {
+        "Bearer"
+    } else {
+        "other"
+    }
+}
+
 fn extract_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get("authorization") {
         if let Ok(value) = auth.to_str() {
             // SECURITY: never log the raw header — it carries a live, mostly
             // non-expiring credential (Bearer dt_/tk_/si_). Log only its shape.
             tracing::debug!(
-                scheme = value.split_whitespace().next().unwrap_or(""),
+                scheme = authorization_scheme(value),
                 len = value.len(),
                 "OTLP extract_token"
             );
             if let Some(key) = value.strip_prefix("Bearer ") {
-                return Some(key.trim().to_string());
+                let key = key.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
             }
             // Some OTLP exporters send the literal string "Bearer%20<token>"
             if let Some(key) = value.strip_prefix("Bearer%20") {
-                return Some(key.trim().to_string());
+                let key = key.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
             }
         }
     }
 
     if let Some(key) = headers.get("x-temps-api-key") {
         if let Ok(value) = key.to_str() {
-            return Some(value.trim().to_string());
+            let key = value.trim();
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
         }
     }
 
@@ -153,30 +173,44 @@ fn extract_project_id_header(headers: &HeaderMap) -> Option<i32> {
         .and_then(|s| s.parse::<i32>().ok())
 }
 
-/// Extract a diagnostic project slug from `X-Temps-Project-Slug`.
+/// Extract a caller-claimed diagnostic project slug.
 ///
 /// This header is not trusted for authentication. It only preserves project
 /// context when authentication cannot run because the credential is missing.
-/// Restricting it to the persisted slug character set prevents arbitrary
-/// attacker-controlled data from entering structured logs.
-fn extract_project_slug_header(headers: &HeaderMap) -> Option<&str> {
+/// Generated deployments use a hex transport header so persisted Unicode
+/// slugs remain valid HTTP metadata. The plain header remains accepted for
+/// manually configured exporters with canonical ASCII slugs.
+fn extract_claimed_project_slug(headers: &HeaderMap) -> Option<String> {
+    let is_valid_slug = |slug: &str| {
+        !slug.is_empty()
+            && slug.len() <= 64
+            && slug
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '-')
+    };
+
+    if let Some(encoded_slug) = headers
+        .get("x-temps-project-slug-hex")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= 128)
+    {
+        let slug = hex::decode(encoded_slug)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())?;
+        return is_valid_slug(&slug).then_some(slug);
+    }
+
     headers
         .get("x-temps-project-slug")
         .and_then(|value| value.to_str().ok())
-        .filter(|slug| {
-            !slug.is_empty()
-                && slug.len() <= 64
-                && slug
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        })
+        .filter(|slug| is_valid_slug(slug))
+        .map(str::to_string)
 }
 
 fn missing_auth_token_error(headers: &HeaderMap) -> OtelError {
     OtelError::MissingAuthToken {
-        project_slug: extract_project_slug_header(headers)
-            .unwrap_or("unknown")
-            .to_string(),
+        claimed_project_slug: extract_claimed_project_slug(headers)
+            .unwrap_or_else(|| "unknown".to_string()),
     }
 }
 
@@ -1069,9 +1103,40 @@ mod tests {
     }
 
     #[test]
+    fn test_authorization_scheme_never_contains_token_material() {
+        let token = "dt_live_credential_must_not_be_logged";
+
+        for value in [
+            format!("Bearer {token}"),
+            format!("Bearer%20{token}"),
+            format!("Custom {token}"),
+        ] {
+            let scheme = authorization_scheme(&value);
+            assert!(!scheme.contains(token));
+        }
+
+        assert_eq!(authorization_scheme(&format!("Bearer {token}")), "Bearer");
+        assert_eq!(authorization_scheme(&format!("Bearer%20{token}")), "Bearer");
+        assert_eq!(authorization_scheme(&format!("Custom {token}")), "other");
+    }
+
+    #[test]
     fn test_extract_token_missing() {
         let headers = HeaderMap::new();
         assert_eq!(extract_token(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_token_treats_empty_credentials_as_missing() {
+        for (header, value) in [
+            ("authorization", "Bearer "),
+            ("authorization", "Bearer%20"),
+            ("x-temps-api-key", ""),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header, value.parse().unwrap());
+            assert_eq!(extract_token(&headers), None, "header: {header}");
+        }
     }
 
     #[test]
@@ -1122,13 +1187,29 @@ mod tests {
     #[test]
     fn test_missing_auth_token_error_includes_valid_project_slug() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-temps-project-slug", "example-project".parse().unwrap());
+        headers.insert(
+            "x-temps-project-slug-hex",
+            "6578616d706c652d70726f6a656374".parse().unwrap(),
+        );
 
         let error = missing_auth_token_error(&headers);
 
         assert!(matches!(
             error,
-            OtelError::MissingAuthToken { project_slug } if project_slug == "example-project"
+            OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "example-project"
+        ));
+    }
+
+    #[test]
+    fn test_missing_auth_token_error_decodes_unicode_project_slug() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-temps-project-slug-hex", "636166c3a9".parse().unwrap());
+
+        let error = missing_auth_token_error(&headers);
+
+        assert!(matches!(
+            error,
+            OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "café"
         ));
     }
 
@@ -1141,8 +1222,24 @@ mod tests {
 
         assert!(matches!(
             error,
-            OtelError::MissingAuthToken { project_slug } if project_slug == "unknown"
+            OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "unknown"
         ));
+    }
+
+    #[test]
+    fn test_missing_auth_token_error_rejects_malformed_hex_slug() {
+        let oversized_slug = "61".repeat(65);
+        for encoded_slug in ["not-hex", "ff", oversized_slug.as_str()] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-temps-project-slug-hex", encoded_slug.parse().unwrap());
+
+            let error = missing_auth_token_error(&headers);
+
+            assert!(matches!(
+                error,
+                OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "unknown"
+            ));
+        }
     }
 
     // ── content_encoding tests ─────────────────────────────────────
@@ -1174,7 +1271,7 @@ mod tests {
     #[test]
     fn test_error_missing_auth_token_maps_to_401() {
         let err = OtelError::MissingAuthToken {
-            project_slug: "example-project".into(),
+            claimed_project_slug: "example-project".into(),
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::UNAUTHORIZED);
