@@ -7,6 +7,7 @@ import {
   revenueMetricsSummaryOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { LastDeployment } from '@/components/deployments/LastDeployment'
+import { RecentDeployments } from '@/components/deployments/RecentDeployments'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
@@ -24,7 +25,6 @@ import {
 import { useEffect, useMemo } from 'react'
 import { Link } from 'react-router'
 import { MetricCard } from '../dashboard/MetricCard'
-import { DeploymentActivityGraph } from './DeploymentActivityGraph'
 import { PROJECT_TOUR_EVENT } from './ProjectTour'
 
 interface ProjectOverviewProps {
@@ -141,7 +141,7 @@ export function ProjectOverview({
           <Skeleton className="h-24" />
         ) : visitorError ? (
           <Link
-            to={`/projects/${project.slug}/analytics`}
+            to={`/projects/${project.slug}/analytics/visitors`}
             className="h-full w-full"
           >
             <MetricCard
@@ -154,7 +154,7 @@ export function ProjectOverview({
           </Link>
         ) : (
           <Link
-            to={`/projects/${project.slug}/analytics`}
+            to={`/projects/${project.slug}/analytics/visitors`}
             className="h-full w-full"
           >
             <MetricCard
@@ -190,8 +190,8 @@ export function ProjectOverview({
         )}
       </div>
 
-      <div className="mt-4 sm:mt-6">
-        <DeploymentActivityGraph projectId={project.id} />
+      <div className="mt-6 sm:mt-8">
+        <RecentDeployments project={project} />
       </div>
 
       <div className="mt-4 flex justify-center sm:mt-6">
