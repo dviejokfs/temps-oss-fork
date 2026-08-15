@@ -2,7 +2,7 @@ use crate::services::workflow_execution_service::WorkflowExecutionService;
 use crate::services::workflow_planner::WorkflowPlanner;
 use sea_orm::{
     sea_query::{Expr, Query},
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set,
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
 };
 use serde_json;
 use std::collections::HashMap;
@@ -943,14 +943,30 @@ async fn find_environments_for_branch(
                 "Restoring soft-deleted preview environment {} for branch '{}'",
                 deleted_preview.id, branch_name
             );
+            let deleted_preview_id = deleted_preview.id;
+            let subdomain = deleted_preview.subdomain.clone();
+            let txn = db
+                .begin()
+                .await
+                .map_err(|error| format!("Failed to begin preview restore: {error}"))?;
+            if environments::claim_subdomain(&txn, &subdomain, &[deleted_preview_id])
+                .await
+                .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
+                .is_some()
+            {
+                return Err(format!("Preview subdomain '{subdomain}' is already in use"));
+            }
             let mut active_env: environments::ActiveModel = deleted_preview.into();
             active_env.deleted_at = Set(None);
             active_env.updated_at = Set(chrono::Utc::now());
             active_env.current_deployment_id = Set(None);
             let restored = active_env
-                .update(db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(|e| format!("Failed to restore preview environment: {}", e))?;
+            txn.commit()
+                .await
+                .map_err(|error| format!("Failed to commit preview restore: {error}"))?;
             return Ok(vec![restored]);
         }
 
@@ -990,10 +1006,11 @@ async fn find_environments_for_branch(
     use chrono::Utc;
     use temps_entities::upstream_config::UpstreamList;
 
+    let subdomain = format!("{}-preview", project.slug);
     let preview_env = environments::ActiveModel {
         name: Set("preview".to_string()),
         slug: Set("preview".to_string()),
-        subdomain: Set(format!("{}-preview", project.slug)),
+        subdomain: Set(subdomain.clone()),
         host: Set(String::new()),
         branch: Set(None), // No specific branch - matches all unmatched branches
         project_id: Set(project.id),
@@ -1008,10 +1025,24 @@ async fn find_environments_for_branch(
         ..Default::default()
     };
 
+    let txn = db
+        .begin()
+        .await
+        .map_err(|error| format!("Failed to begin preview creation: {error}"))?;
+    if environments::claim_subdomain(&txn, &subdomain, &[])
+        .await
+        .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
+        .is_some()
+    {
+        return Err(format!("Preview subdomain '{subdomain}' is already in use"));
+    }
     let created_env = preview_env
-        .insert(db.as_ref())
+        .insert(&txn)
         .await
         .map_err(|e| format!("Failed to create preview environment: {}", e))?;
+    txn.commit()
+        .await
+        .map_err(|error| format!("Failed to commit preview creation: {error}"))?;
 
     info!(
         "Created generic preview environment '{}' for project {}",
@@ -1054,10 +1085,11 @@ async fn create_preview_environment(
         None
     };
 
+    let subdomain = format!("{}-{}", project.slug, slugified_branch);
     let preview_env = environments::ActiveModel {
         name: Set(slugified_branch.to_string()),
         slug: Set(slugified_branch.to_string()),
-        subdomain: Set(format!("{}-{}", project.slug, slugified_branch)),
+        subdomain: Set(subdomain.clone()),
         host: Set(String::new()),
         branch: Set(Some(branch_name.to_string())), // Link to specific branch (used for both deployment and tracking)
         project_id: Set(project.id),
@@ -1072,10 +1104,24 @@ async fn create_preview_environment(
         ..Default::default()
     };
 
+    let txn = db
+        .begin()
+        .await
+        .map_err(|error| format!("Failed to begin preview creation: {error}"))?;
+    if environments::claim_subdomain(&txn, &subdomain, &[])
+        .await
+        .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
+        .is_some()
+    {
+        return Err(format!("Preview subdomain '{subdomain}' is already in use"));
+    }
     let created_env = preview_env
-        .insert(db.as_ref())
+        .insert(&txn)
         .await
         .map_err(|e| format!("Failed to create preview environment: {}", e))?;
+    txn.commit()
+        .await
+        .map_err(|error| format!("Failed to commit preview creation: {error}"))?;
 
     info!(
         "Created preview environment '{}' (ID: {}) for branch '{}'",

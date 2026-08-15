@@ -51,6 +51,7 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt;
 use parking_lot::RwLock;
 use rand::prelude::SliceRandom;
 use tokio::net::TcpListener;
@@ -110,7 +111,6 @@ impl CallerIdentitySnapshot {
 struct ProxyState {
     client: reqwest::Client,
     store: SharedRouteStore,
-    docker: bollard::Docker,
     caller_identities: Arc<RwLock<CallerIdentitySnapshot>>,
 }
 
@@ -147,29 +147,50 @@ pub async fn spawn(
     let state = Arc::new(ProxyState {
         client,
         store,
-        docker: docker.clone(),
         caller_identities: Arc::clone(&caller_identities),
     });
     let app = axum::Router::new().fallback(handle).with_state(state);
 
     let identity_shutdown = Arc::clone(&shutdown);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(IDENTITY_REFRESH_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::select! {
-                _ = identity_shutdown.notified() => break,
-                _ = interval.tick() => match load_source_identities(&docker).await {
-                    Ok(snapshot) => {
-                        *caller_identities.write() = CallerIdentitySnapshot::new(snapshot);
+            let options = bollard::query_parameters::EventsOptionsBuilder::new().build();
+            let mut events = docker.events(Some(options));
+            let mut interval = tokio::time::interval(IDENTITY_REFRESH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            let reconnect = loop {
+                tokio::select! {
+                    _ = identity_shutdown.notified() => return,
+                    _ = interval.tick() => {
+                        refresh_source_identities(&docker, &caller_identities).await;
                     }
-                    Err(error) => {
-                        // Docker is the identity authority. Retaining the old
-                        // IP map after an API failure could authorize a new
-                        // container that inherited a departed container's IP.
-                        caller_identities.write().clear();
-                        warn!(%error, "failed to refresh internal proxy caller identities; denying workload traffic");
+                    event = events.next() => match event {
+                        Some(Ok(event)) if identity_event_requires_refresh(&event) => {
+                            // Invalidate before reloading so an IP released by
+                            // this event cannot retain its old project identity.
+                            caller_identities.write().clear();
+                            refresh_source_identities(&docker, &caller_identities).await;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            caller_identities.write().clear();
+                            warn!(%error, "Docker event stream failed; denying workload traffic until reconnect");
+                            break true;
+                        }
+                        None => {
+                            caller_identities.write().clear();
+                            warn!("Docker event stream ended; denying workload traffic until reconnect");
+                            break true;
+                        }
                     }
+                }
+            };
+
+            if reconnect {
+                tokio::select! {
+                    _ = identity_shutdown.notified() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
             }
         }
@@ -219,7 +240,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
 
-    if !caller_may_access_route(&state, req.extensions(), &entry).await {
+    if !caller_may_access_route(&state, req.extensions(), &entry) {
         warn!(%host, route_project_id = ?entry.project_id, "blocked cross-project internal proxy request");
         return error_body(
             StatusCode::FORBIDDEN,
@@ -248,7 +269,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     proxy_with_retries(&state, &entry, req).await
 }
 
-async fn caller_may_access_route(
+fn caller_may_access_route(
     state: &ProxyState,
     extensions: &axum::http::Extensions,
     entry: &RouteEntry,
@@ -261,9 +282,7 @@ async fn caller_may_access_route(
     let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
         return false;
     };
-    let Some(container_id) =
-        source_container_id(&state.docker, &state.caller_identities, peer.ip()).await
-    else {
+    let Some(container_id) = candidate_container_id(&state.caller_identities, peer.ip()) else {
         return false;
     };
     state
@@ -286,39 +305,33 @@ fn candidate_container_id(
     snapshot.identities.get(&source_ip).cloned()
 }
 
-/// Resolve a cached candidate and verify that Docker still reports the same
-/// running container as the owner of the peer IP. The point lookup prevents a
-/// recycled bridge IP from inheriting the previous container's authorization
-/// without putting a full container-list scan on every request.
-async fn source_container_id(
+fn identity_event_requires_refresh(event: &bollard::models::EventMessage) -> bool {
+    use bollard::models::EventMessageTypeEnum;
+
+    let identity_action = matches!(
+        event.action.as_deref(),
+        Some("start" | "stop" | "die" | "kill" | "destroy" | "connect" | "disconnect")
+    );
+    identity_action
+        && matches!(
+            event.typ,
+            Some(EventMessageTypeEnum::CONTAINER | EventMessageTypeEnum::NETWORK)
+        )
+}
+
+async fn refresh_source_identities(
     docker: &bollard::Docker,
     caller_identities: &RwLock<CallerIdentitySnapshot>,
-    source_ip: IpAddr,
-) -> Option<String> {
-    use bollard::query_parameters::InspectContainerOptions;
-
-    let container_id = candidate_container_id(caller_identities, source_ip)?;
-    let inspected = docker
-        .inspect_container(&container_id, None::<InspectContainerOptions>)
-        .await
-        .ok()?;
-    if inspected.state.and_then(|state| state.running) != Some(true) {
-        return None;
+) {
+    match load_source_identities(docker).await {
+        Ok(snapshot) => {
+            *caller_identities.write() = CallerIdentitySnapshot::new(snapshot);
+        }
+        Err(error) => {
+            caller_identities.write().clear();
+            warn!(%error, "failed to refresh internal proxy caller identities; denying workload traffic");
+        }
     }
-
-    let networks = inspected.network_settings?.networks?;
-    let owns_source_ip = networks.values().any(|endpoint| {
-        [
-            endpoint.ip_address.as_deref(),
-            endpoint.global_ipv6_address.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|address| address.parse::<IpAddr>().ok())
-        .any(|address| address == source_ip)
-    });
-
-    owns_source_ip.then_some(container_id)
 }
 
 async fn load_source_identities(
@@ -903,5 +916,24 @@ mod tests {
         snapshot.clear();
         drop(snapshot);
         assert!(candidate_container_id(&identities, source_ip).is_none());
+    }
+
+    #[test]
+    fn identity_events_refresh_only_for_network_ownership_changes() {
+        use bollard::models::EventMessageTypeEnum;
+
+        let mut event = bollard::models::EventMessage {
+            typ: Some(EventMessageTypeEnum::CONTAINER),
+            action: Some("start".to_string()),
+            ..Default::default()
+        };
+        assert!(identity_event_requires_refresh(&event));
+
+        event.action = Some("health_status: healthy".to_string());
+        assert!(!identity_event_requires_refresh(&event));
+
+        event.typ = Some(EventMessageTypeEnum::NETWORK);
+        event.action = Some("disconnect".to_string());
+        assert!(identity_event_requires_refresh(&event));
     }
 }

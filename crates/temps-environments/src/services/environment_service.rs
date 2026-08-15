@@ -199,22 +199,11 @@ impl EnvironmentService {
         subdomain: &str,
         excluding_environment_id: Option<i32>,
     ) -> Result<(), EnvironmentError> {
-        txn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT pg_advisory_xact_lock(hashtext($1))",
-            [subdomain.to_string().into()],
-        ))
-        .await
-        .map_err(|error| EnvironmentError::DatabaseConnectionError(error.to_string()))?;
-
-        let mut conflict = environments::Entity::find()
-            .filter(environments::Column::Subdomain.eq(subdomain))
-            .filter(environments::Column::DeletedAt.is_null());
-        if let Some(environment_id) = excluding_environment_id {
-            conflict = conflict.filter(environments::Column::Id.ne(environment_id));
-        }
-
-        if conflict.one(txn).await?.is_some() {
+        let excluded = excluding_environment_id.into_iter().collect::<Vec<_>>();
+        if environments::claim_subdomain(txn, subdomain, &excluded)
+            .await?
+            .is_some()
+        {
             return Err(EnvironmentError::InvalidInput(format!(
                 "Subdomain '{}' is already in use",
                 subdomain
