@@ -441,9 +441,34 @@ fn inherited_https_policy(production_https: bool, host_has_cert: bool) -> bool {
     production_https || host_has_cert
 }
 
+/// Whether the "production" HTTPS-by-default assumption (no `external_url`
+/// configured -> treat every host as production) should even be consulted for
+/// this request.
+///
+/// Scoped to resolved project traffic only (`has_environment`): requests whose
+/// `Host` never matched a project domain — the admin/console UI, and internal
+/// cluster-management API calls such as node registration/heartbeat — must
+/// never be redirected off this default. Cluster bootstrap traffic runs over
+/// plaintext HTTP by design, before any TLS material exists to redirect to.
+fn should_apply_production_https_default(
+    disable_https_redirect: bool,
+    is_tls: bool,
+    path: &str,
+    env_force_https: Option<bool>,
+    has_environment: bool,
+) -> bool {
+    !disable_https_redirect
+        && !is_tls
+        && !path.starts_with(ACME_HTTP01_PREFIX)
+        && env_force_https.is_none()
+        && has_environment
+}
+
 #[cfg(test)]
 mod deployment_asset_scope_tests {
-    use super::{deployment_asset_path_matches, inherited_https_policy};
+    use super::{
+        deployment_asset_path_matches, inherited_https_policy, should_apply_production_https_default,
+    };
 
     #[test]
     fn prefixed_asset_must_name_the_current_deployment() {
@@ -457,6 +482,40 @@ mod deployment_asset_scope_tests {
         assert!(inherited_https_policy(true, false));
         assert!(!inherited_https_policy(false, false));
         assert!(inherited_https_policy(false, true));
+    }
+
+    #[test]
+    fn production_https_default_never_applies_without_a_resolved_environment() {
+        // Unresolved Host (admin/console UI, internal cluster API like node
+        // registration) — must not be redirected even though every other gate
+        // would otherwise allow it.
+        assert!(!should_apply_production_https_default(
+            false, false, "/api/internal/nodes/register", None, false
+        ));
+        // Resolved project traffic with everything else the same — applies.
+        assert!(should_apply_production_https_default(
+            false, false, "/", None, true
+        ));
+    }
+
+    #[test]
+    fn production_https_default_respects_the_other_gates() {
+        assert!(!should_apply_production_https_default(
+            true, false, "/", None, true
+        ));
+        assert!(!should_apply_production_https_default(
+            false, true, "/", None, true
+        ));
+        assert!(!should_apply_production_https_default(
+            false,
+            false,
+            "/.well-known/acme-challenge/token",
+            None,
+            true
+        ));
+        assert!(!should_apply_production_https_default(
+            false, false, "/", Some(false), true
+        ));
     }
 }
 
@@ -4350,11 +4409,13 @@ impl ProxyHttp for LoadBalancer {
         // WS3: cert-host check is now a lock-free ArcSwap snapshot read; the
         // background `CertHostCache::run_refresh_loop` keeps it current (±30 s).
         let env_force_https = ctx.environment.as_ref().and_then(|env| env.force_https);
-        let production_https = if !self.disable_https_redirect
-            && !self.is_tls_connection(session)
-            && !ctx.path.starts_with(ACME_HTTP01_PREFIX)
-            && env_force_https.is_none()
-        {
+        let production_https = if should_apply_production_https_default(
+            self.disable_https_redirect,
+            self.is_tls_connection(session),
+            &ctx.path,
+            env_force_https,
+            ctx.environment.is_some(),
+        ) {
             match self.config_service.get_url_scheme().await {
                 Ok(scheme) => scheme != "http",
                 Err(error) => {
