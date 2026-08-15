@@ -12892,7 +12892,7 @@ mod tests {
         params.insert("max_connections".to_string(), JsonValue::Number(100.into()));
         params.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:18".to_string()),
+            JsonValue::String("timescale/timescaledb-ha:pg18".to_string()),
         );
 
         let request = CreateExternalServiceRequest {
@@ -12916,8 +12916,8 @@ mod tests {
         let initial_params = initial_details.current_parameters.unwrap();
         assert_eq!(
             initial_params.get("docker_image").and_then(|v| v.as_str()),
-            Some("postgres:18"),
-            "Initial docker_image should be postgres:18"
+            Some("timescale/timescaledb-ha:pg18"),
+            "Initial docker_image should be timescale/timescaledb-ha:pg18"
         );
 
         // Step 2: Update docker_image parameter to gotempsh/postgres-walg:18-bookworm (same major version, different variant).
@@ -13322,7 +13322,7 @@ mod tests {
         // Explicitly set docker_image so the test is deterministic
         params.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:18".to_string()),
+            JsonValue::String("timescale/timescaledb-ha:pg18".to_string()),
         );
 
         let request = CreateExternalServiceRequest {
