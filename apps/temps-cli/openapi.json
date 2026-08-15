@@ -1582,11 +1582,14 @@
             "type": "array"
           },
           "tool_thinking_options": {
-            "description": "Model-specific reasoning options valid while project-chat function tools are attached. Omitted when the normal options also apply.",
+            "description": "Model-specific reasoning options valid while project-chat function\ntools are attached. Omitted when the normal options also apply.",
             "items": {
               "$ref": "#/components/schemas/AiSelectOptionDto"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           }
         },
         "required": [
@@ -7912,6 +7915,19 @@
           "name",
           "service_type",
           "parameters"
+        ],
+        "type": "object"
+      },
+      "CreateFacetRequest": {
+        "description": "Request body for registering a new facet.",
+        "properties": {
+          "attribute_key": {
+            "description": "The OTel attribute key to facet (e.g. `enduser.id`, `galachain.contract`).\nMust be non-empty, ≤200 characters, and not already registered.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attribute_key"
         ],
         "type": "object"
       },
@@ -16485,6 +16501,46 @@
           "id",
           "name",
           "service_type"
+        ],
+        "type": "object"
+      },
+      "FacetInfo": {
+        "description": "Public representation of a registered span attribute facet.",
+        "properties": {
+          "attribute_key": {
+            "description": "The OTel attribute key, e.g. `enduser.id` or `galachain.contract`.",
+            "type": "string"
+          },
+          "created_at": {
+            "example": "2025-10-12T12:15:47.609192Z",
+            "type": "string"
+          },
+          "slot": {
+            "description": "The slot column index 1..=20 in ClickHouse (`facet_attr_N`).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "attribute_key",
+          "slot",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "FacetsResponse": {
+        "description": "Response body for facet list.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/FacetInfo"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
         ],
         "type": "object"
       },
@@ -69368,6 +69424,219 @@
         ]
       }
     },
+    "/otel/facets": {
+      "get": {
+        "description": "Returns all facets registered on this platform (newest first). Since the\n`spans` ClickHouse table is platform-global, facets are also platform-global.",
+        "operationId": "list_facets",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FacetsResponse"
+                }
+              }
+            },
+            "description": "Registered facets"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List all registered OTel span attribute facets.",
+        "tags": [
+          "OTel Facets"
+        ]
+      },
+      "post": {
+        "description": "Assigns the key to the lowest available slot column (1..=20) in the\nClickHouse `spans` table, inserts the mapping into Postgres, and runs a\nbackfill mutation so existing spans that carry this attribute are populated\nin the slot column. At 500M+ row scale this mutation would be expensive and\nshould be tracked asynchronously; for the current demo dataset it is near-instant.",
+        "operationId": "create_facet",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFacetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FacetInfo"
+                }
+              }
+            },
+            "description": "Facet registered"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Already registered or capacity exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Register an OTel attribute key as a facet.",
+        "tags": [
+          "OTel Facets"
+        ]
+      }
+    },
+    "/otel/facets/{key}": {
+      "delete": {
+        "description": "Clears the corresponding ClickHouse slot column for all existing spans\n(to prevent stale data leaking into a future facet that reuses the slot),\nthen removes the Postgres mapping. The slot becomes available for reuse.",
+        "operationId": "delete_facet",
+        "parameters": [
+          {
+            "description": "The OTel attribute key (URL-encoded)",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Facet deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Facet not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove a registered OTel span attribute facet.",
+        "tags": [
+          "OTel Facets"
+        ]
+      }
+    },
     "/otel/genai/traces": {
       "get": {
         "description": "`duration_ms` is the only field guaranteed to be milliseconds. `gen_ai.*`\nspan attributes (e.g. time-to-first-token, token latency) often follow the\nOTel GenAI semantic conventions, which use **seconds** (a fractional\ndouble), not milliseconds — do not read them as ms without converting.",
@@ -70948,6 +71217,15 @@
             "schema": {
               "format": "int32",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by span attributes as comma-separated key=value pairs, e.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\"",
+            "in": "query",
+            "name": "attributes",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -97338,6 +97616,10 @@
     {
       "description": "Query endpoints for the monitoring UI",
       "name": "OTel"
+    },
+    {
+      "description": "Span attribute facet registration (fast-filter slots)",
+      "name": "OTel Facets"
     },
     {
       "description": "GenAI agent activity tracing endpoints",
