@@ -114,8 +114,9 @@ export const platformToolGroups: PlatformToolGroup[] = [
     items: [
       {
         title: 'Monitoring',
-        description: 'Review resource health, alerts, and alarm history.',
-        url: '/monitoring/resources',
+        description:
+          'Review active alerts, resource health, and alarm history.',
+        url: '/monitoring/alerts',
         icon: Gauge,
         keywords: ['health', 'alarms', 'resources'],
       },

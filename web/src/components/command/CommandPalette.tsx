@@ -223,7 +223,7 @@ const mainNavItems: NavigationItem[] = [
   },
   {
     title: 'Monitoring',
-    url: '/monitoring/resources',
+    url: '/monitoring/alerts',
     icon: Gauge,
     keywords: ['metrics', 'resources', 'alerts', 'alarms', 'health'],
   },

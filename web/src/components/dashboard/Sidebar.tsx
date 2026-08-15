@@ -131,7 +131,12 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
   {
     label: 'Observe',
     items: [
-      { title: 'Monitoring', url: '/monitoring', icon: Gauge },
+      {
+        title: 'Monitoring',
+        url: '/monitoring/alerts',
+        icon: Gauge,
+        activeWhen: (pathname) => pathname.startsWith('/monitoring'),
+      },
       { title: 'Proxy', url: '/proxy', icon: Activity },
     ],
   },

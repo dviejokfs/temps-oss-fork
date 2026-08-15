@@ -548,10 +548,7 @@ const FullAppRoutes = () => {
                       element={<SandboxDetail />}
                     />
                     <Route path="/monitoring" element={<Monitoring />}>
-                      <Route
-                        index
-                        element={<Navigate to="resources" replace />}
-                      />
+                      <Route index element={<Navigate to="alerts" replace />} />
                       <Route
                         path="providers/add"
                         element={
