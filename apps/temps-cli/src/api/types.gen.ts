@@ -3571,6 +3571,17 @@ export type CreateExternalServiceRequest = {
     version?: string | null;
 };
 
+/**
+ * Request body for registering a new facet.
+ */
+export type CreateFacetRequest = {
+    /**
+     * The OTel attribute key to facet (e.g. `enduser.id`, `galachain.contract`).
+     * Must be non-empty, ≤200 characters, and not already registered.
+     */
+    attribute_key: string;
+};
+
 export type CreateFlagRequest = {
     /**
      * Whether the flag may be exposed on the unauthenticated same-origin
@@ -7475,6 +7486,28 @@ export type ExternalServiceSummary = {
      * Service type string (e.g. "postgres", "redis", "mongodb").
      */
     service_type: string;
+};
+
+/**
+ * Public representation of a registered span attribute facet.
+ */
+export type FacetInfo = {
+    /**
+     * The OTel attribute key, e.g. `enduser.id` or `galachain.contract`.
+     */
+    attribute_key: string;
+    created_at: string;
+    /**
+     * The slot column index 1..=20 in ClickHouse (`facet_attr_N`).
+     */
+    slot: number;
+};
+
+/**
+ * Response body for facet list.
+ */
+export type FacetsResponse = {
+    data: Array<FacetInfo>;
 };
 
 export type FieldResponse = {
@@ -18428,25 +18461,26 @@ export type UpdateDeploymentConfigRequest = {
     replicas?: number | null;
     /**
      * Project-level default timeout for regular (non-streaming) HTTP
-     * requests, in seconds (1-86400). Environments may override this; always
-     * clamped to the operator's global hard ceiling regardless of what's set
-     * here. Absent leaves the current value unchanged.
+     * requests, in seconds (0 = no timeout, or 1-86400). Environments may
+     * override this; always clamped to the operator's global hard ceiling
+     * regardless of what's set here. Absent leaves the current value
+     * unchanged.
      */
     requestTimeoutSeconds?: number | null;
     security?: null | SecurityConfig;
     sessionRecordingEnabled?: boolean | null;
     /**
      * Project-level default idle timeout for Server-Sent Events streams, in
-     * seconds (1-86400). Environments may override this; always clamped to
-     * the operator's global hard ceiling. Absent leaves the current value
-     * unchanged.
+     * seconds (0 = no timeout, or 1-86400). Environments may override this;
+     * always clamped to the operator's global hard ceiling. Absent leaves
+     * the current value unchanged.
      */
     sseIdleTimeoutSeconds?: number | null;
     /**
      * Project-level default idle timeout for WebSocket connections, in
-     * seconds (1-86400). Environments may override this; always clamped to
-     * the operator's global hard ceiling. Absent leaves the current value
-     * unchanged.
+     * seconds (0 = no timeout, or 1-86400). Environments may override this;
+     * always clamped to the operator's global hard ceiling. Absent leaves
+     * the current value unchanged.
      */
     websocketIdleTimeoutSeconds?: number | null;
 };
@@ -18598,7 +18632,7 @@ export type UpdateEnvironmentSettingsRequest = {
     replicas?: number | null;
     /**
      * Override the proxy's timeout for regular (non-streaming) HTTP requests
-     * to this environment, in seconds (1-86400). Always clamped to the
+     * to this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the
      * operator's global hard ceiling regardless of what's set here.
      * Absent leaves the current value unchanged. Send JSON `null` to clear
      * the override (inherit the project/global default).
@@ -18611,7 +18645,7 @@ export type UpdateEnvironmentSettingsRequest = {
     session_recording_enabled?: boolean | null;
     /**
      * Override the proxy's idle timeout for Server-Sent Events streams to
-     * this environment, in seconds (1-86400). Always clamped to the
+     * this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the
      * operator's global hard ceiling. Absent leaves the current value
      * unchanged. Send JSON `null` to clear the override.
      */
@@ -18632,7 +18666,7 @@ export type UpdateEnvironmentSettingsRequest = {
     wake_timeout_seconds?: number | null;
     /**
      * Override the proxy's idle timeout for WebSocket connections to this
-     * environment, in seconds (1-86400). Always clamped to the operator's
+     * environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the operator's
      * global hard ceiling. Absent leaves the current value unchanged. Send
      * JSON `null` to clear the override.
      */
@@ -35406,6 +35440,122 @@ export type UpdateDashboardResponses = {
 
 export type UpdateDashboardResponse = UpdateDashboardResponses[keyof UpdateDashboardResponses];
 
+export type ListFacetsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/otel/facets';
+};
+
+export type ListFacetsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListFacetsError = ListFacetsErrors[keyof ListFacetsErrors];
+
+export type ListFacetsResponses = {
+    /**
+     * Registered facets
+     */
+    200: FacetsResponse;
+};
+
+export type ListFacetsResponse = ListFacetsResponses[keyof ListFacetsResponses];
+
+export type CreateFacetData = {
+    body: CreateFacetRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/facets';
+};
+
+export type CreateFacetErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Already registered or capacity exceeded
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateFacetError = CreateFacetErrors[keyof CreateFacetErrors];
+
+export type CreateFacetResponses = {
+    /**
+     * Facet registered
+     */
+    201: FacetInfo;
+};
+
+export type CreateFacetResponse = CreateFacetResponses[keyof CreateFacetResponses];
+
+export type DeleteFacetData = {
+    body?: never;
+    path: {
+        /**
+         * The OTel attribute key (URL-encoded)
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/otel/facets/{key}';
+};
+
+export type DeleteFacetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Facet not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteFacetError = DeleteFacetErrors[keyof DeleteFacetErrors];
+
+export type DeleteFacetResponses = {
+    /**
+     * Facet deleted
+     */
+    204: void;
+};
+
+export type DeleteFacetResponse = DeleteFacetResponses[keyof DeleteFacetResponses];
+
 export type QueryGenaiTracesData = {
     body?: never;
     path?: never;
@@ -36207,6 +36357,10 @@ export type QueryTraceSummariesData = {
          * Filter by deployment ID
          */
         deployment_id?: number;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string;
         /**
          * Filter by span name pattern (ILIKE)
          */

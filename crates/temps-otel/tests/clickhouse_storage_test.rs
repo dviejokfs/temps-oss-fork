@@ -147,8 +147,12 @@ async fn setup() -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>
         .into_connection();
     let inner = Arc::new(TimescaleDbStorage::new(Arc::new(mock_db), None));
 
-    let storage =
-        ClickHouseOtelStorage::new(config, inner, Arc::new(temps_core::FixedRetentionResolver));
+    let storage = ClickHouseOtelStorage::new(
+        config,
+        inner,
+        Arc::new(temps_core::FixedRetentionResolver),
+        None,
+    );
     Some((storage, container))
 }
 
@@ -178,8 +182,12 @@ async fn setup_with_quota(
         Some(limit_bytes),
     ));
 
-    let storage =
-        ClickHouseOtelStorage::new(config, inner, Arc::new(temps_core::FixedRetentionResolver));
+    let storage = ClickHouseOtelStorage::new(
+        config,
+        inner,
+        Arc::new(temps_core::FixedRetentionResolver),
+        None,
+    );
     Some((storage, container))
 }
 
