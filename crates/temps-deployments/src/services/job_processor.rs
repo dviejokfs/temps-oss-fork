@@ -1006,7 +1006,7 @@ async fn find_environments_for_branch(
     use chrono::Utc;
     use temps_entities::upstream_config::UpstreamList;
 
-    let subdomain = format!("{}-preview", project.slug);
+    let subdomain = format!("{}-preview", project.slug).to_ascii_lowercase();
     let preview_env = environments::ActiveModel {
         name: Set("preview".to_string()),
         slug: Set("preview".to_string()),
@@ -1085,7 +1085,7 @@ async fn create_preview_environment(
         None
     };
 
-    let subdomain = format!("{}-{}", project.slug, slugified_branch);
+    let subdomain = format!("{}-{}", project.slug, slugified_branch).to_ascii_lowercase();
     let preview_env = environments::ActiveModel {
         name: Set(slugified_branch.to_string()),
         slug: Set(slugified_branch.to_string()),

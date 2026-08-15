@@ -1320,7 +1320,19 @@ impl ProjectService {
 
         // Update the slug if provided
         if let Some(slug_value) = new_slug {
+            let slug_value = slugify(&slug_value);
+            if slug_value.is_empty() || slug_value.len() > 63 {
+                return Err(ProjectError::InvalidInput(
+                    "Project slug must contain 1-63 lowercase DNS-safe characters".to_string(),
+                ));
+            }
             let txn = self.db.begin().await?;
+            txn.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtext('project-slug:' || $1))",
+                [slug_value.clone().into()],
+            ))
+            .await?;
             // Check if the slug is already taken by another project
             let existing = projects::Entity::find()
                 .filter(projects::Column::Slug.eq(&slug_value))
@@ -1349,7 +1361,12 @@ impl ProjectService {
                 let mut active_claims = envs
                     .iter()
                     .filter(|env| env.deleted_at.is_none())
-                    .map(|env| (format!("{}-{}", slug_value, env.slug), env.id))
+                    .map(|env| {
+                        (
+                            format!("{}-{}", slug_value, env.slug).to_ascii_lowercase(),
+                            env.id,
+                        )
+                    })
                     .collect::<Vec<_>>();
                 active_claims.sort_unstable();
                 for (new_subdomain, _) in &active_claims {
@@ -1381,7 +1398,7 @@ impl ProjectService {
 
                 for env in envs {
                     let previous_subdomain = env.subdomain.clone();
-                    let new_subdomain = format!("{}-{}", slug_value, env.slug);
+                    let new_subdomain = format!("{}-{}", slug_value, env.slug).to_ascii_lowercase();
 
                     // Keep the environment and its auto-managed domain row in
                     // the same transaction as the project rename.

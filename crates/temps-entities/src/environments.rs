@@ -68,15 +68,21 @@ pub async fn claim_subdomain(
     subdomain: &str,
     excluded_environment_ids: &[i32],
 ) -> Result<Option<Model>, DbErr> {
+    let canonical_subdomain = subdomain.trim().to_ascii_lowercase();
     txn.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         "SELECT pg_advisory_xact_lock(hashtext($1))",
-        [subdomain.to_string().into()],
+        [canonical_subdomain.clone().into()],
     ))
     .await?;
 
     let mut conflict = Entity::find()
-        .filter(Column::Subdomain.eq(subdomain))
+        // Include legacy mixed-case rows because DNS and the route store treat
+        // hostnames case-insensitively.
+        .filter(sea_orm::sea_query::Expr::cust_with_values(
+            "LOWER(BTRIM(\"subdomain\")) = $1",
+            [canonical_subdomain],
+        ))
         .filter(Column::DeletedAt.is_null());
     if !excluded_environment_ids.is_empty() {
         conflict = conflict.filter(Column::Id.is_not_in(excluded_environment_ids.iter().copied()));

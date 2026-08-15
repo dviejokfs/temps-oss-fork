@@ -55,7 +55,7 @@ use futures::StreamExt;
 use parking_lot::RwLock;
 use rand::prelude::SliceRandom;
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::route_store::{RouteEntry, SharedRouteStore};
@@ -88,6 +88,9 @@ const MAX_RETRIES: usize = 3;
 /// previous container's project identity.
 const IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const IDENTITY_MAX_AGE: Duration = Duration::from_secs(3);
+const IDENTITY_INSPECTION_BURST: usize = 64;
+const IDENTITY_INSPECTION_REFILL: usize = 32;
+const IDENTITY_INSPECTION_REFILL_INTERVAL: Duration = Duration::from_millis(125);
 
 struct CallerIdentitySnapshot {
     identities: HashMap<IpAddr, String>,
@@ -111,6 +114,8 @@ impl CallerIdentitySnapshot {
 struct ProxyState {
     client: reqwest::Client,
     store: SharedRouteStore,
+    docker: bollard::Docker,
+    inspection_budget: Arc<Semaphore>,
     caller_identities: Arc<RwLock<CallerIdentitySnapshot>>,
 }
 
@@ -144,9 +149,12 @@ pub async fn spawn(
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     let caller_identities = Arc::new(RwLock::new(CallerIdentitySnapshot::new(initial_identities)));
+    let inspection_budget = Arc::new(Semaphore::new(IDENTITY_INSPECTION_BURST));
     let state = Arc::new(ProxyState {
         client,
         store,
+        docker: docker.clone(),
+        inspection_budget: Arc::clone(&inspection_budget),
         caller_identities: Arc::clone(&caller_identities),
     });
     let app = axum::Router::new().fallback(handle).with_state(state);
@@ -196,6 +204,22 @@ pub async fn spawn(
         }
     });
 
+    let budget_shutdown = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(IDENTITY_INSPECTION_REFILL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = budget_shutdown.notified() => return,
+                _ = interval.tick() => {
+                    let missing = IDENTITY_INSPECTION_BURST
+                        .saturating_sub(inspection_budget.available_permits());
+                    inspection_budget.add_permits(missing.min(IDENTITY_INSPECTION_REFILL));
+                }
+            }
+        }
+    });
+
     tokio::spawn(async move {
         let server = axum::serve(
             listener,
@@ -240,7 +264,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
 
-    if !caller_may_access_route(&state, req.extensions(), &entry) {
+    if !caller_may_access_route(&state, req.extensions(), &entry).await {
         warn!(%host, route_project_id = ?entry.project_id, "blocked cross-project internal proxy request");
         return error_body(
             StatusCode::FORBIDDEN,
@@ -269,7 +293,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     proxy_with_retries(&state, &entry, req).await
 }
 
-fn caller_may_access_route(
+async fn caller_may_access_route(
     state: &ProxyState,
     extensions: &axum::http::Extensions,
     entry: &RouteEntry,
@@ -282,12 +306,47 @@ fn caller_may_access_route(
     let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
         return false;
     };
-    let Some(container_id) = candidate_container_id(&state.caller_identities, peer.ip()) else {
+    let Some(container_id) = source_container_id(state, peer.ip()).await else {
         return false;
     };
     state
         .store
         .container_id_has_project(&container_id, route_project_id)
+}
+
+/// Verify the cached candidate against Docker's current running-container and
+/// network state. A bounded token bucket prevents workload traffic from
+/// amplifying without limit into Docker-daemon API calls; exhausted requests
+/// fail closed.
+async fn source_container_id(state: &ProxyState, source_ip: IpAddr) -> Option<String> {
+    use bollard::query_parameters::InspectContainerOptions;
+
+    let container_id = candidate_container_id(&state.caller_identities, source_ip)?;
+    let permit = Arc::clone(&state.inspection_budget)
+        .try_acquire_owned()
+        .ok()?;
+    permit.forget();
+
+    let inspected = state
+        .docker
+        .inspect_container(&container_id, None::<InspectContainerOptions>)
+        .await
+        .ok()?;
+    if inspected.state.and_then(|container| container.running) != Some(true) {
+        return None;
+    }
+    let networks = inspected.network_settings?.networks?;
+    let owns_source_ip = networks.values().any(|endpoint| {
+        [
+            endpoint.ip_address.as_deref(),
+            endpoint.global_ipv6_address.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|address| address.parse::<IpAddr>().ok())
+        .any(|address| address == source_ip)
+    });
+    owns_source_ip.then_some(container_id)
 }
 
 /// Resolve the peer address through the local Docker daemon. The daemon's

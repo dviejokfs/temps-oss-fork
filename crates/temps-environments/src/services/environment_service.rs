@@ -259,7 +259,7 @@ impl EnvironmentService {
         let env_slug = slugify(&name);
 
         // Create main_url using project_slug-env_slug format
-        let main_url = format!("{}-{}", project.slug, env_slug);
+        let main_url = format!("{}-{}", project.slug, env_slug).to_ascii_lowercase();
 
         // Start a transaction for insert + domain creation
         let txn = self.db.begin().await?;
@@ -584,7 +584,7 @@ impl EnvironmentService {
         let env_slug = slugify(&name);
 
         // Create main_url using project_slug-env_slug format
-        let main_url = format!("{}-{}", project.slug, env_slug);
+        let main_url = format!("{}-{}", project.slug, env_slug).to_ascii_lowercase();
 
         // Create the new environment
         let new_environment = environments::ActiveModel {
