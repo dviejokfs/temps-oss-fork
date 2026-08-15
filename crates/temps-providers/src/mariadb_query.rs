@@ -580,8 +580,8 @@ impl Queryable for MariaDbSource {
         // The caller's tokio deadline frees the control-plane task, but dropping
         // the future does not stop the server: it keeps executing and keeps
         // holding its share of the operator's database. That matters here
-        // because this backend accepts a caller-supplied WHERE clause and a
-        // caller-supplied OFFSET, whose cost is O(offset) regardless of LIMIT.
+        // because this backend accepts structured caller-supplied filters and
+        // a caller-supplied OFFSET, whose cost is O(offset) regardless of LIMIT.
         //
         // See `apply_statement_timeout` for why both spellings are tried and
         // why this must share the query's connection.
