@@ -57,20 +57,25 @@ fn connect_to_docker(operation: &str, engine: &str) -> Result<Docker, BackupErro
     })
 }
 
-fn split_image_tag(image_tag: &str) -> (&str, &str) {
+fn split_image_tag(image_tag: &str) -> (&str, Option<&str>) {
+    if image_tag.contains("@sha256:") {
+        return (image_tag, None);
+    }
+
     match image_tag.rsplit_once(':') {
-        Some((image, tag)) if !tag.contains('/') => (image, tag),
-        _ => (image_tag, "latest"),
+        Some((image, tag)) if !tag.contains('/') => (image, Some(tag)),
+        _ => (image_tag, Some("latest")),
     }
 }
 
 async fn pull_image(docker: &Docker, image_tag: &str, engine: &str) -> Result<(), BackupError> {
     use bollard::query_parameters::CreateImageOptionsBuilder;
     let (image, tag) = split_image_tag(image_tag);
-    let options = CreateImageOptionsBuilder::new()
-        .from_image(image)
-        .tag(tag)
-        .build();
+    let mut options = CreateImageOptionsBuilder::new().from_image(image);
+    if let Some(tag) = tag {
+        options = options.tag(tag);
+    }
+    let options = options.build();
 
     let mut stream = docker.create_image(Some(options), None, None);
     while let Some(result) = FuturesStreamExt::next(&mut stream).await {
@@ -100,16 +105,22 @@ mod tests {
     fn split_image_tag_handles_explicit_and_implicit_tags() {
         assert_eq!(
             split_image_tag("minio/mc:RELEASE.2025-08-13T08-35-41Z"),
-            ("minio/mc", "RELEASE.2025-08-13T08-35-41Z")
+            ("minio/mc", Some("RELEASE.2025-08-13T08-35-41Z"))
         );
-        assert_eq!(split_image_tag("minio/mc"), ("minio/mc", "latest"));
+        assert_eq!(split_image_tag("minio/mc"), ("minio/mc", Some("latest")));
     }
 
     #[test]
     fn split_image_tag_does_not_treat_registry_port_as_tag() {
         assert_eq!(
             split_image_tag("registry.example.test:5000/minio/mc"),
-            ("registry.example.test:5000/minio/mc", "latest")
+            ("registry.example.test:5000/minio/mc", Some("latest"))
         );
+    }
+
+    #[test]
+    fn split_image_tag_preserves_digest_reference() {
+        let image = "minio/mc@sha256:0123456789abcdef";
+        assert_eq!(split_image_tag(image), (image, None));
     }
 }

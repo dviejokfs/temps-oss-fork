@@ -937,7 +937,12 @@ pub async fn get_container_info(
         .get_container_info(&container_id)
         .await
     {
-        Ok(info) => AgentResponse::ok(info).into_response(),
+        Ok(info) => match managed_container_detail(info) {
+            Some(info) => AgentResponse::ok(info).into_response(),
+            None => {
+                error_response(StatusCode::NOT_FOUND, "Container not found".into()).into_response()
+            }
+        },
         Err(e) => {
             tracing::error!(container_id = %container_id, "Failed to get info: {}", e);
             error_response(
@@ -954,6 +959,16 @@ fn is_temps_managed_container(container: &temps_deployer::ContainerInfo) -> bool
         .labels
         .get("sh.temps.managed")
         .is_some_and(|value| value == "true")
+}
+
+fn managed_container_detail(
+    mut container: temps_deployer::ContainerInfo,
+) -> Option<temps_deployer::ContainerInfo> {
+    if !is_temps_managed_container(&container) {
+        return None;
+    }
+    container.environment_vars.clear();
+    Some(container)
 }
 
 fn managed_container_inventory(
@@ -998,6 +1013,14 @@ mod inventory_tests {
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0].container_name, "managed");
         assert!(inventory[0].environment_vars.is_empty());
+    }
+
+    #[test]
+    fn detail_policy_rejects_unmanaged_and_redacts_managed_containers() {
+        assert!(managed_container_detail(container("unmanaged", None)).is_none());
+        let managed = managed_container_detail(container("managed", Some("true")))
+            .expect("managed container remains visible");
+        assert!(managed.environment_vars.is_empty());
     }
 }
 

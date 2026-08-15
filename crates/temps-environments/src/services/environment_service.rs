@@ -819,13 +819,31 @@ impl EnvironmentService {
             return Ok(environment);
         }
 
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
+
+        // Serialize claims for the same normalized hostname. A row-level lock
+        // cannot protect the "no conflict exists" case, and a new unique index
+        // would fail upgrades that already contain cross-project duplicates.
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            [normalized.clone().into()],
+        ))
+        .await
+        .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
+
         // Preview hosts are `<subdomain>.<preview-domain>`, so the namespace is
-        // global rather than project-scoped.
+        // global rather than project-scoped. The advisory lock keeps this check
+        // and the update atomic with respect to competing claims for the name.
         let conflict = environments::Entity::find()
             .filter(environments::Column::Subdomain.eq(&normalized))
             .filter(environments::Column::Id.ne(env_id))
             .filter(environments::Column::DeletedAt.is_null())
-            .one(self.db.as_ref())
+            .one(&txn)
             .await?;
         if conflict.is_some() {
             return Err(EnvironmentError::InvalidInput(format!(
@@ -835,12 +853,6 @@ impl EnvironmentService {
         }
 
         let previous_subdomain = environment.subdomain.clone();
-
-        let txn = self
-            .db
-            .begin()
-            .await
-            .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
 
         let mut active_model: environments::ActiveModel = environment.clone().into();
         active_model.subdomain = Set(normalized.clone());
@@ -1665,6 +1677,10 @@ mod tests {
             .append_query_results(vec![vec![env]])
             // 2. conflict check returns the sibling env
             .append_query_results(vec![vec![conflict]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
             .into_connection();
         let svc = make_service(db);
 
@@ -1675,13 +1691,13 @@ mod tests {
         match result {
             Err(EnvironmentError::InvalidInput(msg)) => {
                 assert!(
-                    msg.contains("already used"),
+                    msg.contains("already in use"),
                     "Error should describe conflict: {}",
                     msg
                 );
                 assert!(
-                    msg.contains("production"),
-                    "Error should name the conflicting env: {}",
+                    !msg.contains("production"),
+                    "Error must not disclose the conflicting environment: {}",
                     msg
                 );
             }
@@ -1704,6 +1720,10 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![env]])
             .append_query_results(vec![vec![conflict]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
             .into_connection();
         let svc = make_service(db);
 

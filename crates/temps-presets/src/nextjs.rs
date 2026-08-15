@@ -246,21 +246,6 @@ RUN mkdir -p public
 # - ESLint configs
 # - Custom build tools
 
-# Assemble a minimal runtime tree while still in the build stage. Never copy
-# the complete checkout into the final image: it can contain authenticated Git
-# configuration, dotenv files, tests, and other build-only material.
-RUN set -eu; \
-    mkdir -p /runtime; \
-    for path in \
-        package.json package-lock.json npm-shrinkwrap.json \
-        bun.lock yarn.lock pnpm-lock.yaml \
-        node_modules .next public \
-        next.config.js next.config.mjs next.config.ts \
-        drizzle prisma locales messages mydata; \
-    do \
-        if [ -e "$path" ]; then cp -a "$path" /runtime/; fi; \
-    done
-
 # Stage 2: Production using hardened Alpine Node.js
 # Secure: non-root user, package manager removed, full CA certificates for HTTPS
 FROM {run_image} AS runner
@@ -275,13 +260,31 @@ WORKDIR /{project_slug}
             alpine_hardening = NODEJS_ALPINE_SECURITY_HARDENING,
         ));
 
-        // Alpine uses nodejs:nodejs user (uid 1001).
-        dockerfile.push_str(&format!(
-            r#"# Copy sanitized runtime artifacts only
-COPY --from=build --chown=nodejs:nodejs /runtime /{project_slug}
+        // Copy entire project from build stage
+        // This ensures all runtime files are available (drizzle, config, mydata, locales, etc.)
+        // Alpine uses nodejs:nodejs user (uid 1001)
+        match build_system.monorepo_tool {
+            MonorepoTool::None => {
+                dockerfile.push_str(&format!(
+                    r#"# Copy entire project directory to ensure all runtime files are available
+# This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)
+COPY --from=build --chown=nodejs:nodejs /{project_slug} /{project_slug}
 "#,
-            project_slug = project_slug
-        ));
+                    project_slug = project_slug
+                ));
+            }
+            _ => {
+                // For monorepos, copy the subdirectory
+                dockerfile.push_str(&format!(
+                    r#"# Copy entire project directory to ensure all runtime files are available
+# This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)
+COPY --from=build --chown=nodejs:nodejs /{project_slug}/{relative_path} /{project_slug}
+"#,
+                    project_slug = project_slug,
+                    relative_path = relative_path
+                ));
+            }
+        }
 
         // Set environment (already running as nodejs user via USER directive)
         dockerfile.push_str(
@@ -473,17 +476,13 @@ mod tests {
         assert!(result.content.contains("# Change to project subdirectory"));
         assert!(result.content.contains("WORKDIR /test_project/apps/web"));
 
-        // Verify the final image copies only the runtime allowlist assembled in
-        // the build stage, never the complete monorepo subdirectory.
-        assert!(result.content.contains("# Assemble a minimal runtime tree"));
-        assert!(result.content.contains("node_modules .next public"));
+        // Verify entire project directory is copied in production stage (not selective files)
         assert!(result
             .content
-            .contains("drizzle prisma locales messages mydata"));
-        assert!(result
-            .content
-            .contains("COPY --from=build --chown=nodejs:nodejs /runtime /test_project"));
-        assert!(!result.content.contains(
+            .contains("# Copy entire project directory to ensure all runtime files are available"));
+        assert!(result.content.contains("# This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)"));
+        // Verify the copy is from the subdirectory path (apps/web) with nodejs user ownership
+        assert!(result.content.contains(
             "COPY --from=build --chown=nodejs:nodejs /test_project/apps/web /test_project"
         ));
 
@@ -525,12 +524,6 @@ mod tests {
 
         // Verify no subdirectory change
         assert!(!result.content.contains("# Change to project subdirectory"));
-        assert!(result
-            .content
-            .contains("COPY --from=build --chown=nodejs:nodejs /runtime /test_project"));
-        assert!(!result
-            .content
-            .contains("COPY --from=build --chown=nodejs:nodejs /test_project /test_project"));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();

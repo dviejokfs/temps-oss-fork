@@ -42,6 +42,7 @@
 //! via Docker. The only callers are processes inside the overlay
 //! network, which is precisely the trust boundary we want.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +51,7 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use parking_lot::RwLock;
 use rand::prelude::SliceRandom;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -84,7 +86,7 @@ const MAX_RETRIES: usize = 3;
 struct ProxyState {
     client: reqwest::Client,
     store: SharedRouteStore,
-    docker: bollard::Docker,
+    caller_identities: Arc<RwLock<HashMap<IpAddr, String>>>,
 }
 
 /// Spawn the proxy on `<bridge_ip>:80`. Returns once the listener is
@@ -113,12 +115,30 @@ pub async fn spawn(
         .build()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+    let initial_identities = load_source_identities(&docker)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let caller_identities = Arc::new(RwLock::new(initial_identities));
     let state = Arc::new(ProxyState {
         client,
         store,
-        docker,
+        caller_identities: Arc::clone(&caller_identities),
     });
     let app = axum::Router::new().fallback(handle).with_state(state);
+
+    let identity_shutdown = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tokio::select! {
+                _ = identity_shutdown.notified() => break,
+                _ = interval.tick() => match load_source_identities(&docker).await {
+                    Ok(snapshot) => *caller_identities.write() = snapshot,
+                    Err(error) => warn!(%error, "failed to refresh internal proxy caller identities"),
+                }
+            }
+        }
+    });
 
     tokio::spawn(async move {
         let server = axum::serve(
@@ -206,7 +226,7 @@ async fn caller_may_access_route(
     let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
         return false;
     };
-    let Some(container_id) = source_container_id(&state.docker, peer.ip()).await else {
+    let Some(container_id) = source_container_id(&state.caller_identities, peer.ip()) else {
         return false;
     };
     state
@@ -218,7 +238,16 @@ async fn caller_may_access_route(
 /// network attachment state is the authority for which container owns an IP;
 /// route destination addresses are not caller identity and may be hostnames or
 /// shared node addresses.
-async fn source_container_id(docker: &bollard::Docker, source_ip: IpAddr) -> Option<String> {
+fn source_container_id(
+    caller_identities: &RwLock<HashMap<IpAddr, String>>,
+    source_ip: IpAddr,
+) -> Option<String> {
+    caller_identities.read().get(&source_ip).cloned()
+}
+
+async fn load_source_identities(
+    docker: &bollard::Docker,
+) -> Result<HashMap<IpAddr, String>, bollard::errors::Error> {
     use bollard::query_parameters::ListContainersOptions;
 
     let containers = docker
@@ -226,34 +255,35 @@ async fn source_container_id(docker: &bollard::Docker, source_ip: IpAddr) -> Opt
             all: false,
             ..Default::default()
         }))
-        .await
-        .map_err(|error| {
-            warn!(%source_ip, %error, "failed to resolve internal proxy caller through Docker");
-            error
-        })
-        .ok()?;
+        .await?;
 
-    containers.into_iter().find_map(|container| {
-        let owns_source_ip = container
+    let mut identities = HashMap::new();
+    for container in containers {
+        let Some(container_id) = container.id else {
+            continue;
+        };
+        let Some(networks) = container
             .network_settings
             .as_ref()
             .and_then(|settings| settings.networks.as_ref())
-            .is_some_and(|networks| {
-                networks.values().any(|endpoint| {
-                    endpoint
-                        .ip_address
-                        .as_deref()
-                        .and_then(|value| value.parse::<IpAddr>().ok())
-                        .is_some_and(|ip| ip == source_ip)
-                        || endpoint
-                            .global_ipv6_address
-                            .as_deref()
-                            .and_then(|value| value.parse::<IpAddr>().ok())
-                            .is_some_and(|ip| ip == source_ip)
-                })
-            });
-        owns_source_ip.then_some(container.id).flatten()
-    })
+        else {
+            continue;
+        };
+        for endpoint in networks.values() {
+            for address in [
+                endpoint.ip_address.as_deref(),
+                endpoint.global_ipv6_address.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Ok(ip) = address.parse::<IpAddr>() {
+                    identities.insert(ip, container_id.clone());
+                }
+            }
+        }
+    }
+    Ok(identities)
 }
 
 /// True if the client requested a protocol upgrade. We check both the
@@ -766,5 +796,19 @@ mod tests {
         store.apply_snapshot(1, vec![target.clone()]);
 
         assert!(!store.container_id_has_project("unknown", 42));
+    }
+
+    #[test]
+    fn caller_identity_lookup_is_memory_only_and_fails_closed() {
+        let identities = RwLock::new(HashMap::from([(
+            "172.20.1.10".parse().unwrap(),
+            "container-alpha".to_string(),
+        )]));
+
+        assert_eq!(
+            source_container_id(&identities, "172.20.1.10".parse().unwrap()).as_deref(),
+            Some("container-alpha")
+        );
+        assert!(source_container_id(&identities, "172.20.1.99".parse().unwrap()).is_none());
     }
 }

@@ -554,15 +554,17 @@ impl NodeScheduler {
             || labels
                 .and_then(|selector| selector.as_object())
                 .is_some_and(|selector_map| !selector_map.is_empty());
-        if has_node_constraints && eligible_nodes.is_empty() && !architecture_exclusions.is_empty()
-        {
-            return Err(NodeError::PlacementConstraintsUnsatisfied {
-                excluded: architecture_exclusions
+        if has_node_constraints && eligible_nodes.is_empty() {
+            let excluded = if architecture_exclusions.is_empty() {
+                "no active node matched the requested node IDs or labels".to_string()
+            } else {
+                architecture_exclusions
                     .iter()
                     .map(|e| e.to_string())
                     .collect::<Vec<_>>()
-                    .join("; "),
-            });
+                    .join("; ")
+            };
+            return Err(NodeError::PlacementConstraintsUnsatisfied { excluded });
         }
         let compatible_slots = usize::from(local_compatible) + eligible_nodes.len();
         if anti_affinity
@@ -591,11 +593,6 @@ impl NodeScheduler {
                         .local_platform()
                         .unwrap_or_else(|| "unknown".to_string()),
                 });
-            }
-            if target_node_ids.is_some() {
-                tracing::warn!(
-                    "No active target nodes found for deployment, falling back to local deployment"
-                );
             }
             return Ok(SchedulingOutcome {
                 assignments: vec![NodeAssignment::Local; replica_count as usize],
@@ -1868,7 +1865,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_schedule_with_target_nodes_none_active_falls_back_to_local() {
+    async fn test_schedule_with_target_nodes_none_active_fails_closed() {
         let node_a = make_node(1, "worker-a");
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -1878,14 +1875,14 @@ mod tests {
         let scheduler = NodeScheduler::new(node_service);
 
         let target_ids = vec![99];
-        let assignments = scheduler
+        let error = scheduler
             .schedule_replicas(2, None, Some(&target_ids), false)
             .await
-            .unwrap();
-        assert_eq!(assignments.len(), 2);
-        for a in &assignments {
-            assert!(a.is_local());
-        }
+            .expect_err("explicit node constraints must never fall back to local");
+        assert!(matches!(
+            error,
+            NodeError::PlacementConstraintsUnsatisfied { .. }
+        ));
     }
 
     #[test]
@@ -2183,7 +2180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_schedule_with_labels_no_match_falls_back_to_local() {
+    async fn test_schedule_with_labels_no_match_fails_closed() {
         let node_eu = make_node_with_labels(1, "eu-worker", serde_json::json!({"region": "eu"}));
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -2193,17 +2190,14 @@ mod tests {
         let scheduler = NodeScheduler::new(node_service);
 
         let labels = serde_json::json!({"region": "us"});
-        let assignments = scheduler
+        let error = scheduler
             .schedule_replicas(2, Some(&labels), None, false)
             .await
-            .unwrap();
-        assert_eq!(assignments.len(), 2);
-        for a in &assignments {
-            assert!(
-                a.is_local(),
-                "Should fall back to local when no labels match"
-            );
-        }
+            .expect_err("label constraints must never fall back to local");
+        assert!(matches!(
+            error,
+            NodeError::PlacementConstraintsUnsatisfied { .. }
+        ));
     }
 
     // --- Anti-affinity tests ---

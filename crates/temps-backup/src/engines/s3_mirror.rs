@@ -27,7 +27,8 @@ use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 const ENGINE_KEY: &str = "s3_mirror";
-const MC_IMAGE: &str = "minio/mc:RELEASE.2025-08-13T08-35-41Z";
+const MC_IMAGE: &str =
+    "minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
 
 pub struct S3MirrorDeps {
     pub db: Arc<DatabaseConnection>,
@@ -318,7 +319,7 @@ mod image_tests {
     use super::MC_IMAGE;
 
     #[test]
-    fn credentialed_sidecar_uses_release_pinned_image() {
-        assert!(!MC_IMAGE.ends_with(":latest"));
+    fn credentialed_sidecar_uses_immutable_image() {
+        assert!(MC_IMAGE.contains("@sha256:"));
     }
 }

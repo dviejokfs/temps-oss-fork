@@ -9,7 +9,7 @@ use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
 use flate2::read::GzDecoder;
 use futures::TryStreamExt;
-use redis::{aio::ConnectionManager, AsyncCommands, Client};
+use redis::{aio::ConnectionManager, Client};
 use schemars::JsonSchema;
 use sea_orm::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -581,181 +581,18 @@ impl RedisService {
         Err(anyhow::anyhow!("Redis container health check timed out"))
     }
 
-    fn resource_mapping_key(resource_name: &str) -> String {
-        format!("_temps:redis_db_mapping:{resource_name}")
-    }
+    /// Calculate a deterministic database number (0-15) from a resource name
+    /// This allows us to allocate databases without requiring a Redis connection
+    fn calculate_database_number(&self, resource_name: &str) -> u8 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
-    fn database_owner_key(db_number: u8) -> String {
-        format!("_temps:redis_db_owner:{db_number}")
-    }
+        let mut hasher = DefaultHasher::new();
+        resource_name.hash(&mut hasher);
+        let hash = hasher.finish();
 
-    /// Allocate one of Redis DBs 1-15. DB 0 is reserved for allocation
-    /// metadata, preventing hash collisions from silently sharing data.
-    async fn allocate_database(&self, resource_name: &str) -> Result<u8> {
-        let mut conn = self.get_connection().await?;
-        redis::cmd("SELECT")
-            .arg(0)
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to select Redis metadata DB 0: {e}"))?;
-
-        let mapping_key = Self::resource_mapping_key(resource_name);
-        let existing: Option<u8> = conn.get(&mapping_key).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read Redis DB mapping for resource '{}': {}",
-                resource_name,
-                e
-            )
-        })?;
-        if let Some(db_number @ 1..=15) = existing {
-            let owner: Option<String> = conn
-                .get(Self::database_owner_key(db_number))
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to verify Redis DB {} mapping for resource '{}': {}",
-                        db_number,
-                        resource_name,
-                        e
-                    )
-                })?;
-            if owner.as_deref() == Some(resource_name) {
-                return Ok(db_number);
-            }
-            conn.del::<_, ()>(&mapping_key).await.map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to remove stale Redis DB mapping for resource '{}': {}",
-                    resource_name,
-                    e
-                )
-            })?;
-        }
-
-        for db_number in 1..=15 {
-            let owner_key = Self::database_owner_key(db_number);
-            let claimed: bool = conn.set_nx(&owner_key, resource_name).await.map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to claim Redis DB {} for resource '{}': {}",
-                    db_number,
-                    resource_name,
-                    e
-                )
-            })?;
-
-            if claimed {
-                if let Err(error) = conn.set::<_, _, ()>(&mapping_key, db_number).await {
-                    let _: redis::RedisResult<()> = conn.del(&owner_key).await;
-                    return Err(anyhow::anyhow!(
-                        "Failed to store Redis DB {} mapping for resource '{}': {}",
-                        db_number,
-                        resource_name,
-                        error
-                    ));
-                }
-                return Ok(db_number);
-            }
-
-            let owner: Option<String> = conn.get(&owner_key).await.map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to read Redis DB {} owner while allocating resource '{}': {}",
-                    db_number,
-                    resource_name,
-                    e
-                )
-            })?;
-            if owner.as_deref() == Some(resource_name) {
-                conn.set::<_, _, ()>(&mapping_key, db_number)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to restore Redis DB {} mapping for resource '{}': {}",
-                            db_number,
-                            resource_name,
-                            e
-                        )
-                    })?;
-                return Ok(db_number);
-            }
-        }
-
-        Err(anyhow::anyhow!(
-            "No Redis logical databases are available for resource '{}'; DB 0 is reserved for metadata and DBs 1-15 are already allocated",
-            resource_name
-        ))
-    }
-
-    async fn drop_database(&self, resource_name: &str) -> Result<()> {
-        let mut conn = self.get_connection().await?;
-        redis::cmd("SELECT")
-            .arg(0)
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to select Redis metadata DB 0: {e}"))?;
-
-        let mapping_key = Self::resource_mapping_key(resource_name);
-        let db_number: Option<u8> = conn.get(&mapping_key).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read Redis DB mapping for resource '{}': {}",
-                resource_name,
-                e
-            )
-        })?;
-        let Some(db_number @ 1..=15) = db_number else {
-            info!(
-                "No valid Redis database mapping found for resource '{}'; skipping deprovision",
-                resource_name
-            );
-            return Ok(());
-        };
-
-        let owner_key = Self::database_owner_key(db_number);
-        let owner: Option<String> = conn.get(&owner_key).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to verify Redis DB {} owner for resource '{}': {}",
-                db_number,
-                resource_name,
-                e
-            )
-        })?;
-        if owner.as_deref() != Some(resource_name) {
-            return Err(anyhow::anyhow!(
-                "Redis DB {} ownership mismatch while deprovisioning resource '{}'",
-                db_number,
-                resource_name
-            ));
-        }
-
-        redis::cmd("SELECT")
-            .arg(db_number)
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to select Redis DB {db_number}: {e}"))?;
-        redis::cmd("FLUSHDB")
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to flush Redis DB {db_number}: {e}"))?;
-        redis::cmd("SELECT")
-            .arg(0)
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to reselect Redis metadata DB 0: {e}"))?;
-
-        conn.del::<_, ()>(&mapping_key).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to delete Redis DB mapping for resource '{}': {}",
-                resource_name,
-                e
-            )
-        })?;
-        conn.del::<_, ()>(&owner_key).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to release Redis DB {} for resource '{}': {}",
-                db_number,
-                resource_name,
-                e
-            )
-        })?;
-        Ok(())
+        // Redis supports 16 databases (0-15), so we use modulo to get a valid number
+        (hash % 16) as u8
     }
 
     fn get_redis_config(&self, service_config: ServiceConfig) -> Result<RedisConfig> {
@@ -2087,7 +1924,9 @@ impl ExternalService for RedisService {
     ) -> Result<HashMap<String, String>> {
         let resource_name = format!("{}_{}", project_id, environment);
 
-        let db_number = self.allocate_database(&resource_name).await?;
+        // Calculate database number using a hash instead of requiring Redis connection
+        // This allows us to generate env vars before the service is started
+        let db_number = self.calculate_database_number(&resource_name);
 
         let mut env_vars = HashMap::new();
 
@@ -2323,9 +2162,11 @@ impl ExternalService for RedisService {
         Ok(env_vars)
     }
 
-    async fn deprovision_resource(&self, project_id: &str, environment: &str) -> Result<()> {
-        let resource_name = format!("{}_{}", project_id, environment);
-        self.drop_database(&resource_name).await
+    async fn deprovision_resource(&self, _project_id: &str, _environment: &str) -> Result<()> {
+        // No database-level deprovisioning needed
+        // Each project/environment gets a calculated database number (0-15) based on hash
+        // Cleanup would happen at the application level (flushing keys with specific prefixes)
+        Ok(())
     }
 
     /// Backup Redis data to S3.
@@ -2956,22 +2797,6 @@ impl ExternalService for RedisService {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn redis_database_allocation_metadata_is_namespaced_per_resource_and_database() {
-        assert_ne!(
-            RedisService::resource_mapping_key("project-a_prod"),
-            RedisService::resource_mapping_key("project-b_prod")
-        );
-        assert_eq!(
-            RedisService::database_owner_key(1),
-            "_temps:redis_db_owner:1"
-        );
-        assert_ne!(
-            RedisService::database_owner_key(1),
-            RedisService::database_owner_key(2)
-        );
-    }
 
     use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
 
