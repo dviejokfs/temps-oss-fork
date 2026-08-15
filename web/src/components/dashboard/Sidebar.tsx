@@ -122,6 +122,18 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
     ],
   },
   {
+    label: 'AI',
+    items: [
+      {
+        title: 'AI assistant',
+        url: '/chat',
+        icon: Sparkles,
+        activeWhen: (pathname) =>
+          AI_MODE_PREFIXES.some((prefix) => pathname.startsWith(prefix)),
+      },
+    ],
+  },
+  {
     label: 'Data',
     items: [
       { title: 'Databases', url: '/storage', icon: Database },

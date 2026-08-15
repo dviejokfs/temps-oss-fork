@@ -8,11 +8,14 @@ import {
   listBackupSchedulesOptions,
   listDnsProvidersOptions,
   listUsersOptions,
+  getAiProviderStatusOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from './useSettings'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 
 export interface ActivationSignals {
+  /** Active AI provider can serve requests */
+  aiConfigured: boolean
   /** Git provider connected and active */
   gitConnected: boolean
   /** At least one active wildcard domain in the database */
@@ -38,7 +41,7 @@ export interface ActivationSignals {
   totalCount: number
 }
 
-const TOTAL = 9
+const TOTAL = 10
 
 export function useActivationSignals(): ActivationSignals {
   const { data: settings, isLoading: settingsLoading } = useSettings()
@@ -84,11 +87,18 @@ export function useActivationSignals(): ActivationSignals {
     retry: false,
   })
 
+  const { data: aiProviderStatus, isLoading: aiProviderStatusLoading } =
+    useQuery({
+      ...getAiProviderStatusOptions(),
+      retry: false,
+    })
+
   // TEMP: pretend nothing is set up yet, for building the first-run
   // experience. See lib/devSimulate.ts. Placed after all hooks so hook order
   // stays stable.
   if (SIMULATE_EMPTY_INSTALL) {
     return {
+      aiConfigured: false,
       gitConnected: false,
       wildcardDomainReady: false,
       hasProject: false,
@@ -113,23 +123,24 @@ export function useActivationSignals(): ActivationSignals {
     !servicesLoading &&
     !backupSchedulesLoading &&
     !dnsProvidersLoading &&
-    !usersLoading
+    !usersLoading &&
+    !aiProviderStatusLoading
+
+  const aiConfigured = aiProviderStatus?.configured === true
 
   const gitConnected =
     (connections?.connections?.filter((c) => c.is_active).length ?? 0) > 0
 
   const wildcardDomainReady =
-    domainsData?.domains?.some(
-      (d) => d.is_wildcard && d.status === 'active'
-    ) ?? false
+    domainsData?.domains?.some((d) => d.is_wildcard && d.status === 'active') ??
+    false
 
   const hasProject = (projectsData?.projects?.length ?? 0) > 0
 
   const externalUrlSet = !!settings?.external_url
 
   const notificationsConfigured =
-    Array.isArray(providersData) &&
-    providersData.some((p) => p.enabled)
+    Array.isArray(providersData) && providersData.some((p) => p.enabled)
 
   const hasDatabase = (servicesData?.length ?? 0) > 0
 
@@ -142,6 +153,7 @@ export function useActivationSignals(): ActivationSignals {
   const teamInvited = (usersData?.length ?? 0) > 1
 
   const completed = [
+    aiConfigured,
     gitConnected,
     wildcardDomainReady,
     hasProject,
@@ -154,6 +166,7 @@ export function useActivationSignals(): ActivationSignals {
   ].filter(Boolean).length
 
   return {
+    aiConfigured,
     gitConnected,
     wildcardDomainReady,
     hasProject,

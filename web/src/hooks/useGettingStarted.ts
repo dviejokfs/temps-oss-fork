@@ -21,9 +21,19 @@ export function useGettingStarted() {
 
   const items: GettingStartedItem[] = [
     {
+      key: 'ai',
+      label: 'Start using AI',
+      description:
+        'Connect a provider, add Temps skills, and authenticate Bunx against this instance.',
+      done: signals.aiConfigured,
+      href: '/setup/ai',
+      cta: 'Set up AI',
+    },
+    {
       key: 'git',
       label: 'Connect a Git provider',
-      description: 'Link GitHub, GitLab, or Bitbucket to enable git-push deploys.',
+      description:
+        'Link GitHub, GitLab, or Bitbucket to enable git-push deploys.',
       done: signals.gitConnected,
       // Navigate to the full page rather than a modal — the in-modal
       // GitProviderFlow overflows on smaller viewports (horizontal scroll).
@@ -51,7 +61,8 @@ export function useGettingStarted() {
     {
       key: 'notifications',
       label: 'Configure notifications',
-      description: 'Get alerted on Slack, email, or webhook when deployments fail.',
+      description:
+        'Get alerted on Slack, email, or webhook when deployments fail.',
       done: signals.notificationsConfigured,
       href: '/settings/notifications',
       cta: 'Set up',
