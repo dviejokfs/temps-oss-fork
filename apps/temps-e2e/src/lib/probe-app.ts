@@ -220,8 +220,18 @@ export async function buildHaProbeImage(opts: {
   await writeFile(join(ctxDir, 'main.go'), MAIN_GO_PGX, 'utf8')
   await writeFile(join(ctxDir, 'Dockerfile'), DOCKERFILE, 'utf8')
 
-  opts.onLog?.(`docker build -t ${imageRef} ${ctxDir}`)
-  await runDocker(['build', '--load', '-t', imageRef, ctxDir], opts.onLog, `docker build ${imageRef}`)
+  // This HA probe can be transferred with `docker save` into a nested Docker
+  // daemon. BuildKit's default provenance attestation wraps a single-platform
+  // image in an image index when the runner uses the containerd image store.
+  // That index is not preserved portably by the save/load hand-off and newer
+  // daemons reject it during signature-chain validation. The probe does not
+  // publish supply-chain artifacts, so emit a plain single-platform image.
+  opts.onLog?.(`docker build --provenance=false -t ${imageRef} ${ctxDir}`)
+  await runDocker(
+    ['build', '--load', '--provenance=false', '-t', imageRef, ctxDir],
+    opts.onLog,
+    `docker build ${imageRef}`,
+  )
   if (opts.push !== false) {
     opts.onLog?.(`docker push ${imageRef}`)
     await runDocker(['push', imageRef], opts.onLog, `docker push ${imageRef}`)
