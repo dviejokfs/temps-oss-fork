@@ -18,22 +18,10 @@ use temps_entities::{external_services, postgres_major_upgrades};
 use temps_logs::LogService;
 use uuid::Uuid;
 
-use crate::externalsvc::postgres::validate_postgres_docker_image;
 use crate::externalsvc::postgres_upgrade::{
-    phase, status, validate_os_family, PostgresContainerLifecycle, PostgresUpgradeError,
+    phase, status, validate_image_transition, PostgresContainerLifecycle, PostgresUpgradeError,
     PostgresUpgradeOrchestrator, PreUpgradeBackupProvider,
 };
-
-fn image_major_version(image: &str) -> Option<u32> {
-    image
-        .rsplit_once(':')
-        .map(|(_, tag)| tag)?
-        .trim_start_matches("pg")
-        .split(['-', '.'])
-        .next()?
-        .parse()
-        .ok()
-}
 
 fn validate_configured_source_image(
     req: &StartMajorUpgradeRequest,
@@ -64,43 +52,13 @@ pub fn validate_start_request(
         });
     }
 
-    for image in [&req.from_image, &req.to_image] {
-        validate_postgres_docker_image(image).map_err(|_| {
-            PostgresUpgradeError::UnsupportedImage {
-                service_id: req.service_id,
-                image: image.clone(),
-            }
-        })?;
-    }
-
-    validate_os_family(req.service_id, &req.from_image, &req.to_image)?;
-
-    let from_n: u32 = req.from_version.parse().unwrap_or(0);
-    let to_n: u32 = req.to_version.parse().unwrap_or(0);
-    if to_n == 0 || from_n == 0 || to_n <= from_n {
-        return Err(PostgresUpgradeError::InvalidVersionTransition {
-            service_id: req.service_id,
-            from_version: req.from_version.clone(),
-            to_version: req.to_version.clone(),
-            reason: "to_version must be a greater major version than from_version".into(),
-        });
-    }
-
-    for (image, declared_version) in [(&req.from_image, from_n), (&req.to_image, to_n)] {
-        if image_major_version(image) != Some(declared_version) {
-            return Err(PostgresUpgradeError::InvalidVersionTransition {
-                service_id: req.service_id,
-                from_version: req.from_version.clone(),
-                to_version: req.to_version.clone(),
-                reason: format!(
-                    "image '{}' does not match its declared major version {}",
-                    image, declared_version
-                ),
-            });
-        }
-    }
-
-    Ok(())
+    validate_image_transition(
+        req.service_id,
+        &req.from_version,
+        &req.to_version,
+        &req.from_image,
+        &req.to_image,
+    )
 }
 
 /// Request payload for starting a major-version upgrade.

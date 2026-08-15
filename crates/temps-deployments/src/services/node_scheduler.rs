@@ -316,6 +316,14 @@ impl NodeScheduler {
             .list_active(self.heartbeat_threshold_secs)
             .await?;
 
+        let selector_map = labels
+            .map(|selector| {
+                selector.as_object().ok_or_else(|| NodeError::Validation {
+                    message: "target_labels must be a JSON object".to_string(),
+                })
+            })
+            .transpose()?;
+
         let mut platforms: Vec<String> = Vec::new();
         for node in active_nodes {
             if let Some(target_ids) = target_node_ids {
@@ -323,10 +331,8 @@ impl NodeScheduler {
                     continue;
                 }
             }
-            if let Some(selector) = labels {
-                if selector.as_object().map(|m| !m.is_empty()).unwrap_or(false)
-                    && !node_matches_labels(&node.labels, selector)
-                {
+            if let (Some(selector), Some(selector_map)) = (labels, selector_map) {
+                if !selector_map.is_empty() && !node_matches_labels(&node.labels, selector) {
                     continue;
                 }
             }
@@ -450,6 +456,14 @@ impl NodeScheduler {
             .list_active(self.heartbeat_threshold_secs)
             .await?;
 
+        let selector_map = labels
+            .map(|selector| {
+                selector.as_object().ok_or_else(|| NodeError::Validation {
+                    message: "target_labels must be a JSON object".to_string(),
+                })
+            })
+            .transpose()?;
+
         // Filter by target node IDs if specified
         let mut eligible_nodes: Vec<_> = if let Some(target_ids) = target_node_ids {
             active_nodes
@@ -461,11 +475,9 @@ impl NodeScheduler {
         };
 
         // Filter by label selectors if specified
-        if let Some(selector) = labels {
-            if let Some(selector_map) = selector.as_object() {
-                if !selector_map.is_empty() {
-                    eligible_nodes.retain(|node| node_matches_labels(&node.labels, selector));
-                }
+        if let (Some(selector), Some(selector_map)) = (labels, selector_map) {
+            if !selector_map.is_empty() {
+                eligible_nodes.retain(|node| node_matches_labels(&node.labels, selector));
             }
         }
 
@@ -551,9 +563,7 @@ impl NodeScheduler {
         let architecture_exclusions: Vec<&NodeExclusion> =
             exclusions.iter().filter(|e| e.excluded).collect();
         let has_node_constraints = target_node_ids.is_some()
-            || labels
-                .and_then(|selector| selector.as_object())
-                .is_some_and(|selector_map| !selector_map.is_empty());
+            || selector_map.is_some_and(|selector_map| !selector_map.is_empty());
         if has_node_constraints && eligible_nodes.is_empty() {
             let excluded = if architecture_exclusions.is_empty() {
                 "no active node matched the requested node IDs or labels".to_string()
@@ -913,7 +923,7 @@ fn schedule_anti_affinity_least_loaded(
 fn node_matches_labels(node_labels: &serde_json::Value, selector: &serde_json::Value) -> bool {
     let selector_map = match selector.as_object() {
         Some(m) => m,
-        None => return true, // Non-object selector matches everything
+        None => return false, // Public scheduling entry points reject malformed selectors.
     };
 
     let node_map = match node_labels.as_object() {
@@ -2207,6 +2217,22 @@ mod tests {
             error,
             NodeError::PlacementConstraintsUnsatisfied { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_malformed_label_selector_fails_closed() {
+        let node = make_node_with_labels(1, "worker", serde_json::json!({"region": "us"}));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node]])
+            .into_connection();
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))));
+        let malformed = serde_json::json!(["region", "us"]);
+
+        let error = scheduler
+            .schedule_replicas(1, Some(&malformed), None, false)
+            .await
+            .expect_err("a malformed selector must never become unconstrained");
+        assert!(matches!(error, NodeError::Validation { .. }));
     }
 
     // --- Anti-affinity tests ---

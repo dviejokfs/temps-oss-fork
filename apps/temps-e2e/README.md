@@ -216,8 +216,8 @@ bun run src/index.ts backup-restore-scenario --registry localhost:5111
 # wait time so a WAL segment actually archives -- see the steps section below.
 bun run src/index.ts pitr-scenario --registry localhost:5111
 
-# pg-upgrade: Postgres major-version upgrade (16 → 17) -- provision a service
-# pinned to gotempsh/postgres-walg:16-bookworm, write 5 marker rows, trigger the upgrade
+# pg-upgrade: Postgres major-version upgrade (17 → 18) -- provision a service
+# pinned to timescale/timescaledb-ha:pg17, write 5 marker rows, trigger the upgrade
 # (pre_backup → snapshot → dump → new_container → restore → swap → analyze),
 # and prove via the read-only data-browser API that the marker rows survived
 # the pg_dumpall → psql restore cycle. Needs MinIO (docker-compose.e2e.yml).
@@ -891,13 +891,13 @@ reading the rows back after it finishes, not just watching a status field flip.
 1. build + push the db-probe Go app (`lib/probe-app.ts`) -- the same app
    `backup-restore-scenario` and `pitr-scenario` use. On every `/probe` hit
    it inserts a row into `e2e_probe` and returns the total count
-2. provision a real standalone Postgres service pinned to `gotempsh/postgres-walg:16-bookworm`
-   via `parameters.docker_image` at creation time. Platform-reviewed WAL-G
-   images are used; `extract_postgres_version("gotempsh/postgres-walg:16-bookworm")` returns
-   `"16"` and PGDATA is set to `/var/lib/postgresql/16/docker`. The explicit
+2. provision a real standalone Postgres service pinned to `timescale/timescaledb-ha:pg17`
+   via `parameters.docker_image` at creation time. Published, platform-reviewed
+   images are used; `extract_postgres_version("timescale/timescaledb-ha:pg17")` returns
+   `"17"`. The explicit
    pin is required because the upgrade API validates that `to_version > from_version`
    and both images are on the same OS family (Alpine ↔ Alpine, Debian ↔ Debian)
-   -- using the platform default 18-bookworm image would leave nowhere to
+   -- using the platform default PostgreSQL 18 image would leave nowhere to
    upgrade to in an e2e test
 3. create a **default** S3 source (`is_default: true`) pointed at the local
    MinIO. `phase_pre_backup` in the orchestrator calls
@@ -912,8 +912,8 @@ reading the rows back after it finishes, not just watching a status field flip.
    `normalize_database_name("{project_slug}_{env_slug}")` as computed by
    `normalizePostgresDatabaseName` in `flows.ts`
 6. `POST /external-services/{service_id}/upgrades` with
-   from_version="16" / to_version="17" / from_image="gotempsh/postgres-walg:16-bookworm" /
-   to_image="gotempsh/postgres-walg:17-bookworm". The orchestrator spawns a
+   from_version="17" / to_version="18" / from_image="timescale/timescaledb-ha:pg17" /
+   to_image="timescale/timescaledb-ha:pg18". The orchestrator spawns a
    tokio task and returns immediately with status="pending". It then runs
    seven real phases synchronously:
      - `pre_backup`: wal-g backup to the default MinIO S3 source (safety net)
@@ -922,7 +922,7 @@ reading the rows back after it finishes, not just watching a status field flip.
      - `dump`: boot throwaway old-version container with rollback volume
        mounted, run `pg_dumpall`, write dump to a separate volume
      - `new_container`: `lifecycle.create_and_start(service_id, to_image)` --
-       boots a fresh 17-bookworm container (empty data volume → initdb)
+       boots a fresh PostgreSQL 18 container (empty data volume → initdb)
      - `restore`: boot a psql container with the dump volume, run
        `psql < data.sql` against the new container
      - `swap`: persist `to_image` onto the service's `parameters.docker_image`
@@ -946,7 +946,7 @@ reading the rows back after it finishes, not just watching a status field flip.
    PITR does (WAL-logged `SEQ_LOG_VALS` advance), so we assert count and
    monotonicity, not the exact new id
 10. assert `GET /external-services/{id}`'s `current_parameters.docker_image`
-    now equals `gotempsh/postgres-walg:17-bookworm`. `phase_swap` calls
+    now equals `timescale/timescaledb-ha:pg18`. `phase_swap` calls
     `lifecycle.set_docker_image` which persists the new image into
     `external_services.parameters`; this checks the API-visible result
 11. teardown (deployment, project, service, S3 source)

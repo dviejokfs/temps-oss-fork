@@ -393,6 +393,63 @@ pub fn validate_os_family(
     })
 }
 
+fn image_major_version(image: &str) -> Option<u32> {
+    image
+        .rsplit_once(':')
+        .map(|(_, tag)| tag)?
+        .trim_start_matches("pg")
+        .split(['-', '.'])
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Validate every image/version invariant needed before an upgrade row may
+/// execute. This is shared by request validation, retry/resumption, and
+/// rollback so legacy or manually modified rows cannot bypass the checks.
+pub fn validate_image_transition(
+    service_id: i32,
+    from_version: &str,
+    to_version: &str,
+    from_image: &str,
+    to_image: &str,
+) -> Result<(), PostgresUpgradeError> {
+    for image in [from_image, to_image] {
+        super::postgres::validate_postgres_docker_image(image).map_err(|_| {
+            PostgresUpgradeError::UnsupportedImage {
+                service_id,
+                image: image.to_string(),
+            }
+        })?;
+    }
+    validate_os_family(service_id, from_image, to_image)?;
+
+    let from_major = from_version.parse::<u32>().unwrap_or(0);
+    let to_major = to_version.parse::<u32>().unwrap_or(0);
+    if from_major == 0 || to_major == 0 || to_major <= from_major {
+        return Err(PostgresUpgradeError::InvalidVersionTransition {
+            service_id,
+            from_version: from_version.to_string(),
+            to_version: to_version.to_string(),
+            reason: "to_version must be a greater major version than from_version".into(),
+        });
+    }
+    for (image, declared_version) in [(from_image, from_major), (to_image, to_major)] {
+        if image_major_version(image) != Some(declared_version) {
+            return Err(PostgresUpgradeError::InvalidVersionTransition {
+                service_id,
+                from_version: from_version.to_string(),
+                to_version: to_version.to_string(),
+                reason: format!(
+                    "image '{}' does not match its declared major version {}",
+                    image, declared_version
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_phase_config_image(
     service_id: i32,
     current_phase: &str,
@@ -417,6 +474,28 @@ fn validate_phase_config_image(
         service_id,
         configured_image: configured_image.to_string(),
         expected_image,
+    })
+}
+
+fn validate_rollback_config_image(
+    service_id: i32,
+    rollback_status: &str,
+    configured_image: &str,
+    from_image: &str,
+    to_image: &str,
+) -> Result<(), PostgresUpgradeError> {
+    let retrying = rollback_status == status::ROLLING_BACK;
+    if configured_image == to_image || (retrying && configured_image == from_image) {
+        return Ok(());
+    }
+    Err(PostgresUpgradeError::SourceImageMismatch {
+        service_id,
+        configured_image: configured_image.to_string(),
+        expected_image: if retrying {
+            format!("{} or {}", to_image, from_image)
+        } else {
+            to_image.to_string()
+        },
     })
 }
 
@@ -556,16 +635,15 @@ impl PostgresUpgradeOrchestrator {
     pub async fn run(&self, upgrade_id: i32) -> Result<(), PostgresUpgradeError> {
         let mut row = self.load_upgrade(upgrade_id).await?;
 
-        // Defense in depth for retries and boot-time resumption: never execute
-        // images from a legacy or manually inserted upgrade row.
-        for image in [&row.from_image, &row.to_image] {
-            super::postgres::validate_postgres_docker_image(image).map_err(|_| {
-                PostgresUpgradeError::UnsupportedImage {
-                    service_id: row.service_id,
-                    image: image.clone(),
-                }
-            })?;
-        }
+        // Defense in depth for retries and boot-time resumption: legacy or
+        // manually modified rows must satisfy the same invariants as requests.
+        validate_image_transition(
+            row.service_id,
+            &row.from_version,
+            &row.to_version,
+            &row.from_image,
+            &row.to_image,
+        )?;
         self.validate_service_image(&row).await?;
 
         // Honour a cancel that arrived before we even started dispatching.
@@ -587,7 +665,13 @@ impl PostgresUpgradeOrchestrator {
 
         // Every phase transition re-validates OS family — cheap, and guards
         // against the service's Docker image being edited mid-upgrade.
-        validate_os_family(row.service_id, &row.from_image, &row.to_image)?;
+        validate_image_transition(
+            row.service_id,
+            &row.from_version,
+            &row.to_version,
+            &row.from_image,
+            &row.to_image,
+        )?;
 
         // Dispatch loop — each phase method advances `phase` on success.
         // On failure, the phase method itself writes status=failed + error_message.
@@ -942,6 +1026,11 @@ impl PostgresUpgradeOrchestrator {
                 &dump_container,
                 vec!["sh".to_string(), "-c".to_string(), dump_cmd],
                 Some(&conn.password),
+                // Some reviewed images run as a non-root UID whose primary
+                // group cannot write a freshly-created Docker volume. The
+                // dump client does not need to run as the database server
+                // user; root writes a world-readable SQL file for restore.
+                Some("0"),
             )
             .await;
 
@@ -1265,13 +1354,19 @@ impl PostgresUpgradeOrchestrator {
             "ANALYZE;".to_string(),
         ];
 
-        self.exec_and_wait(row, &container_name, analyze_cmd, Some(&conn.password))
-            .await
-            .map_err(|reason| PostgresUpgradeError::AnalyzeFailed {
-                upgrade_id: row.id,
-                service_id: row.service_id,
-                reason,
-            })?;
+        self.exec_and_wait(
+            row,
+            &container_name,
+            analyze_cmd,
+            Some(&conn.password),
+            None,
+        )
+        .await
+        .map_err(|reason| PostgresUpgradeError::AnalyzeFailed {
+            upgrade_id: row.id,
+            service_id: row.service_id,
+            reason,
+        })?;
 
         self.log_info(&row.log_id, "phase=analyze done").await?;
         self.advance_phase(row.id, phase::COMPLETED).await?;
@@ -1464,6 +1559,7 @@ impl PostgresUpgradeOrchestrator {
         container: &str,
         cmd: Vec<String>,
         pgpassword: Option<&str>,
+        user: Option<&str>,
     ) -> Result<(), String> {
         let env = pgpassword.map(|p| vec![format!("PGPASSWORD={}", p)]);
         let exec = self
@@ -1473,6 +1569,7 @@ impl PostgresUpgradeOrchestrator {
                 bollard::models::ExecConfig {
                     cmd: Some(cmd.clone()),
                     env,
+                    user: user.map(str::to_string),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     ..Default::default()
@@ -1489,10 +1586,12 @@ impl PostgresUpgradeOrchestrator {
             .start_exec(&exec.id, None)
             .await
             .map_err(|e| format!("start_exec: {}", e))?;
+        let mut exec_output = String::new();
         if let bollard::exec::StartExecResults::Attached { mut output, .. } = stream {
             while let Some(chunk) = output.next().await {
                 if let Ok(msg) = chunk {
                     let text = msg.to_string();
+                    exec_output.push_str(&text);
                     if !text.trim().is_empty() {
                         let _ = self
                             .log_service
@@ -1515,7 +1614,18 @@ impl PostgresUpgradeOrchestrator {
                     if info.running == Some(false) {
                         match info.exit_code {
                             Some(0) => return Ok(()),
-                            Some(code) => return Err(format!("exec exited with code {}", code)),
+                            Some(code) => {
+                                let diagnostic = exec_output.trim();
+                                return Err(if diagnostic.is_empty() {
+                                    format!("exec exited with code {}", code)
+                                } else {
+                                    format!(
+                                        "exec exited with code {}: {}",
+                                        code,
+                                        diagnostic.chars().take(2_000).collect::<String>()
+                                    )
+                                });
+                            }
                             None => return Err("exec finished with no exit code".to_string()),
                         }
                     }
@@ -1966,6 +2076,14 @@ impl PostgresUpgradeOrchestrator {
     ) -> Result<postgres_major_upgrades::Model, PostgresUpgradeError> {
         let row = self.load_upgrade(upgrade_id).await?;
 
+        validate_image_transition(
+            row.service_id,
+            &row.from_version,
+            &row.to_version,
+            &row.from_image,
+            &row.to_image,
+        )?;
+
         // Preconditions. ROLLING_BACK is accepted alongside COMPLETED so a
         // rollback that failed partway (leaving the row stuck in
         // ROLLING_BACK) can be retried through this same entry point —
@@ -1979,6 +2097,21 @@ impl PostgresUpgradeOrchestrator {
                 ),
             });
         }
+        let configured_image =
+            self.lifecycle
+                .docker_image(row.service_id)
+                .await
+                .map_err(|reason| PostgresUpgradeError::ServiceConfiguration {
+                    service_id: row.service_id,
+                    reason,
+                })?;
+        validate_rollback_config_image(
+            row.service_id,
+            &row.status,
+            &configured_image,
+            &row.from_image,
+            &row.to_image,
+        )?;
         let rollback_volume = row.rollback_volume_name.clone().ok_or_else(|| {
             PostgresUpgradeError::NotRollbackable {
                 upgrade_id,
@@ -2344,6 +2477,40 @@ mod tests {
         ));
         validate_phase_config_image(1, phase::ANALYZE, to, from, to)
             .expect("analyze must use the persisted target image");
+    }
+
+    #[test]
+    fn resumed_rows_revalidate_image_versions_and_direction() {
+        let from = "gotempsh/postgres-walg:17-bookworm";
+        let to = "gotempsh/postgres-walg:16-bookworm";
+        assert!(matches!(
+            validate_image_transition(1, "17", "16", from, to),
+            Err(PostgresUpgradeError::InvalidVersionTransition { .. })
+        ));
+        assert!(matches!(
+            validate_image_transition(1, "16", "17", from, to),
+            Err(PostgresUpgradeError::InvalidVersionTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn rollback_image_validation_is_phase_aware_and_fail_closed() {
+        let from = "gotempsh/postgres-walg:16-bookworm";
+        let to = "gotempsh/postgres-walg:17-bookworm";
+
+        validate_rollback_config_image(1, status::COMPLETED, to, from, to)
+            .expect("a fresh rollback starts from the target image");
+        assert!(validate_rollback_config_image(1, status::COMPLETED, from, from, to).is_err());
+        validate_rollback_config_image(1, status::ROLLING_BACK, from, from, to)
+            .expect("a rollback retry may resume after persisting the source image");
+        assert!(validate_rollback_config_image(
+            1,
+            status::ROLLING_BACK,
+            "postgres:latest",
+            from,
+            to
+        )
+        .is_err());
     }
 
     #[test]
@@ -3230,8 +3397,8 @@ mod tests {
     // * Cleanup is best-effort per-test via `Drop` plus an explicit
     //   `cleanup()` call. Tests that panic leak Docker resources; CI
     //   reaps them via a `temps_upgrade_test_*` label prune.
-    // * Images are `postgres:17-bookworm` → `postgres:18-bookworm` (official
-    //   images, not gotempsh). Cheaper to pull, no registry auth needed.
+    // * Images use the published, reviewed Timescale PostgreSQL 17/18 range
+    //   accepted by production.
     //
     // Run subset:
     //     cargo test -p temps-providers --features docker-tests \
@@ -3265,9 +3432,9 @@ mod tests {
 
         /// Images used by every integration test. Keep in sync with the
         /// stable range supported by the upgrade orchestrator.
-        pub const FROM_IMAGE: &str = "postgres:17-bookworm";
+        pub const FROM_IMAGE: &str = "timescale/timescaledb-ha:pg17";
         pub const FROM_VERSION: &str = "17";
-        pub const TO_IMAGE: &str = "postgres:18-bookworm";
+        pub const TO_IMAGE: &str = "timescale/timescaledb-ha:pg18";
         pub const TO_VERSION: &str = "18";
 
         /// Return `Some(docker)` if a Docker daemon responds; `None` if the
@@ -3323,7 +3490,7 @@ mod tests {
         }
 
         impl UpgradeTestCtx {
-            /// Spin up a fresh DB schema, a single `postgres:17-bookworm`
+            /// Spin up a fresh DB schema, a single reviewed Timescale PostgreSQL 17
             /// service row, and its container on the app network. Blocks
             /// until Postgres accepts connections.
             pub async fn new(test_name: &str) -> Self {
@@ -4583,47 +4750,26 @@ mod tests {
             ctx.psql_exec("CREATE TABLE dump_probe(id INT)").await?;
             ctx.psql_exec("INSERT INTO dump_probe VALUES (1),(2),(3)").await?;
 
-            // Drive phases PRE_BACKUP + SNAPSHOT via run() by inserting at
-            // PRE_BACKUP. We need the rollback volume in place for dump.
-            // But run() will go through ALL phases — we want to stop after
-            // dump. Simpler: execute snapshot manually by inserting at
-            // SNAPSHOT and running run() with a guard.
-            //
-            // Alternative: insert at DUMP after manually setting up the
-            // rollback volume. But that's brittle. We pick the first
-            // approach: run() until phase advances PAST dump, then reset
-            // phase to DUMP for a replay.
-
-            let upgrade_id = ctx.insert_upgrade_row(phase::PRE_BACKUP).await;
+            let upgrade_id = ctx.insert_upgrade_row(phase::SNAPSHOT).await;
             let rollback_vol =
                 format!("postgres-{}_data_rollback_{}", ctx.service_name, upgrade_id);
             let dump_vol =
                 format!("postgres-{}_pgdump_{}", ctx.service_name, upgrade_id);
             let orch = ctx.orchestrator(backup_provider, lifecycle);
 
-            // Run 1: run() goes through pre_backup → snapshot → dump
-            // → new_container → restore → swap → analyze → completed.
-            // That's the full upgrade. On completion, reset phase to DUMP
-            // and re-run — but that won't work cleanly because the service
-            // is now on v18 and the rollback volume has v17 PGDATA. We
-            // need a narrower test.
-            //
-            // Better: manually step to SNAPSHOT and stop there. We run
-            // run() with a status=cancelled injection after snapshot.
-            // Simplest: drive run() once, capture the TIME elapsed for
-            // dump. Then set phase=DUMP + status=running and re-run.
-            // The re-run will short-circuit dump (marker present) but
-            // then try to continue through new_container → restore →
-            // swap → analyze — all already done; those phases' idempotency
-            // is tested separately, we just assert dump is fast on retry.
-            //
-            // We instrument elapsed time of the `phase=dump` portion by
-            // timestamping DB row reads. Before first run, phase=PRE_BACKUP;
-            // once phase transitions away from DUMP, dump is done.
-
+            // Drive only the two phases needed for this test. Keeping the
+            // authoritative service image on FROM_IMAGE makes the simulated
+            // DUMP retry valid under the phase-aware security guard.
+            let snapshot_row = load_upgrade(ctx.test_db.db.as_ref(), upgrade_id).await;
+            orch.phase_snapshot(&snapshot_row)
+                .await
+                .map_err(|e| format!("snapshot: {}", e))?;
+            let first_dump_row = load_upgrade(ctx.test_db.db.as_ref(), upgrade_id).await;
             let run_start = std::time::Instant::now();
-            orch.run(upgrade_id).await.map_err(|e| format!("first run: {}", e))?;
-            let full_run_ms = run_start.elapsed().as_millis();
+            orch.phase_dump(&first_dump_row)
+                .await
+                .map_err(|e| format!("first dump: {}", e))?;
+            let first_dump_ms = run_start.elapsed().as_millis();
 
             // Marker must be present after a successful dump.
             // We re-check via dump_marker_present by calling the helper —
@@ -4633,26 +4779,21 @@ mod tests {
                 .await
                 .map_err(|e| format!("expected dump volume: {}", e))?;
 
-            // Reset phase to DUMP and status back to running, then re-run.
+            // Reset only the durable phase, simulating a crash after the
+            // marker write but before the phase transition committed.
             let row = load_upgrade(ctx.test_db.db.as_ref(), upgrade_id).await;
             let mut active: postgres_major_upgrades::ActiveModel = row.into();
             active.phase = Set(phase::DUMP.to_string());
             active.status = Set(status::RUNNING.to_string());
-            active.finished_at = Set(None);
             active.update(ctx.test_db.db.as_ref()).await.map_err(|e| e.to_string())?;
 
-            // Re-run. Because dump short-circuits on marker and the
-            // subsequent idempotent phases are no-ops on already-done
-            // state, the whole retry should complete FAST (< 60s typ).
+            // Re-run only DUMP. The marker makes this a fast no-op that
+            // advances back to NEW_CONTAINER.
             let retry_start = std::time::Instant::now();
-            let orch2 = ctx.orchestrator(
-                Arc::new(StubBackupProvider::new(ctx.test_db.db.clone())),
-                ctx.lifecycle_adapter.clone(),
-            );
-            orch2
-                .run(upgrade_id)
+            let retry_row = load_upgrade(ctx.test_db.db.as_ref(), upgrade_id).await;
+            orch.phase_dump(&retry_row)
                 .await
-                .map_err(|e| format!("retry run: {}", e))?;
+                .map_err(|e| format!("retry dump: {}", e))?;
             let retry_ms = retry_start.elapsed().as_millis();
 
             // A full first run includes real pg_dumpall + restore (slow).
@@ -4660,18 +4801,18 @@ mod tests {
             // writes plus at most a container restart, so must be
             // materially faster. We require retry < 0.5 * full_run to
             // give the assertion headroom for noisy CI runners.
-            if retry_ms >= full_run_ms {
+            if retry_ms >= first_dump_ms {
                 return Err(format!(
-                    "retry not materially faster: full={}ms retry={}ms — dump idempotency may be broken",
-                    full_run_ms, retry_ms
+                    "retry not materially faster: first_dump={}ms retry={}ms — dump idempotency may be broken",
+                    first_dump_ms, retry_ms
                 ));
             }
 
             let final_row = load_upgrade(ctx.test_db.db.as_ref(), upgrade_id).await;
-            if final_row.status != status::COMPLETED {
+            if final_row.phase != phase::NEW_CONTAINER {
                 return Err(format!(
-                    "retry left row in status={}, expected COMPLETED",
-                    final_row.status
+                    "retry left row in phase={}, expected NEW_CONTAINER",
+                    final_row.phase
                 ));
             }
 
