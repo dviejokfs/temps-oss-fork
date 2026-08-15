@@ -38,13 +38,24 @@ export type ActiveVisitor = {
     visitor_id?: string | null;
 };
 
+export type ActiveVisitorCountResponse = {
+    active_visitors: number;
+    window_minutes: number;
+};
+
+/**
+ * Query parameters for active visitors endpoint
+ */
 export type ActiveVisitorsQuery = {
     deployment_id?: number | null;
     environment_id?: number | null;
+    project_id: number;
+    window_minutes?: number | null;
 };
 
 export type ActiveVisitorsResponse = {
-    active_visitors: number;
+    count: number;
+    visitors: Array<ActiveVisitor>;
     window_minutes: number;
 };
 
@@ -228,6 +239,11 @@ export type AddManagedDomainApiRequest = {
      * Opt in to reconciling generated hostnames into this domain's DNS zone.
      */
     sync_generated_records?: boolean;
+};
+
+export type AddProviderModelRequest = {
+    display_name?: string | null;
+    model_id: string;
 };
 
 export type AdminGateResponse = {
@@ -745,6 +761,10 @@ export type AiModelOptionDto = {
     id: string;
     name: string;
     thinking_options: Array<AiSelectOptionDto>;
+    /**
+     * Model-specific reasoning options valid while project-chat function tools are attached. Omitted when the normal options also apply.
+     */
+    tool_thinking_options?: Array<AiSelectOptionDto>;
 };
 
 /**
@@ -816,6 +836,10 @@ export type AiProviderStatusResponse = {
      */
     setup_path?: string | null;
     /**
+     * Instance-wide defaults inherited by all server-authored AI summaries.
+     */
+    summary_preference: AiSummaryPreferenceDto;
+    /**
      * Whether the active adapter's normalized realtime contract exposes tool
      * events. Kept under the legacy field name for API compatibility.
      */
@@ -847,6 +871,22 @@ export type AiStatusBreakdownRow = {
      * Status class label.
      */
     status_class: string;
+};
+
+export type AiSummaryPreferenceDto = {
+    /**
+     * `null` uses the selected provider's default model.
+     */
+    model?: string | null;
+    /**
+     * Normalized provider route (`gateway_key:{id}`, `claude_cli`, etc.).
+     * `null` inherits the active instance provider.
+     */
+    provider_id?: string | null;
+    /**
+     * `null` uses the selected model's default reasoning depth.
+     */
+    thinking_level?: string | null;
 };
 
 /**
@@ -1063,6 +1103,42 @@ export type AnomalyPreviewResponse = {
     sufficient: boolean;
 };
 
+/**
+ * A single caller entry in the top-callers breakdown.
+ */
+export type ApiCallerEntry = {
+    /**
+     * Caller IP address as recorded in proxy_logs.client_ip.
+     */
+    client_ip: string;
+    /**
+     * Error rate for this caller (0.0–1.0).
+     */
+    error_rate: number;
+    /**
+     * Timestamp of the most recent request from this IP in the period.
+     */
+    last_seen: string;
+    /**
+     * Total request count from this IP in the period.
+     */
+    request_count: number;
+};
+
+/**
+ * Top callers (by IP) ranked by request count for a given project + time window.
+ */
+export type ApiCallersResponse = {
+    /**
+     * Top callers, ordered by request_count descending.
+     */
+    callers: Array<ApiCallerEntry>;
+    /**
+     * Total distinct client IPs seen in the period (before the limit).
+     */
+    total_callers: number;
+};
+
 export type ApiKeyListResponse = {
     api_keys: Array<ApiKeyResponse>;
     total: number;
@@ -1078,6 +1154,167 @@ export type ApiKeyResponse = {
     name: string;
     permissions?: Array<string> | null;
     role_type: string;
+};
+
+/**
+ * A single route entry in the top-routes breakdown.
+ *
+ * Routes are grouped by raw `(method, path)` — no template normalization.
+ * See the module-level note on path cardinality.
+ */
+export type ApiRouteEntry = {
+    /**
+     * Mean response time in milliseconds for this route.
+     */
+    avg_latency_ms?: number | null;
+    /**
+     * Error rate for this route (0.0–1.0): requests with status >= 400.
+     */
+    error_rate: number;
+    /**
+     * HTTP method (e.g. "GET", "POST").
+     */
+    method: string;
+    /**
+     * Raw request path (e.g. "/api/users/123"). High-cardinality paths with
+     * dynamic IDs will appear as separate rows until path normalization is
+     * implemented.
+     */
+    path: string;
+    /**
+     * Total request count for this route in the period.
+     */
+    request_count: number;
+};
+
+/**
+ * Top routes by request count for a given project + time window.
+ */
+export type ApiRoutesResponse = {
+    /**
+     * Top routes, ordered by request_count descending.
+     */
+    routes: Array<ApiRouteEntry>;
+    /**
+     * Total distinct (method, path) pairs in the period (before the limit).
+     */
+    total_routes: number;
+};
+
+/**
+ * A single time bucket in the API request timeseries.
+ */
+export type ApiTimeseriesPoint = {
+    /**
+     * Mean response time in milliseconds. Null when no rows with a recorded
+     * response_time_ms exist in the bucket.
+     */
+    avg_latency_ms?: number | null;
+    /**
+     * Number of requests with status >= 400.
+     */
+    error_count: number;
+    /**
+     * Error rate: error_count / request_count (0.0–1.0). Zero when
+     * request_count == 0.
+     */
+    error_rate: number;
+    /**
+     * p95 response time in milliseconds. Null when insufficient data.
+     */
+    p95_latency_ms?: number | null;
+    /**
+     * p99 response time in milliseconds. Null when insufficient data.
+     */
+    p99_latency_ms?: number | null;
+    /**
+     * Total request count in this bucket.
+     */
+    request_count: number;
+    /**
+     * Bucket start timestamp (ISO 8601 with Z suffix).
+     */
+    timestamp: string;
+};
+
+/**
+ * Timeseries of API request volume, error rate, and latency percentiles.
+ */
+export type ApiTimeseriesResponse = {
+    /**
+     * Bucket interval used for time series (e.g. "1 hour", "6 hours", "1 day").
+     */
+    bucket_interval: string;
+    /**
+     * Overall mean response time in milliseconds over the full period.
+     */
+    overall_avg_latency_ms?: number | null;
+    /**
+     * Overall error rate over the full period (0.0–1.0).
+     */
+    overall_error_rate: number;
+    /**
+     * Time-bucketed data points ordered ascending by timestamp.
+     */
+    points: Array<ApiTimeseriesPoint>;
+    /**
+     * Aggregate error count (status >= 400) over the full period.
+     */
+    total_errors: number;
+    /**
+     * Aggregate request count over the full period.
+     */
+    total_requests: number;
+};
+
+/**
+ * Structured AI summary of API traffic for a given project + time window.
+ *
+ * Derives `JsonSchema` so `complete_typed` can request this shape from the
+ * configured AI provider. All fields are intentionally short — the prompt
+ * feeds aggregated stats (not raw log lines) to keep token usage bounded.
+ *
+ * When AI is not configured or the project has not opted in, the summary
+ * endpoint returns `null` for this field rather than an error.
+ */
+export type ApiTrafficSummary = {
+    /**
+     * Anomalies or concerns worth investigating (0–3 items). Empty when
+     * traffic appears normal.
+     */
+    anomalies: Array<string>;
+    /**
+     * Bullet-point findings (2–4 items). Each finding is a single sentence.
+     */
+    findings: Array<string>;
+    /**
+     * One-sentence headline describing the traffic pattern.
+     */
+    headline: string;
+    /**
+     * Optional single actionable recommendation.
+     */
+    recommendation?: string | null;
+};
+
+/**
+ * Response from the AI traffic summary endpoint.
+ */
+export type ApiTrafficSummaryResponse = {
+    /**
+     * Whether this response was served from the backend AI-result cache.
+     */
+    cached: boolean;
+    /**
+     * Whether the project has `ai_api_traffic_summary_enabled = true`.
+     */
+    enabled: boolean;
+    summary?: null | ApiTrafficSummary;
+    /**
+     * Why the summary is null when `summary` is None and `enabled` is true:
+     * either AI is not configured or the call failed/timed out.
+     */
+    unavailable_reason?: string | null;
 };
 
 /**
@@ -1108,6 +1345,11 @@ export type AppSettings = {
      * `*.temps.local` service-to-service resolution inside containers.
      */
     cluster_dns?: ClusterDnsSettings;
+    /**
+     * Per-upstream concurrent-connection cap applied by the proxy to
+     * customer app traffic. `0` (the default) is unlimited. See issue #646.
+     */
+    connection_limits?: ConnectionLimitSettings;
     /**
      * Binary version tag (e.g. "v0.1.0") of the *console* process
      * (`temps serve`, role=all or role=console) that last started. Written
@@ -1225,6 +1467,11 @@ export type AppSettingsResponse = {
      * through as-is so the settings UI can read and toggle the flag.
      */
     cluster_dns: ClusterDnsSettings;
+    /**
+     * Per-upstream concurrent-connection cap applied by the proxy to
+     * customer app traffic. No sensitive content. See issue #646.
+     */
+    connection_limits: ConnectionLimitSettings;
     container_logs: ContainerLogSettings;
     disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;
@@ -2625,6 +2872,25 @@ export type ComposeServicePreviewResponse = {
     ports: Array<ComposePortMapping>;
 };
 
+/**
+ * Per-upstream concurrent-connection limiting. Protects the proxy's own
+ * connection/file-descriptor budget from a single slow or malicious
+ * customer upstream — independent of the request/idle timeouts in
+ * `RequestTimeoutSettings`, which bound how long a connection may stay
+ * open, not how many may exist at once. See issue #646.
+ */
+export type ConnectionLimitSettings = {
+    /**
+     * Default max concurrent in-flight requests to a single
+     * project/environment's upstream, used when the project/environment
+     * hasn't set its own `max_concurrent_connections` override. `0` (the
+     * default) means unlimited — matches the "opt-in, never breaks an
+     * existing app on upgrade" philosophy already established for
+     * `RequestTimeoutSettings`.
+     */
+    default_max_concurrent_connections?: number;
+};
+
 export type ConnectionListQuery = {
     direction?: string | null;
     page?: number | null;
@@ -3569,17 +3835,6 @@ export type CreateExternalServiceRequest = {
      */
     topology?: string;
     version?: string | null;
-};
-
-/**
- * Request body for registering a new facet.
- */
-export type CreateFacetRequest = {
-    /**
-     * The OTel attribute key to facet (e.g. `enduser.id`, `galachain.contract`).
-     * Must be non-empty, ≤200 characters, and not already registered.
-     */
-    attribute_key: string;
 };
 
 export type CreateFlagRequest = {
@@ -4724,6 +4979,18 @@ export type DeploymentConfig = {
      * Default: 300 (5 minutes).
      */
     idleTimeoutSeconds?: number;
+    /**
+     * Override for the proxy's cap on concurrent in-flight requests to this
+     * project/environment's upstream, independent of the timeout overrides
+     * above. `None` = inherit the global
+     * `connection_limits.default_max_concurrent_connections`. `Some(0)`
+     * explicitly forces "unlimited" for this project/environment, overriding
+     * a nonzero global default. `Some(n)` for `n > 0` sets an explicit cap —
+     * there is no global ceiling clamp here (unlike the timeout settings):
+     * an operator who has explicitly set a per-project value has made a
+     * deliberate choice and the platform should respect it.
+     */
+    maxConcurrentConnections?: number | null;
     /**
      * Memory limit in megabytes. Three-state semantics:
      * - `None`     → inherit the parent layer (env inherits project, project
@@ -7218,17 +7485,12 @@ export type EventVisitorsResponse = {
 };
 
 export type EventsCountQuery = {
-    /**
-     * Aggregation level: events (raw count), sessions (unique sessions), or visitors (unique visitors)
-     */
-    aggregation_level?: AggregationLevel;
-    /**
-     * Only return custom events, excluding system events like page_view, page_leave, heartbeat (default: true)
-     */
+    breakdown?: null | EventBreakdown;
     custom_events_only?: boolean | null;
     end_date: string;
     environment_id?: number | null;
     limit?: number | null;
+    project_id: number;
     start_date: string;
 };
 
@@ -7488,26 +7750,21 @@ export type ExternalServiceSummary = {
     service_type: string;
 };
 
-/**
- * Public representation of a registered span attribute facet.
- */
-export type FacetInfo = {
+export type FailureReportPreviewResponse = {
+    error_message?: string | null;
+    failed_job_type: string;
+    github_issue_body: string;
+    github_issue_title: string;
     /**
-     * The OTel attribute key, e.g. `enduser.id` or `galachain.contract`.
+     * Redacted, editable draft of the failure trace. Shown in a textarea the
+     * user can edit before sending — nothing is sent without their review.
      */
-    attribute_key: string;
-    created_at: string;
+    redacted_log: string;
     /**
-     * The slot column index 1..=20 in ClickHouse (`facet_attr_N`).
+     * Whether "send to Temps" should be offered. False when the operator
+     * opted out via `TEMPS_TELEMETRY`. The GitHub-issue path is unaffected.
      */
-    slot: number;
-};
-
-/**
- * Response body for facet list.
- */
-export type FacetsResponse = {
-    data: Array<FacetInfo>;
+    reporting_enabled: boolean;
 };
 
 export type FieldResponse = {
@@ -10113,6 +10370,10 @@ export type MetricsQuery = {
  */
 export type MetricsRangeQuery = {
     /**
+     * Explicit window end (ISO 8601). Must be paired with `start_time`.
+     */
+    end_time?: string | null;
+    /**
      * Metric name, e.g. `"pg.connections_active"`.
      */
     metric: string;
@@ -10123,8 +10384,13 @@ export type MetricsRangeQuery = {
     percentile?: number | null;
     /**
      * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+     * Ignored when `start_time` and `end_time` are both set.
      */
     range?: string;
+    /**
+     * Explicit window start (ISO 8601). Must be paired with `end_time`.
+     */
+    start_time?: string | null;
 };
 
 /**
@@ -12766,6 +13032,10 @@ export type ProjectResponse = {
      */
     ai_alert_summaries_enabled?: boolean | null;
     /**
+     * Opt-in to AI summarization of API traffic analytics (NULL/false = off).
+     */
+    ai_api_traffic_summary_enabled?: boolean | null;
+    /**
      * Opt-in to AI debugging chat, e.g. on deployment failures (NULL/false = off).
      */
     ai_debug_chat_enabled?: boolean | null;
@@ -13124,6 +13394,10 @@ export type ProviderCatalogDto = {
      * will actually work.
      */
     host_authenticated: boolean;
+    /**
+     * Installed CLI version used as part of the model-cache identity.
+     */
+    host_version?: string | null;
     id: string;
     install_command: string;
     /**
@@ -13142,11 +13416,19 @@ export type ProviderCatalogDto = {
      */
     max_turns_fix?: number | null;
     /**
+     * `live`, `cache`, `stale_cache`, or `bootstrap`.
+     */
+    model_source: string;
+    /**
      * Model ids this provider accepts, in display order. The first entry is
      * the recommended default. Empty when the provider doesn't expose model
      * selection (e.g. OpenCode), which the UI uses to hide the dropdown.
      */
     models: Array<string>;
+    /**
+     * Time of the last successful account-aware CLI model discovery.
+     */
+    models_refreshed_at?: string | null;
     name: string;
     /**
      * True when this provider's CLI supports enforcing a turn cap. False
@@ -13203,6 +13485,11 @@ export type ProviderDescriptor = {
     recommended_events: Array<string>;
 };
 
+export type ProviderDetailResponse = {
+    key: ProviderKeyResponse;
+    models: Array<ProviderModelResponse>;
+};
+
 export type ProviderKeyResponse = {
     /**
      * Masked API key (only last 4 chars visible)
@@ -13227,6 +13514,19 @@ export type ProviderMetadata = {
     display_name: string;
     icon_url: string;
     service_type: ServiceTypeRoute;
+};
+
+export type ProviderModelResponse = {
+    display_name: string;
+    id: number;
+    is_available: boolean;
+    is_enabled: boolean;
+    last_seen_at?: string | null;
+    model_id: string;
+    owned_by?: string | null;
+    provider_key_id: number;
+    source: string;
+    updated_at: string;
 };
 
 export type ProviderResponse = {
@@ -15515,6 +15815,13 @@ export type SendEmailResponseBody = {
     status: string;
 };
 
+export type SendFailureReportRequest = {
+    /**
+     * The report text as reviewed (and possibly edited) by the user.
+     */
+    report_text: string;
+};
+
 export type SendMessageRequest = {
     /**
      * Optional next-turn model. The provider harness remains pinned, but its
@@ -16048,13 +16355,12 @@ export type SessionDetailsQuery = {
 };
 
 export type SessionEvent = {
-    event_data?: unknown;
-    event_name?: string | null;
-    event_type?: string | null;
+    event_data: unknown;
+    event_name: string;
     id: number;
-    page_title?: string | null;
-    page_url?: string | null;
-    timestamp: string;
+    occurred_at: string;
+    request_path: string;
+    request_query?: string | null;
 };
 
 export type SessionEventDto = {
@@ -16066,8 +16372,13 @@ export type SessionEventDto = {
 };
 
 export type SessionEventsQuery = {
+    end_date?: string | null;
     environment_id?: number | null;
+    limit?: number | null;
+    offset?: number | null;
     project_id: number;
+    sort_order?: string | null;
+    start_date?: string | null;
 };
 
 export type SessionEventsResponse = {
@@ -17369,6 +17680,47 @@ export type StorageSummary = {
     total_bytes: number;
 };
 
+export type StreamStructuredOutputRequest = {
+    /**
+     * Optional screen-owned cache identity. Prompt and schema hashes are also
+     * included automatically, preventing stale output when input data changes.
+     */
+    cache_key?: string | null;
+    /**
+     * Backend cache lifetime in seconds (default 60, clamped to 1-300).
+     */
+    cache_ttl_seconds?: number | null;
+    /**
+     * Optional enabled model id for the selected key.
+     */
+    model?: string | null;
+    /**
+     * The complete, already-authorized context and instructions for the model.
+     */
+    prompt: string;
+    /**
+     * Optional configured gateway key. Omit to use the active gateway key.
+     * Host subscription CLIs are intentionally not accepted here.
+     */
+    provider_key_id?: number | null;
+    /**
+     * Stable product use-case identifier, for example `api_traffic.summary`.
+     */
+    purpose: string;
+    /**
+     * Bypass any matching backend cache entry and replace it with this result.
+     */
+    refresh?: boolean;
+    /**
+     * JSON Schema describing the required response object.
+     */
+    schema: unknown;
+    /**
+     * Optional normalized reasoning depth advertised for the selected model.
+     */
+    thinking_level?: string | null;
+};
+
 export type StripeConfig = {
     /**
      * When an allowlist is set, should we still ingest charges that
@@ -17713,6 +18065,18 @@ export type TimeBucketStats = {
      * Number of errors (status >= 400)
      */
     error_count: number;
+    /**
+     * p50 response time in milliseconds (0 when the bucket has no timings)
+     */
+    p50_response_time_ms: number;
+    /**
+     * p95 response time in milliseconds (0 when the bucket has no timings)
+     */
+    p95_response_time_ms: number;
+    /**
+     * p99 response time in milliseconds (0 when the bucket has no timings)
+     */
+    p99_response_time_ms: number;
     /**
      * Total number of requests in this bucket
      */
@@ -18230,6 +18594,15 @@ export type UpdateAiProviderResponse = {
     provider_id: string;
 };
 
+/**
+ * Replace the instance-wide defaults inherited by every AI summary.
+ */
+export type UpdateAiSummaryPreferenceRequest = {
+    model?: string | null;
+    provider_id?: string | null;
+    thinking_level?: string | null;
+};
+
 export type UpdateAlertRuleRequest = {
     cooldown_minutes?: number | null;
     enabled?: boolean | null;
@@ -18455,6 +18828,13 @@ export type UpdateDeploymentConfigRequest = {
      */
     crossArchitectureBuilds?: boolean | null;
     exposedPort?: number | null;
+    /**
+     * Project-level default cap on concurrent in-flight requests to a
+     * single environment's upstream (0 = unlimited). Environments may
+     * override this. Absent leaves the current value unchanged. See
+     * issue #646.
+     */
+    maxConcurrentConnections?: number | null;
     memoryLimit?: number | null;
     memoryRequest?: number | null;
     performanceMetricsEnabled?: boolean | null;
@@ -18598,6 +18978,13 @@ export type UpdateEnvironmentSettingsRequest = {
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */
     idle_timeout_seconds?: number | null;
+    /**
+     * Override the proxy's cap on concurrent in-flight requests to this
+     * environment's upstream (0 = unlimited). Absent leaves the current
+     * value unchanged. Send JSON `null` to clear the override (inherit
+     * the project/global default). See issue #646.
+     */
+    max_concurrent_connections?: number | null;
     /**
      * Maximum (limit) memory in MB. Send JSON `null` to clear → "no limit".
      * Absent leaves the current value unchanged.
@@ -18919,6 +19306,10 @@ export type UpdateProjectSettingsRequest = {
      */
     ai_alert_summaries_enabled?: boolean | null;
     /**
+     * Opt in to AI summarization of API traffic analytics.
+     */
+    ai_api_traffic_summary_enabled?: boolean | null;
+    /**
      * Opt in to AI debugging chat, e.g. on deployment failures (ADR-023).
      */
     ai_debug_chat_enabled?: boolean | null;
@@ -19028,6 +19419,10 @@ export type UpdateProviderKeyRequest = {
     default_model?: string | null;
     display_name?: string | null;
     is_active?: boolean | null;
+};
+
+export type UpdateProviderModelRequest = {
+    is_enabled: boolean;
 };
 
 /**
@@ -21214,6 +21609,30 @@ export type DeleteProviderKeyResponses = {
 
 export type DeleteProviderKeyResponse = DeleteProviderKeyResponses[keyof DeleteProviderKeyResponses];
 
+export type GetProviderKeyData = {
+    body?: never;
+    path: {
+        /**
+         * Provider key ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ai/providers/{id}';
+};
+
+export type GetProviderKeyErrors = {
+    404: ProblemDetails;
+};
+
+export type GetProviderKeyError = GetProviderKeyErrors[keyof GetProviderKeyErrors];
+
+export type GetProviderKeyResponses = {
+    200: ProviderDetailResponse;
+};
+
+export type GetProviderKeyResponse = GetProviderKeyResponses[keyof GetProviderKeyResponses];
+
 export type UpdateProviderKeyData = {
     body: UpdateProviderKeyRequest;
     path: {
@@ -21253,6 +21672,98 @@ export type UpdateProviderKeyResponses = {
 
 export type UpdateProviderKeyResponse = UpdateProviderKeyResponses[keyof UpdateProviderKeyResponses];
 
+export type AddProviderModelData = {
+    body: AddProviderModelRequest;
+    path: {
+        /**
+         * Provider key ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ai/providers/{id}/models';
+};
+
+export type AddProviderModelErrors = {
+    400: ProblemDetails;
+};
+
+export type AddProviderModelError = AddProviderModelErrors[keyof AddProviderModelErrors];
+
+export type AddProviderModelResponses = {
+    201: ProviderModelResponse;
+};
+
+export type AddProviderModelResponse = AddProviderModelResponses[keyof AddProviderModelResponses];
+
+export type RefreshProviderModelsData = {
+    body?: never;
+    path: {
+        /**
+         * Provider key ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ai/providers/{id}/models/refresh';
+};
+
+export type RefreshProviderModelsErrors = {
+    404: ProblemDetails;
+};
+
+export type RefreshProviderModelsError = RefreshProviderModelsErrors[keyof RefreshProviderModelsErrors];
+
+export type RefreshProviderModelsResponses = {
+    200: Array<ProviderModelResponse>;
+};
+
+export type RefreshProviderModelsResponse = RefreshProviderModelsResponses[keyof RefreshProviderModelsResponses];
+
+export type DeleteProviderModelData = {
+    body?: never;
+    path: {
+        id: number;
+        model_row_id: number;
+    };
+    query?: never;
+    url: '/ai/providers/{id}/models/{model_row_id}';
+};
+
+export type DeleteProviderModelErrors = {
+    400: ProblemDetails;
+};
+
+export type DeleteProviderModelError = DeleteProviderModelErrors[keyof DeleteProviderModelErrors];
+
+export type DeleteProviderModelResponses = {
+    204: void;
+};
+
+export type DeleteProviderModelResponse = DeleteProviderModelResponses[keyof DeleteProviderModelResponses];
+
+export type UpdateProviderModelData = {
+    body: UpdateProviderModelRequest;
+    path: {
+        id: number;
+        model_row_id: number;
+    };
+    query?: never;
+    url: '/ai/providers/{id}/models/{model_row_id}';
+};
+
+export type UpdateProviderModelErrors = {
+    404: ProblemDetails;
+};
+
+export type UpdateProviderModelError = UpdateProviderModelErrors[keyof UpdateProviderModelErrors];
+
+export type UpdateProviderModelResponses = {
+    200: ProviderModelResponse;
+};
+
+export type UpdateProviderModelResponse = UpdateProviderModelResponses[keyof UpdateProviderModelResponses];
+
 export type TestProviderKeyByIdData = {
     body?: never;
     path: {
@@ -21287,6 +21798,39 @@ export type TestProviderKeyByIdResponses = {
 };
 
 export type TestProviderKeyByIdResponse = TestProviderKeyByIdResponses[keyof TestProviderKeyByIdResponses];
+
+export type UpdateAiSummaryPreferenceData = {
+    body: UpdateAiSummaryPreferenceRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/summary-preference';
+};
+
+export type UpdateAiSummaryPreferenceErrors = {
+    /**
+     * Unsupported provider, model, or thinking level
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type UpdateAiSummaryPreferenceError = UpdateAiSummaryPreferenceErrors[keyof UpdateAiSummaryPreferenceErrors];
+
+export type UpdateAiSummaryPreferenceResponses = {
+    /**
+     * Updated summary routing defaults
+     */
+    200: AiProviderStatusResponse;
+};
+
+export type UpdateAiSummaryPreferenceResponse = UpdateAiSummaryPreferenceResponses[keyof UpdateAiSummaryPreferenceResponses];
 
 export type GetUsageByProviderData = {
     body?: never;
@@ -25761,6 +26305,7 @@ export type DeploymentMetricsGetRangeData = {
         metric: string;
         /**
          * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
         /**
@@ -25768,6 +26313,14 @@ export type DeploymentMetricsGetRangeData = {
          * fetches histogram buckets and computes the requested quantile.
          */
         percentile?: number | null;
+        /**
+         * Explicit window start (ISO 8601). Must be paired with `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Explicit window end (ISO 8601). Must be paired with `start_time`.
+         */
+        end_time?: string | null;
     };
     url: '/deployments/{id}/metrics';
 };
@@ -28905,6 +29458,7 @@ export type ExternalServiceMetricsGetRangeData = {
         metric: string;
         /**
          * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
         /**
@@ -28912,6 +29466,14 @@ export type ExternalServiceMetricsGetRangeData = {
          * fetches histogram buckets and computes the requested quantile.
          */
         percentile?: number | null;
+        /**
+         * Explicit window start (ISO 8601). Must be paired with `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Explicit window end (ISO 8601). Must be paired with `start_time`.
+         */
+        end_time?: string | null;
     };
     url: '/external-services/{id}/metrics';
 };
@@ -34316,6 +34878,7 @@ export type NodeMetricsGetRangeData = {
         metric: string;
         /**
          * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
         /**
@@ -34323,6 +34886,14 @@ export type NodeMetricsGetRangeData = {
          * fetches histogram buckets and computes the requested quantile.
          */
         percentile?: number | null;
+        /**
+         * Explicit window start (ISO 8601). Must be paired with `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Explicit window end (ISO 8601). Must be paired with `start_time`.
+         */
+        end_time?: string | null;
     };
     url: '/nodes/{id}/metrics';
 };
@@ -35440,122 +36011,6 @@ export type UpdateDashboardResponses = {
 
 export type UpdateDashboardResponse = UpdateDashboardResponses[keyof UpdateDashboardResponses];
 
-export type ListFacetsData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/otel/facets';
-};
-
-export type ListFacetsErrors = {
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * Internal server error
-     */
-    500: ProblemDetails;
-};
-
-export type ListFacetsError = ListFacetsErrors[keyof ListFacetsErrors];
-
-export type ListFacetsResponses = {
-    /**
-     * Registered facets
-     */
-    200: FacetsResponse;
-};
-
-export type ListFacetsResponse = ListFacetsResponses[keyof ListFacetsResponses];
-
-export type CreateFacetData = {
-    body: CreateFacetRequest;
-    path?: never;
-    query?: never;
-    url: '/otel/facets';
-};
-
-export type CreateFacetErrors = {
-    /**
-     * Validation error
-     */
-    400: ProblemDetails;
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * Already registered or capacity exceeded
-     */
-    409: ProblemDetails;
-    /**
-     * Internal server error
-     */
-    500: ProblemDetails;
-};
-
-export type CreateFacetError = CreateFacetErrors[keyof CreateFacetErrors];
-
-export type CreateFacetResponses = {
-    /**
-     * Facet registered
-     */
-    201: FacetInfo;
-};
-
-export type CreateFacetResponse = CreateFacetResponses[keyof CreateFacetResponses];
-
-export type DeleteFacetData = {
-    body?: never;
-    path: {
-        /**
-         * The OTel attribute key (URL-encoded)
-         */
-        key: string;
-    };
-    query?: never;
-    url: '/otel/facets/{key}';
-};
-
-export type DeleteFacetErrors = {
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * Facet not found
-     */
-    404: ProblemDetails;
-    /**
-     * Internal server error
-     */
-    500: ProblemDetails;
-};
-
-export type DeleteFacetError = DeleteFacetErrors[keyof DeleteFacetErrors];
-
-export type DeleteFacetResponses = {
-    /**
-     * Facet deleted
-     */
-    204: void;
-};
-
-export type DeleteFacetResponse = DeleteFacetResponses[keyof DeleteFacetResponses];
-
 export type QueryGenaiTracesData = {
     body?: never;
     path?: never;
@@ -36357,10 +36812,6 @@ export type QueryTraceSummariesData = {
          * Filter by deployment ID
          */
         deployment_id?: number;
-        /**
-         * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
-         */
-        attributes?: string;
         /**
          * Filter by span name pattern (ILIKE)
          */
@@ -37964,7 +38415,7 @@ export type GetActiveVisitorsResponses = {
     /**
      * Successfully retrieved active visitors count
      */
-    200: ActiveVisitorsResponse;
+    200: ActiveVisitorCountResponse;
 };
 
 export type GetActiveVisitorsResponse = GetActiveVisitorsResponses[keyof GetActiveVisitorsResponses];
@@ -39223,6 +39674,238 @@ export type ResolveAlarmResponses = {
     200: unknown;
 };
 
+export type GetApiCallersData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query: {
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Window start (ISO 8601)
+         */
+        start_date: string;
+        /**
+         * Window end (ISO 8601)
+         */
+        end_date: string;
+        /**
+         * Max callers to return (default: 20, max: 100)
+         */
+        limit?: number;
+        /**
+         * Ranked callers to skip (default: 0)
+         */
+        offset?: number;
+    };
+    url: '/projects/{project_id}/api-analytics/callers';
+};
+
+export type GetApiCallersErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetApiCallersResponses = {
+    /**
+     * Top callers by request count
+     */
+    200: ApiCallersResponse;
+};
+
+export type GetApiCallersResponse = GetApiCallersResponses[keyof GetApiCallersResponses];
+
+export type GetApiRoutesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query: {
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Window start (ISO 8601)
+         */
+        start_date: string;
+        /**
+         * Window end (ISO 8601)
+         */
+        end_date: string;
+        /**
+         * Max routes to return (default: 20, max: 100)
+         */
+        limit?: number;
+        /**
+         * Ranked routes to skip (default: 0)
+         */
+        offset?: number;
+    };
+    url: '/projects/{project_id}/api-analytics/routes';
+};
+
+export type GetApiRoutesErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetApiRoutesResponses = {
+    /**
+     * Top routes by request count
+     */
+    200: ApiRoutesResponse;
+};
+
+export type GetApiRoutesResponse = GetApiRoutesResponses[keyof GetApiRoutesResponses];
+
+export type GetApiSummaryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query: {
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Window start (ISO 8601)
+         */
+        start_date: string;
+        /**
+         * Window end (ISO 8601)
+         */
+        end_date: string;
+        /**
+         * Bypass and replace the backend AI summary cache
+         */
+        refresh?: boolean;
+    };
+    url: '/projects/{project_id}/api-analytics/summary';
+};
+
+export type GetApiSummaryErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error (DB errors only; AI failures return 200 with summary: null)
+     */
+    500: unknown;
+};
+
+export type GetApiSummaryResponses = {
+    /**
+     * AI traffic summary (summary field may be null when AI is unavailable)
+     */
+    200: ApiTrafficSummaryResponse;
+};
+
+export type GetApiSummaryResponse = GetApiSummaryResponses[keyof GetApiSummaryResponses];
+
+export type GetApiTimeseriesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query: {
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Window start (ISO 8601)
+         */
+        start_date: string;
+        /**
+         * Window end (ISO 8601)
+         */
+        end_date: string;
+    };
+    url: '/projects/{project_id}/api-analytics/timeseries';
+};
+
+export type GetApiTimeseriesErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetApiTimeseriesResponses = {
+    /**
+     * Time-series of request volume, errors, and latency
+     */
+    200: ApiTimeseriesResponse;
+};
+
+export type GetApiTimeseriesResponse = GetApiTimeseriesResponses[keyof GetApiTimeseriesResponses];
+
 export type StartAnalysisData = {
     body: StartAnalysisRequest;
     path: {
@@ -40357,6 +41040,90 @@ export type GetDeploymentJobsResponses = {
 };
 
 export type GetDeploymentJobsResponse = GetDeploymentJobsResponses[keyof GetDeploymentJobsResponses];
+
+export type GetFailureReportPreviewData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+        /**
+         * Failed job ID
+         */
+        job_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report';
+};
+
+export type GetFailureReportPreviewErrors = {
+    /**
+     * Job not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetFailureReportPreviewResponses = {
+    /**
+     * Redacted failure-report preview
+     */
+    200: FailureReportPreviewResponse;
+};
+
+export type GetFailureReportPreviewResponse = GetFailureReportPreviewResponses[keyof GetFailureReportPreviewResponses];
+
+export type SendFailureReportData = {
+    body: SendFailureReportRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+        /**
+         * Failed job ID
+         */
+        job_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report';
+};
+
+export type SendFailureReportErrors = {
+    /**
+     * Job not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Failed to reach the central reporting endpoint
+     */
+    502: unknown;
+};
+
+export type SendFailureReportResponses = {
+    /**
+     * Report sent
+     */
+    204: void;
+};
+
+export type SendFailureReportResponse = SendFailureReportResponses[keyof SendFailureReportResponses];
 
 export type GetDeploymentJobLogsData = {
     body?: never;
@@ -47485,7 +48252,8 @@ export type GetTimeBucketStatsData = {
          */
         end_time: string;
         /**
-         * Bucket interval (e.g., "1 hour", "1 day", "5 minutes")
+         * Bucket interval (e.g., "1 hour", "1 day", "5 minutes").
+         * Must keep `span / interval` ≤ 1000 buckets (7 days at 1 minute is rejected).
          */
         bucket_interval?: string;
         /**

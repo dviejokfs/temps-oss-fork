@@ -1782,10 +1782,24 @@ export function DebugChatPanel({
     const textarea = composerRef.current
     if (!textarea) return
 
-    textarea.style.height = '0px'
-    const layout = resolveChatComposerLayout(textarea.scrollHeight)
-    textarea.style.height = `${layout.height}px`
-    textarea.style.overflowY = layout.overflowY
+    const resize = () => {
+      textarea.style.height = '0px'
+      const layout = resolveChatComposerLayout(textarea.scrollHeight)
+      textarea.style.height = `${layout.height}px`
+      textarea.style.overflowY = layout.overflowY
+    }
+    resize()
+
+    // The AI dock panel animates its width in on open (`transition-[width]`
+    // in AiAssistantDock), and this composer mounts immediately rather than
+    // after that transition finishes. So this effect's first run can measure
+    // scrollHeight while the panel is still narrow mid-animation, wrapping
+    // the placeholder onto extra lines and inflating the clamp to its max —
+    // stuck there until `input` next changes. Re-run once the composer's
+    // actual width settles instead of only reacting to typed input.
+    const observer = new ResizeObserver(resize)
+    observer.observe(textarea)
+    return () => observer.disconnect()
   }, [input])
 
   // Abort any in-flight stream if the panel unmounts mid-generation.
@@ -2532,7 +2546,8 @@ export function DebugChatPanel({
                   )}
 
                 {selectedModelOption &&
-                  selectedModelOption.thinking_options.length > 0 && (
+                  (selectedModelOption.tool_thinking_options ??
+                    selectedModelOption.thinking_options).length > 0 && (
                     <Select
                       value={runtimeSelection.thinkingOptionId ?? undefined}
                       onValueChange={(thinkingOptionId) =>
@@ -2554,7 +2569,9 @@ export function DebugChatPanel({
                         <SelectValue placeholder="Thinking" />
                       </SelectTrigger>
                       <SelectContent>
-                        {selectedModelOption.thinking_options.map((option) => (
+                        {(selectedModelOption.tool_thinking_options ??
+                          selectedModelOption.thinking_options
+                        ).map((option) => (
                           <SelectItem key={option.id} value={option.id}>
                             <span className="flex items-center gap-2">
                               <Brain

@@ -1091,6 +1091,7 @@ pub async fn update_project_settings(
             settings.cross_project_trace_sharing,
             settings.error_source_context_enabled,
             settings.error_source_root.clone(),
+            settings.ai_api_traffic_summary_enabled,
         )
         .await
         .map_err(Problem::from)?;
@@ -1460,6 +1461,12 @@ pub async fn update_project_deployment_config(
     if config.websocket_idle_timeout_seconds.is_some() {
         updated_fields.insert(
             "websocket_idle_timeout_seconds".to_string(),
+            "updated".to_string(),
+        );
+    }
+    if config.max_concurrent_connections.is_some() {
+        updated_fields.insert(
+            "max_concurrent_connections".to_string(),
             "updated".to_string(),
         );
     }

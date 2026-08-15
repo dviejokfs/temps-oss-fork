@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated from: `@temps-sdk/cli@0.1.32`
+> Generated from: `@temps-sdk/cli@0.1.33`
 >
 > Apply the authorization, target-context, and secret-handling rules in
 > [the Temps CLI skill](../SKILL.md) before executing a command.
@@ -10,10 +10,10 @@
 ## Installation
 
 ```bash
-bunx @temps-sdk/cli@0.1.32 [command]
+bunx @temps-sdk/cli@0.1.33 [command]
 
 # Fallback when Bun is unavailable
-npx @temps-sdk/cli@0.1.32 [command]
+npx @temps-sdk/cli@0.1.33 [command]
 ```
 
 ## Authentication
@@ -22,10 +22,10 @@ Before using most commands, you need to authenticate:
 
 ```bash
 # Login interactively
-bunx @temps-sdk/cli@0.1.32 login
+bunx @temps-sdk/cli@0.1.33 login
 
 # Or configure with wizard
-bunx @temps-sdk/cli@0.1.32 configure
+bunx @temps-sdk/cli@0.1.33 configure
 ```
 
 ## Global Options
@@ -556,6 +556,7 @@ Manage deployments
 - `resume` - Resume a paused deployment
 - `teardown` - Teardown a deployment and remove all resources
 - `logs` - Show deployment build logs
+- `failure-report` - Preview or send a redacted deploy-failure trace
 
 ### `deployments list` (alias: `ls`)
 
@@ -656,6 +657,40 @@ Show deployment build logs
 | `-f, --follow` | Follow log output | - | No |
 | `-n, --lines <number>` | Number of lines to show | `100` | No |
 | `-d, --deployment <id>` | Specific deployment ID | - | No |
+
+### `deployments failure-report`
+
+Preview or send a redacted deploy-failure trace
+
+**Subcommands:**
+
+- `preview` - Preview the redacted, editable failure-report text for a failed job
+- `send` - Send a failure report to the Temps team. Reads report text from --text-file, or stdin if piped, or defaults to the redacted preview.
+
+#### `deployments failure-report preview`
+
+Preview the redacted, editable failure-report text for a failed job
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project-id <id>` | Project ID | - | Yes |
+| `-d, --deployment-id <id>` | Deployment ID | - | Yes |
+| `-j, --job-id <id>` | Failed job ID (see "deployments logs") | - | Yes |
+
+#### `deployments failure-report send`
+
+Send a failure report to the Temps team. Reads report text from --text-file, or stdin if piped, or defaults to the redacted preview.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project-id <id>` | Project ID | - | Yes |
+| `-d, --deployment-id <id>` | Deployment ID | - | Yes |
+| `-j, --job-id <id>` | Failed job ID (see "deployments logs") | - | Yes |
+| `--text-file <path>` | Read the (already-reviewed) report text from a file | - | No |
 
 ## `domains` (alias: `domain`)
 
@@ -5347,9 +5382,14 @@ View project analytics
 - `overview` (`o`) - Show analytics dashboard overview
 - `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
 - `funnels` - Show funnel conversion metrics for all funnels
+- `performance` (`speed`) - Show real-user Web Vitals and optional dimension breakdowns
 - `ai-agents` - Show AI crawler / provider breakdown (web /analytics/ai-agents)
 - `ai-pages` - Show pages crawled by AI agents, with distinct-agent counts
 - `ai-page` - Show which agents/providers crawled a single page (e.g. /docs)
+- `api-overview` - Show API traffic timeseries (requests, errors, latency) from /api-analytics/timeseries
+- `api-routes` - Show top API routes by request count from /api-analytics/routes
+- `api-callers` - Show top API callers by client IP from /api-analytics/callers
+- `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
 
 ### `analytics overview` (alias: `o`)
 
@@ -5386,6 +5426,31 @@ Show funnel conversion metrics for all funnels
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics performance` (alias: `speed`)
+
+Show real-user Web Vitals and optional dimension breakdowns
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (ignored with --start-date/--end-date) | `7d` | No |
+| `--start-date <date>` | Explicit window start (RFC 3339; requires --end-date) | - | No |
+| `--end-date <date>` | Explicit window end (RFC 3339; requires --start-date) | - | No |
+| `--environment-id <id>` | Restrict samples to one environment ID | - | No |
+| `--deployment-id <id>` | Restrict samples to one deployment ID | - | No |
+| `--device <device>` | Device filter: desktop or mobile | - | No |
+| `--include-bots` | Include crawler and datacenter bot samples | - | No |
+| `--group-by <dimension>` | Break down by path, country, region, city, device_type, browser, or operating_system | - | No |
+| `--path <path>` | Restrict samples to one page pathname | - | No |
+| `--country <country>` | Restrict samples to one country | - | No |
+| `--region <region>` | Restrict samples to one region | - | No |
+| `--city <city>` | Restrict samples to one city | - | No |
+| `--browser <browser>` | Restrict samples to one browser | - | No |
+| `--os <operating-system>` | Restrict samples to one operating system | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `analytics ai-agents`
@@ -5430,6 +5495,62 @@ Show which agents/providers crawled a single page (e.g. /docs)
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | No |
 | `--limit <n>` | Number of rows to fetch (default: 50, max: 100) | - | No |
 | `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-overview`
+
+Show API traffic timeseries (requests, errors, latency) from /api-analytics/timeseries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-routes`
+
+Show top API routes by request count from /api-analytics/routes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--limit <n>` | Number of routes to return (default: 20, max: 100) | - | No |
+| `--offset <n>` | Number of ranked routes to skip (default: 0) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-callers`
+
+Show top API callers by client IP from /api-analytics/callers
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--limit <n>` | Number of callers to return (default: 20, max: 100) | - | No |
+| `--offset <n>` | Number of ranked callers to skip (default: 0) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-summary`
+
+Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `funnels` (alias: `funnel`)
@@ -6584,48 +6705,48 @@ Upgrade your plan
 
 ```bash
 # Login to Temps
-bunx @temps-sdk/cli@0.1.32 login
+bunx @temps-sdk/cli@0.1.33 login
 
 # Create a new project on the intended server
-bunx @temps-sdk/cli@0.1.32 --target-context production projects create --name my-app
+bunx @temps-sdk/cli@0.1.33 --target-context production projects create --name my-app
 
 # Deploy to production
-bunx @temps-sdk/cli@0.1.32 --target-context production deploy --project my-app --environment production
+bunx @temps-sdk/cli@0.1.33 --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-bunx @temps-sdk/cli@0.1.32 deployments logs --project my-app --follow
+bunx @temps-sdk/cli@0.1.33 deployments logs --project my-app --follow
 
 # Stream runtime container logs
-bunx @temps-sdk/cli@0.1.32 runtime-logs --project my-app
+bunx @temps-sdk/cli@0.1.33 runtime-logs --project my-app
 
 # List containers
-bunx @temps-sdk/cli@0.1.32 containers list --project-id 1 --environment-id 1
+bunx @temps-sdk/cli@0.1.33 containers list --project-id 1 --environment-id 1
 ```
 
 ### Managing Environments
 
 ```bash
 # List environments
-bunx @temps-sdk/cli@0.1.32 environments list --project my-app
+bunx @temps-sdk/cli@0.1.33 environments list --project my-app
 
 # Set environment variables on the intended server
-bunx @temps-sdk/cli@0.1.32 --target-context production environments vars set --project my-app --key DATABASE_URL
+bunx @temps-sdk/cli@0.1.33 --target-context production environments vars set --project my-app --key DATABASE_URL
 
 # View environment variables
-bunx @temps-sdk/cli@0.1.32 environments vars list --project my-app
+bunx @temps-sdk/cli@0.1.33 environments vars list --project my-app
 ```
 
 ### Managing Domains
 
 ```bash
 # Add a custom domain on the intended server
-bunx @temps-sdk/cli@0.1.32 --target-context production domains add --project my-app --domain app.example.com
+bunx @temps-sdk/cli@0.1.33 --target-context production domains add --project my-app --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli@0.1.32 domains list --project my-app
+bunx @temps-sdk/cli@0.1.33 domains list --project my-app
 
 # Remove a domain from the intended server
-bunx @temps-sdk/cli@0.1.32 --target-context production domains remove --project my-app --domain app.example.com
+bunx @temps-sdk/cli@0.1.33 --target-context production domains remove --project my-app --domain app.example.com
 ```
 
 ## Environment Variables
@@ -6645,7 +6766,7 @@ Configuration is stored in:
 - **Config file**: `~/.temps/config.json`
 - **Credentials**: Stored securely in `~/.temps/` with restricted file permissions
 
-Use `bunx @temps-sdk/cli@0.1.32 configure show` to view current configuration.
+Use `bunx @temps-sdk/cli@0.1.33 configure show` to view current configuration.
 
 ## Support
 
