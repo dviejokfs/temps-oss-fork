@@ -9,8 +9,9 @@
  * skill) and drives it over HTTP. This one can't: it has to prove a SECOND,
  * genuinely separate node (its own Docker daemon, its own binary, its own
  * network identity) joins the first node's mesh — that needs its own
- * Docker-in-Docker (DinD) 2-node cluster with real single-use enrollment and
- * mTLS registration. WireGuard relay enrollment remains a separate topology,
+ * Docker-in-Docker (DinD) 2-node cluster with real single-use enrollment,
+ * HTTPS transport, and mTLS registration. WireGuard relay enrollment remains
+ * a separate topology,
  * just not automated or asserted against. So this scenario does NOT use the
  * global `--url`/`--api-key`/`connection()` the way every other scenario
  * does (the one precedent for a scenario driving its own topology is
@@ -40,12 +41,12 @@
  *      same as every other scenario.
  *   5. poll `GET /internal/nodes` until a node named `worker-1` (the
  *      `WORKER_NAME` the compose file sets) appears with `status: "active"`
- *      — this is the real proof `POST /internal/nodes/register` completed
- *      a genuine mTLS-registered join, not a mocked one, then assert that the
- *      stored node endpoint is HTTPS, cert material exists, legacy enrollment
- *      is disabled, and the single-use token was consumed. Bounded by the
- *      same generous timeout: the worker ALSO compiles its own binary from
- *      scratch on first boot.
+ *      — this is the real proof `POST /internal/nodes/register` completed over
+ *      trusted HTTPS as a genuine mTLS-registered join, not a mocked one, then
+ *      assert that the stored node endpoint is HTTPS, cert material exists,
+ *      legacy enrollment is disabled, and the single-use token was consumed.
+ *      Bounded by the same generous timeout: the worker ALSO compiles its own
+ *      binary from scratch on first boot.
  *   6. create a throwaway project + resolve its production environment.
  *   7. `PUT .../environments/{id}/settings` with `target_nodes: [worker
  *      node id]` — pins every future deploy in this environment to the
@@ -969,7 +970,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
         WORKER_CONTAINER,
         'bash',
         '-c',
-        'read -r token < /run/temps-bootstrap/join_token.txt; TEMPS_JOIN_TOKEN="$token" /usr/local/bin/temps join http://10.52.0.10:80 "$token" --name worker-1 --private-address 10.52.0.21 --agent-address 0.0.0.0:3100',
+        'read -r token < /run/temps-bootstrap/join_token.txt; TEMPS_JOIN_TOKEN="$token" /usr/local/bin/temps join https://control-plane.temps.test "$token" --name worker-1 --private-address 10.52.0.21 --agent-address 0.0.0.0:3100',
       ])
       if (replay.code === 0) {
         throw new Error('consumed single-use enrollment token unexpectedly registered the removed node again')
