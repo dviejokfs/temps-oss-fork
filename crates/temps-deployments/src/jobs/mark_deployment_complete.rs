@@ -1819,11 +1819,13 @@ WHERE project.id = $2
     /// Teardown all running/pending deployments for the same environment.
     /// This ensures only one active deployment per environment.
     ///
-    /// After a deployment's containers are torn down, the deployment's state is
-    /// flipped to "stopped" so it is no longer re-scanned by subsequent
+    /// After a deployment's recorded containers are torn down, the deployment's
+    /// state is flipped to "stopped" so it is no longer re-scanned by subsequent
     /// teardown passes — bounding this work regardless of how much deployment
-    /// history accumulates. The route table already points at the new
-    /// deployment (via `environments.current_deployment_id`) before this runs.
+    /// history accumulates. Deployments without authoritative container records
+    /// remain active for a future safe retry. The route table already points at
+    /// the new deployment (via `environments.current_deployment_id`) before this
+    /// runs.
     async fn cancel_previous_deployments(
         &self,
         environment_id: i32,
@@ -2757,7 +2759,10 @@ mod teardown_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(previous_after.state, "stopped");
+        assert_eq!(
+            previous_after.state, "completed",
+            "deployment must remain retryable when container ownership cannot be verified"
+        );
     }
 
     /// A slow older completion must never tear down a newer deployment that

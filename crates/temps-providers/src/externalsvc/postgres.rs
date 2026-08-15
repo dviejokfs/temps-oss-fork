@@ -348,7 +348,7 @@ const ALLOWED_POSTGRES_DOCKER_IMAGES: &[&str] = &[
     "timescale/timescaledb-ha:pg18",
 ];
 
-fn validate_postgres_docker_image(docker_image: &str) -> Result<()> {
+pub(crate) fn validate_postgres_docker_image(docker_image: &str) -> Result<()> {
     if ALLOWED_POSTGRES_DOCKER_IMAGES.contains(&docker_image) {
         Ok(())
     } else {

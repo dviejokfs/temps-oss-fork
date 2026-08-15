@@ -77,6 +77,11 @@ pub trait PostgresContainerLifecycle: Send + Sync {
     /// `pg_dumpall` and `psql`.
     async fn connection_params(&self, service_id: i32) -> Result<PostgresConnection, String>;
 
+    /// Return the image currently persisted in the service configuration.
+    /// Upgrade requests must name this exact image as their source so callers
+    /// cannot use the upgrade API as an arbitrary image execution primitive.
+    async fn docker_image(&self, service_id: i32) -> Result<String, String>;
+
     /// Stop (best-effort) and remove any existing container for this
     /// service, preserving its named volume. Safe to call on a
     /// non-existent container.
@@ -117,6 +122,21 @@ pub enum PostgresUpgradeError {
         service_id: i32,
         service_type: String,
     },
+
+    #[error("PostgreSQL Docker image '{image}' is not supported for service {service_id}")]
+    UnsupportedImage { service_id: i32, image: String },
+
+    #[error(
+        "PostgreSQL image mismatch for service {service_id}: configured '{configured_image}', expected '{expected_image}'"
+    )]
+    SourceImageMismatch {
+        service_id: i32,
+        configured_image: String,
+        expected_image: String,
+    },
+
+    #[error("Could not validate PostgreSQL service {service_id} configuration: {reason}")]
+    ServiceConfiguration { service_id: i32, reason: String },
 
     #[error(
         "Cannot upgrade service {service_id} from {from_image} to {to_image}: OS family mismatch ({from_os} -> {to_os}). Cross-OS-family upgrades are unsupported."
@@ -373,6 +393,33 @@ pub fn validate_os_family(
     })
 }
 
+fn validate_phase_config_image(
+    service_id: i32,
+    current_phase: &str,
+    configured_image: &str,
+    from_image: &str,
+    to_image: &str,
+) -> Result<(), PostgresUpgradeError> {
+    let (matches_expected, expected_image) = match current_phase {
+        // `set_docker_image` and the phase update are separate durable
+        // operations. A retry at SWAP may therefore observe either value.
+        phase::SWAP => (
+            configured_image == from_image || configured_image == to_image,
+            format!("{} or {}", from_image, to_image),
+        ),
+        phase::ANALYZE | phase::COMPLETED => (configured_image == to_image, to_image.to_string()),
+        _ => (configured_image == from_image, from_image.to_string()),
+    };
+    if matches_expected {
+        return Ok(());
+    }
+    Err(PostgresUpgradeError::SourceImageMismatch {
+        service_id,
+        configured_image: configured_image.to_string(),
+        expected_image,
+    })
+}
+
 /// Strip the version prefix from a tag, keeping the OS portion.
 /// `postgres:17-alpine` -> `postgres:alpine`; `gotempsh/postgres-ha:17-bookworm` -> `gotempsh/postgres-ha:bookworm`.
 fn image_base(image: &str) -> String {
@@ -445,6 +492,27 @@ pub struct PostgresUpgradeOrchestrator {
 }
 
 impl PostgresUpgradeOrchestrator {
+    async fn validate_service_image(
+        &self,
+        row: &postgres_major_upgrades::Model,
+    ) -> Result<(), PostgresUpgradeError> {
+        let configured_image =
+            self.lifecycle
+                .docker_image(row.service_id)
+                .await
+                .map_err(|reason| PostgresUpgradeError::ServiceConfiguration {
+                    service_id: row.service_id,
+                    reason,
+                })?;
+        validate_phase_config_image(
+            row.service_id,
+            &row.phase,
+            &configured_image,
+            &row.from_image,
+            &row.to_image,
+        )
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         docker: Arc<Docker>,
@@ -488,6 +556,18 @@ impl PostgresUpgradeOrchestrator {
     pub async fn run(&self, upgrade_id: i32) -> Result<(), PostgresUpgradeError> {
         let mut row = self.load_upgrade(upgrade_id).await?;
 
+        // Defense in depth for retries and boot-time resumption: never execute
+        // images from a legacy or manually inserted upgrade row.
+        for image in [&row.from_image, &row.to_image] {
+            super::postgres::validate_postgres_docker_image(image).map_err(|_| {
+                PostgresUpgradeError::UnsupportedImage {
+                    service_id: row.service_id,
+                    image: image.clone(),
+                }
+            })?;
+        }
+        self.validate_service_image(&row).await?;
+
         // Honour a cancel that arrived before we even started dispatching.
         if row.status == status::CANCELLED {
             self.log_info(&row.log_id, "orchestrator aborted: cancel requested")
@@ -514,6 +594,10 @@ impl PostgresUpgradeOrchestrator {
         // Between phases we re-read status so a cancel posted mid-run is
         // honoured without having to interrupt the currently-running phase.
         loop {
+            // Re-read the authoritative service image at every phase boundary.
+            // This catches an out-of-band reconfiguration before another image
+            // is pulled, started, restored, or persisted.
+            self.validate_service_image(&row).await?;
             match row.phase.as_str() {
                 phase::PRE_BACKUP => self.phase_pre_backup(&row).await?,
                 phase::SNAPSHOT => self.phase_snapshot(&row).await?,
@@ -2113,7 +2197,8 @@ impl From<PostgresUpgradeError> for temps_core::problemdetails::Problem {
 
             PostgresUpgradeError::WrongServiceType { .. }
             | PostgresUpgradeError::InvalidVersionTransition { .. }
-            | PostgresUpgradeError::OsFamilyMismatch { .. } => {
+            | PostgresUpgradeError::OsFamilyMismatch { .. }
+            | PostgresUpgradeError::UnsupportedImage { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Upgrade Request")
                     .with_detail(error.to_string())
@@ -2128,6 +2213,12 @@ impl From<PostgresUpgradeError> for temps_core::problemdetails::Problem {
             PostgresUpgradeError::ConcurrentUpgrade { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Upgrade Already In Progress")
+                    .with_detail(error.to_string())
+            }
+
+            PostgresUpgradeError::SourceImageMismatch { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("PostgreSQL Service Changed")
                     .with_detail(error.to_string())
             }
 
@@ -2159,6 +2250,7 @@ impl From<PostgresUpgradeError> for temps_core::problemdetails::Problem {
             | PostgresUpgradeError::RollbackFailed { .. }
             | PostgresUpgradeError::Docker { .. }
             | PostgresUpgradeError::Log { .. }
+            | PostgresUpgradeError::ServiceConfiguration { .. }
             | PostgresUpgradeError::Database(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -2224,6 +2316,34 @@ mod tests {
             "gotempsh/postgres-ha:17-bookworm",
         )
         .expect("same custom repo with same base should pass");
+    }
+
+    #[test]
+    fn phase_image_validation_preserves_idempotent_swap_retries() {
+        let from = "gotempsh/postgres-walg:16-bookworm";
+        let to = "gotempsh/postgres-walg:17-bookworm";
+
+        validate_phase_config_image(1, phase::SWAP, from, from, to)
+            .expect("swap may resume before the image metadata write");
+        validate_phase_config_image(1, phase::SWAP, to, from, to)
+            .expect("swap may resume after the image metadata write");
+        assert!(matches!(
+            validate_phase_config_image(1, phase::SWAP, "postgres:latest", from, to),
+            Err(PostgresUpgradeError::SourceImageMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn phase_image_validation_requires_new_image_after_swap() {
+        let from = "gotempsh/postgres-walg:16-bookworm";
+        let to = "gotempsh/postgres-walg:17-bookworm";
+
+        assert!(matches!(
+            validate_phase_config_image(1, phase::ANALYZE, from, from, to),
+            Err(PostgresUpgradeError::SourceImageMismatch { .. })
+        ));
+        validate_phase_config_image(1, phase::ANALYZE, to, from, to)
+            .expect("analyze must use the persisted target image");
     }
 
     #[test]
@@ -3698,6 +3818,10 @@ mod tests {
             ) -> Result<PostgresConnection, String> {
                 self.record(LifecycleEventKind::ConnectionParams);
                 self.inner.connection_params(service_id).await
+            }
+
+            async fn docker_image(&self, service_id: i32) -> Result<String, String> {
+                self.inner.docker_image(service_id).await
             }
 
             async fn stop_and_remove(&self, service_id: i32) -> Result<(), String> {

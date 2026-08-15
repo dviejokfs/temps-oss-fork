@@ -365,6 +365,7 @@ mod tests {
         assert!(result
             .message
             .as_deref()
-            .is_some_and(|message| message.contains("Refusing to deploy a changed local image")));
+            .is_some_and(|message| message.contains("Image ID mismatch")
+                && message.contains("Refusing to deploy mutable tag")));
     }
 }

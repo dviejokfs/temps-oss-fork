@@ -3458,7 +3458,7 @@ mod tests {
             .unwrap();
         assert_eq!(assignments.len(), 4);
 
-        // Pool is [Local, worker-a(1), worker-c(3)] → round-robin includes Local
+        // Explicit targets restrict the pool to worker-a(1) and worker-c(3).
         for a in &assignments {
             match a {
                 crate::services::NodeAssignment::Remote { node_id, .. } => {
@@ -3469,7 +3469,7 @@ mod tests {
                     );
                 }
                 crate::services::NodeAssignment::Local => {
-                    // Local (control plane) is always part of the pool
+                    panic!("explicit target nodes must exclude the control plane")
                 }
             }
         }

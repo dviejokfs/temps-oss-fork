@@ -5,10 +5,8 @@
  *
  *   1. provision a real standalone postgres service pinned explicitly to
  *      `gotempsh/postgres-walg:16-bookworm` (not the platform default which is 18).
- *      Standard official postgres images are used; the platform's
- *      extract_postgres_version() parses "16" from the tag correctly and
- *      sets PGDATA to /var/lib/postgresql/16/docker. The pre-upgrade backup
- *      falls back to the pg_dump sidecar since these images don't bundle wal-g.
+ *      Platform-reviewed WAL-G images are used; the platform extracts "16"
+ *      from the tag and sets PGDATA to /var/lib/postgresql/16/docker.
  *   2. create a **default** S3 source (`is_default: true`) pointed at the
  *      local MinIO. `phase_pre_backup` in the orchestrator resolves the
  *      default source via `BackupService::default_s3_source_id` (a simple

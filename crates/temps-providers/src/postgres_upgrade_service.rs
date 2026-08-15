@@ -18,10 +18,36 @@ use temps_entities::{external_services, postgres_major_upgrades};
 use temps_logs::LogService;
 use uuid::Uuid;
 
+use crate::externalsvc::postgres::validate_postgres_docker_image;
 use crate::externalsvc::postgres_upgrade::{
     phase, status, validate_os_family, PostgresContainerLifecycle, PostgresUpgradeError,
     PostgresUpgradeOrchestrator, PreUpgradeBackupProvider,
 };
+
+fn image_major_version(image: &str) -> Option<u32> {
+    image
+        .rsplit_once(':')
+        .map(|(_, tag)| tag)?
+        .trim_start_matches("pg")
+        .split(['-', '.'])
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn validate_configured_source_image(
+    req: &StartMajorUpgradeRequest,
+    configured_image: &str,
+) -> Result<(), PostgresUpgradeError> {
+    if req.from_image == configured_image {
+        return Ok(());
+    }
+    Err(PostgresUpgradeError::SourceImageMismatch {
+        service_id: req.service_id,
+        configured_image: configured_image.to_string(),
+        expected_image: req.from_image.clone(),
+    })
+}
 
 /// Pure pre-flight validation for a major upgrade request. Separated so
 /// unit tests can exercise the validation surface without a real Docker
@@ -38,6 +64,15 @@ pub fn validate_start_request(
         });
     }
 
+    for image in [&req.from_image, &req.to_image] {
+        validate_postgres_docker_image(image).map_err(|_| {
+            PostgresUpgradeError::UnsupportedImage {
+                service_id: req.service_id,
+                image: image.clone(),
+            }
+        })?;
+    }
+
     validate_os_family(req.service_id, &req.from_image, &req.to_image)?;
 
     let from_n: u32 = req.from_version.parse().unwrap_or(0);
@@ -49,6 +84,20 @@ pub fn validate_start_request(
             to_version: req.to_version.clone(),
             reason: "to_version must be a greater major version than from_version".into(),
         });
+    }
+
+    for (image, declared_version) in [(&req.from_image, from_n), (&req.to_image, to_n)] {
+        if image_major_version(image) != Some(declared_version) {
+            return Err(PostgresUpgradeError::InvalidVersionTransition {
+                service_id: req.service_id,
+                from_version: req.from_version.clone(),
+                to_version: req.to_version.clone(),
+                reason: format!(
+                    "image '{}' does not match its declared major version {}",
+                    image, declared_version
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -122,6 +171,15 @@ impl PostgresUpgradeService {
                 upgrade_id: req.service_id,
             })?;
         validate_start_request(&req, &svc.service_type)?;
+        let configured_image =
+            self.lifecycle
+                .docker_image(req.service_id)
+                .await
+                .map_err(|reason| PostgresUpgradeError::ServiceConfiguration {
+                    service_id: req.service_id,
+                    reason,
+                })?;
+        validate_configured_source_image(&req, &configured_image)?;
 
         // 4. Defensive concurrency check. The partial-unique index is the
         //    real lock; this just turns the race into a typed 409.
@@ -503,8 +561,8 @@ mod tests {
             service_id: 1,
             from_version: "16".into(),
             to_version: "17".into(),
-            from_image: "postgres:16-bookworm".into(),
-            to_image: "postgres:17-bookworm".into(),
+            from_image: "gotempsh/postgres-walg:16-bookworm".into(),
+            to_image: "gotempsh/postgres-walg:17-bookworm".into(),
             created_by: 1,
         };
         assert_eq!(req.from_version, "16");
@@ -521,8 +579,8 @@ mod tests {
             service_id: 7,
             from_version: "16".into(),
             to_version: "17".into(),
-            from_image: "postgres:16-bookworm".into(),
-            to_image: "postgres:17-bookworm".into(),
+            from_image: "gotempsh/postgres-walg:16-bookworm".into(),
+            to_image: "gotempsh/postgres-walg:17-bookworm".into(),
             created_by: 1,
         }
     }
@@ -539,15 +597,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_cross_os_upgrade() {
+    fn validate_rejects_unreviewed_image() {
         let mut req = sample_request();
         req.from_image = "postgres:16-alpine".into();
-        // to_image stays bookworm
         let err = validate_start_request(&req, "postgres")
-            .expect_err("alpine -> bookworm must be rejected");
+            .expect_err("an unreviewed source image must be rejected");
         assert!(matches!(
             err,
-            PostgresUpgradeError::OsFamilyMismatch { service_id: 7, .. }
+            PostgresUpgradeError::UnsupportedImage { service_id: 7, .. }
         ));
     }
 
@@ -556,8 +613,8 @@ mod tests {
         let mut req = sample_request();
         req.from_version = "17".into();
         req.to_version = "16".into();
-        req.from_image = "postgres:17-bookworm".into();
-        req.to_image = "postgres:16-bookworm".into();
+        req.from_image = "gotempsh/postgres-walg:17-bookworm".into();
+        req.to_image = "gotempsh/postgres-walg:16-bookworm".into();
         let err = validate_start_request(&req, "postgres").expect_err("downgrade must be rejected");
         assert!(matches!(
             err,
@@ -569,7 +626,7 @@ mod tests {
     fn validate_rejects_same_version() {
         let mut req = sample_request();
         req.to_version = "16".into();
-        req.to_image = "postgres:16-bookworm".into();
+        req.to_image = "gotempsh/postgres-walg:16-bookworm".into();
         let err =
             validate_start_request(&req, "postgres").expect_err("same-version must be rejected");
         assert!(matches!(
@@ -587,10 +644,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_custom_repo_upgrade() {
+    fn validate_rejects_unreviewed_repo_upgrade() {
         let mut req = sample_request();
         req.from_image = "gotempsh/postgres-ha:16-bookworm".into();
         req.to_image = "gotempsh/postgres-ha:17-bookworm".into();
-        validate_start_request(&req, "postgres").expect("custom repo 16->17 should pass");
+        assert!(matches!(
+            validate_start_request(&req, "postgres"),
+            Err(PostgresUpgradeError::UnsupportedImage { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_image_version_mismatch() {
+        let mut req = sample_request();
+        req.to_version = "18".into();
+        let err = validate_start_request(&req, "postgres")
+            .expect_err("declared version must agree with the reviewed image tag");
+        assert!(matches!(
+            err,
+            PostgresUpgradeError::InvalidVersionTransition { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_source_image_different_from_service_config() {
+        let req = sample_request();
+        let err = validate_configured_source_image(&req, "gotempsh/postgres-walg:15-bookworm")
+            .expect_err("upgrade source must match the current service image");
+        assert!(matches!(
+            err,
+            PostgresUpgradeError::SourceImageMismatch { service_id: 7, .. }
+        ));
     }
 }

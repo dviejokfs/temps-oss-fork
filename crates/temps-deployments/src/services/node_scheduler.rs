@@ -566,7 +566,11 @@ impl NodeScheduler {
             };
             return Err(NodeError::PlacementConstraintsUnsatisfied { excluded });
         }
-        let compatible_slots = usize::from(local_compatible) + eligible_nodes.len();
+        // The control plane has no node ID or worker labels, so it can never
+        // satisfy an explicit worker constraint. Include it only for
+        // unconstrained scheduling.
+        let include_local = local_compatible && !has_node_constraints;
+        let compatible_slots = usize::from(include_local) + eligible_nodes.len();
         if anti_affinity
             && !architecture_exclusions.is_empty()
             && (compatible_slots as u32) < replica_count
@@ -604,7 +608,7 @@ impl NodeScheduler {
         // The control plane joins the pool only when it can actually run the
         // image — on a heterogeneous cluster it is just another node with an
         // architecture.
-        let full_pool: Vec<PoolEntry> = local_compatible
+        let full_pool: Vec<PoolEntry> = include_local
             .then_some(PoolEntry {
                 assignment: NodeAssignment::Local,
                 load_score: None, // Local node has no capacity reporting
@@ -642,7 +646,7 @@ impl NodeScheduler {
                     self.max_load_threshold * 100.0
                 );
                 // Re-build full pool (moved above)
-                local_compatible
+                include_local
                     .then_some(PoolEntry {
                         assignment: NodeAssignment::Local,
                         load_score: None,
@@ -688,7 +692,7 @@ impl NodeScheduler {
                     "All nodes are excluded for anti-affinity, relaxing exclusion"
                 );
                 // Re-build: we can't use pool since it was moved, rebuild from eligible_nodes
-                local_compatible
+                include_local
                     .then_some(PoolEntry {
                         assignment: NodeAssignment::Local,
                         load_score: None,
@@ -1859,7 +1863,9 @@ mod tests {
                         node_id
                     );
                 }
-                NodeAssignment::Local => {}
+                NodeAssignment::Local => {
+                    panic!("explicit target IDs must never schedule on the control plane")
+                }
             }
         }
     }
@@ -2169,12 +2175,15 @@ mod tests {
         assert_eq!(assignments.len(), 4);
 
         for assignment in &assignments {
-            if let NodeAssignment::Remote { node_id, .. } = assignment {
-                assert!(
+            match assignment {
+                NodeAssignment::Remote { node_id, .. } => assert!(
                     *node_id == 1 || *node_id == 3,
                     "Expected node 1 (us) or 3 (asia), got {}",
                     node_id
-                );
+                ),
+                NodeAssignment::Local => {
+                    panic!("explicit labels must never schedule on the control plane")
+                }
             }
         }
     }
