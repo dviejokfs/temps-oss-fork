@@ -1,0 +1,23 @@
+import { describe, expect, test } from 'bun:test'
+import { isPlatformToolsRoute } from './platform-navigation'
+
+describe('platform navigation route resolution', () => {
+  test('groups secondary platform capabilities under all platform tools', () => {
+    expect(isPlatformToolsRoute('/domains')).toBe(true)
+    expect(isPlatformToolsRoute('/backups/schedules/2')).toBe(true)
+    expect(isPlatformToolsRoute('/proxy-logs/31')).toBe(true)
+    expect(isPlatformToolsRoute('/git-providers/add')).toBe(true)
+  })
+
+  test('keeps primary destinations and settings outside the tools group', () => {
+    expect(isPlatformToolsRoute('/projects')).toBe(false)
+    expect(isPlatformToolsRoute('/storage')).toBe(false)
+    expect(isPlatformToolsRoute('/monitoring/resources')).toBe(false)
+    expect(isPlatformToolsRoute('/settings')).toBe(false)
+  })
+
+  test('does not accept a similar unrelated prefix', () => {
+    expect(isPlatformToolsRoute('/toolsmith')).toBe(false)
+    expect(isPlatformToolsRoute('/proxying')).toBe(false)
+  })
+})

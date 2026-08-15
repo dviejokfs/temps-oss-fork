@@ -22,14 +22,11 @@ import {
   BarChart3,
   Bell,
   Bot,
-  Box,
   Boxes,
   ChevronsUpDown,
   Clock,
-  Cloud,
   Check,
   Database,
-  DatabaseBackup,
   Folder,
   Gauge,
   GitBranch,
@@ -41,7 +38,6 @@ import {
   KeyRound,
   Layers,
   LogOut,
-  Mail,
   Monitor,
   Moon,
   Network,
@@ -55,7 +51,6 @@ import {
   Shield,
   ShieldAlert,
   Sun,
-  ShieldCheck,
   Sparkles,
   Terminal,
   Users,
@@ -69,8 +64,8 @@ import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { useProjectSetup } from '@/hooks/useProjectSetup'
 import { usePinnedProjectTools } from '@/hooks/usePinnedProjectTools'
-import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { usePluginsContext } from '@/contexts/PluginsContext'
+import { isPlatformToolsRoute } from '@/lib/platform-navigation'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import {
   isProjectToolsRoute,
@@ -101,55 +96,25 @@ import {
 } from '../ui/dropdown-menu'
 import { useTheme } from 'next-themes'
 
-// Daily-use root: short, scannable list. Dense areas (AI, Source) drill
-// down into sub-views per the §6.12 sidebar standard.
 interface PlatformNavItem {
   title: string
   url: string
   icon: LucideIcon
-  subItems?: { title: string; url: string; icon: LucideIcon }[]
+  activeWhen?: (pathname: string) => boolean
 }
 
-const navWorkflow: PlatformNavItem[] = [
+// The fresh-install sidebar stays focused on daily work. Every secondary
+// capability remains visible on /tools and in Cmd+K.
+const primaryPlatformNav: PlatformNavItem[] = [
   { title: 'Projects', url: '/projects', icon: Folder },
-  { title: 'Sandboxes', url: '/sandboxes', icon: Box },
-  {
-    title: 'Domains',
-    url: '/domains',
-    icon: Globe,
-    subItems: [
-      { title: 'Domains', url: '/domains', icon: Globe },
-      { title: 'Certificates', url: '/certificates', icon: ShieldCheck },
-    ],
-  },
-  {
-    title: 'Storage',
-    url: '/storage',
-    icon: Database,
-    subItems: [
-      { title: 'Databases', url: '/storage', icon: Database },
-      { title: 'Backups', url: '/backups', icon: DatabaseBackup },
-    ],
-  },
-  { title: 'Email', url: '/email', icon: Mail },
-  { title: 'AI', url: '/ai-gateway', icon: Sparkles },
-  {
-    title: 'Source',
-    url: '/git-providers',
-    icon: GitBranch,
-    subItems: [
-      { title: 'Git Providers', url: '/git-providers', icon: GitBranch },
-      { title: 'DNS Providers', url: '/dns-providers', icon: Cloud },
-    ],
-  },
-]
-
-// Observability section
-const navObservability = [
+  { title: 'Databases', url: '/storage', icon: Database },
   { title: 'Monitoring', url: '/monitoring', icon: Gauge },
-  { title: 'Proxy', url: '/proxy', icon: Activity },
-  { title: 'Proxy Logs', url: '/proxy-logs', icon: Network },
-  { title: 'Audit Logs', url: '/audit-logs', icon: ScrollText },
+  {
+    title: 'All platform tools',
+    url: '/tools',
+    icon: Boxes,
+    activeWhen: isPlatformToolsRoute,
+  },
 ]
 
 // Full grouped settings tree — mirrors SettingsLayout
@@ -157,10 +122,8 @@ interface SettingsGroupDef {
   label: string
   items: { title: string; url: string; icon: LucideIcon }[]
 }
-// Settings drill-down only contains items NOT already surfaced in the
-// main app sidebar (Platform / Storage / AI / Source sections in
-// `navWorkflow`). Anything reachable from the root sidebar is omitted
-// here to avoid duplicate entry points.
+// Settings drill-down contains instance configuration rather than runtime
+// tools, which live on the All platform tools page.
 const settingsGroups: SettingsGroupDef[] = [
   {
     label: 'General',
@@ -461,7 +424,12 @@ function NavSection({
   siblingUrls,
 }: {
   label: string
-  items: { title: string; url: string; icon: LucideIcon }[]
+  items: {
+    title: string
+    url: string
+    icon: LucideIcon
+    activeWhen?: (pathname: string) => boolean
+  }[]
   // URLs of items in OTHER sections that share the sidebar. Used so a
   // parent-like url (e.g. `/settings`) doesn't light up when a more
   // specific sibling (`/settings/keys`) in a different section matches.
@@ -500,7 +468,8 @@ function NavSection({
       </SidebarGroupLabel>
       <SidebarMenu>
         {items.map((item) => {
-          const isActive = item.url === activeUrl
+          const isActive =
+            item.activeWhen?.(location.pathname) ?? item.url === activeUrl
           return (
             <SidebarMenuItem key={item.title}>
               <SidebarMenuButton
@@ -836,17 +805,7 @@ function DefaultNav({
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
 
-  // Split flat items from grouped items. Items with subItems render as
-  // their own labeled sub-section (parent title becomes the group
-  // label, children become flat links). Items without subItems stay in
-  // the main "Platform" group at the top.
-  const flatItems = navWorkflow.filter((it) => !it.subItems?.length)
-  const grouped = navWorkflow.filter((it) => it.subItems?.length)
   const { navItems: extraNavItems } = useConsoleExtensions()
-  const canViewAuditLogs = useCanViewAuditLogs()
-  const observabilityItems = canViewAuditLogs
-    ? navObservability
-    : navObservability.filter((it) => it.url !== '/audit-logs')
 
   return (
     <>
@@ -856,15 +815,7 @@ function DefaultNav({
           onReturn={onReturnToProject}
         />
       )}
-      <NavSection label="Platform" items={flatItems} />
-      {grouped.map((group) => (
-        <NavSection
-          key={group.title}
-          label={group.title}
-          items={group.subItems!}
-        />
-      ))}
-      <NavSection label="Observe" items={observabilityItems} />
+      <NavSection label="Platform" items={primaryPlatformNav} />
       <NavPlugins items={pluginItems} />
       <ExtensionNav items={extraNavItems} />
       <SidebarGroup className="mt-auto">

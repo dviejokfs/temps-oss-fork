@@ -185,6 +185,12 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['apps', 'applications', 'sites'],
   },
   {
+    title: 'All platform tools',
+    url: '/tools',
+    icon: Boxes,
+    keywords: ['tools', 'features', 'capabilities', 'everything'],
+  },
+  {
     title: 'Sandboxes',
     url: '/sandboxes',
     icon: Box,
@@ -2113,7 +2119,6 @@ export function CommandPalette() {
           <span className="hidden sm:inline">
             {commandDestinations.length} destinations indexed
           </span>
-          <span className="ml-auto font-mono">NO MODEL REQUIRED</span>
         </div>
       </Command>
     </CommandDialog>

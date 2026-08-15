@@ -53,6 +53,9 @@ const Account = lazy(() =>
 const Setup = lazy(() =>
   import('./pages/Setup').then((m) => ({ default: m.Setup }))
 )
+const PlatformTools = lazy(() =>
+  import('./pages/PlatformTools').then((m) => ({ default: m.PlatformTools }))
+)
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
 )
@@ -538,6 +541,7 @@ const FullAppRoutes = () => {
                     />
                     <Route path="/account" element={<Account />} />
                     <Route path="/setup" element={<Setup />} />
+                    <Route path="/tools" element={<PlatformTools />} />
                     <Route path="/projects" element={<Projects />} />
                     <Route path="/drop" element={<Drop />} />
                     <Route path="/revenue" element={<Revenue />} />
