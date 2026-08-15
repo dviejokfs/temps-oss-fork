@@ -3475,10 +3475,10 @@ mod tests {
         }
     }
 
-    /// Test that target_nodes with no matching active nodes falls back to local
+    /// Explicit target constraints must never silently fall back to local.
     #[tokio::test]
-    async fn test_node_scheduling_target_nodes_no_match_falls_back_to_local() {
-        use crate::services::{NodeScheduler, NodeService};
+    async fn test_node_scheduling_target_nodes_no_match_fails_closed() {
+        use crate::services::{NodeError, NodeScheduler, NodeService};
         use sea_orm::{DatabaseBackend, MockDatabase};
         use temps_entities::nodes;
 
@@ -3512,16 +3512,20 @@ mod tests {
 
         // Target node 99 doesn't exist
         let target_ids = vec![99];
-        let assignments = scheduler
+        let error = scheduler
             .schedule_replicas(2, None, Some(&target_ids), false)
             .await
-            .unwrap();
-        assert_eq!(assignments.len(), 2);
-        for a in &assignments {
-            assert!(
-                a.is_local(),
-                "Should fall back to local when no target nodes match"
-            );
+            .expect_err("an unmatched explicit target must not run on the control plane");
+        match error {
+            NodeError::PlacementConstraintsUnsatisfied { excluded } => {
+                assert!(
+                    excluded.contains("no active node matched"),
+                    "unexpected placement diagnostic: {excluded}"
+                );
+            }
+            other => {
+                panic!("expected PlacementConstraintsUnsatisfied, got {other:?}");
+            }
         }
     }
 

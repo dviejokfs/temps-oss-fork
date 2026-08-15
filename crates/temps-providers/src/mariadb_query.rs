@@ -1724,7 +1724,9 @@ mod tests {
             .query(
                 &path,
                 "rows_budget",
-                Some(serde_json::json!({"where": "id = 1"})),
+                Some(serde_json::json!({
+                    "conditions": [{"field": "id", "op": "eq", "value": 1}]
+                })),
                 QueryOptions::default(),
             )
             .await?;
@@ -1734,7 +1736,9 @@ mod tests {
             .query(
                 &path,
                 "rows_budget",
-                Some(serde_json::json!({"where": "id = 2"})),
+                Some(serde_json::json!({
+                    "conditions": [{"field": "id", "op": "eq", "value": 2}]
+                })),
                 QueryOptions {
                     limit: Some(1),
                     budget: QueryBudget {

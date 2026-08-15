@@ -217,7 +217,7 @@ bun run src/index.ts backup-restore-scenario --registry localhost:5111
 bun run src/index.ts pitr-scenario --registry localhost:5111
 
 # pg-upgrade: Postgres major-version upgrade (16 → 17) -- provision a service
-# pinned to postgres:16-bookworm, write 5 marker rows, trigger the upgrade
+# pinned to gotempsh/postgres-walg:16-bookworm, write 5 marker rows, trigger the upgrade
 # (pre_backup → snapshot → dump → new_container → restore → swap → analyze),
 # and prove via the read-only data-browser API that the marker rows survived
 # the pg_dumpall → psql restore cycle. Needs MinIO (docker-compose.e2e.yml).
@@ -891,9 +891,9 @@ reading the rows back after it finishes, not just watching a status field flip.
 1. build + push the db-probe Go app (`lib/probe-app.ts`) -- the same app
    `backup-restore-scenario` and `pitr-scenario` use. On every `/probe` hit
    it inserts a row into `e2e_probe` and returns the total count
-2. provision a real standalone Postgres service pinned to `postgres:16-bookworm`
-   via `parameters.docker_image` at creation time. Standard official postgres
-   images are used; `extract_postgres_version("postgres:16-bookworm")` returns
+2. provision a real standalone Postgres service pinned to `gotempsh/postgres-walg:16-bookworm`
+   via `parameters.docker_image` at creation time. Platform-reviewed WAL-G
+   images are used; `extract_postgres_version("gotempsh/postgres-walg:16-bookworm")` returns
    `"16"` and PGDATA is set to `/var/lib/postgresql/16/docker`. The explicit
    pin is required because the upgrade API validates that `to_version > from_version`
    and both images are on the same OS family (Alpine ↔ Alpine, Debian ↔ Debian)
@@ -912,8 +912,8 @@ reading the rows back after it finishes, not just watching a status field flip.
    `normalize_database_name("{project_slug}_{env_slug}")` as computed by
    `normalizePostgresDatabaseName` in `flows.ts`
 6. `POST /external-services/{service_id}/upgrades` with
-   from_version="16" / to_version="17" / from_image="postgres:16-bookworm" /
-   to_image="postgres:17-bookworm". The orchestrator spawns a
+   from_version="16" / to_version="17" / from_image="gotempsh/postgres-walg:16-bookworm" /
+   to_image="gotempsh/postgres-walg:17-bookworm". The orchestrator spawns a
    tokio task and returns immediately with status="pending". It then runs
    seven real phases synchronously:
      - `pre_backup`: wal-g backup to the default MinIO S3 source (safety net)
@@ -946,7 +946,7 @@ reading the rows back after it finishes, not just watching a status field flip.
    PITR does (WAL-logged `SEQ_LOG_VALS` advance), so we assert count and
    monotonicity, not the exact new id
 10. assert `GET /external-services/{id}`'s `current_parameters.docker_image`
-    now equals `postgres:17-bookworm`. `phase_swap` calls
+    now equals `gotempsh/postgres-walg:17-bookworm`. `phase_swap` calls
     `lifecycle.set_docker_image` which persists the new image into
     `external_services.parameters`; this checks the API-visible result
 11. teardown (deployment, project, service, S3 source)
