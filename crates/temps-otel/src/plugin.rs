@@ -216,6 +216,7 @@ fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
         facet_handler::list_facets,
         facet_handler::create_facet,
         facet_handler::delete_facet,
+        facet_handler::retry_facet_backfill,
         dashboard_handler::list_dashboards,
         dashboard_handler::create_dashboard,
         dashboard_handler::get_dashboard,
@@ -279,6 +280,8 @@ fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
             facet_handler::CreateFacetRequest,
             facet_handler::FacetsResponse,
             crate::services::FacetInfo,
+            crate::services::FacetStatus,
+            crate::services::FacetBackendKind,
             dashboard_handler::CreateDashboardRequest,
             dashboard_handler::UpdateDashboardRequest,
             dashboard_handler::OtelDashboardResponse,
@@ -417,25 +420,28 @@ impl TempsPlugin for OtelPlugin {
             // used for everything — the default, unchanged path.
             let ch_config = read_clickhouse_otel_config_from_env();
 
+            // ── Facet cache ──────────────────────────────────────────────────
+            //
+            // Created before both storage backends so ClickHouse, TimescaleDB
+            // (whichever is the ingest/query fast-path) and FacetService
+            // (create/delete) all share the same Arc. The cache starts empty;
+            // FacetService loads initial data from Postgres below.
+            let facet_cache: crate::services::FacetCache = Arc::new(
+                arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
+            );
+
             // TimescaleDbStorage is always constructed: it is the sole
             // backend when CH is disabled, and the inner delegate when
-            // CH is enabled.
+            // CH is enabled. It also needs the facet cache directly since
+            // it's the default backend and handles its own slot-column
+            // ingest/query when ClickHouse isn't configured.
             let timescale_storage = Arc::new(TimescaleDbStorage::with_config(
                 db.clone(),
                 s3_client,
                 config.retention_days,
                 config.quota_bytes_per_project,
+                Some(facet_cache.clone()),
             ));
-
-            // ── Facet cache ──────────────────────────────────────────────────
-            //
-            // Created before the CH storage so both the storage (ingest + query
-            // fast-path) and FacetService (create/delete) share the same Arc.
-            // The cache starts empty; FacetService loads initial data from
-            // Postgres below (after the CH storage is ready).
-            let facet_cache: crate::services::FacetCache = Arc::new(
-                arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
-            );
 
             let storage: Arc<dyn crate::storage::OtelStorage> = if let Some(ch_cfg) = ch_config {
                 info!(
@@ -702,6 +708,34 @@ impl TempsPlugin for OtelPlugin {
                     if let Err(e) = apply_retention_all(&retention_storage, retention_days).await {
                         error!(error = %e, "OTel retention cleanup failed");
                     }
+                }
+            });
+
+            // 1a2. Facet backfill/clear poller.
+            //
+            // Advances every non-terminal facet (pending/running/deleting) by
+            // one bounded unit of work per tick — see
+            // `FacetService::advance_pending_facets` for why this is a poller
+            // rather than a task spawned from the create/delete HTTP handlers
+            // (a handler-spawned task's progress would be lost on a process
+            // restart; this poller's progress lives entirely in the
+            // `otel_span_facets` row, so a restart just resumes).
+            //
+            // 5s keeps facet creation feeling responsive (an admin pinning an
+            // attribute sees `running` within a few seconds) without adding
+            // meaningful load: each tick is a handful of cheap Postgres/CH
+            // status queries plus at most one bounded batch/mutation per
+            // in-flight facet, and there are at most 20 facets ever (one per
+            // slot).
+            const FACET_POLL_INTERVAL_SECS: u64 = 5;
+            let facet_poller_service = facet_service.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(FACET_POLL_INTERVAL_SECS));
+                interval.tick().await; // discard the immediate first tick
+                loop {
+                    interval.tick().await;
+                    facet_poller_service.advance_pending_facets().await;
                 }
             });
 

@@ -137,6 +137,10 @@ pub fn configure_routes() -> Router<OtelAppState> {
             get(facet_handler::list_facets).post(facet_handler::create_facet),
         )
         .route("/otel/facets/{key}", delete(facet_handler::delete_facet))
+        .route(
+            "/otel/facets/{key}/retry",
+            post(facet_handler::retry_facet_backfill),
+        )
         // Metric dashboards (per-project saved dashboard CRUD)
         .route(
             "/otel/dashboards",

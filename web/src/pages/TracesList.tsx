@@ -1116,7 +1116,7 @@ export default function TracesList({ project }: TracesListProps) {
                   value={attrKey || '__none__'}
                   onValueChange={handleAttrKeyChange}
                 >
-                  <SelectTrigger className="w-full sm:w-[200px]">
+                  <SelectTrigger className="h-9 w-full sm:w-[200px]">
                     <Tag className="mr-2 h-3.5 w-3.5" />
                     <SelectValue placeholder="Attribute" />
                   </SelectTrigger>

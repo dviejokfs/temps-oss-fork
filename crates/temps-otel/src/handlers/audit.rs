@@ -190,6 +190,14 @@ pub struct FacetDeletedAudit {
     pub attribute_key: String,
 }
 
+/// Audit event for retrying a failed OTel span attribute facet backfill.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetBackfillRetriedAudit {
+    pub context: AuditContext,
+    /// The OTel attribute key whose backfill is being retried.
+    pub attribute_key: String,
+}
+
 impl AuditOperation for FacetCreatedAudit {
     fn operation_type(&self) -> String {
         "OTEL_FACET_CREATED".to_string()
@@ -216,6 +224,29 @@ impl AuditOperation for FacetCreatedAudit {
 impl AuditOperation for FacetDeletedAudit {
     fn operation_type(&self) -> String {
         "OTEL_FACET_DELETED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+impl AuditOperation for FacetBackfillRetriedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_FACET_BACKFILL_RETRIED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

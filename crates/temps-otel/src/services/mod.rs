@@ -18,7 +18,9 @@ pub use cross_project::{
     TraceHintMsg, TraceProjectRef, UnifiedTrace,
 };
 pub use dashboard_service::MetricDashboardService;
-pub use facet_service::{FacetCache, FacetError, FacetInfo, FacetService};
+pub use facet_service::{
+    FacetBackendKind, FacetCache, FacetError, FacetInfo, FacetService, FacetStatus,
+};
 pub use health_service::HealthComputeService;
 pub use metric_alert_evaluator::MetricAlertEvaluator;
 pub use metric_alert_service::MetricAlertService;

@@ -1,23 +1,24 @@
 //! HTTP handlers for OTel span attribute facet management.
 //!
 //! Facets allow admins to mark any OTel attribute key as "faceted", which pre-populates
-//! a dedicated slot column in ClickHouse and enables bloom-filter-accelerated filtering
-//! for that key — replacing the default full-JSON-parse `JSONExtractString` predicate.
+//! a dedicated slot column (ClickHouse or TimescaleDB, whichever backend is active) and
+//! enables index-accelerated filtering for that key — replacing the default
+//! full-JSON/text-parse predicate. See `services::facet_service` for the backfill
+//! lifecycle these endpoints expose (`status`: pending -> running -> completed/failed).
 //!
 //! ## Endpoints
 //!
-//! - `GET  /otel/facets`          — list all registered facets (OtelRead)
-//! - `POST /otel/facets`          — create a facet for an attribute key (OtelWrite)
-//! - `DELETE /otel/facets/{key}`  — remove a facet by attribute key (OtelWrite)
+//! - `GET    /otel/facets`             — list all registered facets, with status (OtelRead)
+//! - `POST   /otel/facets`             — create a facet for an attribute key (OtelWrite)
+//! - `DELETE /otel/facets/{key}`       — remove a facet by attribute key (OtelWrite)
+//! - `POST   /otel/facets/{key}/retry` — retry a failed backfill (OtelWrite)
 //!
 //! ## CLI parity
 //!
-//! TODO: CLI parity for these endpoints is deferred. The equivalent commands
-//! (`temps otel facets list`, `temps otel facets create`, `temps otel facets delete`)
-//! should be added to `apps/temps-cli/src/commands/` following the `otel-forward`
-//! pattern for plugin-only routes (hand-written local request/response types + the
-//! shared `client` object). See CLAUDE.md "Regenerating the OpenAPI clients" §
-//! "Never add a plugin-only route or schema to `apps/temps-cli/openapi.json`".
+//! `temps facets list/create/remove/retry` in `apps/temps-cli/src/commands/facets/`
+//! (hand-written client, following the `otel-forward` pattern for plugin-only routes —
+//! see CLAUDE.md "Regenerating the OpenAPI clients" §
+//! "Never add a plugin-only route or schema to `apps/temps-cli/openapi.json`").
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -27,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 use utoipa::ToSchema;
 
-use crate::handlers::audit::{FacetCreatedAudit, FacetDeletedAudit};
+use crate::handlers::audit::{FacetBackfillRetriedAudit, FacetCreatedAudit, FacetDeletedAudit};
 use crate::services::facet_service::FacetError;
 use crate::services::FacetInfo;
 use crate::OtelAppState;
@@ -50,6 +51,10 @@ impl From<FacetError> for Problem {
 
             FacetError::NotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Facet Not Found")
+                .with_detail(error.to_string()),
+
+            FacetError::NotFailed { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Facet Backfill Not Failed")
                 .with_detail(error.to_string()),
 
             FacetError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
@@ -113,11 +118,14 @@ pub async fn list_facets(
 
 /// Register an OTel attribute key as a facet.
 ///
-/// Assigns the key to the lowest available slot column (1..=20) in the
-/// ClickHouse `spans` table, inserts the mapping into Postgres, and runs a
-/// backfill mutation so existing spans that carry this attribute are populated
-/// in the slot column. At 500M+ row scale this mutation would be expensive and
-/// should be tracked asynchronously; for the current demo dataset it is near-instant.
+/// Assigns the key to the lowest available slot column (1..=20) and inserts
+/// the mapping into Postgres with `status: pending`. Returns immediately —
+/// the historical backfill (populating the slot column for spans already
+/// ingested before this call) runs entirely in the background, advanced by a
+/// periodic poller; poll `GET /otel/facets` and check the returned `status`
+/// (`pending` -> `running` -> `completed`/`failed`) to track progress. New
+/// spans start getting the attribute written into the slot column right
+/// away, independent of backfill progress.
 #[utoipa::path(
     tag = "OTel Facets",
     post,
@@ -164,9 +172,12 @@ pub async fn create_facet(
 
 /// Remove a registered OTel span attribute facet.
 ///
-/// Clears the corresponding ClickHouse slot column for all existing spans
-/// (to prevent stale data leaking into a future facet that reuses the slot),
-/// then removes the Postgres mapping. The slot becomes available for reuse.
+/// Marks the facet `deleting` and stops new spans from populating its slot
+/// immediately, but the Postgres row (and its slot reservation) isn't
+/// removed until the background poller confirms the slot column has been
+/// cleared for all existing spans — otherwise a future facet reusing the
+/// same slot could see stale data. `GET /otel/facets` will keep returning
+/// this facet with `status: deleting` until that finishes.
 #[utoipa::path(
     tag = "OTel Facets",
     delete,
@@ -206,4 +217,51 @@ pub async fn delete_facet(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Retry a failed OTel span attribute facet backfill.
+///
+/// Only valid when the facet's `status` is `failed`. Resets its progress and
+/// lets the background poller re-attempt the backfill from the beginning on
+/// its next tick.
+#[utoipa::path(
+    tag = "OTel Facets",
+    post,
+    path = "/otel/facets/{key}/retry",
+    params(
+        ("key" = String, Path, description = "The OTel attribute key (URL-encoded)"),
+    ),
+    responses(
+        (status = 200, description = "Backfill retry scheduled", body = FacetInfo),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Facet not found", body = ProblemDetails),
+        (status = 409, description = "Facet is not in a failed state", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn retry_facet_backfill(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(key): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelWrite);
+
+    let info = state.facet_service.retry_backfill(&key).await?;
+
+    let audit = FacetBackfillRetriedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        attribute_key: key,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log for facet backfill retry: {}", e);
+    }
+
+    Ok(Json(info))
 }

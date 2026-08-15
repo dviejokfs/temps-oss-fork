@@ -180,6 +180,7 @@ async fn setup_with_quota(
         None,
         7,
         Some(limit_bytes),
+        None,
     ));
 
     let storage = ClickHouseOtelStorage::new(

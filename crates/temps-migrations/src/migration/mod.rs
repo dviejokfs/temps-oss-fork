@@ -189,6 +189,7 @@ mod m20260813_000001_add_ai_api_traffic_summary_enabled;
 mod m20260814_000001_create_ai_provider_models;
 mod m20260814_000001_create_otel_span_facets;
 mod m20260814_000002_add_ai_summary_preference;
+mod m20260815_000001_add_facet_attr_columns_to_otel_spans;
 
 pub struct Migrator;
 
@@ -409,6 +410,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260814_000001_create_ai_provider_models::Migration),
             Box::new(m20260814_000001_create_otel_span_facets::Migration),
             Box::new(m20260814_000002_add_ai_summary_preference::Migration),
+            Box::new(m20260815_000001_add_facet_attr_columns_to_otel_spans::Migration),
         ]
     }
 }
