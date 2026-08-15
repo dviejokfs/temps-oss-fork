@@ -24,6 +24,7 @@ export interface PlatformToolItem {
   url: string
   icon: LucideIcon
   keywords?: string[]
+  featureKey?: string
 }
 
 export interface PlatformToolGroup {
@@ -50,6 +51,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
         url: '/sandboxes',
         icon: Box,
         keywords: ['development', 'runtime'],
+        featureKey: 'sandboxes-preview-environments',
       },
       {
         title: 'Git providers',
@@ -119,6 +121,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
         url: '/monitoring/alerts',
         icon: Gauge,
         keywords: ['health', 'alarms', 'resources'],
+        featureKey: 'alerts-metric-alerts',
       },
       {
         title: 'Proxy',
@@ -169,6 +172,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
         url: '/ai-gateway',
         icon: Sparkles,
         keywords: ['models', 'providers', 'chat', 'autofix', 'gateway'],
+        featureKey: 'ai-gateway',
       },
       {
         title: 'AI workflows',
@@ -176,6 +180,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
         url: '/ai-workflows',
         icon: Bot,
         keywords: ['automation', 'agents'],
+        featureKey: 'ai-agents-workflows',
       },
       {
         title: 'Settings',

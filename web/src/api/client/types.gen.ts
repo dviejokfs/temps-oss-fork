@@ -7768,6 +7768,13 @@ export type FailureReportPreviewResponse = {
     reporting_enabled: boolean;
 };
 
+export type FeatureMaturity = {
+    docs_path: string;
+    key: string;
+    maturity: Maturity;
+    reason: string;
+};
+
 export type FieldResponse = {
     /**
      * Field type (Int32, String, Timestamp, etc.)
@@ -10189,6 +10196,8 @@ export type ManualAction = {
  * When a manual action needs to happen relative to migration
  */
 export type ManualActionTiming = 'before-migration' | 'after-migration' | 'within-hours';
+
+export type Maturity = 'stable' | 'beta' | 'experimental';
 
 export type McpDefinitionResponse = {
     config: {
@@ -51461,6 +51470,33 @@ export type RemoveRoleResponses = {
 };
 
 export type RemoveRoleResponse = RemoveRoleResponses[keyof RemoveRoleResponses];
+
+export type GetFeatureMaturityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/platform/feature-maturity';
+};
+
+export type GetFeatureMaturityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetFeatureMaturityResponses = {
+    /**
+     * Feature maturity registry for this build
+     */
+    200: Array<FeatureMaturity>;
+};
+
+export type GetFeatureMaturityResponse = GetFeatureMaturityResponses[keyof GetFeatureMaturityResponses];
 
 export type ListSnapshotsData = {
     body?: never;

@@ -10,6 +10,7 @@ import {
   platformToolShortcuts,
   type PlatformToolGroup,
 } from '@/components/platform/platform-tools'
+import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 
 export function PlatformTools() {
   const [query, setQuery] = useState('')
@@ -135,7 +136,13 @@ export function PlatformTools() {
                     </span>
                     <span className="min-w-0">
                       <span className="block truncate text-sm font-medium">
-                        {item.title}
+                        <span className="flex items-center gap-2">
+                          <span className="truncate">{item.title}</span>
+                          <FeatureMaturityBadge
+                            featureKey={item.featureKey}
+                            compact
+                          />
+                        </span>
                       </span>
                       <span className="block truncate text-xs text-muted-foreground">
                         {item.description}

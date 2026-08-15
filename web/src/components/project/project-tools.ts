@@ -29,6 +29,7 @@ export interface ProjectToolItem {
   title: string
   url: string
   icon: LucideIcon
+  featureKey?: string
 }
 
 export interface ProjectToolGroup {
@@ -42,14 +43,54 @@ export const projectToolGroups: ProjectToolGroup[] = [
     label: 'Analytics',
     description: 'Understand traffic, content, conversion, and revenue.',
     items: [
-      { title: 'Visitors', url: 'analytics/visitors', icon: Users },
-      { title: 'Pages', url: 'analytics/pages', icon: FileText },
-      { title: 'AI Agents', url: 'analytics/ai-agents', icon: Bot },
-      { title: 'Funnels', url: 'analytics/funnels', icon: Filter },
-      { title: 'Session Replays', url: 'analytics/replays', icon: Play },
-      { title: 'API Traffic', url: 'analytics/api-traffic', icon: Server },
-      { title: 'Speed', url: 'speed', icon: Zap },
-      { title: 'Revenue', url: 'revenue', icon: CreditCard },
+      {
+        title: 'Visitors',
+        url: 'analytics/visitors',
+        icon: Users,
+        featureKey: 'web-analytics',
+      },
+      {
+        title: 'Pages',
+        url: 'analytics/pages',
+        icon: FileText,
+        featureKey: 'web-analytics',
+      },
+      {
+        title: 'AI Agents',
+        url: 'analytics/ai-agents',
+        icon: Bot,
+        featureKey: 'web-analytics',
+      },
+      {
+        title: 'Funnels',
+        url: 'analytics/funnels',
+        icon: Filter,
+        featureKey: 'funnels',
+      },
+      {
+        title: 'Session Replays',
+        url: 'analytics/replays',
+        icon: Play,
+        featureKey: 'session-replay',
+      },
+      {
+        title: 'API Traffic',
+        url: 'analytics/api-traffic',
+        icon: Server,
+        featureKey: 'web-analytics',
+      },
+      {
+        title: 'Speed',
+        url: 'speed',
+        icon: Zap,
+        featureKey: 'performance-monitoring',
+      },
+      {
+        title: 'Revenue',
+        url: 'revenue',
+        icon: CreditCard,
+        featureKey: 'revenue-tracking',
+      },
     ],
   },
   {
@@ -57,12 +98,32 @@ export const projectToolGroups: ProjectToolGroup[] = [
     description: 'Investigate runtime behavior, health, and incoming requests.',
     items: [
       { title: 'Activity', url: 'observe', icon: Eye },
-      { title: 'AI Traces', url: 'ai-gateway?tab=activity', icon: Bot },
-      { title: 'Metrics', url: 'metrics', icon: LineChart },
-      { title: 'Telemetry Logs', url: 'telemetry-logs', icon: Radio },
+      {
+        title: 'AI Traces',
+        url: 'ai-gateway?tab=activity',
+        icon: Bot,
+        featureKey: 'ai-gateway',
+      },
+      {
+        title: 'Metrics',
+        url: 'metrics',
+        icon: LineChart,
+        featureKey: 'otel-traces-metrics',
+      },
+      {
+        title: 'Telemetry Logs',
+        url: 'telemetry-logs',
+        icon: Radio,
+        featureKey: 'otel-traces-metrics',
+      },
       { title: 'Uptime', url: 'monitors', icon: Activity },
       { title: 'Request Logs', url: 'request-logs', icon: Rss },
-      { title: 'AI Crawlers', url: 'ai-crawlers', icon: Bot },
+      {
+        title: 'AI Crawlers',
+        url: 'ai-crawlers',
+        icon: Bot,
+        featureKey: 'web-analytics',
+      },
     ],
   },
   {
@@ -75,7 +136,12 @@ export const projectToolGroups: ProjectToolGroup[] = [
         icon: KeyRound,
       },
       { title: 'Feature Flags', url: 'flags', icon: Flag },
-      { title: 'AI Workflows', url: 'agents', icon: Workflow },
+      {
+        title: 'AI Workflows',
+        url: 'agents',
+        icon: Workflow,
+        featureKey: 'ai-agents-workflows',
+      },
     ],
   },
   {
@@ -84,13 +150,23 @@ export const projectToolGroups: ProjectToolGroup[] = [
     items: [
       { title: 'General', url: 'settings/general', icon: SlidersHorizontal },
       { title: 'Secrets', url: 'settings/secrets', icon: FileLock2 },
-      { title: 'Security', url: 'settings/security', icon: Shield },
+      {
+        title: 'Security',
+        url: 'settings/security',
+        icon: Shield,
+        featureKey: 'vulnerability-scanning',
+      },
       { title: 'Access', url: 'settings/access', icon: Users },
       { title: 'Cron Jobs', url: 'settings/cron-jobs', icon: Clock },
       { title: 'Webhooks', url: 'settings/webhooks', icon: Webhook },
       { title: 'Skills', url: 'settings/skills', icon: Wand2 },
       { title: 'MCP Servers', url: 'settings/mcp-servers', icon: Server },
-      { title: 'Alert Rules', url: 'errors/alert-rules', icon: AlarmClock },
+      {
+        title: 'Alert Rules',
+        url: 'errors/alert-rules',
+        icon: AlarmClock,
+        featureKey: 'alerts-metric-alerts',
+      },
     ],
   },
 ]
@@ -103,12 +179,14 @@ export const projectToolShortcuts: Array<
     description: 'Journeys, sessions, and audience details',
     url: 'analytics/visitors',
     icon: Users,
+    featureKey: 'web-analytics',
   },
   {
     title: 'Inspect metrics',
     description: 'Explore resource and application signals',
     url: 'metrics',
     icon: LineChart,
+    featureKey: 'otel-traces-metrics',
   },
   {
     title: 'Check availability',

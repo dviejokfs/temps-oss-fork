@@ -96,12 +96,14 @@ import {
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu'
 import { useTheme } from 'next-themes'
+import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 
 interface PlatformNavItem {
   title: string
   url: string
   icon: LucideIcon
   activeWhen?: (pathname: string) => boolean
+  featureKey?: string
 }
 
 interface PlatformNavGroup {
@@ -136,6 +138,7 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
         url: '/monitoring/alerts',
         icon: Gauge,
         activeWhen: (pathname) => pathname.startsWith('/monitoring'),
+        featureKey: 'alerts-metric-alerts',
       },
       { title: 'Proxy', url: '/proxy', icon: Activity },
     ],
@@ -156,7 +159,7 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
 // Full grouped settings tree — mirrors SettingsLayout
 interface SettingsGroupDef {
   label: string
-  items: { title: string; url: string; icon: LucideIcon }[]
+  items: PlatformNavItem[]
 }
 // Settings drill-down contains instance configuration rather than runtime
 // tools, which live on the All platform tools page.
@@ -173,7 +176,12 @@ const settingsGroups: SettingsGroupDef[] = [
     label: 'Access',
     items: [
       { title: 'Users', url: '/settings/users', icon: Users },
-      { title: 'Teams', url: '/settings/teams', icon: UsersRound },
+      {
+        title: 'Teams',
+        url: '/settings/teams',
+        icon: UsersRound,
+        featureKey: 'teams',
+      },
       { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
       { title: 'API Keys', url: '/settings/keys', icon: Key },
     ],
@@ -193,8 +201,18 @@ const settingsGroups: SettingsGroupDef[] = [
         url: '/settings/request-timeouts',
         icon: Clock,
       },
-      { title: 'Worker Nodes', url: '/settings/nodes', icon: Network },
-      { title: 'Plugins', url: '/settings/plugins', icon: Puzzle },
+      {
+        title: 'Worker Nodes',
+        url: '/settings/nodes',
+        icon: Network,
+        featureKey: 'multi-node-worker-join',
+      },
+      {
+        title: 'Plugins',
+        url: '/settings/plugins',
+        icon: Puzzle,
+        featureKey: 'plugin-system',
+      },
     ],
   },
   {
@@ -228,14 +246,49 @@ const AI_MODE_PREFIXES = [
   '/mcp-servers',
   '/ai-workflows',
 ]
-const aiNavItems: { title: string; url: string; icon: LucideIcon }[] = [
-  { title: 'Providers', url: '/ai-gateway', icon: Sparkles },
-  { title: 'Usage', url: '/ai-gateway/usage', icon: BarChart3 },
-  { title: 'Activity', url: '/ai-gateway/activity', icon: Activity },
-  { title: 'Setup', url: '/ai-gateway/setup', icon: Terminal },
-  { title: 'Chats', url: '/chat', icon: MessageSquare },
-  { title: 'Workflows', url: '/ai-workflows', icon: Bot },
-  { title: 'Skills', url: '/skills', icon: Wand2 },
+const aiNavItems: PlatformNavItem[] = [
+  {
+    title: 'Providers',
+    url: '/ai-gateway',
+    icon: Sparkles,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Usage',
+    url: '/ai-gateway/usage',
+    icon: BarChart3,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Activity',
+    url: '/ai-gateway/activity',
+    icon: Activity,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Setup',
+    url: '/ai-gateway/setup',
+    icon: Terminal,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Chats',
+    url: '/chat',
+    icon: MessageSquare,
+    featureKey: 'ai-chat',
+  },
+  {
+    title: 'Workflows',
+    url: '/ai-workflows',
+    icon: Bot,
+    featureKey: 'ai-agents-workflows',
+  },
+  {
+    title: 'Skills',
+    url: '/skills',
+    icon: Wand2,
+    featureKey: 'ai-foundation-api-tools',
+  },
   { title: 'MCP Servers', url: '/mcp-servers', icon: Server },
 ]
 
@@ -465,6 +518,7 @@ function NavSection({
     url: string
     icon: LucideIcon
     activeWhen?: (pathname: string) => boolean
+    featureKey?: string
   }[]
   // URLs of items in OTHER sections that share the sidebar. Used so a
   // parent-like url (e.g. `/settings`) doesn't light up when a more
@@ -519,6 +573,12 @@ function NavSection({
                 <Link to={item.url}>
                   <item.icon />
                   {!compact && <span>{item.title}</span>}
+                  {!compact && (
+                    <FeatureMaturityBadge
+                      featureKey={item.featureKey}
+                      compact
+                    />
+                  )}
                 </Link>
               </SidebarMenuButton>
             </SidebarMenuItem>
@@ -961,9 +1021,24 @@ const projectPrimaryGroups: ProjectNavGroup[] = [
   {
     label: 'Data',
     items: [
-      { title: 'Analytics', url: 'analytics', icon: BarChart3 },
-      { title: 'Errors', url: 'errors', icon: ShieldAlert },
-      { title: 'Traces', url: 'traces', icon: Network },
+      {
+        title: 'Analytics',
+        url: 'analytics',
+        icon: BarChart3,
+        featureKey: 'web-analytics',
+      },
+      {
+        title: 'Errors',
+        url: 'errors',
+        icon: ShieldAlert,
+        featureKey: 'error-tracking',
+      },
+      {
+        title: 'Traces',
+        url: 'traces',
+        icon: Network,
+        featureKey: 'otel-traces-metrics',
+      },
       { title: 'Logs', url: 'runtime', icon: ScrollText },
       { title: 'Databases', url: 'storage', icon: Database },
     ],
@@ -1138,6 +1213,12 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
                     >
                       <item.icon />
                       {!compact && <span>{item.title}</span>}
+                      {!compact && (
+                        <FeatureMaturityBadge
+                          featureKey={item.featureKey}
+                          compact
+                        />
+                      )}
                     </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
@@ -1173,6 +1254,12 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
                   >
                     <item.icon />
                     {!compact && <span>{item.title}</span>}
+                    {!compact && (
+                      <FeatureMaturityBadge
+                        featureKey={item.featureKey}
+                        compact
+                      />
+                    )}
                   </Link>
                 </SidebarMenuButton>
               </SidebarMenuItem>

@@ -1,5 +1,6 @@
 import { type ProjectResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
+import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 import { Input } from '@/components/ui/input'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { usePinnedProjectTools } from '@/hooks/usePinnedProjectTools'
@@ -83,7 +84,10 @@ export function ProjectToolsPage({ project }: { project: ProjectResponse }) {
           <span className="grid size-8 shrink-0 place-items-center rounded-lg border bg-background text-muted-foreground">
             <item.icon className="size-4" />
           </span>
-          <span className="truncate text-sm font-medium">{item.title}</span>
+          <span className="min-w-0 truncate text-sm font-medium">
+            {item.title}
+          </span>
+          <FeatureMaturityBadge featureKey={item.featureKey} compact />
         </Link>
         <Button
           type="button"
@@ -162,7 +166,10 @@ export function ProjectToolsPage({ project }: { project: ProjectResponse }) {
                 className="group rounded-xl border bg-card p-4 transition-colors hover:border-foreground/20 hover:bg-accent"
               >
                 <item.icon className="mb-4 size-5 text-muted-foreground transition-colors group-hover:text-foreground" />
-                <span className="block text-sm font-medium">{item.title}</span>
+                <span className="flex items-center gap-2 text-sm font-medium">
+                  {item.title}
+                  <FeatureMaturityBadge featureKey={item.featureKey} compact />
+                </span>
                 <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
                   {item.description}
                 </span>
