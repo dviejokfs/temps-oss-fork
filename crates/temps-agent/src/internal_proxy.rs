@@ -84,6 +84,7 @@ const MAX_RETRIES: usize = 3;
 struct ProxyState {
     client: reqwest::Client,
     store: SharedRouteStore,
+    docker: bollard::Docker,
 }
 
 /// Spawn the proxy on `<bridge_ip>:80`. Returns once the listener is
@@ -96,6 +97,7 @@ pub async fn spawn(
     bridge_ip: IpAddr,
     port: u16,
     store: SharedRouteStore,
+    docker: bollard::Docker,
     shutdown: Arc<Notify>,
 ) -> std::io::Result<()> {
     let addr = SocketAddr::new(bridge_ip, port);
@@ -111,7 +113,11 @@ pub async fn spawn(
         .build()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    let state = Arc::new(ProxyState { client, store });
+    let state = Arc::new(ProxyState {
+        client,
+        store,
+        docker,
+    });
     let app = axum::Router::new().fallback(handle).with_state(state);
 
     tokio::spawn(async move {
@@ -158,7 +164,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
 
-    if !caller_may_access_route(&state.store, req.extensions(), &entry) {
+    if !caller_may_access_route(&state, req.extensions(), &entry).await {
         warn!(%host, route_project_id = ?entry.project_id, "blocked cross-project internal proxy request");
         return error_body(
             StatusCode::FORBIDDEN,
@@ -187,8 +193,8 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     proxy_with_retries(&state, &entry, req).await
 }
 
-fn caller_may_access_route(
-    store: &SharedRouteStore,
+async fn caller_may_access_route(
+    state: &ProxyState,
     extensions: &axum::http::Extensions,
     entry: &RouteEntry,
 ) -> bool {
@@ -200,7 +206,54 @@ fn caller_may_access_route(
     let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
         return false;
     };
-    store.backend_ip_has_project(peer.ip(), route_project_id)
+    let Some(container_id) = source_container_id(&state.docker, peer.ip()).await else {
+        return false;
+    };
+    state
+        .store
+        .container_id_has_project(&container_id, route_project_id)
+}
+
+/// Resolve the peer address through the local Docker daemon. The daemon's
+/// network attachment state is the authority for which container owns an IP;
+/// route destination addresses are not caller identity and may be hostnames or
+/// shared node addresses.
+async fn source_container_id(docker: &bollard::Docker, source_ip: IpAddr) -> Option<String> {
+    use bollard::query_parameters::ListContainersOptions;
+
+    let containers = docker
+        .list_containers(Some(ListContainersOptions {
+            all: false,
+            ..Default::default()
+        }))
+        .await
+        .map_err(|error| {
+            warn!(%source_ip, %error, "failed to resolve internal proxy caller through Docker");
+            error
+        })
+        .ok()?;
+
+    containers.into_iter().find_map(|container| {
+        let owns_source_ip = container
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+            .is_some_and(|networks| {
+                networks.values().any(|endpoint| {
+                    endpoint
+                        .ip_address
+                        .as_deref()
+                        .and_then(|value| value.parse::<IpAddr>().ok())
+                        .is_some_and(|ip| ip == source_ip)
+                        || endpoint
+                            .global_ipv6_address
+                            .as_deref()
+                            .and_then(|value| value.parse::<IpAddr>().ok())
+                            .is_some_and(|ip| ip == source_ip)
+                })
+            });
+        owns_source_ip.then_some(container.id).flatten()
+    })
 }
 
 /// True if the client requested a protocol upgrade. We check both the
@@ -673,12 +726,12 @@ mod tests {
     use crate::route_store::{RouteBackend, RouteEntry, RouteStore};
     use std::path::PathBuf;
 
-    fn route(host: &str, project_id: i32, backend: &str) -> RouteEntry {
+    fn route(host: &str, project_id: i32, container_id: &str) -> RouteEntry {
         RouteEntry {
             host: host.to_string(),
             backends: vec![RouteBackend {
-                address: backend.to_string(),
-                container_id: None,
+                address: format!("{container_id}:3000"),
+                container_id: Some(container_id.to_string()),
                 container_name: None,
             }],
             deployment_id: Some(project_id * 10),
@@ -687,49 +740,31 @@ mod tests {
         }
     }
 
-    fn extensions_for(peer: &str) -> axum::http::Extensions {
-        let mut extensions = axum::http::Extensions::new();
-        extensions.insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
-        extensions
-    }
-
     #[test]
-    fn caller_policy_allows_same_project_backend_ip() {
+    fn caller_policy_allows_same_project_container() {
         let store = Arc::new(RouteStore::new(PathBuf::from("/tmp/unused-routes.json")));
-        let target = route("prod.alpha.temps.local", 42, "172.20.1.10:3000");
+        let target = route("prod.alpha.temps.local", 42, "container-alpha");
         store.apply_snapshot(1, vec![target.clone()]);
 
-        assert!(caller_may_access_route(
-            &store,
-            &extensions_for("172.20.1.10:49152"),
-            &target
-        ));
+        assert!(store.container_id_has_project("container-alpha", 42));
     }
 
     #[test]
-    fn caller_policy_blocks_cross_project_backend_ip() {
+    fn caller_policy_blocks_cross_project_container() {
         let store = Arc::new(RouteStore::new(PathBuf::from("/tmp/unused-routes.json")));
-        let attacker = route("prod.attacker.temps.local", 7, "172.20.1.7:3000");
-        let victim = route("prod.victim.temps.local", 42, "172.20.1.42:3000");
+        let attacker = route("prod.attacker.temps.local", 7, "container-attacker");
+        let victim = route("prod.victim.temps.local", 42, "container-victim");
         store.apply_snapshot(1, vec![attacker, victim.clone()]);
 
-        assert!(!caller_may_access_route(
-            &store,
-            &extensions_for("172.20.1.7:49152"),
-            &victim
-        ));
+        assert!(!store.container_id_has_project("container-attacker", 42));
     }
 
     #[test]
-    fn caller_policy_blocks_unknown_source_ip() {
+    fn caller_policy_blocks_unknown_container() {
         let store = Arc::new(RouteStore::new(PathBuf::from("/tmp/unused-routes.json")));
-        let target = route("prod.alpha.temps.local", 42, "172.20.1.10:3000");
+        let target = route("prod.alpha.temps.local", 42, "container-alpha");
         store.apply_snapshot(1, vec![target.clone()]);
 
-        assert!(!caller_may_access_route(
-            &store,
-            &extensions_for("172.20.1.99:49152"),
-            &target
-        ));
+        assert!(!store.container_id_has_project("unknown", 42));
     }
 }

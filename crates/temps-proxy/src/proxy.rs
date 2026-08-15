@@ -430,6 +430,36 @@ fn should_redirect_to_https(
     env_force_https.unwrap_or_else(host_has_cert)
 }
 
+fn deployment_asset_path_matches(
+    current_deployment_slug: Option<&str>,
+    requested_deployment_slug: &str,
+) -> bool {
+    current_deployment_slug == Some(requested_deployment_slug)
+}
+
+fn inherited_https_policy(production_https: bool, host_has_cert: bool) -> bool {
+    production_https || host_has_cert
+}
+
+#[cfg(test)]
+mod deployment_asset_scope_tests {
+    use super::{deployment_asset_path_matches, inherited_https_policy};
+
+    #[test]
+    fn prefixed_asset_must_name_the_current_deployment() {
+        assert!(deployment_asset_path_matches(Some("deploy-a"), "deploy-a"));
+        assert!(!deployment_asset_path_matches(Some("deploy-a"), "deploy-b"));
+        assert!(!deployment_asset_path_matches(None, "deploy-a"));
+    }
+
+    #[test]
+    fn production_https_cannot_be_bypassed_with_an_unknown_host() {
+        assert!(inherited_https_policy(true, false));
+        assert!(!inherited_https_policy(false, false));
+        assert!(inherited_https_policy(false, true));
+    }
+}
+
 /// Proxy context for tracking request state
 pub struct ProxyContext {
     pub response_modified: bool,
@@ -547,7 +577,7 @@ pub struct LoadBalancer {
     route_table: Option<Arc<temps_routes::CachedPeerTable>>,
     file_store: Option<Arc<dyn temps_file_store::FileStore>>,
     /// In-memory moka cache for `static_asset_cache` DB lookups. Keyed on
-    /// `(project_id, url_path)`; values are `Option<content_hash>` so that
+    /// `(project_id, environment_id, deployment_id, url_path)`; values are `Option<content_hash>` so that
     /// **negative results (no row found) are cached too** — the miss case is
     /// the common path for container deployments where most assets are served
     /// by upstream, not the fallback store. TTL 60 s, max ~50 k entries. See
@@ -2057,8 +2087,8 @@ impl LoadBalancer {
 
     /// Serve a static asset from CAS via the in-memory lookup cache.
     ///
-    /// `static_asset_lookup` resolves `(project_id, url_path) → content_hash`
-    /// using a moka TTL cache (60 s) so the `static_asset_cache` table is not
+    /// `static_asset_lookup` resolves the exact routed project/environment/
+    /// deployment and URL path using a moka TTL cache (60 s), so the table is not
     /// queried on every cacheable-asset request. Both hits and misses are cached;
     /// the miss case (no fallback row — the common path for container deployments)
     /// is the most important one to protect. See WS4 / `static_asset_lookup.rs`.
@@ -2075,16 +2105,18 @@ impl LoadBalancer {
             None => return Ok(false),
         };
 
-        // Resolve project_id, then look up the content hash via cache (no DB on hit/cached-miss).
-        let content_hash = match ctx.project.as_ref().map(|p| p.id) {
-            Some(pid) => match self
-                .static_asset_lookup
-                .get_content_hash(pid, url_path)
-                .await
-            {
-                Some(hash) => hash,
-                None => return Ok(false),
-            },
+        let scope = match (&ctx.project, &ctx.environment, &ctx.deployment) {
+            (Some(project), Some(environment), Some(deployment)) => {
+                (project.id, environment.id, deployment.id)
+            }
+            _ => return Ok(false),
+        };
+        let content_hash = match self
+            .static_asset_lookup
+            .get_content_hash(scope.0, scope.1, scope.2, url_path)
+            .await
+        {
+            Some(hash) => hash,
             None => return Ok(false),
         };
 
@@ -4318,6 +4350,24 @@ impl ProxyHttp for LoadBalancer {
         // WS3: cert-host check is now a lock-free ArcSwap snapshot read; the
         // background `CertHostCache::run_refresh_loop` keeps it current (±30 s).
         let env_force_https = ctx.environment.as_ref().and_then(|env| env.force_https);
+        let production_https = if !self.disable_https_redirect
+            && !self.is_tls_connection(session)
+            && !ctx.path.starts_with(ACME_HTTP01_PREFIX)
+            && env_force_https.is_none()
+        {
+            match self.config_service.get_url_scheme().await {
+                Ok(scheme) => scheme != "http",
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Failed to read external URL scheme; enforcing HTTPS"
+                    );
+                    true
+                }
+            }
+        } else {
+            false
+        };
         let needs_redirect = should_redirect_to_https(
             self.disable_https_redirect,
             self.is_tls_connection(session),
@@ -4325,7 +4375,12 @@ impl ProxyHttp for LoadBalancer {
             env_force_https,
             // Lock-free ArcSwap snapshot read, and only reached when the
             // environment has no explicit override.
-            || self.cert_host_cache.has_cert_for_host(&ctx.host),
+            || {
+                inherited_https_policy(
+                    production_https,
+                    self.cert_host_cache.has_cert_for_host(&ctx.host),
+                )
+            },
         );
         if needs_redirect {
             // Build the HTTPS redirect URL preserving path and query string
@@ -4674,8 +4729,15 @@ impl ProxyHttp for LoadBalancer {
         if ctx.path.starts_with("/_temps/assets/") {
             let after_prefix = &ctx.path["/_temps/assets/".len()..];
             if let Some(slash_pos) = after_prefix.find('/') {
+                let deployment_slug = &after_prefix[..slash_pos];
                 let asset_path = after_prefix[slash_pos + 1..].to_string();
-                if Self::is_cacheable_static_asset(&asset_path) {
+                if deployment_asset_path_matches(
+                    ctx.deployment
+                        .as_ref()
+                        .map(|deployment| deployment.slug.as_str()),
+                    deployment_slug,
+                ) && Self::is_cacheable_static_asset(&asset_path)
+                {
                     if let Ok(true) = self.serve_asset_from_store(session, ctx, &asset_path).await {
                         ctx.routing_status = "prefixed_asset".to_string();
                         return Ok(true);

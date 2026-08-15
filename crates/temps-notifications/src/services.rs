@@ -17,7 +17,7 @@ use temps_core::notifications::{
     EmailMessage, NotificationData, NotificationError as CoreNotificationError,
     NotificationService as CoreNotificationService,
 };
-use temps_core::url_validation::{validate_domain_async, validate_external_url};
+use temps_core::url_validation::{resolve_and_validate_domain, validate_external_url};
 use temps_entities::types::RoleType;
 use temps_entities::{
     notification_preferences, notification_providers, notifications, roles, user_roles, users,
@@ -256,18 +256,37 @@ async fn validate_webhook_url(url: &str) -> Result<()> {
         .host_str()
         .filter(|host| host.parse::<std::net::IpAddr>().is_err())
     {
-        validate_domain_async(domain)
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            anyhow::anyhow!("Invalid webhook URL '{}': URL has no resolvable port", url)
+        })?;
+        resolve_and_validate_domain(domain, port)
             .await
             .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
     }
     Ok(())
 }
 
-fn webhook_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+async fn webhook_http_client(url: &str, timeout_secs: u64) -> Result<reqwest::Client> {
+    let parsed = validate_external_url(url)
+        .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+    let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?)
+        .redirect(reqwest::redirect::Policy::none());
+
+    if let Some(domain) = parsed
+        .host_str()
+        .filter(|host| host.parse::<std::net::IpAddr>().is_err())
+    {
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            anyhow::anyhow!("Invalid webhook URL '{}': URL has no resolvable port", url)
+        })?;
+        let addrs = resolve_and_validate_domain(domain, port)
+            .await
+            .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+        builder = builder.resolve_to_addrs(domain, &addrs);
+    }
+
+    Ok(builder.build()?)
 }
 
 /// Cloudflare Email Sending provider.
@@ -1262,8 +1281,7 @@ impl NotificationProvider for WebhookProvider {
     }
 
     async fn send(&self, notification: &Notification) -> Result<()> {
-        validate_webhook_url(&self.url).await?;
-        let client = webhook_http_client(self.timeout_secs)?;
+        let client = webhook_http_client(&self.url, self.timeout_secs).await?;
 
         // Build the payload with all notification data. `_`-prefixed keys are
         // channel-specific payloads (e.g. the email's `_chart_svg`) — drop them
@@ -1317,8 +1335,7 @@ impl NotificationProvider for WebhookProvider {
     }
 
     async fn health_check(&self) -> Result<bool> {
-        validate_webhook_url(&self.url).await?;
-        let client = webhook_http_client(self.timeout_secs)?;
+        let client = webhook_http_client(&self.url, self.timeout_secs).await?;
 
         // Send a test payload
         let test_payload = serde_json::json!({

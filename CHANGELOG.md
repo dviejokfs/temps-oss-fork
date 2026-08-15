@@ -10,7 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **email:** Pin validated SMTP probe addresses and remove request-controlled proxy routing ([#305](https://github.com/gotempsh/temps/pull/305))
-- **critical hardening:** Close project-permission, Blob/KV tenant and token-scope bypasses; restrict managed PostgreSQL images; confine Compose build contexts and Docker secret paths; authenticate internal project routes; validate log WebSocket origins; fail closed on local-image tag drift; quote WAL-G environment values; replace raw data-browser SQL filters with safe filtering; and harden AI gateway and webhook egress against SSRF.
 ### Fixed
 
 - **OTel ingest memory backpressure:** Bound concurrent OTLP request processing before body buffering (ceiling configurable via `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`, default 64), single-flight repeated token authentication, coalesce token usage writes, remove duplicate metrics authentication, enforce the decompressed-size limit while streaming zstd payloads, and cap the compressed request body explicitly rather than relying on Axum's implicit default.

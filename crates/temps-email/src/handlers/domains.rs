@@ -572,7 +572,40 @@ pub async fn setup_dns(
             not_found().detail("Email domain not found").build()
         })?;
 
-    // Get the DNS provider
+    // Bind use of the provider credentials to an active, verified zone that
+    // authoritatively covers this email domain. The provider ID is caller
+    // input and must not grant access to unrelated DNS credentials.
+    let email_domain = &domain_with_dns.domain.domain;
+    let base_domain = extract_base_domain(email_domain);
+    let verified_zone = dns_provider_service
+        .find_verified_zone_for_provider(request.dns_provider_id, &base_domain)
+        .await
+        .map_err(|error| {
+            error!(
+                provider_id = request.dns_provider_id,
+                domain = %base_domain,
+                %error,
+                "Failed to verify DNS provider authorization"
+            );
+            internal_server_error()
+                .detail("Failed to verify DNS provider authorization for this domain")
+                .build()
+        })?;
+    if verified_zone.is_none() {
+        warn!(
+            provider_id = request.dns_provider_id,
+            domain = %base_domain,
+            "Rejected email DNS setup through an unrelated provider"
+        );
+        return Err(bad_request()
+            .detail(format!(
+                "DNS provider {} is not authorized to manage {}",
+                request.dns_provider_id, base_domain
+            ))
+            .build());
+    }
+
+    // The authorization query above also requires this provider to be active.
     let dns_provider = dns_provider_service
         .get(request.dns_provider_id)
         .await
@@ -590,10 +623,6 @@ pub async fn setup_dns(
                 .detail(format!("Failed to initialize DNS provider: {}", e))
                 .build()
         })?;
-
-    // Extract the base domain (e.g., "example.com" from "mail.example.com")
-    let email_domain = &domain_with_dns.domain.domain;
-    let base_domain = extract_base_domain(email_domain);
 
     info!(
         "Setting up {} DNS records for {} using provider {}",

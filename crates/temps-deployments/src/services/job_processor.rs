@@ -1193,6 +1193,10 @@ fn is_automatic_deploy_enabled(
     effective.unwrap_or(false)
 }
 
+fn should_skip_git_push_for_auto_deploy(auto_deploy_enabled: bool, manual_trigger: bool) -> bool {
+    !auto_deploy_enabled && !manual_trigger
+}
+
 // Extracted free function for testing
 async fn process_git_push_event(
     workflow_planner: Arc<WorkflowPlanner>,
@@ -1295,40 +1299,16 @@ async fn process_git_push_event(
         // the answer is false (opt-in, not opt-out). Manual triggers bypass this
         // gate entirely — the user clicked deploy, so they unambiguously want one.
         //
-        // Exception: the FIRST deployment for an environment always runs even when
-        // automatic_deploy=false, so a freshly-created opt-out env still boots.
         let auto_deploy_enabled = is_automatic_deploy_enabled(
             project.deployment_config.as_ref(),
             environment.deployment_config.as_ref(),
         );
-        if !auto_deploy_enabled && !job.manual_trigger {
-            let existing_count = match deployments::Entity::find()
-                .filter(deployments::Column::EnvironmentId.eq(environment.id))
-                .count(db.as_ref())
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    error!(
-                        "Failed to count existing deployments for environment {}: {}",
-                        environment.id, e
-                    );
-                    continue;
-                }
-            };
-
-            if existing_count > 0 {
-                info!(
-                    "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
-                    project.id, environment.id, environment.name
-                );
-                continue;
-            }
-
+        if should_skip_git_push_for_auto_deploy(auto_deploy_enabled, job.manual_trigger) {
             info!(
-                "Allowing initial deployment for project {} environment {} ({}) despite automatic_deploy=false (no prior deployments)",
+                "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
                 project.id, environment.id, environment.name
             );
+            continue;
         } else if job.manual_trigger && !auto_deploy_enabled {
             info!(
                 "Manual trigger for project {} environment {} ({}) — bypassing automatic_deploy=false",
@@ -2851,6 +2831,21 @@ mod tests {
             Some(&project_cfg),
             Some(&env_cfg)
         ));
+    }
+
+    #[test]
+    fn webhook_push_is_skipped_when_auto_deploy_disabled_even_for_first_deploy() {
+        assert!(should_skip_git_push_for_auto_deploy(false, false));
+    }
+
+    #[test]
+    fn manual_trigger_bypasses_auto_deploy_disabled() {
+        assert!(!should_skip_git_push_for_auto_deploy(false, true));
+    }
+
+    #[test]
+    fn auto_deploy_enabled_allows_webhook_push() {
+        assert!(!should_skip_git_push_for_auto_deploy(true, false));
     }
 
     #[test]

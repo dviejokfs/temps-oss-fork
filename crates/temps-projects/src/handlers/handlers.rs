@@ -2086,6 +2086,7 @@ pub async fn create_project_from_template(
                     .git_provider_manager
                     .create_repository_and_push_template(
                         connection_id,
+                        auth.user_id(),
                         repository_name,
                         request.repository_owner.as_deref(),
                         Some(&format!("Created from template: {}", template.name)),

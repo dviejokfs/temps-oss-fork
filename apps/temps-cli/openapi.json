@@ -2931,7 +2931,7 @@
             "default": {
               "auto_upgrade": true,
               "host_port": 8090,
-              "image": "ghcr.io/gotempsh/temps-preview-gateway:latest"
+              "image": "ghcr.io/gotempsh/temps-preview-gateway:0.1.0"
             },
             "oneOf": [
               {
@@ -17148,7 +17148,7 @@
             ]
           },
           "image": {
-            "description": "Image reference the container was created with (e.g.\n`ghcr.io/gotempsh/temps-preview-gateway:latest`).",
+            "description": "Image reference the container was created with (e.g.\n`ghcr.io/gotempsh/temps-preview-gateway:0.1.0`).",
             "type": [
               "string",
               "null"
@@ -27900,9 +27900,9 @@
             "type": "integer"
           },
           "image": {
-            "default": "ghcr.io/gotempsh/temps-preview-gateway:latest",
+            "default": "ghcr.io/gotempsh/temps-preview-gateway:0.1.0",
             "description": "Docker image reference for the gateway. Pinned per Temps release.\nOperators can override this to test a custom build.",
-            "example": "ghcr.io/gotempsh/temps-preview-gateway:latest",
+            "example": "ghcr.io/gotempsh/temps-preview-gateway:0.1.0",
             "type": "string"
           },
           "shared_secret": {
@@ -43365,7 +43365,7 @@
       "UpgradeRequest": {
         "properties": {
           "image": {
-            "description": "Image reference to pull and run (e.g.\n`ghcr.io/gotempsh/temps-preview-gateway:latest`). Empty resets to default.",
+            "description": "Image reference to pull and run (e.g.\n`ghcr.io/gotempsh/temps-preview-gateway:0.1.0`). Empty resets to default.",
             "type": "string"
           }
         },

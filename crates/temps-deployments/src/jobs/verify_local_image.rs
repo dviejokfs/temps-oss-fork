@@ -87,7 +87,11 @@ fn image_ids_match(actual_id: &str, expected_id: &str) -> bool {
     if actual_normalized.is_empty() || expected_normalized.is_empty() {
         return false;
     }
-    if expected_normalized.len() <= 12 {
+    if expected_normalized.len() == 12
+        && expected_normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
         actual_normalized.starts_with(&expected_normalized)
     } else {
         actual_normalized == expected_normalized
@@ -267,6 +271,8 @@ mod tests {
     #[test]
     fn test_image_ids_match_detects_mismatch() {
         assert!(!image_ids_match("sha256:abcdef1234567890", "123456abcdef"));
+        assert!(!image_ids_match("sha256:abcdef1234567890", "a"));
+        assert!(!image_ids_match("sha256:abcdef1234567890", "not-hex-id!!"));
         assert!(!image_ids_match(
             "sha256:abcdef1234567890",
             "sha256:abcdef1234560000"
