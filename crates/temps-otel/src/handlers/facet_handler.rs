@@ -15,10 +15,10 @@
 //!
 //! ## CLI parity
 //!
-//! `temps facets list/create/remove/retry` in `apps/temps-cli/src/commands/facets/`
-//! (hand-written client, following the `otel-forward` pattern for plugin-only routes —
-//! see CLAUDE.md "Regenerating the OpenAPI clients" §
-//! "Never add a plugin-only route or schema to `apps/temps-cli/openapi.json`").
+//! `temps facets list/create/remove/retry` in `apps/temps-cli/src/commands/facets/`,
+//! using the regular generated client (these handlers are registered in the main
+//! `ApiDoc`, not plugin-only — `apps/temps-cli/openapi.json` includes them like any
+//! other endpoint; see CLAUDE.md "Regenerating the OpenAPI clients").
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

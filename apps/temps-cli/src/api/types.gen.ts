@@ -7763,6 +7763,13 @@ export type ExternalServiceSummary = {
 };
 
 /**
+ * Which storage engine a facet was created against. A deployment only ever
+ * runs one backend at a time (see `plugin.rs`'s storage selection), but
+ * stamping it on each row keeps the status fields unambiguous.
+ */
+export type FacetBackendKind = 'clickhouse' | 'timescaledb';
+
+/**
  * Public representation of a registered span attribute facet.
  */
 export type FacetInfo = {
@@ -7770,12 +7777,30 @@ export type FacetInfo = {
      * The OTel attribute key, e.g. `enduser.id` or `galachain.contract`.
      */
     attribute_key: string;
+    backend: FacetBackendKind;
     created_at: string;
     /**
-     * The slot column index 1..=20 in ClickHouse (`facet_attr_N`).
+     * Populated when `status = failed`, explaining why.
+     */
+    error_message?: string | null;
+    /**
+     * Rows backfilled so far. Only meaningful for the `timescaledb` backend
+     * — the `clickhouse` backend's mutation doesn't expose a row count
+     * until it's done, so this stays 0 there even while running.
+     */
+    rows_backfilled: number;
+    /**
+     * The slot column index 1..=20 (`facet_attr_N`).
      */
     slot: number;
+    status: FacetStatus;
 };
+
+/**
+ * Backfill/delete-clear lifecycle for a facet. See the module docs for how
+ * the poller advances a facet through these states.
+ */
+export type FacetStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deleting';
 
 /**
  * Response body for facet list.
@@ -36266,6 +36291,52 @@ export type DeleteFacetResponses = {
 };
 
 export type DeleteFacetResponse = DeleteFacetResponses[keyof DeleteFacetResponses];
+
+export type RetryFacetBackfillData = {
+    body?: never;
+    path: {
+        /**
+         * The OTel attribute key (URL-encoded)
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/otel/facets/{key}/retry';
+};
+
+export type RetryFacetBackfillErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Facet not found
+     */
+    404: ProblemDetails;
+    /**
+     * Facet is not in a failed state
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RetryFacetBackfillError = RetryFacetBackfillErrors[keyof RetryFacetBackfillErrors];
+
+export type RetryFacetBackfillResponses = {
+    /**
+     * Backfill retry scheduled
+     */
+    200: FacetInfo;
+};
+
+export type RetryFacetBackfillResponse = RetryFacetBackfillResponses[keyof RetryFacetBackfillResponses];
 
 export type QueryGenaiTracesData = {
     body?: never;

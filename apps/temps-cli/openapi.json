@@ -16504,6 +16504,14 @@
         ],
         "type": "object"
       },
+      "FacetBackendKind": {
+        "description": "Which storage engine a facet was created against. A deployment only ever\nruns one backend at a time (see `plugin.rs`'s storage selection), but\nstamping it on each row keeps the status fields unambiguous.",
+        "enum": [
+          "clickhouse",
+          "timescaledb"
+        ],
+        "type": "string"
+      },
       "FacetInfo": {
         "description": "Public representation of a registered span attribute facet.",
         "properties": {
@@ -16511,23 +16519,55 @@
             "description": "The OTel attribute key, e.g. `enduser.id` or `galachain.contract`.",
             "type": "string"
           },
+          "backend": {
+            "$ref": "#/components/schemas/FacetBackendKind"
+          },
           "created_at": {
             "example": "2025-10-12T12:15:47.609192Z",
             "type": "string"
           },
+          "error_message": {
+            "description": "Populated when `status = failed`, explaining why.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rows_backfilled": {
+            "description": "Rows backfilled so far. Only meaningful for the `timescaledb` backend\n— the `clickhouse` backend's mutation doesn't expose a row count\nuntil it's done, so this stays 0 there even while running.",
+            "format": "int64",
+            "type": "integer"
+          },
           "slot": {
-            "description": "The slot column index 1..=20 in ClickHouse (`facet_attr_N`).",
+            "description": "The slot column index 1..=20 (`facet_attr_N`).",
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/FacetStatus"
           }
         },
         "required": [
           "attribute_key",
           "slot",
-          "created_at"
+          "created_at",
+          "status",
+          "backend",
+          "rows_backfilled"
         ],
         "type": "object"
+      },
+      "FacetStatus": {
+        "description": "Backfill/delete-clear lifecycle for a facet. See the module docs for how\nthe poller advances a facet through these states.",
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "deleting"
+        ],
+        "type": "string"
       },
       "FacetsResponse": {
         "description": "Response body for facet list.",
@@ -69873,7 +69913,7 @@
         ]
       },
       "post": {
-        "description": "Assigns the key to the lowest available slot column (1..=20) in the\nClickHouse `spans` table, inserts the mapping into Postgres, and runs a\nbackfill mutation so existing spans that carry this attribute are populated\nin the slot column. At 500M+ row scale this mutation would be expensive and\nshould be tracked asynchronously; for the current demo dataset it is near-instant.",
+        "description": "Assigns the key to the lowest available slot column (1..=20) and inserts\nthe mapping into Postgres with `status: pending`. Returns immediately —\nthe historical backfill (populating the slot column for spans already\ningested before this call) runs entirely in the background, advanced by a\nperiodic poller; poll `GET /otel/facets` and check the returned `status`\n(`pending` -> `running` -> `completed`/`failed`) to track progress. New\nspans start getting the attribute written into the slot column right\naway, independent of backfill progress.",
         "operationId": "create_facet",
         "requestBody": {
           "content": {
@@ -69960,7 +70000,7 @@
     },
     "/otel/facets/{key}": {
       "delete": {
-        "description": "Clears the corresponding ClickHouse slot column for all existing spans\n(to prevent stale data leaking into a future facet that reuses the slot),\nthen removes the Postgres mapping. The slot becomes available for reuse.",
+        "description": "Marks the facet `deleting` and stops new spans from populating its slot\nimmediately, but the Postgres row (and its slot reservation) isn't\nremoved until the background poller confirms the slot column has been\ncleared for all existing spans — otherwise a future facet reusing the\nsame slot could see stale data. `GET /otel/facets` will keep returning\nthis facet with `status: deleting` until that finishes.",
         "operationId": "delete_facet",
         "parameters": [
           {
@@ -70024,6 +70064,94 @@
           }
         ],
         "summary": "Remove a registered OTel span attribute facet.",
+        "tags": [
+          "OTel Facets"
+        ]
+      }
+    },
+    "/otel/facets/{key}/retry": {
+      "post": {
+        "description": "Only valid when the facet's `status` is `failed`. Resets its progress and\nlets the background poller re-attempt the backfill from the beginning on\nits next tick.",
+        "operationId": "retry_facet_backfill",
+        "parameters": [
+          {
+            "description": "The OTel attribute key (URL-encoded)",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FacetInfo"
+                }
+              }
+            },
+            "description": "Backfill retry scheduled"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Facet not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Facet is not in a failed state"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Retry a failed OTel span attribute facet backfill.",
         "tags": [
           "OTel Facets"
         ]
