@@ -174,10 +174,10 @@ export async function buildProbeImage(opts: {
 }
 
 /**
- * pgx-based variant of the probe app, used ONLY by `db-ha-failover-scenario`
- * -- NOT a drop-in replacement for `buildProbeImage` above, which every
- * other scenario keeps using unmodified against standalone (single-host,
- * single-port) services, where `lib/pq` works fine.
+ * pgx-based variant of the probe app used by the HA failover and multinode
+ * scenarios. It is NOT a drop-in replacement for `buildProbeImage` above,
+ * which standalone-service scenarios keep using against single-host,
+ * single-port services where `lib/pq` works fine.
  *
  * Multi-host HA specifically needs a driver that actually understands
  * `postgresql://host1:port1,host2:port2/db?target_session_attrs=read-write`.
