@@ -1586,12 +1586,19 @@ impl PostgresUpgradeOrchestrator {
             .start_exec(&exec.id, None)
             .await
             .map_err(|e| format!("start_exec: {}", e))?;
+        const MAX_EXEC_DIAGNOSTIC_CHARS: usize = 2_000;
         let mut exec_output = String::new();
+        let mut exec_output_chars = 0usize;
         if let bollard::exec::StartExecResults::Attached { mut output, .. } = stream {
             while let Some(chunk) = output.next().await {
                 if let Ok(msg) = chunk {
                     let text = msg.to_string();
-                    exec_output.push_str(&text);
+                    let remaining = MAX_EXEC_DIAGNOSTIC_CHARS.saturating_sub(exec_output_chars);
+                    if remaining > 0 {
+                        let captured: String = text.chars().take(remaining).collect();
+                        exec_output_chars += captured.chars().count();
+                        exec_output.push_str(&captured);
+                    }
                     if !text.trim().is_empty() {
                         let _ = self
                             .log_service
@@ -1619,11 +1626,7 @@ impl PostgresUpgradeOrchestrator {
                                 return Err(if diagnostic.is_empty() {
                                     format!("exec exited with code {}", code)
                                 } else {
-                                    format!(
-                                        "exec exited with code {}: {}",
-                                        code,
-                                        diagnostic.chars().take(2_000).collect::<String>()
-                                    )
+                                    format!("exec exited with code {}: {}", code, diagnostic)
                                 });
                             }
                             None => return Err("exec finished with no exit code".to_string()),

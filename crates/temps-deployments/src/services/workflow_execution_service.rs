@@ -1281,6 +1281,9 @@ impl WorkflowExecutionService {
                             builder = builder.target_platforms(platforms);
                         }
                         Ok(_) => {}
+                        Err(crate::services::node_service::NodeError::Validation { message }) => {
+                            return Err(WorkflowExecutionError::InvalidJobConfig(message));
+                        }
                         // Not being able to enumerate nodes must not block a
                         // build: fall back to the native-only build and let the
                         // deploy path's architecture check catch a mismatch.

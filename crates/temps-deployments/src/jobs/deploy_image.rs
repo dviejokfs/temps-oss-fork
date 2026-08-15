@@ -1080,6 +1080,9 @@ impl DeployImageJob {
                     }
                     | crate::services::node_service::NodeError::PlacementConstraintsUnsatisfied {
                         ..
+                    }
+                    | crate::services::node_service::NodeError::Validation {
+                        ..
                     }),
                 ) => {
                     let msg = format!("Cannot schedule this deployment: {}", e);
