@@ -349,26 +349,31 @@ impl From<&SpanRecord> for ChSpanRow {
     /// facet cache is available — this variant is kept for tests and code paths
     /// that do not have access to the shared cache.
     fn from(span: &SpanRecord) -> Self {
-        Self::from_span_with_facets(span, &std::collections::HashMap::new())
+        let empty = std::collections::HashMap::new();
+        let facet_slots = crate::services::facet_service::invert_facet_slots(&empty);
+        Self::from_span_with_facets(span, &facet_slots)
     }
 }
 
 impl ChSpanRow {
     /// Build a [`ChSpanRow`] from a [`SpanRecord`], populating facet slot
-    /// columns from the provided cache.
+    /// columns from a pre-inverted `slot -> key` lookup.
     ///
-    /// `facets` maps attribute key → slot index (1..=20). For each assigned
-    /// slot, this function looks up the key in `span.attributes` (span-level
-    /// attributes only — the resource-level attributes are not merged here
-    /// because by ingest time the important resource attrs are already in the
-    /// denormalised columns like `service_name`). If the key is present, its
-    /// value goes into `facet_attr_{slot}`; otherwise that slot is `None`.
+    /// `facet_slots[slot - 1]` is the attribute key assigned to that slot, if
+    /// any (see [`crate::services::facet_service::invert_facet_slots`]). For
+    /// each assigned slot, this function looks up the key in
+    /// `span.attributes` (span-level attributes only — the resource-level
+    /// attributes are not merged here because by ingest time the important
+    /// resource attrs are already in the denormalised columns like
+    /// `service_name`). If the key is present, its value goes into
+    /// `facet_attr_{slot}`; otherwise that slot is `None`.
     ///
-    /// This is a lock-free, pure in-memory operation — the map is loaded once
-    /// from the `ArcSwap` by the caller before the per-span loop.
+    /// This is a lock-free, pure in-memory operation — the caller inverts the
+    /// `ArcSwap`-loaded cache once per batch, not once per span (the closure
+    /// here is then O(1) per slot per span, not O(MAX_FACET_SLOTS)).
     pub fn from_span_with_facets(
         span: &SpanRecord,
-        facets: &std::collections::HashMap<String, u8>,
+        facet_slots: &[Option<&str>; crate::services::facet_service::MAX_FACET_SLOTS as usize],
     ) -> Self {
         let attributes = serde_json::to_string(&span.attributes).unwrap_or_else(|_| "{}".into());
         let events = serde_json::to_string(&span.events).unwrap_or_else(|_| "[]".into());
@@ -378,11 +383,8 @@ impl ChSpanRow {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Helper: look up attribute value for a given slot. O(1) per slot
-        // (one HashMap lookup on `facets` + one BTreeMap lookup on attributes).
         let slot_value = |slot: u8| -> Option<String> {
-            let key = facets.iter().find(|(_, &s)| s == slot).map(|(k, _)| k)?;
-            span.attributes.get(key).cloned()
+            facet_slots[(slot - 1) as usize].and_then(|key| span.attributes.get(key).cloned())
         };
 
         Self {
@@ -1335,6 +1337,9 @@ impl OtelStorage for ClickHouseOtelStorage {
             .as_ref()
             .map(|c| c.load_full())
             .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+        // Invert once per batch, not once per span — see
+        // `invert_facet_slots` doc for why.
+        let facet_slots = crate::services::facet_service::invert_facet_slots(&facet_snapshot);
 
         for chunk in spans.chunks(MAX_SPAN_INSERT_BATCH) {
             let mut inserter = self
@@ -1344,7 +1349,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                 .map_err(|e| ch_ingest_err("store_spans (inserter setup)", e))?;
 
             for span in chunk {
-                let mut row = ChSpanRow::from_span_with_facets(span, &facet_snapshot);
+                let mut row = ChSpanRow::from_span_with_facets(span, &facet_slots);
                 row.retention_days = self
                     .resolver
                     .resolve(span.project_id, temps_core::RetentionTable::Spans);

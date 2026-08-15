@@ -416,6 +416,9 @@ impl TimescaleDbStorage {
             .as_ref()
             .map(|c| c.load_full())
             .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+        // Invert key->slot into slot->key once per batch, not once per span
+        // per slot — see `invert_facet_slots` doc for why.
+        let facet_slots = crate::services::facet_service::invert_facet_slots(&facet_snapshot);
 
         let mut sql = String::from(
             "INSERT INTO otel_spans (
@@ -470,11 +473,8 @@ impl TimescaleDbStorage {
                 attrs_json.into(),
                 events_json.into(),
             ]);
-            for slot in 1..=crate::services::facet_service::MAX_FACET_SLOTS {
-                let value: Option<String> = facet_snapshot
-                    .iter()
-                    .find(|(_, &s_slot)| s_slot == slot)
-                    .and_then(|(key, _)| s.attributes.get(key).cloned());
+            for key in &facet_slots {
+                let value: Option<String> = key.and_then(|k| s.attributes.get(k).cloned());
                 values.push(value.into());
             }
         }

@@ -1,3 +1,4 @@
+use sea_orm::Statement;
 use sea_orm_migration::prelude::*;
 
 /// Add the 20 pre-allocated `facet_attr_N` slot columns (and matching
@@ -75,6 +76,35 @@ impl MigrationTrait for Migration {
             add_columns.push_str(&format!(" ADD COLUMN IF NOT EXISTS facet_attr_{slot} TEXT"));
         }
         db.execute_unprepared(&add_columns).await?;
+
+        // The column adds above are metadata-only and instant regardless of
+        // table size. The indexes below are not — warn loudly at the point
+        // an operator would actually see it (migration-run logs) rather than
+        // leaving this only in a doc comment nobody reads until the ALTER is
+        // already blocking. Only fires when otel_spans already has rows,
+        // i.e. an existing/upgrading install, not a fresh one.
+        let has_existing_rows = db
+            .query_one(Statement::from_string(
+                manager.get_database_backend(),
+                "SELECT EXISTS (SELECT 1 FROM otel_spans LIMIT 1) AS has_rows",
+            ))
+            .await?
+            .map(|row| row.try_get::<bool>("", "has_rows").unwrap_or(true))
+            .unwrap_or(false);
+
+        if has_existing_rows {
+            tracing::warn!(
+                "otel_spans already has data: building the 20 facet_attr_N indexes below will \
+                 take a SHARE lock and block writes to otel_spans for the duration of a full \
+                 heap scan of every uncompressed chunk (compressed chunks are exempt). On a \
+                 large/hot table, consider stopping this migration now and running the \
+                 `CREATE INDEX CONCURRENTLY idx_otel_spans_facet_attr_N ON otel_spans \
+                 (facet_attr_N)` statements manually (from \
+                 m20260815_000001_add_facet_attr_columns_to_otel_spans.rs) during a maintenance \
+                 window instead, since CONCURRENTLY cannot run inside this migration's \
+                 transaction."
+            );
+        }
 
         for slot in 1..=FACET_SLOTS {
             db.execute_unprepared(&format!(

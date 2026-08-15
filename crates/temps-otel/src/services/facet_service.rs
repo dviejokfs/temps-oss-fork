@@ -220,6 +220,70 @@ const PG_BATCH_SIZE: u64 = 2000;
 /// `system.mutations`, etc.) rather than still-in-flight.
 const STALE_MUTATION_THRESHOLD: ChronoDuration = ChronoDuration::minutes(30);
 
+/// Max length stored/returned for `otel_span_facets.error_message`.
+///
+/// ClickHouse mutation failure reasons (`system.mutations.latest_fail_reason`)
+/// can include internal detail — column/expression fragments, cluster
+/// topology — that an `OtelWrite`-authorized-but-otherwise-unprivileged user
+/// shouldn't necessarily see verbatim, especially on a shared multi-tenant
+/// ClickHouse cluster. Truncating bounds the exposure without losing the
+/// actionable prefix of the message.
+const ERROR_MESSAGE_MAX_LEN: usize = 1024;
+
+/// Truncate an error message to [`ERROR_MESSAGE_MAX_LEN`] bytes at a valid
+/// UTF-8 char boundary, appending a marker so it's obvious the message was
+/// cut rather than genuinely ending there.
+fn truncate_error_message(message: String) -> String {
+    if message.len() <= ERROR_MESSAGE_MAX_LEN {
+        return message;
+    }
+    let mut end = ERROR_MESSAGE_MAX_LEN;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = message[..end].to_string();
+    truncated.push_str("... [truncated]");
+    truncated
+}
+
+/// Restrict `attribute_key` to the OTel-spec-like charset
+/// `[a-zA-Z][a-zA-Z0-9_.:-]*` (mirrors `validate_label_key` in
+/// `storage::timescaledb`).
+///
+/// `attribute_key` is always bound as a SQL/ClickHouse parameter, never
+/// interpolated — so this is defense-in-depth, not an injection guard. It
+/// exists to keep control characters (which would otherwise flow verbatim
+/// into structured logs via `warn!`/`error!` on facet failures, a log-
+/// injection vector) and other unexpected bytes out of a value that gets
+/// echoed back through the API and CLI.
+fn validate_attribute_key_charset(key: &str) -> Result<(), FacetError> {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return Err(FacetError::Validation {
+            message: "attribute_key must not be empty".to_string(),
+        });
+    };
+    if !first.is_ascii_alphabetic() {
+        return Err(FacetError::Validation {
+            message: format!(
+                "attribute_key '{key}' must start with an ASCII letter \
+                 (allowed characters: [a-zA-Z0-9_.:-])"
+            ),
+        });
+    }
+    for ch in chars {
+        if !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' | '-' | ':') {
+            return Err(FacetError::Validation {
+                message: format!(
+                    "attribute_key '{key}' is outside the allowed character set \
+                     [a-zA-Z0-9_.:-] (starting with a letter)"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 // ── Service ─────────────────────────────────────────────────────────────────
 
 /// Shared type alias for the facet attribute-key → slot cache.
@@ -304,6 +368,7 @@ impl FacetService {
                 ),
             });
         }
+        validate_attribute_key_charset(&key)?;
 
         // 2. Check for duplicate. A facet mid-deletion still counts as
         // occupying its key/slot until the row is hard-deleted, so a
@@ -860,7 +925,7 @@ impl FacetService {
             ..Default::default()
         };
         active.status = Set(FacetStatus::Failed.as_db_str().to_string());
-        active.error_message = Set(Some(message));
+        active.error_message = Set(Some(truncate_error_message(message)));
         active.updated_at = Set(Utc::now());
         active.update(self.db.as_ref()).await?;
         Ok(())
@@ -907,6 +972,29 @@ fn is_stale(updated_at: DateTime<Utc>) -> bool {
 /// function is called.
 pub fn facet_column_name(slot: u8) -> String {
     format!("facet_attr_{slot}")
+}
+
+/// Invert a `key -> slot` facet cache snapshot into a `slot -> key` lookup,
+/// indexed by `slot - 1`.
+///
+/// Both storage backends' hot-path span ingest need, per span, "what
+/// attribute key (if any) is assigned to slot N" for N in 1..=20. Doing that
+/// via `snapshot.iter().find(|(_, &s)| s == slot)` per slot per span is
+/// O(MAX_FACET_SLOTS) per lookup — O(MAX_FACET_SLOTS^2) per span. Inverting
+/// once per batch (this function) and then indexing the array is O(1) per
+/// slot per span. Shared by `TimescaleDbStorage::batch_insert_spans` and
+/// `ChSpanRow::from_span_with_facets` so the two backends don't duplicate the
+/// inversion logic.
+pub fn invert_facet_slots(
+    snapshot: &HashMap<String, u8>,
+) -> [Option<&str>; MAX_FACET_SLOTS as usize] {
+    let mut slots: [Option<&str>; MAX_FACET_SLOTS as usize] = [None; MAX_FACET_SLOTS as usize];
+    for (key, &slot) in snapshot.iter() {
+        if (1..=MAX_FACET_SLOTS).contains(&slot) {
+            slots[(slot - 1) as usize] = Some(key.as_str());
+        }
+    }
+    slots
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1028,5 +1116,187 @@ mod tests {
         assert_eq!(info.status, FacetStatus::Completed);
         assert_eq!(info.backend, FacetBackendKind::Clickhouse);
         assert!(info.created_at.ends_with('Z') || info.created_at.contains('+'));
+    }
+
+    #[test]
+    fn truncate_error_message_leaves_short_messages_untouched() {
+        let msg = "short failure reason".to_string();
+        assert_eq!(truncate_error_message(msg.clone()), msg);
+    }
+
+    #[test]
+    fn truncate_error_message_caps_long_messages() {
+        let long = "x".repeat(ERROR_MESSAGE_MAX_LEN * 2);
+        let truncated = truncate_error_message(long);
+        assert!(truncated.len() <= ERROR_MESSAGE_MAX_LEN + "... [truncated]".len());
+        assert!(truncated.ends_with("... [truncated]"));
+    }
+
+    #[test]
+    fn truncate_error_message_respects_utf8_boundary() {
+        // A multi-byte char straddling the cutoff must not panic and must
+        // not split the char.
+        let long = "é".repeat(ERROR_MESSAGE_MAX_LEN); // 2 bytes each
+        let truncated = truncate_error_message(long);
+        assert!(truncated.is_char_boundary(truncated.len() - "... [truncated]".len()));
+    }
+
+    #[test]
+    fn validate_attribute_key_charset_accepts_otel_style_keys() {
+        for key in [
+            "enduser.id",
+            "gen_ai.system",
+            "galachain.contract",
+            "http.request.method",
+        ] {
+            assert!(
+                validate_attribute_key_charset(key).is_ok(),
+                "expected {key} to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_attribute_key_charset_rejects_leading_digit() {
+        let err = validate_attribute_key_charset("1abc").unwrap_err();
+        assert!(matches!(err, FacetError::Validation { .. }));
+    }
+
+    #[test]
+    fn validate_attribute_key_charset_rejects_control_characters() {
+        let err = validate_attribute_key_charset("abc\ninjected").unwrap_err();
+        assert!(matches!(err, FacetError::Validation { .. }));
+    }
+
+    #[test]
+    fn validate_attribute_key_charset_rejects_empty() {
+        let err = validate_attribute_key_charset("").unwrap_err();
+        assert!(matches!(err, FacetError::Validation { .. }));
+    }
+
+    // ── retry_backfill / advance_one ─────────────────────────────────────────
+
+    use sea_orm::{DatabaseBackend as MockBackend, MockDatabase, MockExecResult};
+
+    fn facet_model(id: i32, status: &str, backend: &str, ch_mutation_id: Option<&str>) -> Model {
+        Model {
+            id,
+            attribute_key: "enduser.id".to_string(),
+            slot: 1,
+            created_by: Some(1),
+            created_at: Utc::now(),
+            status: status.to_string(),
+            backend: backend.to_string(),
+            ch_mutation_id: ch_mutation_id.map(|s| s.to_string()),
+            backfill_cursor: None,
+            rows_backfilled: 0,
+            error_message: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn empty_cache() -> FacetCache {
+        Arc::new(ArcSwap::from_pointee(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn retry_backfill_success_resets_failed_facet() {
+        let failed = facet_model(1, "failed", "timescaledb", None);
+        let db = MockDatabase::new(MockBackend::Postgres)
+            // find-by-attribute_key
+            .append_query_results(vec![vec![failed.clone()]])
+            // update returns the row again
+            .append_query_results(vec![vec![facet_model(1, "pending", "timescaledb", None)]])
+            .into_connection();
+        let service = FacetService::new(Arc::new(db), None, empty_cache());
+
+        let info = service.retry_backfill("enduser.id").await.unwrap();
+        assert_eq!(info.status, FacetStatus::Pending);
+        assert_eq!(info.rows_backfilled, 0);
+    }
+
+    #[tokio::test]
+    async fn retry_backfill_rejects_non_failed_status() {
+        for input_status in ["pending", "running", "completed", "deleting"] {
+            let model = facet_model(1, input_status, "timescaledb", None);
+            let db = MockDatabase::new(MockBackend::Postgres)
+                .append_query_results(vec![vec![model]])
+                .into_connection();
+            let service = FacetService::new(Arc::new(db), None, empty_cache());
+
+            let err = service.retry_backfill("enduser.id").await.unwrap_err();
+            match err {
+                FacetError::NotFailed { status: got, .. } => {
+                    assert_eq!(
+                        got, input_status,
+                        "status echoed in error should match input"
+                    )
+                }
+                other => panic!("expected NotFailed for status={input_status}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_backfill_not_found() {
+        let db = MockDatabase::new(MockBackend::Postgres)
+            .append_query_results(vec![Vec::<Model>::new()])
+            .into_connection();
+        let service = FacetService::new(Arc::new(db), None, empty_cache());
+
+        let err = service.retry_backfill("missing.key").await.unwrap_err();
+        assert!(matches!(err, FacetError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn advance_one_is_noop_for_terminal_statuses() {
+        for status in ["completed", "failed"] {
+            for backend in ["clickhouse", "timescaledb"] {
+                let model = facet_model(1, status, backend, None);
+                // No query results appended: a terminal-status dispatch must
+                // not touch the database at all.
+                let db = MockDatabase::new(MockBackend::Postgres).into_connection();
+                let service = FacetService::new(Arc::new(db), None, empty_cache());
+
+                let result = service.advance_one(model).await;
+                assert!(
+                    result.is_ok(),
+                    "expected no-op Ok for status={status} backend={backend}, got {result:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn advance_one_pending_clickhouse_without_client_is_noop() {
+        // backend=clickhouse but the service has no ch_client configured
+        // (e.g. TEMPS_CLICKHOUSE_* unset since this facet was created) —
+        // ch_issue_backfill must log and return Ok without any DB access.
+        let model = facet_model(1, "pending", "clickhouse", None);
+        let db = MockDatabase::new(MockBackend::Postgres).into_connection();
+        let service = FacetService::new(Arc::new(db), None, empty_cache());
+
+        let result = service.advance_one(model).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn advance_one_deleting_clickhouse_without_client_finalizes_delete() {
+        // backend=clickhouse, deleting, no mutation_id yet, no ch_client ->
+        // ch_issue_clear short-circuits straight to finalize_delete (nothing
+        // to clear on a backend that was never configured).
+        let model = facet_model(1, "deleting", "clickhouse", None);
+        let db = MockDatabase::new(MockBackend::Postgres)
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            // refresh_cache() reload after the delete
+            .append_query_results(vec![Vec::<Model>::new()])
+            .into_connection();
+        let service = FacetService::new(Arc::new(db), None, empty_cache());
+
+        let result = service.advance_one(model).await;
+        assert!(result.is_ok());
     }
 }
