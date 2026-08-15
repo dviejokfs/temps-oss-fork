@@ -22,12 +22,12 @@ export function useGettingStarted() {
   const items: GettingStartedItem[] = [
     {
       key: 'ai',
-      label: 'Start using AI',
+      label: 'Connect your AI harness',
       description:
-        'Connect a provider, add Temps skills, and authenticate Bunx against this instance.',
-      done: signals.aiConfigured,
+        'Create a dedicated admin key, install the Temps skill, and verify access from your harness.',
+      done: signals.aiHarnessConfigured,
       href: '/setup/ai',
-      cta: 'Set up AI',
+      cta: 'Connect harness',
     },
     {
       key: 'git',

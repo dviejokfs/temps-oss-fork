@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -7,51 +7,78 @@ import {
   Bot,
   Check,
   Circle,
+  Database,
   ExternalLink,
-  MessageSquare,
+  FolderPlus,
+  KeyRound,
+  ShieldAlert,
   Sparkles,
   Terminal,
   Wand2,
+  type LucideIcon,
 } from 'lucide-react'
-import {
-  getAiProviderStatusOptions,
-  listGlobalSkillsOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { listApiKeysOptions } from '@/api/client/@tanstack/react-query.gen'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { buildAiOnboardingCommands } from '@/lib/ai-onboarding'
+import {
+  AI_HARNESS_KEY_NAME,
+  buildAiHarnessCommands,
+  buildAiHarnessKeyHref,
+} from '@/lib/ai-onboarding'
 import { cn } from '@/lib/utils'
+
+const STARTER_PROMPTS = [
+  {
+    icon: Bot,
+    title: 'Verify access',
+    prompt:
+      'Use the Temps skill to verify my connection and list the projects on this instance. Do not make any changes.',
+  },
+  {
+    icon: FolderPlus,
+    title: 'Create a project',
+    prompt:
+      'Use the Temps skill to create a manual project named api-playground. Explain the target and ask for confirmation before creating it, then verify it appears in the project list.',
+  },
+  {
+    icon: Database,
+    title: 'Create PostgreSQL',
+    prompt:
+      'Use the Temps skill to create a PostgreSQL service named app-db. Explain the target and ask for confirmation before creating it, then verify the service is running.',
+  },
+] as const
 
 export function AiOnboarding() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const origin = typeof window === 'undefined' ? '' : window.location.origin
-  const commands = buildAiOnboardingCommands(origin)
+  const commands = buildAiHarnessCommands(origin)
+  const keyHref = buildAiHarnessKeyHref()
 
-  const { data: providerStatus, isLoading: providerLoading } = useQuery({
-    ...getAiProviderStatusOptions(),
-    retry: false,
-  })
-  const { data: skillsData, isLoading: skillsLoading } = useQuery({
-    ...listGlobalSkillsOptions(),
+  const { data: apiKeysData, isLoading: apiKeysLoading } = useQuery({
+    ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
     retry: false,
   })
 
-  usePageTitle('Start using AI')
+  usePageTitle('Connect AI harness')
 
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Finish setting up', href: '/setup' },
-      { label: 'Start using AI' },
+      { label: 'Connect AI harness' },
     ])
   }, [setBreadcrumbs])
 
-  const providerReady = providerStatus?.configured === true
-  const globalSkillCount = skillsData?.items?.length ?? 0
-  const providerSetupPath = providerStatus?.setup_path || '/ai-gateway'
+  const harnessKey = apiKeysData?.api_keys?.find(
+    (key) =>
+      key.name === AI_HARNESS_KEY_NAME &&
+      key.role_type.toLowerCase() === 'admin' &&
+      key.is_active
+  )
 
   return (
     <div className="mx-auto w-full max-w-6xl space-y-6 p-4 sm:p-8">
@@ -63,14 +90,14 @@ export function AiOnboarding() {
         </Button>
         <div>
           <p className="text-xs font-medium uppercase tracking-[0.18em] text-primary">
-            AI quickstart
+            AI harness quickstart
           </p>
           <h1 className="mt-1 text-2xl font-semibold tracking-tight sm:text-3xl">
-            Make Temps useful to your AI
+            Let your AI operate Temps
           </h1>
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground sm:text-base">
-            Connect a model once, teach your coding agent how Temps works, and
-            authenticate Bunx against this instance.
+          <p className="mt-1 max-w-3xl text-sm text-muted-foreground sm:text-base">
+            Give Codex, Claude Code, Cursor, or another compatible harness the
+            Temps skill and a dedicated credential for this instance.
           </p>
         </div>
       </div>
@@ -92,28 +119,26 @@ export function AiOnboarding() {
               </div>
               <div>
                 <h2 className="text-lg font-semibold tracking-tight">
-                  Your first useful AI loop
+                  One connection, every platform workflow
                 </h2>
                 <p className="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
-                  Ask your agent to prepare an app for Temps, deploy it through
-                  Bunx, then use Temps AI to investigate the resulting errors,
-                  traces, and traffic.
+                  Your harness can inspect projects, create services, deploy
+                  applications, and verify the result using the same pinned
+                  Temps CLI workflow.
                 </p>
               </div>
             </div>
-            {providerLoading ? (
-              <Skeleton className="h-10 w-40" />
-            ) : providerReady ? (
-              <Button asChild size="lg">
-                <Link to="/chat">
-                  Open AI chat
-                  <MessageSquare className="ml-1.5 size-4" />
-                </Link>
-              </Button>
+            {apiKeysLoading ? (
+              <Skeleton className="h-10 w-44" />
+            ) : harnessKey ? (
+              <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-2.5 text-sm font-medium text-emerald-600 dark:text-emerald-400">
+                <Check className="size-4" />
+                Harness key ready
+              </div>
             ) : (
               <Button asChild size="lg">
-                <Link to={providerSetupPath}>
-                  Connect AI provider
+                <Link to={keyHref}>
+                  Create harness API key
                   <ArrowRight className="ml-1.5 size-4" />
                 </Link>
               </Button>
@@ -125,89 +150,154 @@ export function AiOnboarding() {
       <div className="grid gap-4 lg:grid-cols-3">
         <OnboardingStep
           number="01"
-          icon={Bot}
-          title="Connect a model"
-          description="Choose a subscription CLI or bring an API key. This powers chat, autofix, summaries, and workflows across Temps."
-          ready={providerReady}
-          loading={providerLoading}
-          status={providerReady ? 'AI ready' : 'Required'}
+          icon={KeyRound}
+          title="Create a dedicated admin key"
+          description="The harness needs platform access to create and verify projects, databases, deployments, domains, and other resources."
+          ready={!!harnessKey}
+          loading={apiKeysLoading}
+          status={harnessKey ? 'Key ready' : 'Required'}
         >
-          {!providerLoading && (
-            <div className="space-y-3">
-              {!providerReady && providerStatus?.reason && (
-                <p className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs leading-relaxed text-amber-700 dark:text-amber-300">
-                  {providerStatus.reason}
-                </p>
-              )}
-              <Button asChild variant={providerReady ? 'outline' : 'default'}>
-                <Link to={providerSetupPath}>
-                  {providerReady ? 'Manage provider' : 'Choose provider'}
-                  <ArrowRight className="ml-1.5 size-3.5" />
-                </Link>
-              </Button>
-            </div>
-          )}
+          <div className="space-y-3">
+            <Alert className="border-amber-500/25 bg-amber-500/5">
+              <ShieldAlert className="size-4 text-amber-600 dark:text-amber-400" />
+              <AlertTitle>Full platform access</AlertTitle>
+              <AlertDescription>
+                This admin key can change the entire instance. Use a dedicated
+                key, keep it only in your harness credential store, and revoke
+                it when you stop using the integration.
+              </AlertDescription>
+            </Alert>
+            <Button asChild variant={harnessKey ? 'outline' : 'default'}>
+              <Link
+                to={harnessKey ? `/settings/keys/${harnessKey.id}` : keyHref}
+              >
+                {harnessKey ? 'Manage harness key' : 'Create admin key'}
+                <ArrowRight className="ml-1.5 size-3.5" />
+              </Link>
+            </Button>
+          </div>
         </OnboardingStep>
 
         <OnboardingStep
           number="02"
           icon={Wand2}
-          title="Give your agent Temps skills"
-          description="Install the maintained Temps skill pack in your app so Codex, Claude Code, Cursor, and compatible agents know the right setup steps."
-          ready={globalSkillCount > 0}
-          loading={skillsLoading}
-          status={
-            globalSkillCount > 0
-              ? `${globalSkillCount} workflow skill${globalSkillCount === 1 ? '' : 's'}`
-              : 'Recommended'
-          }
+          title="Add Temps to your harness"
+          description="Run the skill installer inside the repository where you use your AI agent, then authenticate the pinned CLI with the key from step one."
+          status="Two commands"
         >
           <div className="space-y-3">
-            <Command value={commands.installSkills} />
-            <div className="flex flex-wrap items-center gap-3 text-xs">
-              <Link
-                to="/skills"
-                className="inline-flex items-center gap-1 font-medium text-primary hover:underline"
-              >
-                Add a skill to Temps workflows
-                <ArrowRight className="size-3" />
-              </Link>
-              <a
-                href="https://temps.sh/docs/features/skills"
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground"
-              >
-                Skill catalog
-                <ExternalLink className="size-3" />
-              </a>
-            </div>
+            <Command
+              label="Install the Temps skill"
+              value={commands.installSkill}
+            />
+            <Command
+              label="Store this instance as a CLI context"
+              value={commands.connectCli}
+              multiline
+            />
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              The key is entered through a hidden terminal prompt and removed
+              from the shell environment after login.
+            </p>
           </div>
         </OnboardingStep>
 
         <OnboardingStep
           number="03"
           icon={Terminal}
-          title="Connect Bunx to this instance"
-          description="Run one device-login command in your terminal. Bunx downloads the CLI on demand, so there is nothing to install globally."
-          status="One command"
+          title="Verify before changing anything"
+          description="Confirm the harness is targeting this instance and can read its projects. Neither verification command changes platform state."
+          status="Read-only"
         >
           <div className="space-y-3">
-            <Command value={commands.connectCli} />
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              The browser will ask you to approve the terminal. Credentials stay
-              on your machine and are scoped to this Temps instance.
-            </p>
+            <Command
+              label="Verify identity and context"
+              value={commands.verifyIdentity}
+            />
+            <Command
+              label="Verify project access"
+              value={commands.verifyProjects}
+            />
           </div>
         </OnboardingStep>
       </div>
 
+      <section className="space-y-3">
+        <div>
+          <h2 className="text-base font-semibold tracking-tight">
+            Try a real task in your harness
+          </h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Copy a prompt after verification. Write operations explicitly ask
+            for confirmation and finish with read-only proof.
+          </p>
+        </div>
+        <div className="grid gap-3 md:grid-cols-3">
+          {STARTER_PROMPTS.map((example) => (
+            <Card key={example.title} className="group h-full">
+              <CardContent className="flex h-full flex-col p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex size-8 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                    <example.icon className="size-4" />
+                  </div>
+                  <CopyButton
+                    value={example.prompt}
+                    minimal
+                    className="size-8 rounded-md text-muted-foreground"
+                    label={`Copy ${example.title} prompt`}
+                  />
+                </div>
+                <h3 className="mt-4 text-sm font-semibold">{example.title}</h3>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                  {example.prompt}
+                </p>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      </section>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Link
+          to="/ai-gateway"
+          className="group flex items-center justify-between gap-4 rounded-xl border bg-card p-4 transition-colors hover:border-primary/30 hover:bg-muted/30"
+        >
+          <div>
+            <p className="text-sm font-medium">Enable Temps built-in AI</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Separately configure a provider for console chat, autofix, and AI
+              summaries.
+            </p>
+          </div>
+          <ArrowRight className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
+        </Link>
+        <a
+          href="https://temps.sh/docs/features/skills"
+          target="_blank"
+          rel="noreferrer"
+          className="group flex items-center justify-between gap-4 rounded-xl border bg-card p-4 transition-colors hover:border-primary/30 hover:bg-muted/30"
+        >
+          <div>
+            <p className="text-sm font-medium">
+              Browse the Temps skill catalog
+            </p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Add focused skills for analytics, error tracking, SDKs, and
+              platform setup.
+            </p>
+          </div>
+          <ExternalLink className="size-4 shrink-0 text-muted-foreground" />
+        </a>
+      </div>
+
       <div className="flex flex-col gap-3 rounded-xl border bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <p className="text-sm font-medium">You can return here at any time</p>
+          <p className="text-sm font-medium">
+            Need the rest of platform setup?
+          </p>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Finish setup keeps this AI quickstart visible until a provider is
-            ready.
+            Domains, notifications, backups, and team access remain in the
+            complete setup checklist.
           </p>
         </div>
         <Button asChild variant="outline">
@@ -229,13 +319,13 @@ function OnboardingStep({
   children,
 }: {
   number: string
-  icon: typeof Bot
+  icon: LucideIcon
   title: string
   description: string
   ready?: boolean
   loading?: boolean
   status: string
-  children: React.ReactNode
+  children: ReactNode
 }) {
   return (
     <Card className="h-full overflow-hidden">
@@ -290,18 +380,34 @@ function OnboardingStep({
   )
 }
 
-function Command({ value }: { value: string }) {
+function Command({
+  label,
+  value,
+  multiline = false,
+}: {
+  label: string
+  value: string
+  multiline?: boolean
+}) {
   return (
-    <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-background px-3 py-2.5">
-      <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-xs">
-        {value}
-      </code>
-      <CopyButton
-        value={value}
-        minimal
-        className="size-7 shrink-0 rounded-md"
-        label="Copy command"
-      />
+    <div className="space-y-1.5">
+      <p className="text-[11px] font-medium text-muted-foreground">{label}</p>
+      <div className="flex min-w-0 items-start gap-2 rounded-lg border bg-background px-3 py-2.5">
+        <code
+          className={cn(
+            'min-w-0 flex-1 overflow-x-auto font-mono text-xs',
+            multiline ? 'whitespace-pre leading-relaxed' : 'whitespace-nowrap'
+          )}
+        >
+          {value}
+        </code>
+        <CopyButton
+          value={value}
+          minimal
+          className="size-7 shrink-0 rounded-md"
+          label={`Copy ${label.toLowerCase()}`}
+        />
+      </div>
     </div>
   )
 }

@@ -1,24 +1,52 @@
-export interface AiOnboardingCommands {
-  installSkills: string
+export const AI_HARNESS_KEY_NAME = 'Temps AI harness'
+export const TEMPS_CLI_VERSION = '0.1.33'
+
+export interface AiHarnessCommands {
+  installSkill: string
   connectCli: string
+  verifyIdentity: string
+  verifyProjects: string
 }
 
 function normalizeOrigin(origin: string): string {
   return origin.replace(/\/+$/, '')
 }
 
+function contextName(origin: string): string {
+  try {
+    return new URL(origin).hostname.replace(/[^a-z0-9-]+/gi, '-') || 'temps'
+  } catch {
+    return 'temps'
+  }
+}
+
 /**
- * Commands shown during AI onboarding. Keeping these in one place prevents
- * the setup page and future onboarding surfaces from drifting onto different
- * package runners or authenticating against the wrong Temps instance.
+ * Secret-safe commands for connecting an external AI harness to Temps.
+ * The API key is read without terminal echo and referenced through an
+ * environment variable so the real value never appears in copied commands.
  */
-export function buildAiOnboardingCommands(
-  origin: string
-): AiOnboardingCommands {
+export function buildAiHarnessCommands(origin: string): AiHarnessCommands {
   const instanceOrigin = normalizeOrigin(origin)
+  const context = contextName(instanceOrigin)
+  const cli = `bunx @temps-sdk/cli@${TEMPS_CLI_VERSION}`
 
   return {
-    installSkills: 'bunx skills add gotempsh/temps',
-    connectCli: `bunx @temps-sdk/cli login ${instanceOrigin}`,
+    installSkill: 'bunx skills add gotempsh/temps --skill temps',
+    connectCli: [
+      'read -rsp "Temps API key: " TEMPS_API_KEY && echo',
+      `${cli} login ${instanceOrigin} --api-key "$TEMPS_API_KEY" --context ${context}`,
+      'unset TEMPS_API_KEY',
+    ].join('\n'),
+    verifyIdentity: `${cli} --target-context ${context} whoami`,
+    verifyProjects: `${cli} --target-context ${context} projects list --json`,
   }
+}
+
+export function buildAiHarnessKeyHref(): string {
+  const params = new URLSearchParams({
+    name: AI_HARNESS_KEY_NAME,
+    role: 'admin',
+    returnTo: '/setup/ai',
+  })
+  return `/settings/keys/new?${params.toString()}`
 }

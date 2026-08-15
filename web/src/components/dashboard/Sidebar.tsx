@@ -125,11 +125,9 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
     label: 'AI',
     items: [
       {
-        title: 'AI assistant',
-        url: '/chat',
+        title: 'AI harness',
+        url: '/setup/ai',
         icon: Sparkles,
-        activeWhen: (pathname) =>
-          AI_MODE_PREFIXES.some((prefix) => pathname.startsWith(prefix)),
       },
     ],
   },

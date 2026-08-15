@@ -59,6 +59,18 @@ function buildRecommendations(
 ): Recommendation[] {
   const recs: Recommendation[] = []
 
+  if (!s.aiProviderConfigured) {
+    recs.push({
+      key: 'ai-provider',
+      icon: Sparkles,
+      tone: 'default',
+      title: 'Enable built-in AI',
+      body: 'Separately connect a model provider for Temps chat, autofix, and AI summaries.',
+      href: '/ai-gateway',
+      cta: 'Choose provider',
+    })
+  }
+
   if (s.hasDatabase && !s.backupsConfigured) {
     recs.push({
       key: 'backups',
