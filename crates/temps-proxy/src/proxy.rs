@@ -467,7 +467,8 @@ fn should_apply_production_https_default(
 #[cfg(test)]
 mod deployment_asset_scope_tests {
     use super::{
-        deployment_asset_path_matches, inherited_https_policy, should_apply_production_https_default,
+        deployment_asset_path_matches, inherited_https_policy,
+        should_apply_production_https_default,
     };
 
     #[test]
@@ -490,7 +491,11 @@ mod deployment_asset_scope_tests {
         // registration) — must not be redirected even though every other gate
         // would otherwise allow it.
         assert!(!should_apply_production_https_default(
-            false, false, "/api/internal/nodes/register", None, false
+            false,
+            false,
+            "/api/internal/nodes/register",
+            None,
+            false
         ));
         // Resolved project traffic with everything else the same — applies.
         assert!(should_apply_production_https_default(
@@ -514,7 +519,11 @@ mod deployment_asset_scope_tests {
             true
         ));
         assert!(!should_apply_production_https_default(
-            false, false, "/", Some(false), true
+            false,
+            false,
+            "/",
+            Some(false),
+            true
         ));
     }
 }
