@@ -4,13 +4,14 @@ import { isPlatformToolsRoute } from './platform-navigation'
 describe('platform navigation route resolution', () => {
   test('groups secondary platform capabilities under all platform tools', () => {
     expect(isPlatformToolsRoute('/proxy-logs/31')).toBe(true)
-    expect(isPlatformToolsRoute('/git-providers/add')).toBe(true)
+    expect(isPlatformToolsRoute('/dns-providers/add')).toBe(true)
   })
 
   test('keeps primary destinations and settings outside the tools group', () => {
     expect(isPlatformToolsRoute('/projects')).toBe(false)
     expect(isPlatformToolsRoute('/storage')).toBe(false)
     expect(isPlatformToolsRoute('/domains')).toBe(false)
+    expect(isPlatformToolsRoute('/git-providers/add')).toBe(false)
     expect(isPlatformToolsRoute('/backups/schedules/2')).toBe(false)
     expect(isPlatformToolsRoute('/proxy')).toBe(false)
     expect(isPlatformToolsRoute('/monitoring')).toBe(false)

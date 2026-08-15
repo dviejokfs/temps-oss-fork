@@ -9,7 +9,6 @@ const PLATFORM_TOOL_PREFIXES = [
   '/agent-sandbox',
   '/skills',
   '/mcp-servers',
-  '/git-providers',
   '/dns-providers',
   '/proxy-logs',
   '/audit-logs',
