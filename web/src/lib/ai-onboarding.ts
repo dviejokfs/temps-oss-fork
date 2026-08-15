@@ -1,11 +1,40 @@
 export const AI_HARNESS_KEY_NAME = 'Temps AI harness'
 export const TEMPS_CLI_VERSION = '0.1.33'
 
+export type AiHarnessStatus = 'missing' | 'waiting' | 'connected'
+
+export interface AiHarnessKey {
+  id: number
+  name: string
+  role_type: string
+  is_active: boolean
+  last_used_at?: string | null
+}
+
 export interface AiHarnessCommands {
   installSkill: string
   connectCli: string
   verifyIdentity: string
   verifyProjects: string
+}
+
+export function findAiHarnessKey(
+  keys: readonly AiHarnessKey[] | undefined
+): AiHarnessKey | undefined {
+  return keys?.find(
+    (key) =>
+      key.name === AI_HARNESS_KEY_NAME &&
+      key.role_type.toLowerCase() === 'admin' &&
+      key.is_active
+  )
+}
+
+export function getAiHarnessStatus(
+  keys: readonly AiHarnessKey[] | undefined
+): AiHarnessStatus {
+  const key = findAiHarnessKey(keys)
+  if (!key) return 'missing'
+  return key.last_used_at ? 'connected' : 'waiting'
 }
 
 function normalizeOrigin(origin: string): string {

@@ -26,9 +26,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
-  AI_HARNESS_KEY_NAME,
   buildAiHarnessCommands,
   buildAiHarnessKeyHref,
+  findAiHarnessKey,
+  getAiHarnessStatus,
 } from '@/lib/ai-onboarding'
 import { cn } from '@/lib/utils'
 
@@ -62,6 +63,10 @@ export function AiOnboarding() {
   const { data: apiKeysData, isLoading: apiKeysLoading } = useQuery({
     ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
     retry: false,
+    refetchInterval: (query) =>
+      getAiHarnessStatus(query.state.data?.api_keys) === 'waiting'
+        ? 5_000
+        : false,
   })
 
   usePageTitle('Connect AI harness')
@@ -73,12 +78,8 @@ export function AiOnboarding() {
     ])
   }, [setBreadcrumbs])
 
-  const harnessKey = apiKeysData?.api_keys?.find(
-    (key) =>
-      key.name === AI_HARNESS_KEY_NAME &&
-      key.role_type.toLowerCase() === 'admin' &&
-      key.is_active
-  )
+  const harnessKey = findAiHarnessKey(apiKeysData?.api_keys)
+  const harnessStatus = getAiHarnessStatus(apiKeysData?.api_keys)
 
   return (
     <div className="mx-auto w-full max-w-6xl space-y-6 p-4 sm:p-8">
@@ -130,10 +131,15 @@ export function AiOnboarding() {
             </div>
             {apiKeysLoading ? (
               <Skeleton className="h-10 w-44" />
-            ) : harnessKey ? (
+            ) : harnessStatus === 'connected' ? (
               <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-2.5 text-sm font-medium text-emerald-600 dark:text-emerald-400">
                 <Check className="size-4" />
-                Harness key ready
+                Harness connected
+              </div>
+            ) : harnessStatus === 'waiting' ? (
+              <div className="inline-flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-2.5 text-sm font-medium text-amber-700 dark:text-amber-300">
+                <Circle className="size-3 fill-current" />
+                Waiting for first request
               </div>
             ) : (
               <Button asChild size="lg">
@@ -146,6 +152,18 @@ export function AiOnboarding() {
           </div>
         </CardContent>
       </Card>
+
+      {harnessStatus === 'waiting' && (
+        <Alert className="border-amber-500/30 bg-amber-500/5">
+          <Terminal className="size-4 text-amber-700 dark:text-amber-300" />
+          <AlertTitle>API key created — finish the connection</AlertTitle>
+          <AlertDescription>
+            Install the skill, authenticate the CLI, and run either read-only
+            verification command below. This page checks for the key&apos;s
+            first authenticated request automatically.
+          </AlertDescription>
+        </Alert>
+      )}
 
       <div className="grid gap-4 lg:grid-cols-3">
         <OnboardingStep
@@ -183,7 +201,10 @@ export function AiOnboarding() {
           icon={Wand2}
           title="Add Temps to your harness"
           description="Run the skill installer inside the repository where you use your AI agent, then authenticate the pinned CLI with the key from step one."
-          status="Two commands"
+          ready={harnessStatus === 'connected'}
+          status={
+            harnessStatus === 'connected' ? 'Authenticated' : 'Two commands'
+          }
         >
           <div className="space-y-3">
             <Command
@@ -207,7 +228,8 @@ export function AiOnboarding() {
           icon={Terminal}
           title="Verify before changing anything"
           description="Confirm the harness is targeting this instance and can read its projects. Neither verification command changes platform state."
-          status="Read-only"
+          ready={harnessStatus === 'connected'}
+          status={harnessStatus === 'connected' ? 'Verified' : 'Read-only'}
         >
           <div className="space-y-3">
             <Command

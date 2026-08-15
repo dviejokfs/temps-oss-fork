@@ -13,10 +13,10 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from './useSettings'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
-import { AI_HARNESS_KEY_NAME } from '@/lib/ai-onboarding'
+import { getAiHarnessStatus } from '@/lib/ai-onboarding'
 
 export interface ActivationSignals {
-  /** Dedicated active admin key exists for an external AI harness */
+  /** Dedicated active admin key has authenticated an external AI harness */
   aiHarnessConfigured: boolean
   /** Active provider can power Temps' built-in chat and AI features */
   aiProviderConfigured: boolean
@@ -139,12 +139,7 @@ export function useActivationSignals(): ActivationSignals {
 
   const aiProviderConfigured = aiProviderStatus?.configured === true
   const aiHarnessConfigured =
-    apiKeysData?.api_keys?.some(
-      (key) =>
-        key.name === AI_HARNESS_KEY_NAME &&
-        key.role_type.toLowerCase() === 'admin' &&
-        key.is_active
-    ) ?? false
+    getAiHarnessStatus(apiKeysData?.api_keys) === 'connected'
 
   const gitConnected =
     (connections?.connections?.filter((c) => c.is_active).length ?? 0) > 0

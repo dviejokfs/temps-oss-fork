@@ -30,6 +30,7 @@ import { Header } from './components/dashboard/Header'
 import AppSidebar from './components/dashboard/Sidebar'
 import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
 import { UpdateAvailableBanner } from './components/alerts/UpdateAvailableBanner'
+import { AiHarnessPendingBanner } from './components/alerts/AiHarnessPendingBanner'
 import { ProtectedLayout } from './components/layout/ProtectedLayout'
 import { SettingsLayout } from './components/settings/SettingsLayout'
 import { SidebarInset, SidebarProvider } from './components/ui/sidebar'
@@ -489,6 +490,7 @@ const FullAppRoutes = () => {
               {/* App-wide "newer release published" banner — informational, per-
               version dismissible, links the upgrade docs. */}
               <UpdateAvailableBanner />
+              <AiHarnessPendingBanner />
               {/* Wrap header with independent error boundary */}
               <ErrorBoundary
                 fallback={(error, _errorInfo, resetError) => (

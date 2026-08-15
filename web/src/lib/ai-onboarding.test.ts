@@ -3,6 +3,8 @@ import {
   AI_HARNESS_KEY_NAME,
   buildAiHarnessCommands,
   buildAiHarnessKeyHref,
+  findAiHarnessKey,
+  getAiHarnessStatus,
 } from './ai-onboarding'
 
 describe('AI harness onboarding', () => {
@@ -42,5 +44,42 @@ describe('AI harness onboarding', () => {
     expect(url.searchParams.get('name')).toBe(AI_HARNESS_KEY_NAME)
     expect(url.searchParams.get('role')).toBe('admin')
     expect(url.searchParams.get('returnTo')).toBe('/setup/ai')
+  })
+
+  test('requires the dedicated key to make an authenticated request', () => {
+    const key = {
+      id: 12,
+      name: AI_HARNESS_KEY_NAME,
+      role_type: 'ADMIN',
+      is_active: true,
+      last_used_at: null,
+    }
+
+    expect(findAiHarnessKey([key])?.id).toBe(12)
+    expect(getAiHarnessStatus([key])).toBe('waiting')
+    expect(
+      getAiHarnessStatus([{ ...key, last_used_at: '2026-08-16T12:00:00Z' }])
+    ).toBe('connected')
+  })
+
+  test('ignores inactive, non-admin, and unrelated keys', () => {
+    expect(
+      getAiHarnessStatus([
+        {
+          id: 1,
+          name: AI_HARNESS_KEY_NAME,
+          role_type: 'user',
+          is_active: true,
+          last_used_at: '2026-08-16T12:00:00Z',
+        },
+        {
+          id: 2,
+          name: AI_HARNESS_KEY_NAME,
+          role_type: 'admin',
+          is_active: false,
+          last_used_at: '2026-08-16T12:00:00Z',
+        },
+      ])
+    ).toBe('missing')
   })
 })
