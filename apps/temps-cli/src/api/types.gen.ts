@@ -17557,6 +17557,11 @@ export type StatsFilters = {
     device_type?: string | null;
     environment_id?: number | null;
     /**
+     * Exclude Temps status-monitor traffic, including legacy rows written
+     * before monitor requests received their own `request_source` value.
+     */
+    exclude_synthetic?: boolean;
+    /**
      * When true, only count requests that matched a project (project_id IS NOT NULL).
      * Used by the health dashboard so totals match the per-project cards.
      */
@@ -18100,6 +18105,10 @@ export type TimeBucketStats = {
      */
     error_count: number;
     /**
+     * Number of requests in this bucket that recorded a latency value.
+     */
+    latency_count: number;
+    /**
      * p50 response time in milliseconds (0 when the bucket has no timings)
      */
     p50_response_time_ms: number;
@@ -18369,6 +18378,103 @@ export type TrackingEventResponse = {
     link_url?: string | null;
     user_agent?: string | null;
 };
+
+export type TrafficAggregationRequest = {
+    /**
+     * Zero to four grouping dimensions. Zero returns one overall rollup;
+     * multiple dimensions form a tuple.
+     */
+    dimensions: Array<TrafficDimension>;
+    end_time: string;
+    environment_id?: number | null;
+    filters?: Array<TrafficFilter>;
+    /**
+     * Include Temps status-monitor requests. They are excluded by default.
+     */
+    include_synthetic?: boolean;
+    /**
+     * Aggregates to calculate. Unrequested response fields remain null.
+     */
+    metrics: Array<TrafficMetric>;
+    /**
+     * Ordered sort keys. Multiple keys provide stable pagination when the
+     * primary metric ties. Every field must be requested/grouped.
+     */
+    order_by?: Array<TrafficOrderBy>;
+    page?: number;
+    page_size?: number;
+    start_time: string;
+};
+
+export type TrafficAggregationResponse = {
+    dimensions: Array<TrafficDimension>;
+    metrics: Array<TrafficMetric>;
+    page: number;
+    page_size: number;
+    rows: Array<TrafficAggregationRow>;
+    synthetic_excluded: boolean;
+    total_groups: number;
+    total_pages: number;
+};
+
+export type TrafficAggregationRow = {
+    dimensions: Array<TrafficDimensionValue>;
+    metrics: TrafficMetricValues;
+};
+
+export type TrafficDimension = 'client_ip' | 'method' | 'path' | 'host' | 'status_code' | 'status_class' | 'environment_id' | 'deployment_id' | 'request_source' | 'is_bot' | 'browser' | 'operating_system' | 'device_type' | 'cache_status';
+
+export type TrafficDimensionValue = {
+    dimension: TrafficDimension;
+    /**
+     * Dimensions are serialized as display-safe strings across both storage
+     * backends. Null database values remain null rather than becoming empty.
+     */
+    value?: string | null;
+};
+
+export type TrafficFilter = {
+    dimension: TrafficDimension;
+    operator: TrafficFilterOperator;
+    /**
+     * One value for scalar operators; one or more values for `in`.
+     */
+    values: Array<string>;
+};
+
+export type TrafficFilterOperator = 'eq' | 'not_eq' | 'contains' | 'starts_with' | 'in';
+
+export type TrafficMetric = 'requests' | 'errors' | 'error_rate' | 'latency_avg' | 'latency_min' | 'latency_max' | 'latency_p50' | 'latency_p95' | 'latency_p99' | 'unique_ips' | 'unique_paths' | 'last_seen';
+
+export type TrafficMetricValues = {
+    error_rate?: number | null;
+    errors?: number | null;
+    last_seen?: string | null;
+    latency_avg_ms?: number | null;
+    latency_max_ms?: number | null;
+    latency_min_ms?: number | null;
+    latency_p50_ms?: number | null;
+    latency_p95_ms?: number | null;
+    latency_p99_ms?: number | null;
+    requests?: number | null;
+    unique_ips?: number | null;
+    unique_paths?: number | null;
+};
+
+export type TrafficOrderBy = {
+    direction: TrafficSortDirection;
+    field: TrafficOrderField;
+};
+
+export type TrafficOrderField = {
+    field: TrafficDimension;
+    kind: 'dimension';
+} | {
+    field: TrafficMetric;
+    kind: 'metric';
+};
+
+export type TrafficSortDirection = 'asc' | 'desc';
 
 export type TriggerAgentRequest = {
     trigger_source_id?: number | null;
@@ -32939,13 +33045,13 @@ export type DetectPublicEnvExampleData = {
     };
     query?: {
         /**
-         * Branch name to detect presets for (default: repository's default branch)
+         * Branch name to inspect (default: repository's default branch)
          */
         branch?: string | null;
         /**
-         * Force fetch fresh data, bypassing cache (default: false)
+         * Project root directory to search (default: repository root)
          */
-        fresh?: boolean;
+        root_directory?: string | null;
     };
     url: '/git/public/{provider}/{owner}/{repo}/env-example';
 };
@@ -39949,6 +40055,56 @@ export type GetApiCallersResponses = {
 };
 
 export type GetApiCallersResponse = GetApiCallersResponses[keyof GetApiCallersResponses];
+
+export type AggregateApiTrafficData = {
+    body: TrafficAggregationRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/api-analytics/query';
+};
+
+export type AggregateApiTrafficErrors = {
+    /**
+     * Invalid dimensions, metrics, filters, or time range
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Aggregation request budget exceeded
+     */
+    429: ProblemDetails;
+    /**
+     * Storage query failed
+     */
+    500: ProblemDetails;
+    /**
+     * Aggregation query timed out
+     */
+    504: ProblemDetails;
+};
+
+export type AggregateApiTrafficError = AggregateApiTrafficErrors[keyof AggregateApiTrafficErrors];
+
+export type AggregateApiTrafficResponses = {
+    /**
+     * Aggregated API traffic
+     */
+    200: TrafficAggregationResponse;
+};
+
+export type AggregateApiTrafficResponse = AggregateApiTrafficResponses[keyof AggregateApiTrafficResponses];
 
 export type GetApiRoutesData = {
     body?: never;
@@ -49082,6 +49238,10 @@ export type GetRepositoryEnvExampleLiveData = {
          * Git branch to check (defaults to repository's default branch)
          */
         branch?: string;
+        /**
+         * Project root directory to search (defaults to repository root)
+         */
+        root_directory?: string;
     };
     url: '/repositories/{repository_id}/env-example/live';
 };
