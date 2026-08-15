@@ -13568,6 +13568,11 @@ export type ProvisionResponse = (DomainError & {
     type: 'pending';
 });
 
+export type ProxyLogAccessResponse = {
+    allowed: boolean;
+    reason?: string | null;
+};
+
 /**
  * Response model for proxy logs
  */
@@ -18420,9 +18425,10 @@ export type TrafficFilter = {
 
 export type TrafficFilterOperator = 'eq' | 'not_eq' | 'contains' | 'starts_with' | 'in';
 
-export type TrafficMetric = 'requests' | 'errors' | 'error_rate' | 'latency_avg' | 'latency_min' | 'latency_max' | 'latency_p50' | 'latency_p95' | 'latency_p99' | 'unique_ips' | 'unique_paths' | 'last_seen';
+export type TrafficMetric = 'requests' | 'errors' | 'error_rate' | 'latency_avg' | 'latency_min' | 'latency_max' | 'latency_p50' | 'latency_p95' | 'latency_p99' | 'unique_ips' | 'unique_paths' | 'bot_requests' | 'robots_txt_requests' | 'last_seen';
 
 export type TrafficMetricValues = {
+    bot_requests?: number | null;
     error_rate?: number | null;
     errors?: number | null;
     last_seen?: string | null;
@@ -18433,6 +18439,7 @@ export type TrafficMetricValues = {
     latency_p95_ms?: number | null;
     latency_p99_ms?: number | null;
     requests?: number | null;
+    robots_txt_requests?: number | null;
     unique_ips?: number | null;
     unique_paths?: number | null;
 };
@@ -39851,6 +39858,44 @@ export type GetApiCallersResponses = {
 
 export type GetApiCallersResponse = GetApiCallersResponses[keyof GetApiCallersResponses];
 
+export type GetApiTrafficProxyLogAccessData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/api-analytics/proxy-log-access';
+};
+
+export type GetApiTrafficProxyLogAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient analytics permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project permission check failed
+     */
+    500: ProblemDetails;
+};
+
+export type GetApiTrafficProxyLogAccessError = GetApiTrafficProxyLogAccessErrors[keyof GetApiTrafficProxyLogAccessErrors];
+
+export type GetApiTrafficProxyLogAccessResponses = {
+    /**
+     * Proxy-log drilldown capability
+     */
+    200: ProxyLogAccessResponse;
+};
+
+export type GetApiTrafficProxyLogAccessResponse = GetApiTrafficProxyLogAccessResponses[keyof GetApiTrafficProxyLogAccessResponses];
+
 export type AggregateApiTrafficData = {
     body: TrafficAggregationRequest;
     path: {
@@ -47802,9 +47847,18 @@ export type GetProxyLogsData = {
          */
         path?: string | null;
         /**
+         * Filter by an exact request path
+         */
+        path_exact?: string | null;
+        /**
          * Filter by client IP address
          */
         client_ip?: string | null;
+        /**
+         * Exclude Temps status-monitor requests, including legacy monitor rows
+         * identified only by their user-agent.
+         */
+        exclude_synthetic?: boolean | null;
         /**
          * Filter by HTTP status code
          */
@@ -47991,6 +48045,11 @@ export type GetProxyLogByRequestIdData = {
         request_id: string;
     };
     query?: {
+        /**
+         * Project scope for the lookup. Required for non-administrator callers.
+         * Instance administrators may omit it for legacy global deep links.
+         */
+        project_id?: number | null;
         /**
          * Event time of the log row (ISO 8601). When provided, the lookup is
          * bounded to the hypertable chunks around this instant instead of
@@ -48601,6 +48660,11 @@ export type GetProxyLogByIdData = {
         id: number;
     };
     query?: {
+        /**
+         * Project scope for the lookup. Required for non-administrator callers.
+         * Instance administrators may omit it for legacy global deep links.
+         */
+        project_id?: number | null;
         /**
          * Event time of the log row (ISO 8601). When provided, the lookup is
          * bounded to the hypertable chunks around this instant instead of
