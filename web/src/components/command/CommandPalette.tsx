@@ -222,15 +222,15 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['import', 'migrate', 'workload', 'platform', 'external'],
   },
   {
-    title: 'Monitoring',
-    url: '/monitoring',
+    title: 'Proxy',
+    url: '/proxy',
     icon: Activity,
     keywords: [
       'metrics',
       'performance',
       'analytics',
       'stats',
-      'alerts',
+      'traffic',
       'health',
     ],
   },
@@ -259,7 +259,7 @@ const settingsNavItems: NavigationItem[] = [
   },
   {
     title: 'Add Notification Provider',
-    url: '/monitoring/providers/add',
+    url: '/settings/notifications/new',
     icon: BellPlus,
     keywords: [
       'notifications',

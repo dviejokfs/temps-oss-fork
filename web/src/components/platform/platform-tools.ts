@@ -6,7 +6,6 @@ import {
   Database,
   DatabaseBackup,
   Folder,
-  Gauge,
   GitBranch,
   Globe,
   Mail,
@@ -113,13 +112,6 @@ export const platformToolGroups: PlatformToolGroup[] = [
     description: 'Understand platform health, traffic, and operator activity.',
     items: [
       {
-        title: 'Monitoring',
-        description: 'Review resource health and configure alerts.',
-        url: '/monitoring',
-        icon: Gauge,
-        keywords: ['health', 'alarms', 'resources'],
-      },
-      {
         title: 'Proxy',
         description: 'Inspect traffic and reverse-proxy performance.',
         url: '/proxy',
@@ -191,9 +183,9 @@ export const platformToolShortcuts: PlatformToolItem[] = [
     icon: Globe,
   },
   {
-    title: 'Check platform health',
-    description: 'Open resources, alarms, and monitoring.',
-    url: '/monitoring',
-    icon: Gauge,
+    title: 'Inspect platform traffic',
+    description: 'Open reverse-proxy traffic and performance.',
+    url: '/proxy',
+    icon: Activity,
   },
 ]

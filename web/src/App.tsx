@@ -41,10 +41,8 @@ import { AuthProvider } from './contexts/AuthContext'
 import { BreadcrumbProvider } from './contexts/BreadcrumbContext'
 import { PlatformAccessProvider } from './contexts/PlatformAccessContext'
 import './globals.css'
-import { MonitoringSettings } from './components/monitoring/MonitoringSettings'
 import { AddNotificationProvider } from './pages/AddNotificationProvider'
 import { EditNotificationProvider } from './pages/EditNotificationProvider'
-import { Monitoring } from './pages/Monitoring'
 import { PluginPage } from './pages/plugins/PluginPage'
 // Lazy load all pages
 const Account = lazy(() =>
@@ -550,22 +548,22 @@ const FullAppRoutes = () => {
                       path="/sandboxes/:sandboxId"
                       element={<SandboxDetail />}
                     />
-                    <Route path="/monitoring" element={<Monitoring />}>
-                      <Route
-                        index
-                        element={<Navigate to="resources" replace />}
-                      />
-                      <Route path="alarms" element={<Alarms />} />
-                      <Route
-                        path="providers/add"
-                        element={<AddNotificationProvider />}
-                      />
-                      <Route
-                        path="providers/edit/:id"
-                        element={<EditNotificationProvider />}
-                      />
-                      <Route path=":section" element={<MonitoringSettings />} />
-                    </Route>
+                    <Route
+                      path="/monitoring/*"
+                      element={<Navigate to="/proxy" replace />}
+                    />
+                    <Route path="/monitoring/alarms" element={<Alarms />} />
+                    <Route
+                      path="/monitoring/providers/add"
+                      element={
+                        <Navigate to="/settings/notifications/new" replace />
+                      }
+                    />
+                    <Route
+                      path="/monitoring/providers/edit/:id"
+                      element={<EditNotificationProvider />}
+                    />
+                    <Route path="/alarms" element={<Alarms />} />
                     {/* Observe section */}
                     {/* ADR-027 Phase 2: global cross-project unified trace waterfall */}
                     <Route
@@ -593,6 +591,14 @@ const FullAppRoutes = () => {
                     <Route path="/settings" element={<SettingsLayout />}>
                       <Route index element={<Settings />} />
                       <Route path="notifications" element={<Notifications />} />
+                      <Route
+                        path="notifications/new"
+                        element={<AddNotificationProvider />}
+                      />
+                      <Route
+                        path="notifications/:id"
+                        element={<EditNotificationProvider />}
+                      />
                       <Route path="users" element={<Users />} />
                       <Route path="users/new" element={<CreateUser />} />
                       <Route path="users/:userId" element={<UserDetail />} />

@@ -27,6 +27,7 @@ import {
   Clock,
   Check,
   Database,
+  DatabaseBackup,
   Folder,
   Gauge,
   GitBranch,
@@ -107,8 +108,10 @@ interface PlatformNavItem {
 // capability remains visible on /tools and in Cmd+K.
 const primaryPlatformNav: PlatformNavItem[] = [
   { title: 'Projects', url: '/projects', icon: Folder },
+  { title: 'Domains', url: '/domains', icon: Globe },
   { title: 'Databases', url: '/storage', icon: Database },
-  { title: 'Monitoring', url: '/monitoring', icon: Gauge },
+  { title: 'Backups', url: '/backups', icon: DatabaseBackup },
+  { title: 'Proxy', url: '/proxy', icon: Activity },
   {
     title: 'All platform tools',
     url: '/tools',

@@ -1252,7 +1252,7 @@ function MonitoringDashboard({
             {firingCount} alert{firingCount > 1 ? 's' : ''} firing
           </span>
           <Link
-            to="/monitoring/alarms"
+            to="/alarms"
             className="ml-auto text-xs underline underline-offset-2 hover:no-underline"
           >
             View all
