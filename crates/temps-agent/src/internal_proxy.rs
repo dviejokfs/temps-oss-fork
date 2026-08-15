@@ -88,9 +88,13 @@ const MAX_RETRIES: usize = 3;
 /// previous container's project identity.
 const IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const IDENTITY_MAX_AGE: Duration = Duration::from_secs(3);
-const IDENTITY_INSPECTION_BURST: usize = 64;
-const IDENTITY_INSPECTION_REFILL: usize = 32;
+const IDENTITY_INSPECTION_PROJECT_BURST: usize = 16;
+const IDENTITY_INSPECTION_PROJECT_REFILL: usize = 8;
 const IDENTITY_INSPECTION_REFILL_INTERVAL: Duration = Duration::from_millis(125);
+const IDENTITY_INSPECTION_PROJECT_CONCURRENCY: usize = 2;
+const IDENTITY_INSPECTION_GLOBAL_CONCURRENCY: usize = 32;
+const IDENTITY_INSPECTION_QUEUE_TIMEOUT: Duration = Duration::from_millis(100);
+const IDENTITY_INSPECTION_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct CallerIdentitySnapshot {
     identities: HashMap<IpAddr, String>,
@@ -110,12 +114,27 @@ impl CallerIdentitySnapshot {
     }
 }
 
+struct InspectionQuota {
+    tokens: Arc<Semaphore>,
+    concurrency: Arc<Semaphore>,
+}
+
+impl InspectionQuota {
+    fn new() -> Self {
+        Self {
+            tokens: Arc::new(Semaphore::new(IDENTITY_INSPECTION_PROJECT_BURST)),
+            concurrency: Arc::new(Semaphore::new(IDENTITY_INSPECTION_PROJECT_CONCURRENCY)),
+        }
+    }
+}
+
 /// Shared HTTP client + route store for the proxy's request handler.
 struct ProxyState {
     client: reqwest::Client,
     store: SharedRouteStore,
     docker: bollard::Docker,
-    inspection_budget: Arc<Semaphore>,
+    inspection_quotas: Arc<RwLock<HashMap<i32, Arc<InspectionQuota>>>>,
+    inspection_concurrency: Arc<Semaphore>,
     caller_identities: Arc<RwLock<CallerIdentitySnapshot>>,
 }
 
@@ -149,12 +168,13 @@ pub async fn spawn(
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     let caller_identities = Arc::new(RwLock::new(CallerIdentitySnapshot::new(initial_identities)));
-    let inspection_budget = Arc::new(Semaphore::new(IDENTITY_INSPECTION_BURST));
+    let inspection_quotas = Arc::new(RwLock::new(HashMap::new()));
     let state = Arc::new(ProxyState {
         client,
         store,
         docker: docker.clone(),
-        inspection_budget: Arc::clone(&inspection_budget),
+        inspection_quotas: Arc::clone(&inspection_quotas),
+        inspection_concurrency: Arc::new(Semaphore::new(IDENTITY_INSPECTION_GLOBAL_CONCURRENCY)),
         caller_identities: Arc::clone(&caller_identities),
     });
     let app = axum::Router::new().fallback(handle).with_state(state);
@@ -212,9 +232,14 @@ pub async fn spawn(
             tokio::select! {
                 _ = budget_shutdown.notified() => return,
                 _ = interval.tick() => {
-                    let missing = IDENTITY_INSPECTION_BURST
-                        .saturating_sub(inspection_budget.available_permits());
-                    inspection_budget.add_permits(missing.min(IDENTITY_INSPECTION_REFILL));
+                    let quotas = inspection_quotas.read().values().cloned().collect::<Vec<_>>();
+                    for quota in quotas {
+                        let missing = IDENTITY_INSPECTION_PROJECT_BURST
+                            .saturating_sub(quota.tokens.available_permits());
+                        quota.tokens.add_permits(
+                            missing.min(IDENTITY_INSPECTION_PROJECT_REFILL),
+                        );
+                    }
                 }
             }
         }
@@ -306,36 +331,74 @@ async fn caller_may_access_route(
     let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
         return false;
     };
-    let Some(container_id) = source_container_id(state, peer.ip()).await else {
+    let Some(container_id) = candidate_container_id(&state.caller_identities, peer.ip()) else {
         return false;
     };
-    state
+    // Reject cross-project callers from memory before they can consume any
+    // Docker inspection capacity.
+    if !state
         .store
         .container_id_has_project(&container_id, route_project_id)
+    {
+        return false;
+    }
+    if !source_container_is_current(state, peer.ip(), &container_id, route_project_id).await {
+        return false;
+    }
+    true
 }
 
 /// Verify the cached candidate against Docker's current running-container and
 /// network state. A bounded token bucket prevents workload traffic from
 /// amplifying without limit into Docker-daemon API calls; exhausted requests
 /// fail closed.
-async fn source_container_id(state: &ProxyState, source_ip: IpAddr) -> Option<String> {
+async fn source_container_is_current(
+    state: &ProxyState,
+    source_ip: IpAddr,
+    container_id: &str,
+    project_id: i32,
+) -> bool {
     use bollard::query_parameters::InspectContainerOptions;
 
-    let container_id = candidate_container_id(&state.caller_identities, source_ip)?;
-    let permit = Arc::clone(&state.inspection_budget)
-        .try_acquire_owned()
-        .ok()?;
-    permit.forget();
+    let quota = inspection_quota(state, project_id);
+    let project_slot = Arc::clone(&quota.concurrency).try_acquire_owned().ok();
+    let Some(_project_slot) = project_slot else {
+        return false;
+    };
+    let token = Arc::clone(&quota.tokens).try_acquire_owned().ok();
+    let Some(token) = token else {
+        return false;
+    };
+    token.forget();
 
-    let inspected = state
-        .docker
-        .inspect_container(&container_id, None::<InspectContainerOptions>)
-        .await
-        .ok()?;
+    let global_slot = tokio::time::timeout(
+        IDENTITY_INSPECTION_QUEUE_TIMEOUT,
+        Arc::clone(&state.inspection_concurrency).acquire_owned(),
+    )
+    .await;
+    let Ok(Ok(_global_slot)) = global_slot else {
+        return false;
+    };
+
+    let inspected = tokio::time::timeout(
+        IDENTITY_INSPECTION_TIMEOUT,
+        state
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>),
+    )
+    .await;
+    let Ok(Ok(inspected)) = inspected else {
+        return false;
+    };
     if inspected.state.and_then(|container| container.running) != Some(true) {
-        return None;
+        return false;
     }
-    let networks = inspected.network_settings?.networks?;
+    let Some(networks) = inspected
+        .network_settings
+        .and_then(|settings| settings.networks)
+    else {
+        return false;
+    };
     let owns_source_ip = networks.values().any(|endpoint| {
         [
             endpoint.ip_address.as_deref(),
@@ -346,7 +409,19 @@ async fn source_container_id(state: &ProxyState, source_ip: IpAddr) -> Option<St
         .filter_map(|address| address.parse::<IpAddr>().ok())
         .any(|address| address == source_ip)
     });
-    owns_source_ip.then_some(container_id)
+    owns_source_ip
+}
+
+fn inspection_quota(state: &ProxyState, project_id: i32) -> Arc<InspectionQuota> {
+    if let Some(quota) = state.inspection_quotas.read().get(&project_id).cloned() {
+        return quota;
+    }
+    state
+        .inspection_quotas
+        .write()
+        .entry(project_id)
+        .or_insert_with(|| Arc::new(InspectionQuota::new()))
+        .clone()
 }
 
 /// Resolve the peer address through the local Docker daemon. The daemon's
@@ -994,5 +1069,23 @@ mod tests {
         event.typ = Some(EventMessageTypeEnum::NETWORK);
         event.action = Some("disconnect".to_string());
         assert!(identity_event_requires_refresh(&event));
+    }
+
+    #[test]
+    fn inspection_quotas_are_bounded_and_project_local() {
+        let project_a = InspectionQuota::new();
+        let project_b = InspectionQuota::new();
+
+        for _ in 0..IDENTITY_INSPECTION_PROJECT_BURST {
+            project_a.tokens.try_acquire().unwrap().forget();
+        }
+        assert!(project_a.tokens.try_acquire().is_err());
+        assert!(project_b.tokens.try_acquire().is_ok());
+
+        let first = project_a.concurrency.try_acquire().unwrap();
+        let second = project_a.concurrency.try_acquire().unwrap();
+        assert!(project_a.concurrency.try_acquire().is_err());
+        drop((first, second));
+        assert!(project_a.concurrency.try_acquire().is_ok());
     }
 }
