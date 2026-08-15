@@ -3435,9 +3435,9 @@ mod tests {
 
         /// Images used by every integration test. Keep in sync with the
         /// stable range supported by the upgrade orchestrator.
-        pub const FROM_IMAGE: &str = "timescale/timescaledb-ha:pg17";
+        pub const FROM_IMAGE: &str = "gotempsh/postgres-walg:17-bookworm";
         pub const FROM_VERSION: &str = "17";
-        pub const TO_IMAGE: &str = "timescale/timescaledb-ha:pg18";
+        pub const TO_IMAGE: &str = "gotempsh/postgres-walg:18-bookworm";
         pub const TO_VERSION: &str = "18";
 
         /// Return `Some(docker)` if a Docker daemon responds; `None` if the

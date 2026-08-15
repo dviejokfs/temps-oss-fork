@@ -4,7 +4,7 @@
  * backup (same infra as `backup-restore-scenario` and `pitr-scenario`):
  *
  *   1. provision a real standalone postgres service pinned explicitly to
- *      `timescale/timescaledb-ha:pg17` (not the platform default which is 18).
+ *      `gotempsh/postgres-walg:17-bookworm` (not the platform default which is 18).
  *      Published platform-reviewed images are used; the platform extracts
  *      "17" from the tag.
  *   2. create a **default** S3 source (`is_default: true`) pointed at the
@@ -22,7 +22,7 @@
  *      `database` parameter -- see `PostgresService::get_runtime_env_vars` /
  *      `normalizePostgresDatabaseName`'s doc comment in flows.ts).
  *   5. start the upgrade: `POST /external-services/{id}/upgrades` with
- *      from_version="17", to_version="18", with reviewed Timescale images.
+ *      from_version="17", to_version="18", with reviewed managed images.
  *      The orchestrator runs phases
  *      synchronously inside a spawned tokio task:
  *        pre_backup  → wal-g backup to MinIO (pre-upgrade safety net)
@@ -51,7 +51,7 @@
  *      the same reason PITR does (WAL-logged `SEQ_LOG_VALS` advance), so we
  *      assert the count and that the new row's id is > 5, not that it equals 6.
  *   9. assert the service's reported `docker_image` parameter now reflects
- *      the new image (`timescale/timescaledb-ha:pg18`). `phase_swap`
+ *      the new image (`gotempsh/postgres-walg:18-bookworm`). `phase_swap`
  *      calls `lifecycle.set_docker_image` which persists the new image into
  *      `external_services.parameters` -- `GET /external-services/{id}`'s
  *      `current_parameters.docker_image` is the API-visible proof.
@@ -91,11 +91,11 @@ import { buildProbeImage, PROBE_APP_HEALTH_PATH } from '../lib/probe-app.ts'
 
 // The from/to images MUST be on the same OS family (Alpine ↔ Alpine or
 // Debian ↔ Debian) -- `validate_os_family` in postgres_upgrade.rs enforces
-// this at start time. Temps' reviewed Timescale images are used here; the platform's
+// this at start time. Temps' reviewed managed images are used here; the platform's
 // extract_postgres_version() parses the major version from the tag correctly,
 // and the managed-service allowlist admits only platform-reviewed images.
-const FROM_IMAGE = 'timescale/timescaledb-ha:pg17'
-const TO_IMAGE = 'timescale/timescaledb-ha:pg18'
+const FROM_IMAGE = 'gotempsh/postgres-walg:17-bookworm'
+const TO_IMAGE = 'gotempsh/postgres-walg:18-bookworm'
 const FROM_VERSION = '17'
 const TO_VERSION = '18'
 
