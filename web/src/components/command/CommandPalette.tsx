@@ -430,6 +430,22 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
+    title: 'Connect AI Harness',
+    url: '/setup/ai',
+    icon: Wand2,
+    keywords: [
+      'connect ai',
+      'ai harness',
+      'install temps skill',
+      'bunx skills',
+      'admin api key',
+      'codex',
+      'claude code',
+      'cursor',
+      'agent setup',
+    ],
+  },
+  {
     title: 'Skills',
     url: '/skills',
     icon: Wand2,

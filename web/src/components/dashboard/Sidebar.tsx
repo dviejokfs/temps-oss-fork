@@ -122,16 +122,6 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
     ],
   },
   {
-    label: 'AI',
-    items: [
-      {
-        title: 'AI harness',
-        url: '/setup/ai',
-        icon: Sparkles,
-      },
-    ],
-  },
-  {
     label: 'Data',
     items: [
       { title: 'Databases', url: '/storage', icon: Database },

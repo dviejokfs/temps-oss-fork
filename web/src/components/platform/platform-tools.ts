@@ -148,11 +148,27 @@ export const platformToolGroups: PlatformToolGroup[] = [
     description: 'Configure AI-assisted and programmable platform workflows.',
     items: [
       {
-        title: 'AI',
-        description: 'Manage providers, usage, chats, and agent tools.',
+        title: 'Connect AI harness',
+        description:
+          'Give Codex, Claude Code, Cursor, or another harness access to Temps.',
+        url: '/setup/ai',
+        icon: Sparkles,
+        keywords: [
+          'skill',
+          'bunx',
+          'api key',
+          'codex',
+          'claude',
+          'cursor',
+          'agent',
+        ],
+      },
+      {
+        title: 'Built-in AI',
+        description: 'Manage providers, usage, console chat, and agent tools.',
         url: '/ai-gateway',
         icon: Sparkles,
-        keywords: ['models', 'agents', 'gateway'],
+        keywords: ['models', 'providers', 'chat', 'autofix', 'gateway'],
       },
       {
         title: 'AI workflows',
