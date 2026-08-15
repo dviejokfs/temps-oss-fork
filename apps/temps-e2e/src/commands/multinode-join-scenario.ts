@@ -68,9 +68,10 @@
  *      control-plane's proxy (localhost:18180) with the app's Host header
  *      and assert a real response body, not just a healthy status field.
  *  11. enable the opt-in cluster resolver, deploy a second unprivileged
- *      application on the worker, and `docker exec` its `wget` against
- *      `production.<project>.temps.local`. This proves application DNS from
- *      inside a real deployed container, not from the host test process.
+ *      application in another project, and `docker exec` its `wget` against
+ *      `production.<project>.temps.local`. DNS must resolve inside the real
+ *      deployed container, but the internal proxy must reject the cross-project
+ *      request with 403 rather than exposing the target application.
  *  12. create a real Postgres HA service and a linked Go probe application.
  *      The probe replaces only the linked DSN's address with the published
  *      service-member FQDN, then performs a real INSERT + SELECT through it.
@@ -639,7 +640,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       if (!status.ok) throw new Error(`DNS client deployment ${dnsClientDeploymentId} is in state "${status.state}"`)
     })
 
-    await step('prove one deployed application reaches another through *.temps.local DNS', async () => {
+    await step('prove *.temps.local DNS rejects cross-project application access', async () => {
       const clientContainer = await pollUntil(
         async () => (await dockerPsNames(WORKER_CONTAINER)).find((name) => name.includes(dnsClientProject.slug)),
         (name) => name !== undefined,
@@ -659,18 +660,20 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
             '-qO-',
             appUrl,
           ]),
-        (result) => result.code === 0,
+        (result) => result.code !== 0 && result.stderr.includes('403 Forbidden'),
         {
           timeoutMs: 60_000,
           intervalMs: 2000,
           onPoll: (result) => log(`    ...wget exit=${result.code}`),
-          label: `worker application to GET ${appUrl}`,
+          label: `worker application to resolve ${appUrl} and receive the cross-project 403`,
         },
       )
-      if (!request.stdout.includes('Hostname:')) {
-        throw new Error(`worker application received an unexpected response from ${appUrl}: ${request.stdout}`)
+      if (!request.stderr.includes('403 Forbidden')) {
+        throw new Error(
+          `worker application did not receive the expected cross-project 403 from ${appUrl}: ${request.stderr || request.stdout}`,
+        )
       }
-      log(`  ${clientContainer} -> ${appUrl}`)
+      log(`  ${clientContainer} -> ${appUrl}: cross-project access blocked`)
     })
 
     await step('remove the temporary DNS client application', async () => {
