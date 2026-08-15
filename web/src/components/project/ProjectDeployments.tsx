@@ -263,6 +263,35 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
 
   const imageRef = resolveImageRef()
 
+  /* eslint-disable react-hooks/set-state-in-effect -- the query parameter is
+     an external navigation intent that must open the matching controlled dialog. */
+  useEffect(() => {
+    if (searchParams.get('deploy') !== 'true') return
+
+    const nextSearchParams = new URLSearchParams(searchParams)
+    nextSearchParams.delete('deploy')
+    setSearchParams(nextSearchParams, { replace: true })
+
+    if (project.source_type === 'static_files') {
+      setStaticDialogOpen(true)
+      return
+    }
+    if (project.source_type === 'docker_image') {
+      setImageRefInput(imageRef ?? '')
+      setImageDialogOpen(true)
+      return
+    }
+
+    handleOpenNewDeployment()
+  }, [
+    handleOpenNewDeployment,
+    imageRef,
+    project.source_type,
+    searchParams,
+    setSearchParams,
+  ])
+  /* eslint-enable react-hooks/set-state-in-effect */
+
   const handleRedeploy = async ({
     branch,
     commit,
@@ -750,7 +779,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
 
   return (
     <>
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
+      <div className="mb-4 flex items-center gap-2">
         <div className="flex items-center gap-2">
           <h2 className="text-lg font-semibold">Deployments</h2>
           <Button
@@ -767,45 +796,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             )}
           </Button>
         </div>
-        {project.source_type === 'static_files' ? (
-          <Button
-            onClick={() => setStaticDialogOpen(true)}
-            className="w-full sm:w-auto"
-          >
-            <Upload className="h-4 w-4 mr-2" />
-            Deploy static files
-          </Button>
-        ) : project.source_type === 'uploaded_source' ? (
-          <Button asChild className="w-full sm:w-auto">
-            <Link to={`/projects/${project.slug}/drop`}>
-              <UploadCloud className="h-4 w-4 mr-2" />
-              Upload new source
-            </Link>
-          </Button>
-        ) : project.source_type === 'docker_image' ? (
-          <Button
-            onClick={() => {
-              setImageRefInput(imageRef ?? '')
-              setImageDialogOpen(true)
-            }}
-            className="w-full sm:w-auto"
-          >
-            <PlusIcon className="h-4 w-4 mr-2" />
-            New Deployment
-          </Button>
-        ) : (
-          <Button
-            onClick={handleOpenNewDeployment}
-            className="w-full sm:w-auto"
-          >
-            <PlusIcon className="h-4 w-4 mr-2" />
-            New Deployment
-            <KeyboardShortcut
-              shortcut="N"
-              onTrigger={handleOpenNewDeployment}
-            />
-          </Button>
-        )}
       </div>
 
       <Card>
@@ -818,6 +808,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             >
               <DeploymentCompactRow
                 deployment={deployment}
+                projectSourceType={project.source_type}
                 onRedeploy={() => {
                   setSelectedDeployment(deployment.id)
                   setIsRedeployModalOpen(true)

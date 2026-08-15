@@ -1091,6 +1091,7 @@ pub async fn update_project_settings(
             settings.cross_project_trace_sharing,
             settings.error_source_context_enabled,
             settings.error_source_root.clone(),
+            settings.ai_api_traffic_summary_enabled,
         )
         .await
         .map_err(Problem::from)?;
@@ -1225,7 +1226,6 @@ pub async fn update_git_settings(
         .project_service
         .update_git_settings(
             project_id,
-            auth.user_id(),
             settings.git_provider_connection_id,
             settings.main_branch.clone(),
             settings.repo_owner.clone(),
