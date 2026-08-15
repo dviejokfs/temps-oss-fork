@@ -852,7 +852,7 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
             {firingCount} active alert{firingCount > 1 ? 's' : ''}
           </span>
           <Link
-            to="/alarms"
+            to="/monitoring/alarms"
             className="ml-auto text-xs underline underline-offset-2 hover:no-underline"
           >
             View

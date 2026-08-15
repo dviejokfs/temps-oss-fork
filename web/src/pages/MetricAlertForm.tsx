@@ -298,7 +298,7 @@ function AlertFormBody({
   const maxSeries = form.watch('max_series')
   const hasGroupBy = groupBy.length > 0
   const labelFilters = form.watch('label_filters')
-  const alarmsBasePath = '/alarms'
+  const alarmsBasePath = '/monitoring/alarms'
 
   // "Scope" (label filters + break-down/per-series settings) is the least
   // commonly needed section — most alerts just watch the whole metric — so it

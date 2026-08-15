@@ -222,6 +222,12 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['import', 'migrate', 'workload', 'platform', 'external'],
   },
   {
+    title: 'Monitoring',
+    url: '/monitoring/resources',
+    icon: Gauge,
+    keywords: ['metrics', 'resources', 'alerts', 'alarms', 'health'],
+  },
+  {
     title: 'Proxy',
     url: '/proxy',
     icon: Activity,

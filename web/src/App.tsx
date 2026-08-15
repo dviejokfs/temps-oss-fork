@@ -41,8 +41,10 @@ import { AuthProvider } from './contexts/AuthContext'
 import { BreadcrumbProvider } from './contexts/BreadcrumbContext'
 import { PlatformAccessProvider } from './contexts/PlatformAccessContext'
 import './globals.css'
+import { MonitoringSettings } from './components/monitoring/MonitoringSettings'
 import { AddNotificationProvider } from './pages/AddNotificationProvider'
 import { EditNotificationProvider } from './pages/EditNotificationProvider'
+import { Monitoring } from './pages/Monitoring'
 import { PluginPage } from './pages/plugins/PluginPage'
 // Lazy load all pages
 const Account = lazy(() =>
@@ -59,9 +61,6 @@ const Projects = lazy(() =>
 )
 const Drop = lazy(() =>
   import('./pages/Drop').then((m) => ({ default: m.Drop }))
-)
-const Alarms = lazy(() =>
-  import('./pages/Alarms').then((m) => ({ default: m.Alarms }))
 )
 const Revenue = lazy(() =>
   import('./pages/Revenue').then((m) => ({ default: m.Revenue }))
@@ -548,22 +547,27 @@ const FullAppRoutes = () => {
                       path="/sandboxes/:sandboxId"
                       element={<SandboxDetail />}
                     />
+                    <Route path="/monitoring" element={<Monitoring />}>
+                      <Route
+                        index
+                        element={<Navigate to="resources" replace />}
+                      />
+                      <Route
+                        path="providers/add"
+                        element={
+                          <Navigate to="/settings/notifications/new" replace />
+                        }
+                      />
+                      <Route
+                        path="providers/edit/:id"
+                        element={<EditNotificationProvider />}
+                      />
+                      <Route path=":section" element={<MonitoringSettings />} />
+                    </Route>
                     <Route
-                      path="/monitoring/*"
-                      element={<Navigate to="/proxy" replace />}
+                      path="/alarms"
+                      element={<Navigate to="/monitoring/alarms" replace />}
                     />
-                    <Route path="/monitoring/alarms" element={<Alarms />} />
-                    <Route
-                      path="/monitoring/providers/add"
-                      element={
-                        <Navigate to="/settings/notifications/new" replace />
-                      }
-                    />
-                    <Route
-                      path="/monitoring/providers/edit/:id"
-                      element={<EditNotificationProvider />}
-                    />
-                    <Route path="/alarms" element={<Alarms />} />
                     {/* Observe section */}
                     {/* ADR-027 Phase 2: global cross-project unified trace waterfall */}
                     <Route

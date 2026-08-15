@@ -130,7 +130,10 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
   },
   {
     label: 'Observe',
-    items: [{ title: 'Proxy', url: '/proxy', icon: Activity }],
+    items: [
+      { title: 'Monitoring', url: '/monitoring', icon: Gauge },
+      { title: 'Proxy', url: '/proxy', icon: Activity },
+    ],
   },
   {
     label: 'More',
