@@ -45,7 +45,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
@@ -82,11 +82,36 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// connect failure before returning 502.
 const MAX_RETRIES: usize = 3;
 
+/// Caller identity is derived from Docker's current network attachments. Keep
+/// the acceptance window short so a recycled bridge IP cannot retain the
+/// previous container's project identity.
+const IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const IDENTITY_MAX_AGE: Duration = Duration::from_secs(3);
+
+struct CallerIdentitySnapshot {
+    identities: HashMap<IpAddr, String>,
+    refreshed_at: Instant,
+}
+
+impl CallerIdentitySnapshot {
+    fn new(identities: HashMap<IpAddr, String>) -> Self {
+        Self {
+            identities,
+            refreshed_at: Instant::now(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.identities.clear();
+    }
+}
+
 /// Shared HTTP client + route store for the proxy's request handler.
 struct ProxyState {
     client: reqwest::Client,
     store: SharedRouteStore,
-    caller_identities: Arc<RwLock<HashMap<IpAddr, String>>>,
+    docker: bollard::Docker,
+    caller_identities: Arc<RwLock<CallerIdentitySnapshot>>,
 }
 
 /// Spawn the proxy on `<bridge_ip>:80`. Returns once the listener is
@@ -118,23 +143,33 @@ pub async fn spawn(
     let initial_identities = load_source_identities(&docker)
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let caller_identities = Arc::new(RwLock::new(initial_identities));
+    let caller_identities = Arc::new(RwLock::new(CallerIdentitySnapshot::new(initial_identities)));
     let state = Arc::new(ProxyState {
         client,
         store,
+        docker: docker.clone(),
         caller_identities: Arc::clone(&caller_identities),
     });
     let app = axum::Router::new().fallback(handle).with_state(state);
 
     let identity_shutdown = Arc::clone(&shutdown);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        let mut interval = tokio::time::interval(IDENTITY_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = identity_shutdown.notified() => break,
                 _ = interval.tick() => match load_source_identities(&docker).await {
-                    Ok(snapshot) => *caller_identities.write() = snapshot,
-                    Err(error) => warn!(%error, "failed to refresh internal proxy caller identities"),
+                    Ok(snapshot) => {
+                        *caller_identities.write() = CallerIdentitySnapshot::new(snapshot);
+                    }
+                    Err(error) => {
+                        // Docker is the identity authority. Retaining the old
+                        // IP map after an API failure could authorize a new
+                        // container that inherited a departed container's IP.
+                        caller_identities.write().clear();
+                        warn!(%error, "failed to refresh internal proxy caller identities; denying workload traffic");
+                    }
                 }
             }
         }
@@ -226,7 +261,9 @@ async fn caller_may_access_route(
     let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
         return false;
     };
-    let Some(container_id) = source_container_id(&state.caller_identities, peer.ip()) else {
+    let Some(container_id) =
+        source_container_id(&state.docker, &state.caller_identities, peer.ip()).await
+    else {
         return false;
     };
     state
@@ -238,11 +275,50 @@ async fn caller_may_access_route(
 /// network attachment state is the authority for which container owns an IP;
 /// route destination addresses are not caller identity and may be hostnames or
 /// shared node addresses.
-fn source_container_id(
-    caller_identities: &RwLock<HashMap<IpAddr, String>>,
+fn candidate_container_id(
+    caller_identities: &RwLock<CallerIdentitySnapshot>,
     source_ip: IpAddr,
 ) -> Option<String> {
-    caller_identities.read().get(&source_ip).cloned()
+    let snapshot = caller_identities.read();
+    if snapshot.refreshed_at.elapsed() > IDENTITY_MAX_AGE {
+        return None;
+    }
+    snapshot.identities.get(&source_ip).cloned()
+}
+
+/// Resolve a cached candidate and verify that Docker still reports the same
+/// running container as the owner of the peer IP. The point lookup prevents a
+/// recycled bridge IP from inheriting the previous container's authorization
+/// without putting a full container-list scan on every request.
+async fn source_container_id(
+    docker: &bollard::Docker,
+    caller_identities: &RwLock<CallerIdentitySnapshot>,
+    source_ip: IpAddr,
+) -> Option<String> {
+    use bollard::query_parameters::InspectContainerOptions;
+
+    let container_id = candidate_container_id(caller_identities, source_ip)?;
+    let inspected = docker
+        .inspect_container(&container_id, None::<InspectContainerOptions>)
+        .await
+        .ok()?;
+    if inspected.state.and_then(|state| state.running) != Some(true) {
+        return None;
+    }
+
+    let networks = inspected.network_settings?.networks?;
+    let owns_source_ip = networks.values().any(|endpoint| {
+        [
+            endpoint.ip_address.as_deref(),
+            endpoint.global_ipv6_address.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|address| address.parse::<IpAddr>().ok())
+        .any(|address| address == source_ip)
+    });
+
+    owns_source_ip.then_some(container_id)
 }
 
 async fn load_source_identities(
@@ -800,15 +876,32 @@ mod tests {
 
     #[test]
     fn caller_identity_lookup_is_memory_only_and_fails_closed() {
-        let identities = RwLock::new(HashMap::from([(
+        let identities = RwLock::new(CallerIdentitySnapshot::new(HashMap::from([(
             "172.20.1.10".parse().unwrap(),
             "container-alpha".to_string(),
-        )]));
+        )])));
 
         assert_eq!(
-            source_container_id(&identities, "172.20.1.10".parse().unwrap()).as_deref(),
+            candidate_container_id(&identities, "172.20.1.10".parse().unwrap()).as_deref(),
             Some("container-alpha")
         );
-        assert!(source_container_id(&identities, "172.20.1.99".parse().unwrap()).is_none());
+        assert!(candidate_container_id(&identities, "172.20.1.99".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn caller_identity_lookup_rejects_stale_or_cleared_snapshots() {
+        let source_ip = "172.20.1.10".parse().unwrap();
+        let identities = RwLock::new(CallerIdentitySnapshot {
+            identities: HashMap::from([(source_ip, "departed-container".to_string())]),
+            refreshed_at: Instant::now() - IDENTITY_MAX_AGE - Duration::from_millis(1),
+        });
+
+        assert!(candidate_container_id(&identities, source_ip).is_none());
+
+        let mut snapshot = identities.write();
+        snapshot.refreshed_at = Instant::now();
+        snapshot.clear();
+        drop(snapshot);
+        assert!(candidate_container_id(&identities, source_ip).is_none());
     }
 }

@@ -1,6 +1,6 @@
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
-    Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbErr, EntityTrait,
+    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use serde::Serialize;
 use slug::slugify;
@@ -190,6 +190,39 @@ impl EnvironmentService {
         )
     }
 
+    /// Serialize every activation of a preview hostname and reject an active
+    /// owner. This must be called inside the transaction that creates,
+    /// restores, or renames the environment.
+    async fn claim_environment_subdomain(
+        &self,
+        txn: &DatabaseTransaction,
+        subdomain: &str,
+        excluding_environment_id: Option<i32>,
+    ) -> Result<(), EnvironmentError> {
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            [subdomain.to_string().into()],
+        ))
+        .await
+        .map_err(|error| EnvironmentError::DatabaseConnectionError(error.to_string()))?;
+
+        let mut conflict = environments::Entity::find()
+            .filter(environments::Column::Subdomain.eq(subdomain))
+            .filter(environments::Column::DeletedAt.is_null());
+        if let Some(environment_id) = excluding_environment_id {
+            conflict = conflict.filter(environments::Column::Id.ne(environment_id));
+        }
+
+        if conflict.one(txn).await?.is_some() {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Subdomain '{}' is already in use",
+                subdomain
+            )));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_environment(
         &self,
@@ -219,11 +252,17 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} for branch '{}' in project {}",
                 deleted_env.id, branch, project_id
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self.db.begin().await?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.updated_at = Set(chrono::Utc::now());
             active_env.current_deployment_id = Set(None);
-            let restored = active_env.update(self.db.as_ref()).await?;
+            let restored = active_env.update(&txn).await?;
+            txn.commit().await?;
             return Ok(restored);
         }
 
@@ -235,6 +274,8 @@ impl EnvironmentService {
 
         // Start a transaction for insert + domain creation
         let txn = self.db.begin().await?;
+        self.claim_environment_subdomain(&txn, &main_url, None)
+            .await?;
 
         // Create the new environment
         let new_environment = environments::ActiveModel {
@@ -432,13 +473,25 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} for branch '{}'",
                 deleted_env.id, branch
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self
+                .db
+                .begin()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.updated_at = Set(chrono::Utc::now());
             let restored = active_env
-                .update(self.db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            txn.commit()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
             return Ok(restored);
         }
 
@@ -506,6 +559,15 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} ('{}') in project {}",
                 deleted_env.id, name, project_id
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self
+                .db
+                .begin()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.branch = Set(Some(branch));
@@ -519,9 +581,12 @@ impl EnvironmentService {
                     }));
             }
             let restored = active_env
-                .update(self.db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            txn.commit()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
             return Ok(restored);
         }
 
@@ -558,6 +623,8 @@ impl EnvironmentService {
             .begin()
             .await
             .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+        self.claim_environment_subdomain(&txn, &main_url, None)
+            .await?;
 
         // Insert the environment
         let environment = new_environment
@@ -825,32 +892,10 @@ impl EnvironmentService {
             .await
             .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
 
-        // Serialize claims for the same normalized hostname. A row-level lock
-        // cannot protect the "no conflict exists" case, and a new unique index
-        // would fail upgrades that already contain cross-project duplicates.
-        txn.execute(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT pg_advisory_xact_lock(hashtext($1))",
-            [normalized.clone().into()],
-        ))
-        .await
-        .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
-
-        // Preview hosts are `<subdomain>.<preview-domain>`, so the namespace is
-        // global rather than project-scoped. The advisory lock keeps this check
-        // and the update atomic with respect to competing claims for the name.
-        let conflict = environments::Entity::find()
-            .filter(environments::Column::Subdomain.eq(&normalized))
-            .filter(environments::Column::Id.ne(env_id))
-            .filter(environments::Column::DeletedAt.is_null())
-            .one(&txn)
+        // A row lock cannot protect the "no conflict exists" case, and a new
+        // unique index would fail upgrades that already contain duplicates.
+        self.claim_environment_subdomain(&txn, &normalized, Some(env_id))
             .await?;
-        if conflict.is_some() {
-            return Err(EnvironmentError::InvalidInput(format!(
-                "Subdomain '{}' is already in use",
-                normalized
-            )));
-        }
 
         let previous_subdomain = environment.subdomain.clone();
 
