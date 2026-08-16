@@ -187,7 +187,9 @@ mod m20260811_000001_add_cli_session_fingerprint;
 mod m20260811_000001_create_renewal_attempts;
 mod m20260813_000001_add_ai_api_traffic_summary_enabled;
 mod m20260814_000001_create_ai_provider_models;
+mod m20260814_000001_create_otel_span_facets;
 mod m20260814_000002_add_ai_summary_preference;
+mod m20260815_000001_add_facet_attr_columns_to_otel_spans;
 
 pub struct Migrator;
 
@@ -400,8 +402,15 @@ impl MigratorTrait for Migrator {
             Box::new(m20260811_000001_create_renewal_attempts::Migration),
             Box::new(m20260811_000001_add_cli_session_fingerprint::Migration),
             Box::new(m20260813_000001_add_ai_api_traffic_summary_enabled::Migration),
+            // Main shipped m20260814_000001_create_ai_provider_models first.
+            // Keep it ahead of this branch's independently authored migration
+            // with the same date and sequence stamp; DeriveMigrationName uses
+            // the full module name, so the two records remain distinct in
+            // seaql_migrations.
             Box::new(m20260814_000001_create_ai_provider_models::Migration),
+            Box::new(m20260814_000001_create_otel_span_facets::Migration),
             Box::new(m20260814_000002_add_ai_summary_preference::Migration),
+            Box::new(m20260815_000001_add_facet_attr_columns_to_otel_spans::Migration),
         ]
     }
 }

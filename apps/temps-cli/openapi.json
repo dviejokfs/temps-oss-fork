@@ -7918,6 +7918,19 @@
         ],
         "type": "object"
       },
+      "CreateFacetRequest": {
+        "description": "Request body for registering a new facet.",
+        "properties": {
+          "attribute_key": {
+            "description": "The OTel attribute key to facet (e.g. `enduser.id`, `galachain.contract`).\nMust be non-empty, ≤200 characters, and not already registered.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attribute_key"
+        ],
+        "type": "object"
+      },
       "CreateFlagRequest": {
         "properties": {
           "client_visible": {
@@ -16488,6 +16501,86 @@
           "id",
           "name",
           "service_type"
+        ],
+        "type": "object"
+      },
+      "FacetBackendKind": {
+        "description": "Which storage engine a facet was created against. A deployment only ever\nruns one backend at a time (see `plugin.rs`'s storage selection), but\nstamping it on each row keeps the status fields unambiguous.",
+        "enum": [
+          "clickhouse",
+          "timescaledb"
+        ],
+        "type": "string"
+      },
+      "FacetInfo": {
+        "description": "Public representation of a registered span attribute facet.",
+        "properties": {
+          "attribute_key": {
+            "description": "The OTel attribute key, e.g. `enduser.id` or `galachain.contract`.",
+            "type": "string"
+          },
+          "backend": {
+            "$ref": "#/components/schemas/FacetBackendKind"
+          },
+          "created_at": {
+            "example": "2025-10-12T12:15:47.609192Z",
+            "type": "string"
+          },
+          "error_message": {
+            "description": "Populated when `status = failed`, explaining why.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rows_backfilled": {
+            "description": "Rows backfilled so far. Only meaningful for the `timescaledb` backend\n— the `clickhouse` backend's mutation doesn't expose a row count\nuntil it's done, so this stays 0 there even while running.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "slot": {
+            "description": "The slot column index 1..=20 (`facet_attr_N`).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/FacetStatus"
+          }
+        },
+        "required": [
+          "attribute_key",
+          "slot",
+          "created_at",
+          "status",
+          "backend",
+          "rows_backfilled"
+        ],
+        "type": "object"
+      },
+      "FacetStatus": {
+        "description": "Backfill/delete-clear lifecycle for a facet. See the module docs for how\nthe poller advances a facet through these states.",
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "deleting"
+        ],
+        "type": "string"
+      },
+      "FacetsResponse": {
+        "description": "Response body for facet list.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/FacetInfo"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
         ],
         "type": "object"
       },
@@ -69796,6 +69889,307 @@
         ]
       }
     },
+    "/otel/facets": {
+      "get": {
+        "description": "Returns all facets registered on this platform (newest first). Since the\n`spans` ClickHouse table is platform-global, facets are also platform-global.",
+        "operationId": "list_facets",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FacetsResponse"
+                }
+              }
+            },
+            "description": "Registered facets"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List all registered OTel span attribute facets.",
+        "tags": [
+          "OTel Facets"
+        ]
+      },
+      "post": {
+        "description": "Assigns the key to the lowest available slot column (1..=20) and inserts\nthe mapping into Postgres with `status: pending`. Returns immediately —\nthe historical backfill (populating the slot column for spans already\ningested before this call) runs entirely in the background, advanced by a\nperiodic poller; poll `GET /otel/facets` and check the returned `status`\n(`pending` -> `running` -> `completed`/`failed`) to track progress. New\nspans start getting the attribute written into the slot column right\naway, independent of backfill progress.",
+        "operationId": "create_facet",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFacetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FacetInfo"
+                }
+              }
+            },
+            "description": "Facet registered"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Already registered or capacity exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Register an OTel attribute key as a facet.",
+        "tags": [
+          "OTel Facets"
+        ]
+      }
+    },
+    "/otel/facets/{key}": {
+      "delete": {
+        "description": "Marks the facet `deleting` and stops new spans from populating its slot\nimmediately, but the Postgres row (and its slot reservation) isn't\nremoved until the background poller confirms the slot column has been\ncleared for all existing spans — otherwise a future facet reusing the\nsame slot could see stale data. `GET /otel/facets` will keep returning\nthis facet with `status: deleting` until that finishes.",
+        "operationId": "delete_facet",
+        "parameters": [
+          {
+            "description": "The OTel attribute key (URL-encoded)",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Facet deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Facet not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove a registered OTel span attribute facet.",
+        "tags": [
+          "OTel Facets"
+        ]
+      }
+    },
+    "/otel/facets/{key}/retry": {
+      "post": {
+        "description": "Only valid when the facet's `status` is `failed`. Resets its progress and\nlets the background poller re-attempt the backfill from the beginning on\nits next tick.",
+        "operationId": "retry_facet_backfill",
+        "parameters": [
+          {
+            "description": "The OTel attribute key (URL-encoded)",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FacetInfo"
+                }
+              }
+            },
+            "description": "Backfill retry scheduled"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Facet not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Facet is not in a failed state"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Retry a failed OTel span attribute facet backfill.",
+        "tags": [
+          "OTel Facets"
+        ]
+      }
+    },
     "/otel/genai/traces": {
       "get": {
         "description": "`duration_ms` is the only field guaranteed to be milliseconds. `gen_ai.*`\nspan attributes (e.g. time-to-first-token, token latency) often follow the\nOTel GenAI semantic conventions, which use **seconds** (a fractional\ndouble), not milliseconds — do not read them as ms without converting.",
@@ -71376,6 +71770,15 @@
             "schema": {
               "format": "int32",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by span attributes as comma-separated key=value pairs, e.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\"",
+            "in": "query",
+            "name": "attributes",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -98001,6 +98404,10 @@
     {
       "description": "Query endpoints for the monitoring UI",
       "name": "OTel"
+    },
+    {
+      "description": "Span attribute facet registration (fast-filter slots)",
+      "name": "OTel Facets"
     },
     {
       "description": "GenAI agent activity tracing endpoints",
