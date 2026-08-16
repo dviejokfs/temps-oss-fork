@@ -782,15 +782,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
     const probeEnv = await step('resolve the probe production environment', () =>
       getProductionEnvironment(client!, probeProject.id),
     )
-    await step('pin the database probe to the control plane and link the database', async () => {
-      unwrap(
-        await updateEnvironmentSettings({
-          client: client!,
-          path: { project_id: probeProject.id, env_id: probeEnv.id },
-          body: { target_nodes: [0] },
-        }),
-        'updateEnvironmentSettings',
-      )
+    await step('link the database to the control-plane probe application', async () => {
       unwrap(
         await linkServiceToProject({
           client: client!,
@@ -823,14 +815,17 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       }),
     )
     deployments.push({ projectId: probeProject.id, deploymentId: probeDeploymentId })
-    await step('wait for the DNS/database probe deployment', () =>
-      waitForDeployment(client!, {
+    await step('wait for the DNS/database probe deployment', async () => {
+      const status = await waitForDeployment(client!, {
         projectId: probeProject.id,
         deploymentId: probeDeploymentId,
         timeoutMs: 300_000,
         onPoll: (status) => log(`    ...${status.state}`),
-      }),
-    )
+      })
+      if (!status.ok) {
+        throw new Error(`DNS/database probe deployment ${probeDeploymentId} is in state "${status.state}"`)
+      }
+    })
 
     const probeTarget = resolveLoadTarget(cfg.url, probeEnv.mainUrl)
     await step('prove the deployed application accesses Postgres through *.temps.local DNS', async () => {
