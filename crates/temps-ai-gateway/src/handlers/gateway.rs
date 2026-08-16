@@ -16,10 +16,11 @@ use tracing::{debug, error, info};
 use utoipa::OpenApi;
 
 use crate::error::AiGatewayError;
+use crate::handlers::pricing::estimate_cost_microcents;
 use crate::handlers::types::AiGatewayAppState;
 use crate::services::gateway_service::{ByokOverride, CredentialType};
 use crate::services::usage_service::AiRequestContext;
-use crate::services::UsageService;
+use crate::services::{AiUsageAttribution, GovernanceReservation, UsageService};
 use crate::types::*;
 
 /// Extract BYOK overrides from request headers.
@@ -88,6 +89,39 @@ fn reject_deployment_token_base_url(
     None
 }
 
+/// Build usage attribution from the authenticated request context.
+/// For deployment tokens the project/environment/deployment/token IDs come from
+/// the trusted JWT claim, never from caller-supplied headers.
+fn usage_attribution(auth: &temps_auth::AuthContext) -> AiUsageAttribution {
+    let token_info = auth.deployment_token_info();
+    AiUsageAttribution {
+        user_id: auth.user_id_opt(),
+        project_id: token_info.as_ref().map(|t| t.project_id),
+        environment_id: token_info.as_ref().and_then(|t| t.environment_id),
+        deployment_id: token_info.as_ref().and_then(|t| t.deployment_id),
+        deployment_token_id: token_info.as_ref().map(|t| t.token_id),
+    }
+}
+
+/// Rough input-token estimate for a chat request, used for pre-flight budget
+/// reservation.  Over-estimates to be conservative (4 bytes ≈ 1 token, plus 4
+/// overhead tokens per message for role/delimiter overhead).
+fn projected_chat_input_tokens(request: &ChatCompletionRequest) -> i64 {
+    request.messages.iter().fold(0i64, |acc, msg| {
+        let text_len = match &msg.content {
+            Some(MessageContent::Text(t)) => t.len() as i64,
+            Some(MessageContent::Parts(parts)) => parts
+                .iter()
+                .filter_map(|p| p.text.as_deref())
+                .map(|t| t.len() as i64)
+                .sum(),
+            None => 0,
+        };
+        // 4 chars per token + 4 overhead tokens per message
+        acc + (text_len / 4).max(1) + 4
+    })
+}
+
 // ============================================================================
 // Streaming usage extraction
 // ============================================================================
@@ -120,18 +154,24 @@ fn extract_usage_from_sse_line(line: &str) -> Option<(i64, i64)> {
 
 /// Wraps an upstream SSE byte stream to transparently intercept usage data
 /// from the final chunks, then logs it after the stream ends.
+///
+/// The `reservation` is consumed atomically when the stream completes
+/// successfully (converted to an actual usage row in a single transaction).
+/// On early drop (client disconnect) it is also consumed — the conservative
+/// worst-case cost from the pre-flight reservation remains in the budget.
 #[allow(clippy::too_many_arguments)]
 fn wrap_stream_with_usage_tracking(
     inner: std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<Bytes, AiGatewayError>> + Send>,
     >,
     usage_service: Arc<UsageService>,
-    user_id: Option<i32>,
+    attribution: AiUsageAttribution,
     provider: String,
     model: String,
     start: Instant,
     is_byok: bool,
     ai_context: AiRequestContext,
+    reservation: Option<GovernanceReservation>,
 ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<Bytes, AiGatewayError>> + Send>> {
     use tokio_stream::StreamExt;
 
@@ -164,7 +204,7 @@ fn wrap_stream_with_usage_tracking(
         result
     });
 
-    // When the stream ends, log usage
+    // When the stream ends, log usage (converting or consuming the reservation)
     let pt_final = prompt_tokens;
     let ct_final = completion_tokens;
 
@@ -176,20 +216,22 @@ fn wrap_stream_with_usage_tracking(
             let latency_ms = start.elapsed().as_millis() as i32;
 
             if input > 0 || output > 0 {
+                let cost = estimate_cost_microcents(&model, input, output).unwrap_or(0);
                 tokio::spawn(async move {
                     if let Err(e) = usage_service
-                        .log_usage_with_context(
-                            user_id,
+                        .log_usage_with_context_and_reservation(
+                            &attribution,
                             &provider,
                             &model,
                             input,
                             output,
                             latency_ms,
-                            0,
+                            cost,
                             200,
                             true, // streaming
                             is_byok,
                             &ai_context,
+                            reservation.as_ref(),
                         )
                         .await
                     {
@@ -339,6 +381,51 @@ fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
                 "invalid_provider_url",
             ),
         ),
+        AiGatewayError::RateLimitExceeded {
+            scope,
+            limit_per_minute,
+            ..
+        } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            OpenAiErrorResponse::server_error(
+                format!(
+                    "Rate limit exceeded for scope '{}': {} requests/minute allowed.",
+                    scope, limit_per_minute
+                ),
+                "rate_limit_exceeded",
+            ),
+        ),
+        AiGatewayError::MonthlyBudgetExceeded { scope, .. } => (
+            StatusCode::PAYMENT_REQUIRED,
+            OpenAiErrorResponse::server_error(
+                format!("Monthly AI budget exceeded for scope '{}'.", scope),
+                "budget_exceeded",
+            ),
+        ),
+        AiGatewayError::PricingUnavailable { model, .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            OpenAiErrorResponse::server_error(
+                format!("Pricing data unavailable for model '{}'.", model),
+                "pricing_unavailable",
+            ),
+        ),
+        AiGatewayError::BudgetRequiresMaxTokens { scope } => (
+            StatusCode::BAD_REQUEST,
+            OpenAiErrorResponse::invalid_request(
+                format!(
+                    "Budget governance is active for scope '{}': max_tokens is required.",
+                    scope
+                ),
+                "max_tokens_required",
+            ),
+        ),
+        AiGatewayError::BudgetProjectionUnavailable { .. }
+        | AiGatewayError::InvalidGovernanceConfig { .. }
+        | AiGatewayError::InvalidGovernanceScope { .. }
+        | AiGatewayError::GovernanceConfigNotFound { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            OpenAiErrorResponse::server_error(error.to_string(), "governance_error"),
+        ),
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             OpenAiErrorResponse::server_error(error.to_string(), "internal_error"),
@@ -421,9 +508,28 @@ async fn chat_completions(
     let start = Instant::now();
     let model = request.model.clone();
     let is_streaming = request.stream;
-    // None for deployment tokens (machine callers) so usage rows store NULL
-    // instead of falsely attributing all deployed-app traffic to user id 0.
-    let user_id = auth.user_id_opt();
+    let attribution = usage_attribution(&auth);
+    let is_byok_header = byok.api_key.is_some();
+
+    // Pre-flight governance check: allowlist, RPM, and budget reservation.
+    // BYOK requests bypass operator-funded budget limits but still obey
+    // allowlists and request-rate limits.
+    let projected_input = projected_chat_input_tokens(&request);
+    let max_output = request.max_tokens;
+    let reservation = match app_state
+        .governance_service
+        .check_request(
+            &attribution,
+            &model,
+            is_byok_header,
+            Some(projected_input),
+            max_output,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return Ok(error_to_response(e).into_response()),
+    };
 
     if is_streaming {
         match app_state
@@ -437,7 +543,7 @@ async fn chat_completions(
 
                 info!(
                     model = model,
-                    user_id = ?user_id,
+                    user_id = ?attribution.user_id,
                     streaming = true,
                     credential_type = credential_type_str(cred_type),
                     "AI gateway streaming request started"
@@ -457,12 +563,13 @@ async fn chat_completions(
                 let wrapped = wrap_stream_with_usage_tracking(
                     stream,
                     app_state.usage_service.clone(),
-                    user_id,
+                    attribution,
                     provider_id.to_string(),
                     model.clone(),
                     start,
                     cred_type == CredentialType::Byok,
                     ai_context.clone(),
+                    Some(reservation),
                 );
                 let body = Body::from_stream(wrapped);
 
@@ -487,6 +594,13 @@ async fn chat_completions(
             }
             Err(e) => {
                 error!(model = model, error = %e, "AI gateway streaming request failed");
+                // Release the reservation so budget is not consumed on upstream failure.
+                let gs = app_state.governance_service.clone();
+                tokio::spawn(async move {
+                    if let Err(re) = gs.release_cost_reservation(&reservation).await {
+                        error!(error = %re, "Failed to release governance reservation after streaming error");
+                    }
+                });
                 Ok(error_to_response(e).into_response())
             }
         }
@@ -511,20 +625,23 @@ async fn chat_completions(
                     let latency_ms = latency.as_millis() as i32;
                     let is_byok = cred_type == CredentialType::Byok;
                     let ctx = ai_context.clone();
+                    let cost = estimate_cost_microcents(&model_clone, input, output).unwrap_or(0);
+                    let attr = attribution.clone();
                     tokio::spawn(async move {
                         if let Err(e) = usage_service
-                            .log_usage_with_context(
-                                user_id,
+                            .log_usage_with_context_and_reservation(
+                                &attr,
                                 &provider_clone,
                                 &model_clone,
                                 input,
                                 output,
                                 latency_ms,
-                                0,
+                                cost,
                                 200,
                                 false, // non-streaming path
                                 is_byok,
                                 &ctx,
+                                Some(&reservation),
                             )
                             .await
                         {
@@ -535,7 +652,7 @@ async fn chat_completions(
 
                 info!(
                     model = model,
-                    user_id = ?user_id,
+                    user_id = ?attribution.user_id,
                     latency_ms = latency.as_millis() as u64,
                     credential_type = credential_type_str(cred_type),
                     "AI gateway request completed"
@@ -597,6 +714,13 @@ async fn chat_completions(
                     error = %e,
                     "AI gateway request failed"
                 );
+                // Release the reservation so budget is not consumed on upstream failure.
+                let gs = app_state.governance_service.clone();
+                tokio::spawn(async move {
+                    if let Err(re) = gs.release_cost_reservation(&reservation).await {
+                        error!(error = %re, "Failed to release governance reservation after error");
+                    }
+                });
                 Ok(error_to_response(e).into_response())
             }
         }
@@ -688,7 +812,18 @@ async fn embeddings(
     }
     let ai_context = extract_ai_context(&headers);
     let start = Instant::now();
-    let user_id = auth.user_id_opt();
+    let attribution = usage_attribution(&auth);
+    let is_byok_header = byok.api_key.is_some();
+
+    // Embeddings have no output tokens; max_output_tokens is None.
+    let reservation = match app_state
+        .governance_service
+        .check_request(&attribution, &request.model, is_byok_header, Some(1), None)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return Ok(error_to_response(e).into_response()),
+    };
 
     match app_state.gateway_service.embeddings(&request, &byok).await {
         Ok((response, cred_type)) => {
@@ -698,6 +833,7 @@ async fn embeddings(
 
             // Log usage asynchronously (don't block the response). Embeddings
             // only consume prompt tokens; there is no completion output.
+            let embedding_user_id = attribution.user_id;
             {
                 let usage_service = app_state.usage_service.clone();
                 let model = request.model.clone();
@@ -706,20 +842,22 @@ async fn embeddings(
                 let latency_ms = latency.as_millis() as i32;
                 let is_byok = cred_type == CredentialType::Byok;
                 let ctx = ai_context.clone();
+                let cost = estimate_cost_microcents(&model, input_tokens, 0).unwrap_or(0);
                 tokio::spawn(async move {
                     if let Err(e) = usage_service
-                        .log_usage_with_context(
-                            user_id,
+                        .log_usage_with_context_and_reservation(
+                            &attribution,
                             &provider,
                             &model,
                             input_tokens,
                             0,
                             latency_ms,
-                            0,
+                            cost,
                             200,
                             false,
                             is_byok,
                             &ctx,
+                            Some(&reservation),
                         )
                         .await
                     {
@@ -730,7 +868,7 @@ async fn embeddings(
 
             info!(
                 model = request.model,
-                user_id = ?user_id,
+                user_id = ?embedding_user_id,
                 latency_ms = latency.as_millis() as u64,
                 credential_type = credential_type_str(cred_type),
                 "AI gateway embedding request completed"
@@ -762,7 +900,16 @@ async fn embeddings(
                 }
             }
         }
-        Err(e) => Ok(error_to_response(e).into_response()),
+        Err(e) => {
+            // Release the reservation so budget is not consumed on upstream failure.
+            let gs = app_state.governance_service.clone();
+            tokio::spawn(async move {
+                if let Err(re) = gs.release_cost_reservation(&reservation).await {
+                    error!(error = %re, "Failed to release governance reservation after embedding error");
+                }
+            });
+            Ok(error_to_response(e).into_response())
+        }
     }
 }
 

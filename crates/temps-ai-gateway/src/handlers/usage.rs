@@ -223,6 +223,10 @@ impl RecentQueryParams {
             tokens_gt: self.tokens_gt,
             tokens_lte: self.tokens_lte,
             tokens_lt: self.tokens_lt,
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            deployment_token_id: None,
         }
     }
 

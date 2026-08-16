@@ -387,11 +387,14 @@ impl AiProvider for OpenAiCompatProvider {
             sanitize_openai_request(&mut req);
         }
 
-        // Inject stream_options.include_usage so the final chunk includes token counts
+        // Always inject stream_options.include_usage so the final chunk includes
+        // token counts.  Use insert() (not or_insert_with()) to overwrite any
+        // caller-supplied stream_options that might omit include_usage.
         let extra = req.extra.get_or_insert_with(Default::default);
-        extra
-            .entry("stream_options")
-            .or_insert_with(|| serde_json::json!({"include_usage": true}));
+        extra.insert(
+            "stream_options".to_string(),
+            serde_json::json!({"include_usage": true}),
+        );
 
         let response = self
             .client
