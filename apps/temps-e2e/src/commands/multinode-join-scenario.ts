@@ -72,7 +72,8 @@
  *      `production.<project>.temps.local`. DNS must resolve inside the real
  *      deployed container, but the internal proxy must reject the cross-project
  *      request with 403 rather than exposing the target application.
- *  12. drain the worker (`POST /internal/nodes/{id}/drain`), poll
+ *  12. clear the test's worker-only placement override, then drain the worker
+ *      (`POST /internal/nodes/{id}/drain`) and poll
  *      `GET /internal/nodes/{id}/drain` until `drain_complete`, then
  *      re-run the same `docker ps` side-channel check on both containers —
  *      in this 2-node cluster the container has nowhere to go but the
@@ -628,6 +629,17 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       if (cleanup.errors.length) throw new Error(cleanup.errors.join('; '))
       deployments.splice(deployments.findIndex((d) => d.deploymentId === dnsClientDeploymentId), 1)
       projectIds.splice(projectIds.indexOf(dnsClientProject.id), 1)
+    })
+
+    await step('clear the worker-only placement override before draining', async () => {
+      unwrap(
+        await updateEnvironmentSettings({
+          client: client!,
+          path: { project_id: project.id, env_id: env.id },
+          body: { target_nodes: [] },
+        }),
+        'updateEnvironmentSettings',
+      )
     })
 
     await step('drain the worker', async () => {

@@ -394,7 +394,8 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// Security configuration for this environment (overrides project-level settings)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<temps_entities::deployment_config::SecurityConfig>,
-    /// Optional list of node IDs to deploy to (overrides project-level setting)
+    /// Optional list of node IDs to deploy to (overrides project-level setting).
+    /// Send an empty list to clear the environment-level override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_nodes: Option<Vec<i32>>,
     /// Label selector for node-based scheduling (overrides project-level setting).

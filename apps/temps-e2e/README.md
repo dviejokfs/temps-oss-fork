@@ -1303,7 +1303,8 @@ tears the whole thing down at the end. It does NOT accept `--url`/
     `http://production.<project>.temps.local`. DNS must resolve inside the
     deployed container, and the proxy must return 403 because applications
     cannot use internal DNS to cross project boundaries.
-12. drain the worker (`POST /internal/nodes/{id}/drain`), poll
+12. clear the test's worker-only placement override with `target_nodes: []`,
+    then drain the worker (`POST /internal/nodes/{id}/drain`) and poll
     `GET /internal/nodes/{id}/drain` until `drain_complete`, then re-run the
     same `docker ps` side-channel check on both containers to confirm the
     container migrated off the worker. In this 2-node cluster it has

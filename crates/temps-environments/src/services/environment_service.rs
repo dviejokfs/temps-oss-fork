@@ -13,6 +13,13 @@ use temps_entities::{environment_domains, environments, projects};
 use thiserror::Error;
 use tracing::{info, warn};
 
+/// An empty target-node list means "remove this environment override".
+/// Persisting `Some([])` would instead create an explicit placement constraint
+/// that no node can satisfy, leaving workloads impossible to redeploy or drain.
+fn normalize_target_nodes(target_nodes: Vec<i32>) -> Option<Vec<i32>> {
+    (!target_nodes.is_empty()).then_some(target_nodes)
+}
+
 #[derive(Error, Debug)]
 pub enum EnvironmentError {
     #[error("Database connection error: {0}")]
@@ -725,8 +732,8 @@ impl EnvironmentService {
             }
             deployment_config.security = Some(security);
         }
-        if settings.target_nodes.is_some() {
-            deployment_config.target_nodes = settings.target_nodes;
+        if let Some(target_nodes) = settings.target_nodes {
+            deployment_config.target_nodes = normalize_target_nodes(target_nodes);
         }
         if settings.target_labels.is_some() {
             deployment_config.target_labels = settings.target_labels;
@@ -1164,6 +1171,12 @@ impl EnvironmentService {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    #[test]
+    fn empty_target_nodes_clears_environment_placement_override() {
+        assert_eq!(normalize_target_nodes(Vec::new()), None);
+        assert_eq!(normalize_target_nodes(vec![1, 3]), Some(vec![1, 3]));
+    }
 
     #[test]
     fn public_url_preserves_external_http_scheme_and_non_default_port() {
