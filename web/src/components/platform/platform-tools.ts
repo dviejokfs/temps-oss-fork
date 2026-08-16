@@ -11,10 +11,15 @@ import {
   Globe,
   Mail,
   Network,
+  PackageOpen,
+  Puzzle,
+  Radar,
+  Rocket,
   ScrollText,
   Settings,
   ShieldCheck,
   Sparkles,
+  Workflow,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -30,6 +35,7 @@ export interface PlatformToolItem {
 export interface PlatformToolGroup {
   label: string
   description: string
+  icon: LucideIcon
   items: PlatformToolItem[]
 }
 
@@ -37,6 +43,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
   {
     label: 'Build and run',
     description: 'Deploy applications and use isolated development runtimes.',
+    icon: Rocket,
     items: [
       {
         title: 'Projects',
@@ -65,6 +72,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
   {
     label: 'Data and delivery',
     description: 'Manage persistent services, backups, email, and domains.',
+    icon: PackageOpen,
     items: [
       {
         title: 'Databases',
@@ -113,6 +121,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
   {
     label: 'Observe',
     description: 'Understand platform health, traffic, and operator activity.',
+    icon: Radar,
     items: [
       {
         title: 'Monitoring',
@@ -149,6 +158,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
   {
     label: 'Automate',
     description: 'Configure AI-assisted and programmable platform workflows.',
+    icon: Workflow,
     items: [
       {
         title: 'Connect AI harness',
@@ -192,6 +202,8 @@ export const platformToolGroups: PlatformToolGroup[] = [
     ],
   },
 ]
+
+export const extensionToolGroupIcon = Puzzle
 
 export const platformToolShortcuts: PlatformToolItem[] = [
   {

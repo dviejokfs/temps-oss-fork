@@ -8,6 +8,7 @@ import { Link } from 'react-router'
 import {
   platformToolGroups,
   platformToolShortcuts,
+  extensionToolGroupIcon,
   type PlatformToolGroup,
 } from '@/components/platform/platform-tools'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
@@ -30,6 +31,7 @@ export function PlatformTools() {
       {
         label: 'Extensions',
         description: 'Open capabilities added by installed plugins.',
+        icon: extensionToolGroupIcon,
         items: platformNavEntries.map((entry) => ({
           title: entry.label,
           description: `Open the ${entry.label} extension.`,
@@ -118,11 +120,16 @@ export function PlatformTools() {
               key={group.label}
               className="rounded-xl border bg-card p-4"
             >
-              <div className="mb-3 px-1">
-                <h2 className="text-base font-semibold">{group.label}</h2>
-                <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-                  {group.description}
-                </p>
+              <div className="mb-3 flex items-start gap-3 px-1">
+                <span className="grid size-9 shrink-0 place-items-center rounded-lg border bg-muted/40 text-muted-foreground">
+                  <group.icon className="size-4" />
+                </span>
+                <div className="min-w-0">
+                  <h2 className="text-base font-semibold">{group.label}</h2>
+                  <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                    {group.description}
+                  </p>
+                </div>
               </div>
               <div className="grid gap-1 sm:grid-cols-2">
                 {group.items.map((item) => (
