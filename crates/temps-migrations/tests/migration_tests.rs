@@ -32,6 +32,34 @@ async fn env_var_preview_value(db: &DatabaseConnection, id: i32) -> anyhow::Resu
     Ok(row.try_get("", "include_in_preview")?)
 }
 
+async fn project_secret_preview_value(db: &DatabaseConnection, id: i32) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT include_in_preview FROM secrets WHERE id = $1",
+            [id.into()],
+        ))
+        .await?
+        .expect("migration fixture project secret exists");
+    Ok(row.try_get("", "include_in_preview")?)
+}
+
+async fn project_secret_preview_default(db: &DatabaseConnection) -> anyhow::Result<String> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_default \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' \
+               AND table_name = 'secrets' \
+               AND column_name = 'include_in_preview'"
+                .to_string(),
+        ))
+        .await?
+        .expect("secrets.include_in_preview metadata exists");
+    Ok(row.try_get("", "column_default")?)
+}
+
 #[tokio::test]
 async fn test_preview_inclusion_default_migration_up_and_down() -> anyhow::Result<()> {
     if external_db_configured() {
@@ -74,24 +102,38 @@ async fn test_preview_inclusion_default_migration_up_and_down() -> anyhow::Resul
         .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
     Migrator::up(&db, Some(pre_target_count as u32)).await?;
     assert_eq!(env_var_preview_default(&db).await?, "true");
+    assert_eq!(project_secret_preview_default(&db).await?, "false");
     db.execute_unprepared(
         "SET session_replication_role = replica; \
          INSERT INTO env_vars \
              (id, project_id, key, value, created_at, updated_at) \
          VALUES \
              (987654, 987654, 'LEGACY_SECRET', 'encrypted', NOW(), NOW()); \
+         INSERT INTO secrets \
+             (id, project_id, key, value, include_in_preview, created_at, updated_at) \
+         VALUES \
+             (987654, 987654, 'LEGACY_FILE_SECRET', 'encrypted', TRUE, NOW(), NOW()), \
+             (987655, 987654, 'OPTED_OUT_FILE_SECRET', 'encrypted', FALSE, NOW(), NOW()); \
          SET session_replication_role = origin;",
     )
     .await?;
     assert!(env_var_preview_value(&db, 987654).await?);
+    assert!(project_secret_preview_value(&db, 987654).await?);
+    assert!(!project_secret_preview_value(&db, 987655).await?);
 
     Migrator::up(&db, Some(1)).await?;
     assert_eq!(env_var_preview_default(&db).await?, "false");
+    assert_eq!(project_secret_preview_default(&db).await?, "false");
     assert!(!env_var_preview_value(&db, 987654).await?);
+    assert!(!project_secret_preview_value(&db, 987654).await?);
+    assert!(!project_secret_preview_value(&db, 987655).await?);
 
     Migrator::down(&db, Some(1)).await?;
     assert_eq!(env_var_preview_default(&db).await?, "true");
+    assert_eq!(project_secret_preview_default(&db).await?, "false");
     assert!(env_var_preview_value(&db, 987654).await?);
+    assert!(project_secret_preview_value(&db, 987654).await?);
+    assert!(!project_secret_preview_value(&db, 987655).await?);
 
     Ok(())
 }

@@ -20,6 +20,15 @@ fn normalize_target_nodes(target_nodes: Vec<i32>) -> Option<Vec<i32>> {
     (!target_nodes.is_empty()).then_some(target_nodes)
 }
 
+/// An empty target-label object means "remove this environment override" so
+/// the environment inherits any project-level placement constraint.
+fn normalize_target_labels(target_labels: serde_json::Value) -> Option<serde_json::Value> {
+    (!target_labels
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty))
+    .then_some(target_labels)
+}
+
 #[derive(Error, Debug)]
 pub enum EnvironmentError {
     #[error("Database connection error: {0}")]
@@ -735,8 +744,8 @@ impl EnvironmentService {
         if let Some(target_nodes) = settings.target_nodes {
             deployment_config.target_nodes = normalize_target_nodes(target_nodes);
         }
-        if settings.target_labels.is_some() {
-            deployment_config.target_labels = settings.target_labels;
+        if let Some(target_labels) = settings.target_labels {
+            deployment_config.target_labels = normalize_target_labels(target_labels);
         }
         if let Some(anti_affinity) = settings.anti_affinity {
             deployment_config.anti_affinity = anti_affinity;
@@ -1176,6 +1185,15 @@ mod tests {
     fn empty_target_nodes_clears_environment_placement_override() {
         assert_eq!(normalize_target_nodes(Vec::new()), None);
         assert_eq!(normalize_target_nodes(vec![1, 3]), Some(vec![1, 3]));
+    }
+
+    #[test]
+    fn empty_target_labels_clear_environment_placement_override() {
+        assert_eq!(normalize_target_labels(serde_json::json!({})), None);
+        assert_eq!(
+            normalize_target_labels(serde_json::json!({"region": "eu"})),
+            Some(serde_json::json!({"region": "eu"}))
+        );
     }
 
     #[test]

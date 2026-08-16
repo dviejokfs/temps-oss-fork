@@ -1250,22 +1250,22 @@ impl WorkflowExecutionService {
                     let target_nodes = environment
                         .deployment_config
                         .as_ref()
-                        .and_then(|c| c.target_nodes.clone())
+                        .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
                         .or_else(|| {
                             project
                                 .deployment_config
                                 .as_ref()
-                                .and_then(|c| c.target_nodes.clone())
+                                .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
                         });
                     let target_labels = environment
                         .deployment_config
                         .as_ref()
-                        .and_then(|c| c.target_labels.clone())
+                        .and_then(|c| c.configured_target_labels().cloned())
                         .or_else(|| {
                             project
                                 .deployment_config
                                 .as_ref()
-                                .and_then(|c| c.target_labels.clone())
+                                .and_then(|c| c.configured_target_labels().cloned())
                         });
 
                     match scheduler
@@ -1417,24 +1417,24 @@ impl WorkflowExecutionService {
                 let target_nodes = environment
                     .deployment_config
                     .as_ref()
-                    .and_then(|c| c.target_nodes.clone())
+                    .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
                     .or_else(|| {
                         project
                             .deployment_config
                             .as_ref()
-                            .and_then(|c| c.target_nodes.clone())
+                            .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
                     });
 
                 // Resolve target_labels from environment or project config
                 let target_labels = environment
                     .deployment_config
                     .as_ref()
-                    .and_then(|c| c.target_labels.clone())
+                    .and_then(|c| c.configured_target_labels().cloned())
                     .or_else(|| {
                         project
                             .deployment_config
                             .as_ref()
-                            .and_then(|c| c.target_labels.clone())
+                            .and_then(|c| c.configured_target_labels().cloned())
                     });
 
                 // Resolve CPU/memory limits + requests from environment first,

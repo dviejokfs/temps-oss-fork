@@ -68,6 +68,7 @@ pub struct CreateEnvironmentVariableRequest {
     pub environment_ids: Vec<i32>,
     /// Include this environment variable in preview environments (default: false)
     #[serde(default = "default_include_in_preview")]
+    #[schema(default = false)]
     pub include_in_preview: bool,
     /// When true the variable is treated as write-only: never returned in
     /// plaintext from the API, masked in the UI, and updates that omit the
@@ -399,6 +400,7 @@ pub struct UpdateEnvironmentSettingsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_nodes: Option<Vec<i32>>,
     /// Label selector for node-based scheduling (overrides project-level setting).
+    /// Send an empty object to clear the environment-level override.
     /// Same key with array value -> OR, different keys -> AND.
     /// Example: `{"region": ["us", "asia"], "gpu": "true"}`
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -521,6 +523,7 @@ pub struct CreateProjectSecretRequest {
     pub environment_ids: Vec<i32>,
     /// Include this secret in preview environments (default: false).
     #[serde(default = "default_include_in_preview")]
+    #[schema(default = false)]
     pub include_in_preview: bool,
 }
 
