@@ -7,6 +7,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboarding'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
+import { OnboardingNextStepCard } from '@/components/dashboard/OnboardingNextStepCard'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -134,6 +135,8 @@ export function Projects() {
           </>
         }
       />
+
+      {(projectsData?.projects.length ?? 0) > 0 && <OnboardingNextStepCard />}
 
       {isLoading || gitProvidersLoading ? (
         <div className="overflow-hidden rounded-xl border bg-card divide-y">
