@@ -84,40 +84,42 @@ export function OnboardingNextStepCard() {
           </div>
         </div>
 
-        <div className="flex shrink-0 items-center gap-2 pl-12 sm:pl-0">
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-8"
-            aria-label="Previous onboarding step"
-            disabled={safeSelectedIndex === 0}
-            onClick={() =>
-              setSelectedStepKey(items[safeSelectedIndex - 1]?.key ?? null)
-            }
-          >
-            <ChevronLeft className="size-4" />
-          </Button>
-          <span className="min-w-10 text-center text-xs tabular-nums text-muted-foreground">
-            {safeSelectedIndex + 1} / {totalCount}
-          </span>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-8"
-            aria-label="Next onboarding step"
-            disabled={safeSelectedIndex === items.length - 1}
-            onClick={() =>
-              setSelectedStepKey(items[safeSelectedIndex + 1]?.key ?? null)
-            }
-          >
-            <ChevronRight className="size-4" />
-          </Button>
+        <div className="flex w-full shrink-0 items-center justify-end gap-2 pl-12 sm:w-auto sm:pl-0">
           <Button asChild size="sm">
             <Link to={selectedStep.href}>
               {selectedStep.cta}
               <ArrowRight className="size-3.5" />
             </Link>
           </Button>
+          <div className="flex w-[7.5rem] shrink-0 items-center justify-end gap-2">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8"
+              aria-label="Previous onboarding step"
+              disabled={safeSelectedIndex === 0}
+              onClick={() =>
+                setSelectedStepKey(items[safeSelectedIndex - 1]?.key ?? null)
+              }
+            >
+              <ChevronLeft className="size-4" />
+            </Button>
+            <span className="min-w-10 text-center text-xs tabular-nums text-muted-foreground">
+              {safeSelectedIndex + 1} / {totalCount}
+            </span>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8"
+              aria-label="Next onboarding step"
+              disabled={safeSelectedIndex === items.length - 1}
+              onClick={() =>
+                setSelectedStepKey(items[safeSelectedIndex + 1]?.key ?? null)
+              }
+            >
+              <ChevronRight className="size-4" />
+            </Button>
+          </div>
         </div>
       </div>
     </section>
