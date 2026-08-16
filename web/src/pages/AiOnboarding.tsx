@@ -1,6 +1,6 @@
-import { useEffect, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
   ArrowRight,
@@ -11,27 +11,35 @@ import {
   ExternalLink,
   FolderPlus,
   KeyRound,
+  Loader2,
   ShieldAlert,
   Sparkles,
   Terminal,
   Wand2,
   type LucideIcon,
 } from 'lucide-react'
-import { listApiKeysOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  createApiKeyMutation,
+  listApiKeysOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
+import { HighlightedCode } from '@/components/ui/code-block'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   buildAiHarnessCommands,
-  buildAiHarnessKeyHref,
+  buildAiHarnessKeyRequest,
   findAiHarnessKey,
   getAiHarnessStatus,
 } from '@/lib/ai-onboarding'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import { cn } from '@/lib/utils'
+import { toast } from 'sonner'
 
 const STARTER_PROMPTS = [
   {
@@ -56,17 +64,50 @@ const STARTER_PROMPTS = [
 
 export function AiOnboarding() {
   const { setBreadcrumbs } = useBreadcrumbs()
+  const [createdKeySecret, setCreatedKeySecret] = useState<string | null>(null)
   const origin = typeof window === 'undefined' ? '' : window.location.origin
   const commands = buildAiHarnessCommands(origin)
-  const keyHref = buildAiHarnessKeyHref()
 
-  const { data: apiKeysData, isLoading: apiKeysLoading } = useQuery({
+  const {
+    data: apiKeysData,
+    isLoading: apiKeysLoading,
+    refetch: refetchApiKeys,
+  } = useQuery({
     ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
     retry: false,
     refetchInterval: (query) =>
       getAiHarnessStatus(query.state.data?.api_keys) === 'waiting'
         ? 5_000
         : false,
+  })
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
+
+  const createHarnessKey = useMutation({
+    ...createApiKeyMutation(),
+    meta: {
+      errorTitle: 'Failed to create AI harness key',
+    },
+    onSuccess: async (response) => {
+      setCreatedKeySecret(response.api_key)
+      await refetchApiKeys()
+      toast.success('AI harness key created')
+    },
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          createHarnessKey.mutate(variables)
+        )
+      ) {
+        return
+      }
+      toast.error(
+        sensitiveActionErrorMessage(
+          error,
+          'Failed to create the AI harness key'
+        )
+      )
+    },
   })
 
   usePageTitle('Connect AI harness')
@@ -80,9 +121,15 @@ export function AiOnboarding() {
 
   const harnessKey = findAiHarnessKey(apiKeysData?.api_keys)
   const harnessStatus = getAiHarnessStatus(apiKeysData?.api_keys)
+  const effectiveHarnessStatus =
+    createdKeySecret && harnessStatus === 'missing' ? 'waiting' : harnessStatus
+
+  const handleCreateHarnessKey = () => {
+    createHarnessKey.mutate({ body: buildAiHarnessKeyRequest() })
+  }
 
   return (
-    <div className="mx-auto w-full max-w-6xl space-y-6 p-4 sm:p-8">
+    <div className="w-full space-y-6 p-4 sm:p-8">
       <div className="flex items-center gap-3">
         <Button asChild variant="ghost" size="icon" className="shrink-0">
           <Link to="/setup" aria-label="Back to setup">
@@ -131,29 +178,38 @@ export function AiOnboarding() {
             </div>
             {apiKeysLoading ? (
               <Skeleton className="h-10 w-44" />
-            ) : harnessStatus === 'connected' ? (
+            ) : effectiveHarnessStatus === 'connected' ? (
               <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-2.5 text-sm font-medium text-emerald-600 dark:text-emerald-400">
                 <Check className="size-4" />
                 Harness connected
               </div>
-            ) : harnessStatus === 'waiting' ? (
+            ) : effectiveHarnessStatus === 'waiting' ? (
               <div className="inline-flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-2.5 text-sm font-medium text-amber-700 dark:text-amber-300">
                 <Circle className="size-3 fill-current" />
                 Waiting for first request
               </div>
             ) : (
-              <Button asChild size="lg">
-                <Link to={keyHref}>
-                  Create harness API key
+              <Button
+                size="lg"
+                onClick={handleCreateHarnessKey}
+                disabled={createHarnessKey.isPending}
+              >
+                {createHarnessKey.isPending ? (
+                  <Loader2 className="mr-1.5 size-4 animate-spin" />
+                ) : null}
+                {createHarnessKey.isPending
+                  ? 'Creating harness key…'
+                  : 'Create harness API key'}
+                {!createHarnessKey.isPending && (
                   <ArrowRight className="ml-1.5 size-4" />
-                </Link>
+                )}
               </Button>
             )}
           </div>
         </CardContent>
       </Card>
 
-      {harnessStatus === 'waiting' && (
+      {effectiveHarnessStatus === 'waiting' && !createdKeySecret && (
         <Alert className="border-amber-500/30 bg-amber-500/5">
           <Terminal className="size-4 text-amber-700 dark:text-amber-300" />
           <AlertTitle>API key created — finish the connection</AlertTitle>
@@ -165,15 +221,15 @@ export function AiOnboarding() {
         </Alert>
       )}
 
-      <div className="grid gap-4 lg:grid-cols-3">
+      <div className="grid gap-4">
         <OnboardingStep
           number="01"
           icon={KeyRound}
           title="Create a dedicated admin key"
           description="The harness needs platform access to create and verify projects, databases, deployments, domains, and other resources."
-          ready={!!harnessKey}
+          ready={!!harnessKey || !!createdKeySecret}
           loading={apiKeysLoading}
-          status={harnessKey ? 'Key ready' : 'Required'}
+          status={harnessKey || createdKeySecret ? 'Key ready' : 'Required'}
         >
           <div className="space-y-3">
             <Alert className="border-amber-500/25 bg-amber-500/5">
@@ -185,14 +241,31 @@ export function AiOnboarding() {
                 it when you stop using the integration.
               </AlertDescription>
             </Alert>
-            <Button asChild variant={harnessKey ? 'outline' : 'default'}>
-              <Link
-                to={harnessKey ? `/settings/keys/${harnessKey.id}` : keyHref}
+            {createdKeySecret ? (
+              <OneTimeKeySecret value={createdKeySecret} />
+            ) : harnessKey ? (
+              <Button asChild variant="outline">
+                <Link to={`/settings/keys/${harnessKey.id}`}>
+                  Manage harness key
+                  <ArrowRight className="ml-1.5 size-3.5" />
+                </Link>
+              </Button>
+            ) : (
+              <Button
+                onClick={handleCreateHarnessKey}
+                disabled={createHarnessKey.isPending}
               >
-                {harnessKey ? 'Manage harness key' : 'Create admin key'}
-                <ArrowRight className="ml-1.5 size-3.5" />
-              </Link>
-            </Button>
+                {createHarnessKey.isPending ? (
+                  <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+                ) : null}
+                {createHarnessKey.isPending
+                  ? 'Creating admin key…'
+                  : 'Create admin key'}
+                {!createHarnessKey.isPending && (
+                  <ArrowRight className="ml-1.5 size-3.5" />
+                )}
+              </Button>
+            )}
           </div>
         </OnboardingStep>
 
@@ -201,9 +274,11 @@ export function AiOnboarding() {
           icon={Wand2}
           title="Add Temps to your harness"
           description="Run the skill installer inside the repository where you use your AI agent, then authenticate the pinned CLI with the key from step one."
-          ready={harnessStatus === 'connected'}
+          ready={effectiveHarnessStatus === 'connected'}
           status={
-            harnessStatus === 'connected' ? 'Authenticated' : 'Two commands'
+            effectiveHarnessStatus === 'connected'
+              ? 'Authenticated'
+              : 'Two commands'
           }
         >
           <div className="space-y-3">
@@ -228,8 +303,10 @@ export function AiOnboarding() {
           icon={Terminal}
           title="Verify before changing anything"
           description="Confirm the harness is targeting this instance and can read its projects. Neither verification command changes platform state."
-          ready={harnessStatus === 'connected'}
-          status={harnessStatus === 'connected' ? 'Verified' : 'Read-only'}
+          ready={effectiveHarnessStatus === 'connected'}
+          status={
+            effectiveHarnessStatus === 'connected' ? 'Verified' : 'Read-only'
+          }
         >
           <div className="space-y-3">
             <Command
@@ -326,6 +403,7 @@ export function AiOnboarding() {
           <Link to="/setup">Back to all setup steps</Link>
         </Button>
       </div>
+      {verificationDialog}
     </div>
   )
 }
@@ -350,53 +428,57 @@ function OnboardingStep({
   children: ReactNode
 }) {
   return (
-    <Card className="h-full overflow-hidden">
-      <CardContent className="flex h-full flex-col p-5">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div
-              className={cn(
-                'flex size-9 items-center justify-center rounded-lg border',
-                ready
-                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-500'
-                  : 'bg-muted text-muted-foreground'
-              )}
-            >
-              {ready ? (
-                <Check className="size-4" />
-              ) : (
-                <Icon className="size-4" />
-              )}
+    <Card className="w-full overflow-hidden">
+      <CardContent className="grid gap-6 p-5 sm:p-6 lg:grid-cols-[minmax(18rem,0.8fr)_minmax(0,1.2fr)] lg:gap-10">
+        <div>
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div
+                className={cn(
+                  'flex size-9 items-center justify-center rounded-lg border',
+                  ready
+                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-500'
+                    : 'bg-muted text-muted-foreground'
+                )}
+              >
+                {ready ? (
+                  <Check className="size-4" />
+                ) : (
+                  <Icon className="size-4" />
+                )}
+              </div>
+              <span className="font-mono text-[11px] text-muted-foreground">
+                {number}
+              </span>
             </div>
-            <span className="font-mono text-[11px] text-muted-foreground">
-              {number}
-            </span>
+            {loading ? (
+              <Skeleton className="h-5 w-20" />
+            ) : (
+              <span
+                className={cn(
+                  'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] font-medium uppercase tracking-wide',
+                  ready
+                    ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-600 dark:text-emerald-400'
+                    : 'text-muted-foreground'
+                )}
+              >
+                {ready ? (
+                  <Check className="size-3" />
+                ) : (
+                  <Circle className="size-2.5" />
+                )}
+                {status}
+              </span>
+            )}
           </div>
-          {loading ? (
-            <Skeleton className="h-5 w-20" />
-          ) : (
-            <span
-              className={cn(
-                'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] font-medium uppercase tracking-wide',
-                ready
-                  ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-600 dark:text-emerald-400'
-                  : 'text-muted-foreground'
-              )}
-            >
-              {ready ? (
-                <Check className="size-3" />
-              ) : (
-                <Circle className="size-2.5" />
-              )}
-              {status}
-            </span>
-          )}
+          <h2 className="mt-5 text-base font-semibold tracking-tight">
+            {title}
+          </h2>
+          <p className="mt-1 max-w-xl text-sm leading-relaxed text-muted-foreground">
+            {description}
+          </p>
         </div>
-        <h2 className="mt-5 text-base font-semibold tracking-tight">{title}</h2>
-        <p className="mt-1 min-h-16 text-sm leading-relaxed text-muted-foreground">
-          {description}
-        </p>
-        <div className="mt-auto pt-5">{children}</div>
+        <div className="min-w-0 lg:border-l lg:pl-10">{children}</div>
       </CardContent>
     </Card>
   )
@@ -415,19 +497,47 @@ function Command({
     <div className="space-y-1.5">
       <p className="text-[11px] font-medium text-muted-foreground">{label}</p>
       <div className="flex min-w-0 items-start gap-2 rounded-lg border bg-background px-3 py-2.5">
-        <code
+        <pre
           className={cn(
-            'min-w-0 flex-1 overflow-x-auto font-mono text-xs',
+            'm-0 min-w-0 flex-1 overflow-x-auto font-mono text-xs',
             multiline ? 'whitespace-pre leading-relaxed' : 'whitespace-nowrap'
           )}
         >
-          {value}
-        </code>
+          <HighlightedCode code={value} language="bash" />
+        </pre>
         <CopyButton
           value={value}
           minimal
           className="size-7 shrink-0 rounded-md"
           label={`Copy ${label.toLowerCase()}`}
+        />
+      </div>
+    </div>
+  )
+}
+
+function OneTimeKeySecret({ value }: { value: string }) {
+  return (
+    <div className="space-y-3 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-4">
+      <div className="flex items-start gap-3">
+        <Check className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+        <div>
+          <p className="text-sm font-semibold">Copy this key now</p>
+          <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+            This secret is shown once. Store it in your harness credential store
+            before leaving or refreshing this page.
+          </p>
+        </div>
+      </div>
+      <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-background px-3 py-2.5">
+        <code className="min-w-0 flex-1 select-all overflow-x-auto whitespace-nowrap font-mono text-xs">
+          {value}
+        </code>
+        <CopyButton
+          value={value}
+          minimal
+          className="size-8 shrink-0 rounded-md"
+          label="Copy AI harness API key"
         />
       </div>
     </div>

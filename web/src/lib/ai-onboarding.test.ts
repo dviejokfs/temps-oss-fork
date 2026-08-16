@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   AI_HARNESS_KEY_NAME,
   buildAiHarnessCommands,
-  buildAiHarnessKeyHref,
+  buildAiHarnessKeyRequest,
   findAiHarnessKey,
   getAiHarnessStatus,
 } from './ai-onboarding'
@@ -36,14 +36,11 @@ describe('AI harness onboarding', () => {
     )
   })
 
-  test('deep-links to an admin key dedicated to the harness', () => {
-    const href = buildAiHarnessKeyHref()
-    const url = new URL(href, 'https://temps.example.com')
-
-    expect(url.pathname).toBe('/settings/keys/new')
-    expect(url.searchParams.get('name')).toBe(AI_HARNESS_KEY_NAME)
-    expect(url.searchParams.get('role')).toBe('admin')
-    expect(url.searchParams.get('returnTo')).toBe('/setup/ai')
+  test('creates the dedicated harness key with admin access', () => {
+    expect(buildAiHarnessKeyRequest()).toEqual({
+      name: AI_HARNESS_KEY_NAME,
+      role_type: 'admin',
+    })
   })
 
   test('requires the dedicated key to make an authenticated request', () => {

@@ -18,6 +18,18 @@ export interface AiHarnessCommands {
   verifyProjects: string
 }
 
+export interface AiHarnessKeyRequest {
+  name: string
+  role_type: 'admin'
+}
+
+export function buildAiHarnessKeyRequest(): AiHarnessKeyRequest {
+  return {
+    name: AI_HARNESS_KEY_NAME,
+    role_type: 'admin',
+  }
+}
+
 export function findAiHarnessKey(
   keys: readonly AiHarnessKey[] | undefined
 ): AiHarnessKey | undefined {
@@ -69,13 +81,4 @@ export function buildAiHarnessCommands(origin: string): AiHarnessCommands {
     verifyIdentity: `${cli} --target-context ${context} whoami`,
     verifyProjects: `${cli} --target-context ${context} projects list --json`,
   }
-}
-
-export function buildAiHarnessKeyHref(): string {
-  const params = new URLSearchParams({
-    name: AI_HARNESS_KEY_NAME,
-    role: 'admin',
-    returnTo: '/setup/ai',
-  })
-  return `/settings/keys/new?${params.toString()}`
 }
