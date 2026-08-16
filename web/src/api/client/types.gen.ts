@@ -20123,6 +20123,10 @@ export type UsageQueryParams = {
      */
     conversation_id?: string | null;
     /**
+     * Filter by environment ID (matches the governance policy scope `environment:<id>`)
+     */
+    environment_id?: number | null;
+    /**
      * ISO 8601 start time (defaults to 24h ago)
      */
     from?: string | null;
@@ -20130,6 +20134,10 @@ export type UsageQueryParams = {
      * Filter by model name
      */
     model?: string | null;
+    /**
+     * Filter by project ID (matches the governance policy scope `project:<id>`)
+     */
+    project_id?: number | null;
     /**
      * Filter by provider name
      */
@@ -22219,6 +22227,14 @@ export type GetUsageByProviderData = {
          * ISO 8601 end time (defaults to now)
          */
         to?: string;
+        /**
+         * Filter by project ID
+         */
+        project_id?: number;
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
     };
     url: '/ai/usage/by-provider';
 };
@@ -22440,6 +22456,14 @@ export type GetUsageSummaryData = {
          * ISO 8601 end time (defaults to now)
          */
         to?: string;
+        /**
+         * Filter by project ID
+         */
+        project_id?: number;
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
     };
     url: '/ai/usage/summary';
 };
