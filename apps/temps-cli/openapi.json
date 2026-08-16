@@ -16621,6 +16621,29 @@
         ],
         "type": "object"
       },
+      "FeatureMaturity": {
+        "properties": {
+          "docs_path": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "maturity": {
+            "$ref": "#/components/schemas/Maturity"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "maturity",
+          "reason",
+          "docs_path"
+        ],
+        "type": "object"
+      },
       "FieldResponse": {
         "properties": {
           "field_type": {
@@ -22289,6 +22312,14 @@
           "before-migration",
           "after-migration",
           "within-hours"
+        ],
+        "type": "string"
+      },
+      "Maturity": {
+        "enum": [
+          "stable",
+          "beta",
+          "experimental"
         ],
         "type": "string"
       },
@@ -30612,6 +30643,23 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "ReassignCustomDomainRequest": {
+        "properties": {
+          "target_environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_project_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "target_project_id",
+          "target_environment_id"
+        ],
         "type": "object"
       },
       "RecentActivityQuery": {
@@ -46532,7 +46580,8 @@
         "summary": "Add events to existing session replay",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/_temps/session-replay/init": {
@@ -46583,7 +46632,8 @@
         "summary": "Initialize session replay with metadata",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/_temps/speed": {
@@ -47147,7 +47197,8 @@
         "summary": "Public webhook endpoint. Authenticated via `X-Webhook-Token` header.",
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations": {
@@ -47182,7 +47233,8 @@
         "summary": "List the current user's active conversations across all projects,\nmost-recently-active first, annotated with project name/slug.",
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/pricing": {
@@ -47227,7 +47279,8 @@
         ],
         "tags": [
           "AI Gateway Pricing"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/provider-preference": {
@@ -47302,7 +47355,8 @@
         ],
         "tags": [
           "AI Provider Status"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/provider-status": {
@@ -47357,7 +47411,8 @@
         ],
         "tags": [
           "AI Provider Status"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/provider-status/refresh": {
@@ -47412,7 +47467,8 @@
         ],
         "tags": [
           "AI Provider Status"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/providers": {
@@ -47460,7 +47516,8 @@
         ],
         "tags": [
           "AI Gateway Admin"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "post": {
         "operationId": "create_provider_key",
@@ -47523,7 +47580,8 @@
         ],
         "tags": [
           "AI Gateway Admin"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/providers/test": {
@@ -47588,7 +47646,8 @@
         ],
         "tags": [
           "AI Gateway Admin"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/providers/{id}": {
@@ -47647,7 +47706,8 @@
         ],
         "tags": [
           "AI Gateway Admin"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "get": {
         "operationId": "get_provider_key",
@@ -47692,7 +47752,8 @@
         ],
         "tags": [
           "AI Gateway Admin"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "patch": {
         "operationId": "update_provider_key",
@@ -47776,7 +47837,8 @@
         ],
         "tags": [
           "AI Gateway Admin"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/providers/{id}/models": {
@@ -47833,7 +47895,8 @@
         ],
         "tags": [
           "AI Gateway Admin"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/providers/{id}/models/refresh": {
@@ -47883,7 +47946,8 @@
         ],
         "tags": [
           "AI Gateway Admin"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/providers/{id}/models/{model_row_id}": {
@@ -47931,7 +47995,8 @@
         ],
         "tags": [
           "AI Gateway Admin"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "patch": {
         "operationId": "update_provider_model",
@@ -47994,7 +48059,8 @@
         ],
         "tags": [
           "AI Gateway Admin"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/providers/{id}/test": {
@@ -48060,7 +48126,8 @@
         ],
         "tags": [
           "AI Gateway Admin"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/summary-preference": {
@@ -48125,7 +48192,8 @@
         ],
         "tags": [
           "AI Provider Status"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/usage/by-provider": {
@@ -48203,7 +48271,8 @@
         ],
         "tags": [
           "AI Gateway Usage"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/usage/conversations": {
@@ -48320,7 +48389,8 @@
         ],
         "tags": [
           "AI Gateway Usage"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/usage/conversations/{conversation_id}": {
@@ -48390,7 +48460,8 @@
         ],
         "tags": [
           "AI Gateway Usage"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/usage/recent": {
@@ -48567,7 +48638,8 @@
         ],
         "tags": [
           "AI Gateway Usage"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/usage/summary": {
@@ -48642,7 +48714,8 @@
         ],
         "tags": [
           "AI Gateway Usage"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/usage/timeseries": {
@@ -48729,7 +48802,8 @@
         ],
         "tags": [
           "AI Gateway Usage"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/usage/top-models": {
@@ -48818,7 +48892,8 @@
         ],
         "tags": [
           "AI Gateway Usage"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/v1/chat/completions": {
@@ -48893,7 +48968,8 @@
         ],
         "tags": [
           "AI Gateway"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/v1/embeddings": {
@@ -48958,7 +49034,8 @@
         ],
         "tags": [
           "AI Gateway"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/v1/models": {
@@ -48993,7 +49070,8 @@
         ],
         "tags": [
           "AI Gateway"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/analytics/active-visitors": {
@@ -49067,7 +49145,8 @@
         "summary": "Get detailed active visitors",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/event-detail": {
@@ -49157,7 +49236,8 @@
         "summary": "Get detailed analytics for a specific event",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/event-entries": {
@@ -49260,7 +49340,8 @@
         "summary": "Get paginated list of raw occurrences of a specific event, including custom JSON properties",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/event-visitors": {
@@ -49363,7 +49444,8 @@
         "summary": "Get paginated list of visitors who triggered a specific event",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/events": {
@@ -49465,7 +49547,8 @@
         ],
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/general-stats": {
@@ -49549,7 +49632,8 @@
         "summary": "Get general statistics across all projects for a time frame",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/has-events": {
@@ -49608,7 +49692,8 @@
         ],
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/live-visitors": {
@@ -49672,7 +49757,8 @@
         "summary": "Get list of currently live visitors from visitor table",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/page-flow": {
@@ -49774,7 +49860,8 @@
         "summary": "Get page flow analytics: entry pages, exit pages, drop-off points, and page transitions",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/page-hourly-sessions": {
@@ -49863,7 +49950,8 @@
         ],
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/page-path-detail": {
@@ -49953,7 +50041,8 @@
         "summary": "Get detailed analytics for a specific page path\nReturns visitors, page views, activity over time, geographic distribution, and referrers",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/page-path-visitors": {
@@ -50056,7 +50145,8 @@
         "summary": "Get individual visitor sessions for a specific page path",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/page-paths": {
@@ -50137,7 +50227,8 @@
         ],
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/page-paths-sparklines": {
@@ -50217,7 +50308,8 @@
         ],
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/recent-activity": {
@@ -50291,7 +50383,8 @@
         "summary": "Get recent activity events for real-time activity feed",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/sessions/{session_id}": {
@@ -50358,7 +50451,8 @@
         "summary": "Get detailed information about a specific session including events and request logs",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/sessions/{session_id}/events": {
@@ -50462,7 +50556,8 @@
         ],
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/sessions/{session_id}/logs": {
@@ -50566,7 +50661,8 @@
         ],
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/visitor-facets": {
@@ -50711,7 +50807,8 @@
         "summary": "Get filter dropdown contents for the visitors page. Returns the top\nvalues per dimension with distinct visitor counts so the UI can render\n\"Country — 1,234 visitors\" rows. Each dimension is computed against the\nsegment minus its own filter, so a selected value never collapses its\nown dropdown.",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/visitors": {
@@ -50866,7 +50963,8 @@
         "summary": "Get list of visitors with summary information",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/visitors/guid/{visitor_id}": {
@@ -50932,7 +51030,8 @@
         "summary": "Get visitor by GUID with geolocation data",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/visitors/id/{id}": {
@@ -50999,7 +51098,8 @@
         "summary": "Get visitor by numeric ID with geolocation data",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/visitors/{visitor_id}": {
@@ -51066,7 +51166,8 @@
         "summary": "Get detailed information about a specific visitor by numeric ID",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/visitors/{visitor_id}/enrich": {
@@ -51131,7 +51232,8 @@
         ],
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/visitors/{visitor_id}/info": {
@@ -51188,7 +51290,8 @@
         "summary": "Get visitor record from database",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/visitors/{visitor_id}/journey": {
@@ -51255,7 +51358,8 @@
         "summary": "Get the complete visitor journey: all events across all sessions, grouped by session",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/visitors/{visitor_id}/sessions": {
@@ -51332,7 +51436,8 @@
         "summary": "Get all sessions for a specific visitor by numeric ID",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/analytics/visitors/{visitor_id}/stats": {
@@ -51389,7 +51494,8 @@
         "summary": "Get visitor statistics",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/api-keys": {
@@ -55481,7 +55587,8 @@
         "summary": "Get dashboard analytics for multiple projects in a single batch request",
         "tags": [
           "Events"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/deployments/activity-graph": {
@@ -55622,7 +55729,8 @@
         ],
         "tags": [
           "Vulnerability Scans"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/deployments/{id}/metrics": {
@@ -57262,7 +57370,8 @@
         "summary": "Get challenge token for a domain (returns plain text token)",
         "tags": [
           "Domains"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/domains/{domain}/http-challenge-debug": {
@@ -58333,7 +58442,8 @@
         "summary": "One-click AWS-side setup of SES event tracking (SNS topic + webhook\nsubscription + SESv2 event destination), using the provider's stored\ncredentials.",
         "tags": [
           "Email Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/email-providers/{id}/tracking/status": {
@@ -58380,7 +58490,8 @@
         "summary": "Live status of SES event tracking for a provider",
         "tags": [
           "Email Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails": {
@@ -58597,7 +58708,8 @@
         "summary": "GET /emails/events",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/events/stats": {
@@ -58626,7 +58738,8 @@
         "summary": "GET /emails/events/stats",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/stats": {
@@ -58760,7 +58873,8 @@
         "summary": "Track email link click - redirects to original URL",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/{email_id}/track/open": {
@@ -58789,7 +58903,8 @@
         "summary": "Track email open - returns a 1x1 transparent GIF",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/{id}": {
@@ -58884,7 +58999,8 @@
         "summary": "Get email tracking summary",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/{id}/tracking/events": {
@@ -58942,7 +59058,8 @@
         "summary": "Get email tracking events",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/{id}/tracking/links": {
@@ -58991,7 +59108,8 @@
         "summary": "Get tracked links for an email",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services": {
@@ -59264,7 +59382,8 @@
         "summary": "Import an existing Docker container as a managed external service",
         "tags": [
           "External Services"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/projects/{project_id}": {
@@ -60221,7 +60340,8 @@
         "summary": "List all monitoring alert rules for an external service.",
         "tags": [
           "Metrics"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "description": "If metric collection is enabled and the service engine has default rules,\nseeding is idempotent (ON CONFLICT DO NOTHING).",
@@ -60280,7 +60400,8 @@
         "summary": "Create a monitoring alert rule for an external service.",
         "tags": [
           "Metrics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/{id}/metrics/alert-rules/{rule_id}": {
@@ -60333,7 +60454,8 @@
         "summary": "Delete a monitoring alert rule for an external service.",
         "tags": [
           "Metrics"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "ExternalServiceMetricsUpdateAlertRule",
@@ -60404,7 +60526,8 @@
         "summary": "Update an existing monitoring alert rule for an external service.",
         "tags": [
           "Metrics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/{id}/metrics/by-database": {
@@ -61974,7 +62097,8 @@
         "summary": "Report whether the AI assistant may read row data from this service.",
         "tags": [
           "External Services - Query"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "patch": {
         "description": "Off by default. Row contents can include password hashes, API tokens and\npersonal data, and enabling this sends them to the configured AI provider —\nso it is a deliberate, audited, per-service decision by the operator.",
@@ -62033,7 +62157,8 @@
         "summary": "Enable or disable AI assistant access to this service's row data.",
         "tags": [
           "External Services - Query"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/{service_id}/query/containers": {
@@ -62085,7 +62210,8 @@
         "summary": "List containers at the root level (databases, keyspaces, etc.)",
         "tags": [
           "External Services - Query"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/{service_id}/query/containers/{path}": {
@@ -62145,7 +62271,8 @@
         "summary": "List containers at a specific path\nPath segments are separated by forward slashes\nExample: /external-services/1/query/containers/mydb lists schemas in database \"mydb\"",
         "tags": [
           "External Services - Query"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/{service_id}/query/containers/{path}/entities": {
@@ -62221,7 +62348,8 @@
         "summary": "List entities (tables, collections, etc.) in a container\nExample: /external-services/1/query/containers/mydb/public/entities lists tables in the public schema",
         "tags": [
           "External Services - Query"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/{service_id}/query/containers/{path}/entities/{entity}": {
@@ -62286,7 +62414,8 @@
         "summary": "Get detailed information about an entity (table schema)",
         "tags": [
           "External Services - Query"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/{service_id}/query/containers/{path}/entities/{entity}/data": {
@@ -62405,7 +62534,8 @@
         "summary": "Read rows from an entity (read-only `GET`; see [`query_data`] for the\n`POST` form used by the console).",
         "tags": [
           "External Services - Query"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "query_data",
@@ -62481,7 +62611,8 @@
         "summary": "Query data from an entity with optional filters, pagination, and sorting",
         "tags": [
           "External Services - Query"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/{service_id}/query/containers/{path}/entities/{entity}/download": {
@@ -62542,7 +62673,8 @@
         "summary": "Download an object (S3 only) as a streaming response",
         "tags": [
           "External Services - Query"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/{service_id}/query/containers/{path}/info": {
@@ -62599,7 +62731,8 @@
         "summary": "Get information about a specific container",
         "tags": [
           "External Services - Query"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/{service_id}/query/explorer-support": {
@@ -62648,7 +62781,8 @@
         "summary": "Check if a service supports query explorer functionality",
         "tags": [
           "External Services - Query"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services/{service_id}/upgrades": {
@@ -65250,7 +65384,8 @@
         "summary": "Discover workloads from a source",
         "tags": [
           "Imports"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/imports/execute": {
@@ -65295,7 +65430,8 @@
         "summary": "Execute an import",
         "tags": [
           "Imports"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/imports/plan": {
@@ -65340,7 +65476,8 @@
         "summary": "Create an import plan",
         "tags": [
           "Imports"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/imports/sources": {
@@ -65375,7 +65512,8 @@
         "summary": "List available import sources",
         "tags": [
           "Imports"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/imports/{session_id}": {
@@ -65421,7 +65559,8 @@
         "summary": "Get import status",
         "tags": [
           "Imports"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/incidents/{incident_id}": {
@@ -65471,7 +65610,8 @@
         "summary": "Get an incident by ID",
         "tags": [
           "Status Page"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/incidents/{incident_id}/status": {
@@ -65534,7 +65674,8 @@
         "summary": "Update incident status",
         "tags": [
           "Status Page"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/incidents/{incident_id}/updates": {
@@ -65587,7 +65728,8 @@
         "summary": "Get incident updates",
         "tags": [
           "Status Page"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/internal/nodes": {
@@ -66273,7 +66415,8 @@
         "summary": "List all IP access control rules",
         "tags": [
           "IP Access Control"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_ip_access_control",
@@ -66357,7 +66500,8 @@
         "summary": "Create a new IP access control rule",
         "tags": [
           "IP Access Control"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/ip-access-control/check/{ip}": {
@@ -66417,7 +66561,8 @@
         "summary": "Check if an IP address is blocked",
         "tags": [
           "IP Access Control"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/ip-access-control/{id}": {
@@ -66488,7 +66633,8 @@
         "summary": "Delete an IP access control rule",
         "tags": [
           "IP Access Control"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_ip_access_control",
@@ -66564,7 +66710,8 @@
         "summary": "Get a single IP access control rule by ID",
         "tags": [
           "IP Access Control"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "patch": {
         "operationId": "update_ip_access_control",
@@ -66660,7 +66807,8 @@
         "summary": "Update an IP access control rule",
         "tags": [
           "IP Access Control"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/kv/del": {
@@ -68034,7 +68182,8 @@
         "summary": "Delete notification preferences",
         "tags": [
           "Notification Preferences"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_preferences",
@@ -68064,7 +68213,8 @@
         "summary": "Get notification preferences",
         "tags": [
           "Notification Preferences"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "update_preferences",
@@ -68104,7 +68254,8 @@
         "summary": "Update notification preferences",
         "tags": [
           "Notification Preferences"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers": {
@@ -68190,7 +68341,8 @@
         "summary": "List all notification providers",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_notification_provider",
@@ -68230,7 +68382,8 @@
         "summary": "Create a new notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers/cloudflare": {
@@ -68272,7 +68425,8 @@
         "summary": "Create a new Cloudflare Email Sending notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers/cloudflare/{id}": {
@@ -68326,7 +68480,8 @@
         "summary": "Update a Cloudflare Email Sending notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers/email": {
@@ -68368,7 +68523,8 @@
         "summary": "Create a new Email notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers/email/{id}": {
@@ -68422,7 +68578,8 @@
         "summary": "Update an Email notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers/slack": {
@@ -68464,7 +68621,8 @@
         "summary": "Create a new Slack notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers/slack/{id}": {
@@ -68518,7 +68676,8 @@
         "summary": "Update a Slack notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers/webhook": {
@@ -68561,7 +68720,8 @@
         "summary": "Create a new Webhook notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers/webhook/{id}": {
@@ -68615,7 +68775,8 @@
         "summary": "Update a Webhook notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers/{id}": {
@@ -68652,7 +68813,8 @@
         "summary": "Delete a notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_notification_provider",
@@ -68694,7 +68856,8 @@
         "summary": "Get a single notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "update_notification_provider",
@@ -68749,7 +68912,8 @@
         "summary": "Update a notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers/{id}/config/{field}": {
@@ -68807,7 +68971,8 @@
         ],
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-providers/{id}/test": {
@@ -68851,7 +69016,8 @@
         "summary": "Test a notification provider",
         "tags": [
           "Notification Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/orders": {
@@ -69027,7 +69193,8 @@
         "summary": "List alert rules for a project (newest first, paginated).",
         "tags": [
           "Alerts"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_alert",
@@ -69101,7 +69268,8 @@
         "summary": "Create a new alert rule for a project.",
         "tags": [
           "Alerts"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/alerts/preview": {
@@ -69178,7 +69346,8 @@
         "summary": "Backtest an anomaly detector over a time range without saving a rule.",
         "tags": [
           "Alerts"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/alerts/{id}": {
@@ -69259,7 +69428,8 @@
         "summary": "Delete an alert rule.",
         "tags": [
           "Alerts"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_alert",
@@ -69345,7 +69515,8 @@
         "summary": "Fetch a single alert rule by id.",
         "tags": [
           "Alerts"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "patch": {
         "operationId": "update_alert",
@@ -69451,7 +69622,8 @@
         "summary": "Update an alert rule's fields.",
         "tags": [
           "Alerts"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/dashboards": {
@@ -69541,7 +69713,8 @@
         "summary": "List dashboards for a project (newest first, paginated).",
         "tags": [
           "Dashboards"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_dashboard",
@@ -69615,7 +69788,8 @@
         "summary": "Create a new dashboard for a project.",
         "tags": [
           "Dashboards"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/dashboards/{id}": {
@@ -69696,7 +69870,8 @@
         "summary": "Delete a dashboard.",
         "tags": [
           "Dashboards"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_dashboard",
@@ -69782,7 +69957,8 @@
         "summary": "Fetch a single dashboard by id.",
         "tags": [
           "Dashboards"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "patch": {
         "operationId": "update_dashboard",
@@ -69888,7 +70064,8 @@
         "summary": "Update a dashboard's name and/or layout.",
         "tags": [
           "Dashboards"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/facets": {
@@ -69945,7 +70122,8 @@
         "summary": "List all registered OTel span attribute facets.",
         "tags": [
           "OTel Facets"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "description": "Assigns the key to the lowest available slot column (1..=20) and inserts\nthe mapping into Postgres with `status: pending`. Returns immediately —\nthe historical backfill (populating the slot column for spans already\ningested before this call) runs entirely in the background, advanced by a\nperiodic poller; poll `GET /otel/facets` and check the returned `status`\n(`pending` -> `running` -> `completed`/`failed`) to track progress. New\nspans start getting the attribute written into the slot column right\naway, independent of backfill progress.",
@@ -70030,7 +70208,8 @@
         "summary": "Register an OTel attribute key as a facet.",
         "tags": [
           "OTel Facets"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/facets/{key}": {
@@ -70101,7 +70280,8 @@
         "summary": "Remove a registered OTel span attribute facet.",
         "tags": [
           "OTel Facets"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/facets/{key}/retry": {
@@ -70189,7 +70369,8 @@
         "summary": "Retry a failed OTel span attribute facet backfill.",
         "tags": [
           "OTel Facets"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/genai/traces": {
@@ -70325,7 +70506,8 @@
         "summary": "Query GenAI trace summaries — traces containing spans with `gen_ai.*` attributes.",
         "tags": [
           "GenAI"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/otel/genai/traces/{project_id}/{trace_id}": {
@@ -70403,7 +70585,8 @@
         "summary": "Get GenAI span details for a specific trace.",
         "tags": [
           "GenAI"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/otel/global/traces/{trace_id}": {
@@ -70481,7 +70664,8 @@
         "summary": "Assemble a unified cross-project span waterfall (Phase 2).",
         "tags": [
           "Traces"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/has-traces/{project_id}": {
@@ -70550,7 +70734,8 @@
         "summary": "Whether a project has ever received at least one trace span.",
         "tags": [
           "OTel"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/health/{project_id}": {
@@ -70628,7 +70813,8 @@
         "summary": "Get health summaries for a project.",
         "tags": [
           "OTel"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/insights/{project_id}": {
@@ -70727,7 +70913,8 @@
         "summary": "List anomaly insights for a project.",
         "tags": [
           "Insights"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/logs": {
@@ -70871,7 +71058,8 @@
         "summary": "Query log records with optional filters.",
         "tags": [
           "Telemetry Logs"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/metric-label-keys": {
@@ -70966,7 +71154,8 @@
         "summary": "List the attribute (label) keys observed on a metric — powers the\nlabel-filter key autocomplete.",
         "tags": [
           "Telemetry Metrics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/metric-label-values": {
@@ -71080,7 +71269,8 @@
         "summary": "List the distinct values seen for a label key on a metric — powers value\nautocomplete once a key is chosen.",
         "tags": [
           "Telemetry Metrics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/metric-names/{project_id}": {
@@ -71148,7 +71338,8 @@
         "summary": "List distinct metric names for a project.",
         "tags": [
           "Telemetry Metrics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/metrics": {
@@ -71327,7 +71518,8 @@
         "summary": "Query metrics with time bucketing.",
         "tags": [
           "Telemetry Metrics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/pipeline-stats": {
@@ -71373,7 +71565,8 @@
         "summary": "Get OTel pipeline statistics (admin/system view).",
         "tags": [
           "OTel"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/quota/{project_id}": {
@@ -71441,7 +71634,8 @@
         "summary": "Get storage quota for a project.",
         "tags": [
           "OTel"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/span-stats": {
@@ -71682,7 +71876,8 @@
         "summary": "Rank operations by latency, volume, or inconsistency.",
         "tags": [
           "Traces"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/trace-summaries": {
@@ -71892,7 +72087,8 @@
         "summary": "Query trace summaries — one row per trace with span count, error count,\nroot span info, and proper trace-level pagination.",
         "tags": [
           "Traces"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/traces": {
@@ -72076,7 +72272,8 @@
         "summary": "Query trace spans with optional filters.",
         "tags": [
           "Traces"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/traces/cross-project/{trace_id}": {
@@ -72164,7 +72361,8 @@
         "summary": "Discover sibling projects that share the same `trace_id` (Phase 1 banner).",
         "tags": [
           "Traces"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/traces/{project_id}/{trace_id}": {
@@ -72242,7 +72440,8 @@
         "summary": "Get all spans for a specific trace.",
         "tags": [
           "Traces"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/v1/logs": {
@@ -72323,7 +72522,8 @@
         "summary": "Ingest log records via OTLP/HTTP protobuf.",
         "tags": [
           "OTel Ingest"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/v1/metrics": {
@@ -72404,7 +72604,8 @@
         "summary": "Ingest metrics via OTLP/HTTP protobuf.",
         "tags": [
           "OTel Ingest"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/v1/traces": {
@@ -72485,7 +72686,8 @@
         "summary": "Ingest trace spans via OTLP/HTTP protobuf.",
         "tags": [
           "OTel Ingest"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/v1/{project_id}/{environment_id}/{deployment_id}/logs": {
@@ -72597,7 +72799,8 @@
         "summary": "Ingest log records with project/environment/deployment in the URL path.",
         "tags": [
           "OTel Ingest"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics": {
@@ -72709,7 +72912,8 @@
         "summary": "Ingest metrics with project/environment/deployment in the URL path.",
         "tags": [
           "OTel Ingest"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/v1/{project_id}/{environment_id}/{deployment_id}/traces": {
@@ -72821,7 +73025,8 @@
         "summary": "Ingest trace spans with project/environment/deployment in the URL path.",
         "tags": [
           "OTel Ingest"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/performance/has-metrics": {
@@ -72889,7 +73094,8 @@
         "summary": "Check if performance metrics exist for a project",
         "tags": [
           "Performance"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/performance/metrics": {
@@ -73077,7 +73283,8 @@
         "summary": "Get performance metrics",
         "tags": [
           "Performance"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/performance/metrics-over-time": {
@@ -73265,7 +73472,8 @@
         "summary": "Get metrics over time",
         "tags": [
           "Performance"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/performance/page-metrics": {
@@ -73462,7 +73670,8 @@
         "summary": "Get grouped page metrics",
         "tags": [
           "Performance"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/platform/access-info": {
@@ -73937,6 +74146,52 @@
         "summary": "Get details of a specific project by slug",
         "tags": [
           "Projects"
+        ]
+      }
+    },
+    "/projects/custom-domains/by-host/{hostname}": {
+      "get": {
+        "operationId": "get_visible_custom_domain_by_hostname",
+        "parameters": [
+          {
+            "description": "Domain hostname",
+            "in": "path",
+            "name": "hostname",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomDomainResponse"
+                }
+              }
+            },
+            "description": "Custom domain assignment retrieved"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Project access denied"
+          },
+          "404": {
+            "description": "Domain is not assigned to a project"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Find the project assignment for a certificate hostname.",
+        "tags": [
+          "Custom Domains"
         ]
       }
     },
@@ -74514,7 +74769,8 @@
         ],
         "tags": [
           "Teams"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/active-visitors": {
@@ -74578,7 +74834,8 @@
         "summary": "Get active visitors count",
         "tags": [
           "Events"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/agents": {
@@ -74624,7 +74881,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "post": {
         "operationId": "create_agent",
@@ -74681,7 +74939,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/cli-status": {
@@ -74726,7 +74985,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs": {
@@ -74794,7 +75054,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs/latest-for-source": {
@@ -74866,7 +75127,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}": {
@@ -74925,7 +75187,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}/cancel": {
@@ -74987,7 +75250,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}/retry": {
@@ -75050,7 +75314,8 @@
         "summary": "Retry a completed, failed, cancelled, or no_fix run with the same trigger context.\nCreates a new run record and spawns the executor.",
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}/stream": {
@@ -75103,7 +75368,8 @@
         "summary": "SSE endpoint for real-time streaming of run events.\nPolls the agent_run_logs table every 500ms for new entries and streams them.\nCloses when the run reaches a terminal status.",
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/sandbox-status": {
@@ -75146,7 +75412,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/smoke-test": {
@@ -75199,7 +75466,8 @@
         "summary": "Run a smoke test to verify the selected AI CLI works in the environment\nwhere agents will actually execute (host or sandbox container). If no\n`provider_id` is supplied the globally active provider is tested.",
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/{slug}": {
@@ -75250,7 +75518,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "get": {
         "operationId": "get_agent",
@@ -75303,7 +75572,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "put": {
         "operationId": "update_agent",
@@ -75372,7 +75642,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/{slug}/runs": {
@@ -75452,7 +75723,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/{slug}/trigger": {
@@ -75532,7 +75804,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/aggregated-buckets": {
@@ -76835,7 +77108,8 @@
         "summary": "Return the top callers (by client IP, ranked by request count) in a\nproject's API traffic window.",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/api-analytics/proxy-log-access": {
@@ -76903,7 +77177,8 @@
         "summary": "Report whether the current principal may drill into a project's proxy logs.",
         "tags": [
           "Proxy Logs"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/api-analytics/query": {
@@ -77011,7 +77286,8 @@
         "summary": "Run a backend-neutral, multi-dimensional API traffic aggregation.",
         "tags": [
           "Proxy Logs"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/api-analytics/routes": {
@@ -77109,7 +77385,8 @@
         "summary": "Return the top routes (by request count) in a project's API traffic,\ngrouped by raw `(method, path)`.",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/api-analytics/summary": {
@@ -77197,7 +77474,8 @@
         "summary": "Return an AI-generated summary of API traffic for the given window.",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/api-analytics/timeseries": {
@@ -77276,7 +77554,8 @@
         "summary": "Return a time-bucketed series of request volume, error rate, and latency\npercentiles for a project's API traffic.",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/autofixer/analyze": {
@@ -82136,7 +82415,8 @@
         "summary": "Deploy from an uploaded static bundle",
         "tags": [
           "Deployments"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/error-alert-rules": {
@@ -82175,7 +82455,8 @@
         "summary": "List all alert rules for a project",
         "tags": [
           "error-alert-rules"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_alert_rule",
@@ -82222,7 +82503,8 @@
         "summary": "Create a new alert rule",
         "tags": [
           "error-alert-rules"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/error-alert-rules/{rule_id}": {
@@ -82264,7 +82546,8 @@
         "summary": "Delete an alert rule",
         "tags": [
           "error-alert-rules"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_alert_rule",
@@ -82311,7 +82594,8 @@
         "summary": "Get a specific alert rule",
         "tags": [
           "error-alert-rules"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "update_alert_rule",
@@ -82371,7 +82655,8 @@
         "summary": "Update an existing alert rule",
         "tags": [
           "error-alert-rules"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/error-dashboard-stats": {
@@ -82448,7 +82733,8 @@
         "summary": "Get error dashboard statistics",
         "tags": [
           "error-tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/error-groups": {
@@ -82570,7 +82856,8 @@
         "summary": "List error groups for a project",
         "tags": [
           "error-tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/error-groups/{group_id}": {
@@ -82619,7 +82906,8 @@
         "summary": "Get a specific error group",
         "tags": [
           "error-tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "update_error_group",
@@ -82669,7 +82957,8 @@
         "summary": "Update error group status",
         "tags": [
           "error-tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/error-groups/{group_id}/events": {
@@ -82738,7 +83027,8 @@
         "summary": "List error events for a specific group",
         "tags": [
           "error-tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/error-groups/{group_id}/events/{event_id}": {
@@ -82797,7 +83087,8 @@
         "summary": "Get a specific error event",
         "tags": [
           "error-tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/error-stats": {
@@ -82833,7 +83124,8 @@
         "summary": "Get error statistics for a project",
         "tags": [
           "error-tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/error-time-series": {
@@ -82899,7 +83191,8 @@
         "summary": "Get error time series data for charts",
         "tags": [
           "error-tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/events": {
@@ -84384,7 +84677,8 @@
         "summary": "List all funnels for a project",
         "tags": [
           "Funnels"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_funnel",
@@ -84439,7 +84733,8 @@
         "summary": "Create a new funnel",
         "tags": [
           "Funnels"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/funnels/preview": {
@@ -84496,7 +84791,8 @@
         "summary": "Preview funnel metrics without creating the funnel",
         "tags": [
           "Funnels"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/funnels/{funnel_id}": {
@@ -84546,7 +84842,8 @@
         "summary": "Delete a funnel",
         "tags": [
           "Funnels"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "update_funnel",
@@ -84607,7 +84904,8 @@
         "summary": "Update a funnel",
         "tags": [
           "Funnels"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/funnels/{funnel_id}/metrics": {
@@ -84704,7 +85002,8 @@
         "summary": "Get funnel metrics",
         "tags": [
           "Funnels"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/git": {
@@ -84857,7 +85156,8 @@
         "summary": "Check if project has any error groups",
         "tags": [
           "error-tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/has-events": {
@@ -86519,7 +86819,8 @@
         "summary": "Recent ingested events for the activity feed.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/revenue/integrations": {
@@ -86560,7 +86861,8 @@
         "summary": "List revenue integrations for a project.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "post": {
         "operationId": "revenue_create_integration",
@@ -86611,7 +86913,8 @@
         "summary": "Create a new revenue integration. Response contains the generated\nwebhook path that the user must paste into their provider's dashboard.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/revenue/integrations/{integration_id}": {
@@ -86650,7 +86953,8 @@
         "summary": "Delete a revenue integration (permanent — use rotate_token to refresh\ncredentials without breaking history).",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/revenue/integrations/{integration_id}/config": {
@@ -86712,7 +87016,8 @@
         "summary": "Replace the typed provider config on an integration. Passing `null`\nclears the config back to the accept-everything default. The config's\nprovider tag must match the integration's provider.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/revenue/integrations/{integration_id}/import/invoices": {
@@ -86767,7 +87072,8 @@
         "summary": "Import a Stripe invoices CSV export. Each paid invoice becomes an\n`invoice.paid` event so historical MRR/charge totals populate the\ntimeseries. Ingestion is idempotent: re-uploading the same file is a\nno-op.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/revenue/integrations/{integration_id}/import/subscriptions": {
@@ -86822,7 +87128,8 @@
         "summary": "Import a Stripe subscriptions CSV export. Use this to backfill MRR /\nactive subscriptions when migrating from Stripe without providing\nAPI keys. Webhooks remain the source of truth for live updates —\nCSV rows never overwrite newer webhook state.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/revenue/integrations/{integration_id}/rotate-token": {
@@ -86868,7 +87175,8 @@
         "summary": "Rotate the webhook path token. Returns the new integration state —\nthe user must paste the new URL into their provider's dashboard.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/revenue/integrations/{integration_id}/update-secret": {
@@ -86930,7 +87238,8 @@
         "summary": "Replace the stored signing secret without rotating the webhook URL.\nUse this after rotating the secret in the provider's dashboard.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/revenue/metrics/customers": {
@@ -86970,7 +87279,8 @@
         "summary": "New + churned customers per bucket.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/revenue/metrics/mrr": {
@@ -87010,7 +87320,8 @@
         "summary": "Bucketed MRR timeseries for the revenue chart.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/revenue/metrics/summary": {
@@ -87047,7 +87358,8 @@
         "summary": "Current MRR / ARR / churn / ARPU for a project, in one currency.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/secrets": {
@@ -87817,7 +88129,8 @@
         "summary": "List static bundles for a project",
         "tags": [
           "Static Bundles"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/static-bundles/{bundle_id}": {
@@ -87868,7 +88181,8 @@
         "summary": "Delete a static bundle",
         "tags": [
           "Static Bundles"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "get": {
         "operationId": "get_static_bundle",
@@ -87924,7 +88238,8 @@
         "summary": "Get details of a specific static bundle",
         "tags": [
           "Static Bundles"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/status": {
@@ -88233,7 +88548,8 @@
         ],
         "tags": [
           "Vulnerability Scans"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "post": {
         "operationId": "trigger_scan",
@@ -88318,7 +88634,8 @@
         ],
         "tags": [
           "Vulnerability Scans"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/vulnerability-scans/environments": {
@@ -88388,7 +88705,8 @@
         ],
         "tags": [
           "Vulnerability Scans"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/vulnerability-scans/latest": {
@@ -88475,7 +88793,8 @@
         ],
         "tags": [
           "Vulnerability Scans"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/webhooks": {
@@ -88577,7 +88896,8 @@
         "summary": "List all webhooks for a project",
         "tags": [
           "Webhooks"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_webhook",
@@ -88635,7 +88955,8 @@
         "summary": "Create a new webhook",
         "tags": [
           "Webhooks"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/webhooks/{webhook_id}": {
@@ -88688,7 +89009,8 @@
         "summary": "Delete a webhook",
         "tags": [
           "Webhooks"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_webhook",
@@ -88746,7 +89068,8 @@
         "summary": "Get a specific webhook",
         "tags": [
           "Webhooks"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "update_webhook",
@@ -88817,7 +89140,8 @@
         "summary": "Update a webhook",
         "tags": [
           "Webhooks"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/webhooks/{webhook_id}/deliveries": {
@@ -88888,7 +89212,8 @@
         "summary": "List webhook deliveries",
         "tags": [
           "Webhook Deliveries"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}": {
@@ -88958,7 +89283,8 @@
         "summary": "Get a specific webhook delivery by ID",
         "tags": [
           "Webhook Deliveries"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry": {
@@ -89028,7 +89354,8 @@
         "summary": "Retry a failed delivery",
         "tags": [
           "Webhook Deliveries"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/workflows/dry-run": {
@@ -89090,6 +89417,79 @@
         ],
         "tags": [
           "Workflows"
+        ]
+      }
+    },
+    "/projects/{source_project_id}/custom-domains/{domain_id}/assignment": {
+      "put": {
+        "operationId": "reassign_project_custom_domain",
+        "parameters": [
+          {
+            "description": "Current project ID",
+            "in": "path",
+            "name": "source_project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Custom domain ID",
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReassignCustomDomainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomDomainResponse"
+                }
+              }
+            },
+            "description": "Domain assignment updated atomically"
+          },
+          "400": {
+            "description": "Target environment does not belong to the target project"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Write access required for both projects"
+          },
+          "404": {
+            "description": "Custom domain not found"
+          },
+          "409": {
+            "description": "Domain assignment changed; refresh and retry"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Move a domain between projects without deleting its route or certificate.",
+        "tags": [
+          "Custom Domains"
         ]
       }
     },
@@ -89952,7 +90352,8 @@
         "summary": "Get the top pages accessed by a specific AI agent over a time window.",
         "tags": [
           "Proxy Logs"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/proxy-logs/stats/ai-agents": {
@@ -90391,7 +90792,8 @@
         "summary": "Get the top pages crawled by AI agents over a time window.",
         "tags": [
           "Proxy Logs"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/proxy-logs/stats/ai-status": {
@@ -92315,7 +92717,8 @@
         "summary": "Org-wide revenue events across every project. Powers the revenue\ntransactions page. Supports filtering by project, date range, and\nevent type.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/revenue/metrics/global-mrr": {
@@ -92341,7 +92744,8 @@
         "summary": "Org-wide MRR total, summed across every project in the install.\nPowers the single-number MRR card on the main dashboard.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/revenue/metrics/global-summary": {
@@ -92378,7 +92782,8 @@
         "summary": "Org-wide revenue summary: MRR, paid cash (30d + all-time), refunds,\nactive subscriptions/customers, and transaction count. Powers the\nheader on the Revenue transactions page.",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/revenue/providers": {
@@ -92407,7 +92812,8 @@
         "summary": "List registered providers (what the UI needs to render the \"Connect\"\ndropdown + its wizard instructions).",
         "tags": [
           "Revenue"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/session-replays": {
@@ -92517,7 +92923,8 @@
         "summary": "Get session replays for a project",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/sessions/{session_id}/events": {
@@ -94090,7 +94497,8 @@
         ],
         "tags": [
           "Teams"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_team",
@@ -94132,7 +94540,8 @@
         ],
         "tags": [
           "Teams"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/teams/{team_id}": {
@@ -94168,7 +94577,8 @@
         ],
         "tags": [
           "Teams"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_team",
@@ -94209,7 +94619,8 @@
         ],
         "tags": [
           "Teams"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "patch": {
         "operationId": "update_team",
@@ -94263,7 +94674,8 @@
         ],
         "tags": [
           "Teams"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/teams/{team_id}/members": {
@@ -94308,7 +94720,8 @@
         ],
         "tags": [
           "Teams"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "add_team_member",
@@ -94361,7 +94774,8 @@
         ],
         "tags": [
           "Teams"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/teams/{team_id}/members/{user_id}": {
@@ -94405,7 +94819,8 @@
         ],
         "tags": [
           "Teams"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "patch": {
         "operationId": "update_team_member_role",
@@ -94464,7 +94879,8 @@
         ],
         "tags": [
           "Teams"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/teams/{team_id}/projects": {
@@ -94509,7 +94925,8 @@
         ],
         "tags": [
           "Teams"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/templates": {
@@ -95216,6 +95633,41 @@
         ]
       }
     },
+    "/v1/platform/feature-maturity": {
+      "get": {
+        "operationId": "get_feature_maturity",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/FeatureMaturity"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Feature maturity registry for this build"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Return the build-time compatibility promise for every user-facing feature.",
+        "tags": [
+          "Platform"
+        ]
+      }
+    },
     "/v1/sandbox-snapshots": {
       "get": {
         "operationId": "list_snapshots",
@@ -95285,7 +95737,8 @@
         "summary": "`GET /v1/sandbox-snapshots`",
         "tags": [
           "Snapshots"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandbox-snapshots/storage-summary": {
@@ -95314,7 +95767,8 @@
         "summary": "`GET /v1/sandbox-snapshots/storage-summary`",
         "tags": [
           "Snapshots"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandbox-snapshots/{snap_id}": {
@@ -95353,7 +95807,8 @@
         "summary": "`DELETE /v1/sandbox-snapshots/{snap_id}`",
         "tags": [
           "Snapshots"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "get": {
         "operationId": "get_snapshot",
@@ -95394,7 +95849,8 @@
         "summary": "`GET /v1/sandbox-snapshots/{snap_id}`",
         "tags": [
           "Snapshots"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes": {
@@ -95465,7 +95921,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "post": {
         "operationId": "create_sandbox",
@@ -95507,7 +95964,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/rootfs": {
@@ -95526,7 +95984,8 @@
         "summary": "Inspect rootfs storage: the Firecracker digest-keyed cache (with which\nsandboxes reference each entry) and per-VM disks. Empty on Docker-only\nhosts. Admin/read scope — this exposes host storage layout.",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/rootfs/gc": {
@@ -95545,7 +96004,8 @@
         "summary": "Reclaim rootfs cache entries not backing any live sandbox. Idempotent;\nsafe to call any time (live VMs hold their own per-VM disks).",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}": {
@@ -95583,7 +96043,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/cmd": {
@@ -95633,7 +96094,8 @@
         "summary": "Run a command inside the sandbox (`@vercel/sandbox`-compatible).",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/cmd/{cmd_id}": {
@@ -95679,7 +96141,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/cmd/{cmd_id}/logs": {
@@ -95719,7 +96182,8 @@
         "summary": "Stream a command's stdout/stderr as `application/x-ndjson`\n(`@vercel/sandbox`-compatible). Each line is either\n`{stream:\"stdout\"|\"stderr\", data:\"...\"}` or\n`{stream:\"error\", data:{code, message}}`.",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/destroy": {
@@ -95753,7 +96217,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/domain": {
@@ -95805,7 +96270,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/events": {
@@ -95841,7 +96307,8 @@
         "summary": "The operations timeline for a sandbox (lifecycle events only — never\nshell/exec activity), newest first.",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/exec": {
@@ -95889,7 +96356,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/exec-detached": {
@@ -95937,7 +96405,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/extend-timeout": {
@@ -95988,7 +96457,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/fs/mkdir": {
@@ -96029,7 +96499,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/fs/read": {
@@ -96079,7 +96550,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/fs/stat": {
@@ -96126,7 +96598,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/fs/write": {
@@ -96175,7 +96648,8 @@
         "summary": "Write a file into the sandbox. Accepts two body shapes — the SDK\npicks one based on `Content-Type`:",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/fs/write-batch": {
@@ -96227,7 +96701,8 @@
         "summary": "Batch-write multiple files in a single request. Mirrors\n`@vercel/sandbox` `writeFiles()`. Semantics are fail-fast: if any\nfile errors, previously-written entries are left in place and the\nerror describes which file broke.",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/jobs": {
@@ -96265,7 +96740,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/jobs/{job_id}": {
@@ -96311,7 +96787,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/jobs/{job_id}/kill": {
@@ -96361,7 +96838,8 @@
         "summary": "Terminate a detached job. Aborts the server-side tracking task and\nsends SIGTERM (or SIGKILL if `force=true`) to any matching processes\ninside the sandbox container. Returns 204 on success; 404 if the\nsandbox or job is unknown.",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/jobs/{job_id}/logs": {
@@ -96402,7 +96880,8 @@
         "summary": "SSE endpoint streaming each stdout/stderr line from a detached job\nas it's produced. Mirrors the `Command.logs()` async iterator shape\non `@vercel/sandbox` — events carry `{ stream, data }`.",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/pause": {
@@ -96443,7 +96922,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/preview-link": {
@@ -96502,7 +96982,8 @@
         "summary": "Mint a shareable link to a sandbox preview.",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/preview-password": {
@@ -96533,7 +97014,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "put": {
         "operationId": "set_preview_password",
@@ -96582,7 +97064,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/resize": {
@@ -96631,7 +97114,8 @@
         "summary": "Grow a Firecracker sandbox's root disk. Offline resize — the VM reboots\n(filesystem/data persist) rather than resizing fully live.",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/restart": {
@@ -96672,7 +97156,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/resume": {
@@ -96713,7 +97198,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/snapshots": {
@@ -96782,7 +97268,8 @@
         "summary": "`POST /v1/sandboxes/{id}/snapshots`",
         "tags": [
           "Snapshots"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/source": {
@@ -96839,7 +97326,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/stop": {
@@ -96873,7 +97361,8 @@
         ],
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/terminal": {
@@ -96955,7 +97444,8 @@
         "summary": "Attach an interactive terminal to a sandbox.",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/v1/sandboxes/{id}/{cmd_id}/kill": {
@@ -97011,7 +97501,8 @@
         "summary": "Kill a running command (`@vercel/sandbox`-compatible). The SDK\ncalls `POST /v1/sandboxes/{id}/{cmdId}/kill` — note the path has the\ncommand ID directly under the sandbox, NOT under `/jobs/` or `/cmd/`.",
         "tags": [
           "Sandboxes"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/visitors/{visitor_id}/session-replays": {
@@ -97101,7 +97592,8 @@
         "summary": "Get session replays for a visitor",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/visitors/{visitor_id}/session-replays/{session_id}": {
@@ -97181,7 +97673,8 @@
         "summary": "Delete a session replay",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_session_replay",
@@ -97267,7 +97760,8 @@
         "summary": "Get session replay data with visitor info (without events)",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/visitors/{visitor_id}/session-replays/{session_id}/duration": {
@@ -97364,7 +97858,8 @@
         "summary": "Update session duration",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/visitors/{visitor_id}/session-replays/{session_id}/events": {
@@ -97452,7 +97947,8 @@
         "summary": "Get session replay events (with session and visitor metadata)",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "add_events",
@@ -97557,7 +98053,8 @@
         "summary": "Add events to an existing session",
         "tags": [
           "Analytics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/vulnerability-scans/{scan_id}": {
@@ -97627,7 +98124,8 @@
         ],
         "tags": [
           "Vulnerability Scans"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "get": {
         "operationId": "get_scan",
@@ -97702,7 +98200,8 @@
         ],
         "tags": [
           "Vulnerability Scans"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/vulnerability-scans/{scan_id}/vulnerabilities": {
@@ -97813,7 +98312,8 @@
         ],
         "tags": [
           "Vulnerability Scans"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/webhook-event-types": {

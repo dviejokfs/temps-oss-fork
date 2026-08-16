@@ -627,7 +627,7 @@ pub async fn create_project(
 /// Fails the request on an infrastructure error rather than falling back
 /// to an unfiltered list — a checker that can't answer must not silently
 /// widen what a user sees.
-async fn resolve_hidden_projects(
+pub(super) async fn resolve_hidden_projects(
     state: &Arc<AppState>,
     auth: &temps_auth::context::AuthContext,
 ) -> Result<Vec<i32>, Problem> {
