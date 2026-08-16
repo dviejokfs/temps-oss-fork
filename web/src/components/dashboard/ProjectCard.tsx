@@ -22,6 +22,7 @@ import {
 import { Link } from 'react-router'
 import { VisitorSparkline } from './VisitorSparkline'
 import {
+  deploymentLabel,
   projectBuildSource,
   projectPresetLabel,
   projectRepository,
@@ -234,7 +235,7 @@ export function ProjectCard({
           </div>
           {project.last_deployment && (
             <Badge variant="secondary" className="h-5 shrink-0 px-1.5">
-              Deployed
+              {deploymentLabel()}
             </Badge>
           )}
         </div>

@@ -353,6 +353,15 @@ export function GitImportClone({
     }
   }, [connections, selectedConnection, isInitialLoad, connectionIdFromUrl])
 
+  const selectedConnectionDetails = connections?.connections.find(
+    (connection) => connection.id.toString() === selectedConnection
+  )
+  const selectedConnectionProviderType = selectedConnectionDetails
+    ? providerTypeForConnectionId(selectedConnectionDetails.provider_id)
+    : undefined
+  const parsedGitUrlPreview =
+    gitUrl && !isValidatingUrl ? parseGitUrl(gitUrl) : null
+
   // Parse owner/repo from full_name
   const [owner, repo] = (selectedRepository?.full_name || '/').split('/')
 
@@ -809,24 +818,21 @@ export function GitImportClone({
                 <SelectValue placeholder="Select Connection">
                   {selectedConnection &&
                     connections &&
-                    (() => {
-                      const selectedConn = connections.connections.find(
-                        (c) => c.id.toString() === selectedConnection
-                      )
-                      return selectedConn ? (
-                        <div className="flex items-center gap-2">
-                          {renderProviderIcon(selectedConn.provider_id)}
-                          <span className="font-medium">
-                            {selectedConn.account_name}
-                          </span>
-                          <span className="text-xs text-muted-foreground">
-                            ({selectedConn.account_type})
-                          </span>
-                        </div>
-                      ) : (
-                        'Select Connection'
-                      )
-                    })()}
+                    (selectedConnectionDetails ? (
+                      <div className="flex items-center gap-2">
+                        {renderProviderIcon(
+                          selectedConnectionDetails.provider_id
+                        )}
+                        <span className="font-medium">
+                          {selectedConnectionDetails.account_name}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          ({selectedConnectionDetails.account_type})
+                        </span>
+                      </div>
+                    ) : (
+                      'Select Connection'
+                    ))}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent>
@@ -857,14 +863,7 @@ export function GitImportClone({
                 itemsPerPage={15}
                 showHeader={true}
                 compactMode
-                providerType={(() => {
-                  const selectedConn = connections?.connections?.find(
-                    (c) => c.id.toString() === selectedConnection
-                  )
-                  return selectedConn
-                    ? providerTypeForConnectionId(selectedConn.provider_id)
-                    : undefined
-                })()}
+                providerType={selectedConnectionProviderType}
               />
             )}
           </CardContent>
@@ -920,31 +919,23 @@ export function GitImportClone({
             </Button>
 
             {/* Show parsed URL preview */}
-            {gitUrl &&
-              !isValidatingUrl &&
-              (() => {
-                const parsed = parseGitUrl(gitUrl)
-                if (parsed) {
-                  return (
-                    <div className="p-3 bg-muted/50 rounded-md text-sm">
-                      <div className="flex items-center gap-2">
-                        {parsed.provider === 'github' ? (
-                          <Github className="h-4 w-4" />
-                        ) : (
-                          <Gitlab className="h-4 w-4" />
-                        )}
-                        <span className="font-medium">
-                          {parsed.owner}/{parsed.repo}
-                        </span>
-                        <Badge variant="secondary" className="text-xs">
-                          {parsed.provider}
-                        </Badge>
-                      </div>
-                    </div>
-                  )
-                }
-                return null
-              })()}
+            {parsedGitUrlPreview && (
+              <div className="p-3 bg-muted/50 rounded-md text-sm">
+                <div className="flex items-center gap-2">
+                  {parsedGitUrlPreview.provider === 'github' ? (
+                    <Github className="h-4 w-4" />
+                  ) : (
+                    <Gitlab className="h-4 w-4" />
+                  )}
+                  <span className="font-medium">
+                    {parsedGitUrlPreview.owner}/{parsedGitUrlPreview.repo}
+                  </span>
+                  <Badge variant="secondary" className="text-xs">
+                    {parsedGitUrlPreview.provider}
+                  </Badge>
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
       )}

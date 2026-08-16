@@ -1519,13 +1519,11 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_unique_events",
         // ── API traffic: privacy-safe investigation ──
         // The time series contains only bounded counts and latency/error
-        // aggregates. The summary is generated behind the endpoint's
-        // additional AiGatewayExecute guard and returns findings rather than
-        // raw route paths or caller addresses. Keep get_api_routes and
-        // get_api_callers out of the general tool loop: paths are
-        // attacker-controlled and caller addresses are personal data.
+        // aggregates. Keep get_api_summary out because refresh=true can incur
+        // paid provider work. Keep get_api_routes and get_api_callers out of
+        // the general tool loop: paths are attacker-controlled and caller
+        // addresses are personal data.
         "get_api_timeseries",
-        "get_api_summary",
         // Per-visitor/session metadata — same risk class as
         // get_visitors/get_visitor_stats above (IP, geolocation,
         // user_agent, is_crawler, custom_data/event_data)
@@ -3704,21 +3702,19 @@ mod ai_tool_allowlist_tests {
         let allowlist_refs: Vec<&str> = allowlist.iter().map(String::as_str).collect();
         let index = ReadOnlyApiIndex::from_openapi_allowlist(&openapi, &allowlist_refs);
 
-        for operation in ["get_api_timeseries", "get_api_summary"] {
-            assert!(
-                index.get(operation).is_some(),
-                "AI chat must discover the privacy-safe API traffic operation `{operation}`"
-            );
-        }
+        assert!(
+            index.get("get_api_timeseries").is_some(),
+            "AI chat must discover the privacy-safe API traffic time series"
+        );
 
-        for operation in ["get_api_routes", "get_api_callers"] {
+        for operation in ["get_api_summary", "get_api_routes", "get_api_callers"] {
             assert!(
                 !allowlist.iter().any(|entry| entry == operation),
-                "raw route paths and caller addresses must not enter the AI read allowlist: `{operation}`"
+                "paid or sensitive API traffic operation must not enter the AI read allowlist: `{operation}`"
             );
             assert!(
                 index.get(operation).is_none(),
-                "raw API traffic operation must remain invisible to AI discovery: `{operation}`"
+                "paid or sensitive API traffic operation must remain invisible to AI discovery: `{operation}`"
             );
         }
     }

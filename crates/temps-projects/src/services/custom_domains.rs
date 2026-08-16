@@ -5,7 +5,7 @@ use sea_orm::{
 use std::sync::Arc;
 use temps_core::url_validation;
 use temps_core::AppSettings;
-use temps_entities::{project_custom_domains, settings};
+use temps_entities::{domains, environments, project_custom_domains, settings};
 use thiserror::Error;
 use tracing::{debug, info};
 use url::Url;
@@ -42,6 +42,35 @@ pub enum CustomDomainError {
         target_project_id: i32,
         reason: String,
     },
+    #[error(
+        "Database operation '{operation}' failed while enriching custom domain {domain_id} (certificate {certificate_id:?}, environment {environment_id})"
+    )]
+    EnrichmentDatabase {
+        operation: &'static str,
+        domain_id: i32,
+        certificate_id: Option<i32>,
+        environment_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error(
+        "Database operation '{operation}' failed while reassigning custom domain {domain_id} from project {source_project_id} to project {target_project_id} environment {target_environment_id}"
+    )]
+    ReassignmentDatabase {
+        operation: &'static str,
+        domain_id: i32,
+        source_project_id: i32,
+        target_project_id: i32,
+        target_environment_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+}
+
+pub struct CustomDomainEnrichment {
+    pub custom_domain: project_custom_domains::Model,
+    pub certificate: Option<domains::Model>,
+    pub environment: Option<environments::Model>,
 }
 
 pub struct CustomDomainService {
@@ -443,6 +472,98 @@ impl CustomDomainService {
             .map_err(CustomDomainError::from)
     }
 
+    /// Load the certificate and environment metadata used by custom-domain responses.
+    ///
+    /// Keeping these queries in the service preserves the Handler -> Service ->
+    /// Data Access boundary. Database sources remain attached for logs while the
+    /// public error conversion exposes only operation and resource identifiers.
+    pub async fn get_domain_with_info(
+        &self,
+        custom_domain: project_custom_domains::Model,
+    ) -> Result<CustomDomainEnrichment, CustomDomainError> {
+        let certificate = if let Some(certificate_id) = custom_domain.certificate_id {
+            domains::Entity::find_by_id(certificate_id)
+                .one(self.db.as_ref())
+                .await
+                .map_err(|source| CustomDomainError::EnrichmentDatabase {
+                    operation: "load certificate metadata",
+                    domain_id: custom_domain.id,
+                    certificate_id: custom_domain.certificate_id,
+                    environment_id: custom_domain.environment_id,
+                    source,
+                })?
+        } else {
+            None
+        };
+
+        let environment = environments::Entity::find_by_id(custom_domain.environment_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| CustomDomainError::EnrichmentDatabase {
+                operation: "load environment metadata",
+                domain_id: custom_domain.id,
+                certificate_id: custom_domain.certificate_id,
+                environment_id: custom_domain.environment_id,
+                source,
+            })?;
+
+        Ok(CustomDomainEnrichment {
+            custom_domain,
+            certificate,
+            environment,
+        })
+    }
+
+    /// Confirm that both sides of a requested reassignment are in the caller's
+    /// authorized project scopes before the handler writes its durable intent
+    /// audit. The scoped predicates make foreign and absent identifiers
+    /// indistinguishable.
+    pub async fn validate_reassignment(
+        &self,
+        id: i32,
+        source_project_id: i32,
+        target_project_id: i32,
+        target_environment_id: i32,
+    ) -> Result<(), CustomDomainError> {
+        let map_database_error = |operation, source| CustomDomainError::ReassignmentDatabase {
+            operation,
+            domain_id: id,
+            source_project_id,
+            target_project_id,
+            target_environment_id,
+            source,
+        };
+
+        let domain_exists = project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Id.eq(id))
+            .filter(project_custom_domains::Column::ProjectId.eq(source_project_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| map_database_error("validate source assignment", source))?
+            .is_some();
+        if !domain_exists {
+            return Err(CustomDomainError::NotFound(format!(
+                "Custom domain with ID {id} not found in source project {source_project_id}"
+            )));
+        }
+
+        let environment_exists = environments::Entity::find()
+            .filter(environments::Column::Id.eq(target_environment_id))
+            .filter(environments::Column::ProjectId.eq(target_project_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| map_database_error("validate target environment", source))?
+            .is_some();
+        if !environment_exists {
+            return Err(CustomDomainError::NotFound(format!(
+                "Environment {target_environment_id} not found in target project {target_project_id}"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Atomically move a custom domain to another project environment.
     ///
     /// The row and certificate association are preserved, so the proxy keeps
@@ -455,47 +576,64 @@ impl CustomDomainService {
         target_project_id: i32,
         target_environment_id: i32,
     ) -> Result<project_custom_domains::Model, CustomDomainError> {
-        let transaction = self.db.begin().await?;
+        let map_database_error = |operation, source| CustomDomainError::ReassignmentDatabase {
+            operation,
+            domain_id: id,
+            source_project_id,
+            target_project_id,
+            target_environment_id,
+            source,
+        };
 
-        let query = project_custom_domains::Entity::find_by_id(id);
+        let transaction = self
+            .db
+            .begin()
+            .await
+            .map_err(|source| map_database_error("begin transaction", source))?;
+
+        let query = project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Id.eq(id))
+            .filter(project_custom_domains::Column::ProjectId.eq(source_project_id));
         let query = if self.db.get_database_backend() == DatabaseBackend::Postgres {
             query.lock_exclusive()
         } else {
             query
         };
-        let custom_domain = query.one(&transaction).await?.ok_or_else(|| {
-            CustomDomainError::NotFound(format!("Custom domain with ID {id} not found"))
-        })?;
+        let custom_domain = query
+            .one(&transaction)
+            .await
+            .map_err(|source| map_database_error("load and lock custom domain", source))?
+            .ok_or_else(|| {
+                CustomDomainError::NotFound(format!(
+                    "Custom domain with ID {id} not found in source project {source_project_id}"
+                ))
+            })?;
 
-        if custom_domain.project_id != source_project_id {
-            return Err(CustomDomainError::AssignmentChanged {
-                domain_id: id,
-                source_project_id,
-            });
-        }
-
-        let target_environment =
-            temps_entities::environments::Entity::find_by_id(target_environment_id)
-                .filter(temps_entities::environments::Column::DeletedAt.is_null())
-                .one(&transaction)
-                .await?
-                .ok_or_else(|| {
-                    CustomDomainError::InvalidDomain(format!(
-                        "Target environment {target_environment_id} not found"
-                    ))
-                })?;
-
-        if target_environment.project_id != target_project_id {
-            return Err(CustomDomainError::InvalidDomain(format!(
-                "Environment {target_environment_id} does not belong to target project {target_project_id}"
+        let target_environment_exists = environments::Entity::find()
+            .filter(environments::Column::Id.eq(target_environment_id))
+            .filter(environments::Column::ProjectId.eq(target_project_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .one(&transaction)
+            .await
+            .map_err(|source| map_database_error("load target environment", source))?
+            .is_some();
+        if !target_environment_exists {
+            return Err(CustomDomainError::NotFound(format!(
+                "Environment {target_environment_id} not found in target project {target_project_id}"
             )));
         }
 
         let mut active_model: project_custom_domains::ActiveModel = custom_domain.into();
         active_model.project_id = Set(target_project_id);
         active_model.environment_id = Set(target_environment_id);
-        let updated_domain = active_model.update(&transaction).await?;
-        transaction.commit().await?;
+        let updated_domain = active_model
+            .update(&transaction)
+            .await
+            .map_err(|source| map_database_error("update domain assignment", source))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| map_database_error("commit transaction", source))?;
 
         info!(
             "Reassigned custom domain {} from project {} to project {} environment {}",
@@ -1256,7 +1394,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reassign_custom_domain_missing_or_deleted_target_returns_validation_without_mutation(
+    async fn test_validate_reassignment_hides_foreign_domain_and_environment_ownership() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (source_project_id, source_environment_id) = setup_test_data(&test_db.db).await;
+        let (foreign_project, foreign_environment) =
+            insert_project_environment(&test_db.db, "Foreign Assignment").await;
+        let custom_domain = service
+            .create_custom_domain(
+                source_project_id,
+                source_environment_id,
+                "scoped-assignment.example.com".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let foreign_domain = service
+            .validate_reassignment(
+                custom_domain.id,
+                foreign_project.id,
+                foreign_project.id,
+                foreign_environment.id,
+            )
+            .await;
+        let missing_domain = service
+            .validate_reassignment(
+                i32::MAX,
+                foreign_project.id,
+                foreign_project.id,
+                foreign_environment.id,
+            )
+            .await;
+        assert!(matches!(
+            foreign_domain,
+            Err(CustomDomainError::NotFound(_))
+        ));
+        assert!(matches!(
+            missing_domain,
+            Err(CustomDomainError::NotFound(_))
+        ));
+
+        let foreign_environment_result = service
+            .validate_reassignment(
+                custom_domain.id,
+                source_project_id,
+                source_project_id,
+                foreign_environment.id,
+            )
+            .await;
+        let missing_environment_result = service
+            .validate_reassignment(
+                custom_domain.id,
+                source_project_id,
+                source_project_id,
+                i32::MAX,
+            )
+            .await;
+        assert!(matches!(
+            foreign_environment_result,
+            Err(CustomDomainError::NotFound(_))
+        ));
+        assert!(matches!(
+            missing_environment_result,
+            Err(CustomDomainError::NotFound(_))
+        ));
+
+        let persisted = service
+            .get_custom_domain(custom_domain.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.project_id, source_project_id);
+        assert_eq!(persisted.environment_id, source_environment_id);
+    }
+
+    #[tokio::test]
+    async fn test_reassign_custom_domain_missing_or_deleted_target_returns_not_found_without_mutation(
     ) {
         let Some(test_db) = test_database().await else {
             return;
@@ -1299,7 +1518,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(CustomDomainError::InvalidDomain(message))
+                Err(CustomDomainError::NotFound(message))
                     if message.contains(&target_environment_id.to_string())
             ));
             let persisted = service
@@ -1313,8 +1532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reassign_custom_domain_wrong_target_project_returns_validation_without_mutation()
-    {
+    async fn test_reassign_custom_domain_wrong_target_project_returns_not_found_without_mutation() {
         let Some(test_db) = test_database().await else {
             return;
         };
@@ -1348,7 +1566,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(CustomDomainError::InvalidDomain(message))
+            Err(CustomDomainError::NotFound(message))
                 if message.contains(&target_environment.id.to_string())
                     && message.contains(&wrong_target_project.id.to_string())
         ));
@@ -1363,8 +1581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reassign_custom_domain_stale_source_returns_assignment_changed_without_mutation()
-    {
+    async fn test_reassign_custom_domain_stale_source_returns_not_found_without_mutation() {
         let Some(test_db) = test_database().await else {
             return;
         };
@@ -1404,11 +1621,9 @@ mod tests {
             .await;
         assert!(matches!(
             stale_retry,
-            Err(CustomDomainError::AssignmentChanged {
-                domain_id,
-                source_project_id: stale_source_project_id,
-            }) if domain_id == custom_domain.id
-                && stale_source_project_id == source_project_id
+            Err(CustomDomainError::NotFound(message))
+                if message.contains(&custom_domain.id.to_string())
+                    && message.contains(&source_project_id.to_string())
         ));
         let persisted = service
             .get_custom_domain(custom_domain.id)

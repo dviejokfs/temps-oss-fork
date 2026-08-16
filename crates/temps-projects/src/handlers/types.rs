@@ -1033,10 +1033,10 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
         use crate::services::custom_domains::CustomDomainError;
 
         match error {
-            CustomDomainError::Database(msg) => {
+            CustomDomainError::Database(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
-                    .with_detail(msg.to_string())
+                    .with_detail("A database operation failed while managing custom domains")
             }
             CustomDomainError::NotFound(msg) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Custom Domain Not Found")
@@ -1077,6 +1077,29 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
                         "Custom domain {domain_id} could not be reassigned from project {source_project_id} to project {target_project_id} because the required audit record could not be persisted; no ownership change was made"
                     ))
             }
+            CustomDomainError::EnrichmentDatabase {
+                operation,
+                domain_id,
+                certificate_id,
+                environment_id,
+                ..
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Custom Domain Metadata Unavailable")
+                .with_detail(format!(
+                    "Could not {operation} for custom domain {domain_id} (certificate {certificate_id:?}, environment {environment_id})"
+                )),
+            CustomDomainError::ReassignmentDatabase {
+                operation,
+                domain_id,
+                source_project_id,
+                target_project_id,
+                target_environment_id,
+                ..
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Domain Reassignment Failed")
+                .with_detail(format!(
+                    "Database operation '{operation}' failed while reassigning custom domain {domain_id} from project {source_project_id} to project {target_project_id} environment {target_environment_id}"
+                )),
             CustomDomainError::Internal(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")

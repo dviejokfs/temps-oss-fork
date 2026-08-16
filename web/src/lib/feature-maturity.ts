@@ -8,7 +8,7 @@ export interface FeatureMaturity {
 }
 
 export const BETA_TOOLTIP =
-  'Tested end to end. The data model and API may change between releases.'
+  'Available for use. The data model and API may change between releases.'
 export const EXPERIMENTAL_TOOLTIP =
   "Under active development. May change substantially or be removed. Don't build on it yet."
 

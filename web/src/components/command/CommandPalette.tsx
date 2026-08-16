@@ -1,8 +1,8 @@
 import {
-  getProjectsOptions,
+  getProjectsInfiniteOptions,
   listGlobalMcpsOptions,
   listGlobalSkillsOptions,
-  listServicesOptions,
+  listServicesInfiniteOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import {
@@ -28,7 +28,7 @@ import {
   type CommandDestination,
 } from '@/lib/command-navigation'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
-import { useQuery } from '@tanstack/react-query'
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import Fuse from 'fuse.js'
 import {
   Activity,
@@ -978,16 +978,23 @@ export function CommandPalette() {
   const showFullBrowseCatalog =
     localStorage.getItem('temps:show-full-command-catalog') === 'true'
 
-  const { data: projectResponse, refetch: refetchProjects } = useQuery({
-    ...getProjectsOptions({
-      query: {
-        page: 1,
-        per_page: 100,
-      },
-    }),
+  const {
+    data: projectResponse,
+    refetch: refetchProjects,
+    fetchNextPage: fetchNextProjectPage,
+    hasNextPage: hasNextProjectPage,
+    isFetchingNextPage: isFetchingNextProjectPage,
+  } = useInfiniteQuery({
+    ...getProjectsInfiniteOptions({ query: { per_page: 100 } }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => {
+      const loaded = lastPage.page * lastPage.per_page
+      return loaded < lastPage.total ? lastPage.page + 1 : undefined
+    },
+    enabled: open,
   })
   const projects = useMemo(
-    () => projectResponse?.projects || [],
+    () => projectResponse?.pages.flatMap((page) => page.projects) ?? [],
     [projectResponse]
   )
 
@@ -1011,10 +1018,46 @@ export function CommandPalette() {
     [globalMcpServersData]
   )
 
-  const { data: services = [], refetch: refetchServices } = useQuery({
-    ...listServicesOptions({ query: { page: 1, page_size: 100 } }),
+  const {
+    data: serviceResponse,
+    refetch: refetchServices,
+    fetchNextPage: fetchNextServicePage,
+    hasNextPage: hasNextServicePage,
+    isFetchingNextPage: isFetchingNextServicePage,
+  } = useInfiniteQuery({
+    ...listServicesInfiniteOptions({ query: { page_size: 100 } }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage, pages) =>
+      lastPage.length === 100 ? pages.length + 1 : undefined,
+    enabled: open,
     staleTime: 60_000,
   })
+  const services = useMemo(
+    () => serviceResponse?.pages.flatMap((page) => page) ?? [],
+    [serviceResponse]
+  )
+
+  useEffect(() => {
+    if (open && hasNextProjectPage && !isFetchingNextProjectPage) {
+      void fetchNextProjectPage()
+    }
+  }, [
+    open,
+    hasNextProjectPage,
+    isFetchingNextProjectPage,
+    fetchNextProjectPage,
+  ])
+
+  useEffect(() => {
+    if (open && hasNextServicePage && !isFetchingNextServicePage) {
+      void fetchNextServicePage()
+    }
+  }, [
+    open,
+    hasNextServicePage,
+    isFetchingNextServicePage,
+    fetchNextServicePage,
+  ])
 
   // Detect if user is on a project page and extract slug
   const currentProjectSlug = useMemo(() => {

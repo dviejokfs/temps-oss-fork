@@ -18,19 +18,36 @@ test.describe('command palette', () => {
     })
 
     await page.route('**/api/projects?*', async (route) => {
+      const requestUrl = new URL(route.request().url())
+      const pageNumber = Number(requestUrl.searchParams.get('page') ?? '1')
+      const projects =
+        pageNumber === 1
+          ? [
+              {
+                id: 999,
+                name: 'Monitoring App',
+                slug: 'monitoring-app',
+              },
+              ...Array.from({ length: 99 }, (_, index) => ({
+                id: index + 1,
+                name: `Project ${index + 1}`,
+                slug: `project-${index + 1}`,
+              })),
+            ]
+          : [
+              {
+                id: 1001,
+                name: 'Marketing Site',
+                slug: 'marketing-site',
+              },
+            ]
       await route.fulfill({
         contentType: 'application/json',
         json: {
-          page: 1,
+          page: pageNumber,
           per_page: 100,
-          projects: [
-            {
-              id: 999,
-              name: 'Monitoring App',
-              slug: 'monitoring-app',
-            },
-          ],
-          total: 1,
+          projects,
+          total: 101,
         },
       })
     })
@@ -112,5 +129,23 @@ test.describe('command palette', () => {
     // Icons survive the flattening: projects render an avatar, pages an svg.
     await expect(project.locator(':scope > span').first()).toBeVisible()
     await expect(navigation.locator(':scope > svg')).toHaveCount(1)
+  })
+
+  test('loads later project pages for cross-project environment navigation', async ({
+    page,
+  }) => {
+    await page
+      .getByRole('combobox')
+      .fill('production environment marketing-site')
+
+    const productionEnvironment = page.getByRole('option', {
+      name: /Production environment · marketing-site/,
+    })
+    await expect(productionEnvironment).toBeVisible()
+    await productionEnvironment.click()
+
+    await expect(page).toHaveURL(
+      /\/projects\/marketing-site\/environments\?environment=production$/
+    )
   })
 })

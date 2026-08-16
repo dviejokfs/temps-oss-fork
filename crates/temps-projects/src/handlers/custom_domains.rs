@@ -6,7 +6,7 @@ use super::{
     audit::AuditContext, audit::CustomDomainReassignedAudit,
     audit::CustomDomainReassignmentRequestedAudit,
 };
-use crate::services::custom_domains::CustomDomainError;
+use crate::services::custom_domains::{CustomDomainEnrichment, CustomDomainError};
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
@@ -14,7 +14,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use sea_orm::EntityTrait;
 use std::sync::Arc;
 use temps_auth::{
     deny_deployment_token, permission_guard, project_access_guard, project_permission_guard,
@@ -23,7 +22,7 @@ use temps_auth::{
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
-use temps_entities::{domains, environments, project_custom_domains};
+use temps_entities::project_custom_domains;
 use tracing::{error, info};
 use utoipa::OpenApi;
 
@@ -104,7 +103,10 @@ pub async fn create_custom_domain(
         .await?;
 
     // Fetch additional info for response
-    let domain_with_info = get_domain_with_info(&state, custom_domain).await?;
+    let domain_with_info = state
+        .custom_domain_service
+        .get_domain_with_info(custom_domain)
+        .await?;
 
     state
         .telemetry
@@ -114,7 +116,9 @@ pub async fn create_custom_domain(
 
     Ok((
         StatusCode::CREATED,
-        Json(CustomDomainResponse::from(domain_with_info)),
+        Json(CustomDomainResponse::from(CustomDomainWithInfo::from(
+            domain_with_info,
+        ))),
     ))
 }
 
@@ -167,11 +171,16 @@ pub async fn get_custom_domain(
             .with_detail("Domain does not belong to the specified project"));
     }
 
-    let domain_with_info = get_domain_with_info(&state, custom_domain).await?;
+    let domain_with_info = state
+        .custom_domain_service
+        .get_domain_with_info(custom_domain)
+        .await?;
 
     Ok((
         StatusCode::OK,
-        Json(CustomDomainResponse::from(domain_with_info)),
+        Json(CustomDomainResponse::from(CustomDomainWithInfo::from(
+            domain_with_info,
+        ))),
     ))
 }
 
@@ -211,8 +220,13 @@ pub async fn list_custom_domains_for_project(
 
     let mut domain_responses = Vec::new();
     for domain in custom_domains {
-        let domain_with_info = get_domain_with_info(&state, domain).await?;
-        domain_responses.push(CustomDomainResponse::from(domain_with_info));
+        let domain_with_info = state
+            .custom_domain_service
+            .get_domain_with_info(domain)
+            .await?;
+        domain_responses.push(CustomDomainResponse::from(CustomDomainWithInfo::from(
+            domain_with_info,
+        )));
     }
 
     Ok((
@@ -260,10 +274,15 @@ pub async fn get_custom_domain_by_hostname(
                 ))
         })?;
 
-    let domain_with_info = get_domain_with_info(&state, custom_domain).await?;
+    let domain_with_info = state
+        .custom_domain_service
+        .get_domain_with_info(custom_domain)
+        .await?;
     Ok((
         StatusCode::OK,
-        Json(CustomDomainResponse::from(domain_with_info)),
+        Json(CustomDomainResponse::from(CustomDomainWithInfo::from(
+            domain_with_info,
+        ))),
     ))
 }
 
@@ -275,10 +294,9 @@ pub async fn get_custom_domain_by_hostname(
     request_body = ReassignCustomDomainRequest,
     responses(
         (status = 200, description = "Domain assignment updated atomically", body = CustomDomainResponse),
-        (status = 400, description = "Target environment does not belong to the target project"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Write access required for both projects"),
-        (status = 404, description = "Custom domain not found"),
+        (status = 404, description = "Custom domain or target environment not found in the authorized project scopes"),
         (status = 409, description = "Domain assignment changed; refresh and retry")
     ),
     params(
@@ -308,10 +326,6 @@ pub async fn reassign_custom_domain(
         state.project_access_checker
     );
 
-    // Persist a forensic intent before changing ownership. Audit backends may
-    // fail independently from the project database, so mutation must not begin
-    // until this record is durable. The operation deliberately says
-    // REQUESTED: it remains accurate if row locking or validation later fails.
     let audit = CustomDomainReassignmentRequestedAudit {
         context: AuditContext {
             user_id: auth.user_id(),
@@ -323,33 +337,74 @@ pub async fn reassign_custom_domain(
         target_project_id: request.target_project_id,
         target_environment_id: request.target_environment_id,
     };
-    state
-        .audit_service
+    let updated_domain = execute_reassignment(
+        state.custom_domain_service.as_ref(),
+        state.audit_service.as_ref(),
+        audit,
+    )
+    .await?;
+
+    let domain_with_info = state
+        .custom_domain_service
+        .get_domain_with_info(updated_domain)
+        .await?;
+    Ok((
+        StatusCode::OK,
+        Json(CustomDomainResponse::from(CustomDomainWithInfo::from(
+            domain_with_info,
+        ))),
+    ))
+}
+
+async fn execute_reassignment(
+    custom_domain_service: &crate::services::custom_domains::CustomDomainService,
+    audit_service: &dyn temps_core::AuditLogger,
+    audit: CustomDomainReassignmentRequestedAudit,
+) -> Result<project_custom_domains::Model, CustomDomainError> {
+    let domain_id = audit.custom_domain_id;
+    let source_project_id = audit.source_project_id;
+    let target_project_id = audit.target_project_id;
+    let target_environment_id = audit.target_environment_id;
+
+    // Validate scoped ownership before writing the durable REQUESTED audit.
+    // Foreign and absent IDs deliberately produce the same not-found result.
+    custom_domain_service
+        .validate_reassignment(
+            domain_id,
+            source_project_id,
+            target_project_id,
+            target_environment_id,
+        )
+        .await?;
+
+    // Persist a forensic intent before changing ownership. Audit backends may
+    // fail independently from the project database, so mutation must not begin
+    // until this record is durable.
+    audit_service
         .create_audit_log(&audit)
         .await
         .map_err(|audit_error| {
             error!(
                 domain_id,
                 source_project_id,
-                target_project_id = request.target_project_id,
+                target_project_id,
                 error = %audit_error,
                 "Failed to persist required custom-domain reassignment audit intent"
             );
             CustomDomainError::AuditIntentFailed {
                 domain_id,
                 source_project_id,
-                target_project_id: request.target_project_id,
+                target_project_id,
                 reason: audit_error.to_string(),
             }
         })?;
 
-    let updated_domain = state
-        .custom_domain_service
+    let updated_domain = custom_domain_service
         .reassign_custom_domain(
             domain_id,
             source_project_id,
-            request.target_project_id,
-            request.target_environment_id,
+            target_project_id,
+            target_environment_id,
         )
         .await?;
 
@@ -358,24 +413,20 @@ pub async fn reassign_custom_domain(
         custom_domain_id: updated_domain.id,
         domain: updated_domain.domain.clone(),
         source_project_id,
-        target_project_id: request.target_project_id,
-        target_environment_id: request.target_environment_id,
+        target_project_id,
+        target_environment_id,
     };
-    if let Err(audit_error) = state.audit_service.create_audit_log(&completed_audit).await {
+    if let Err(audit_error) = audit_service.create_audit_log(&completed_audit).await {
         error!(
             domain_id,
             source_project_id,
-            target_project_id = request.target_project_id,
+            target_project_id,
             error = %audit_error,
             "Failed to persist custom-domain reassignment completion audit"
         );
     }
 
-    let domain_with_info = get_domain_with_info(&state, updated_domain).await?;
-    Ok((
-        StatusCode::OK,
-        Json(CustomDomainResponse::from(domain_with_info)),
-    ))
+    Ok(updated_domain)
 }
 
 /// Update a custom domain
@@ -477,11 +528,16 @@ pub async fn update_custom_domain(
         updated_domain
     };
 
-    let domain_with_info = get_domain_with_info(&state, updated_domain).await?;
+    let domain_with_info = state
+        .custom_domain_service
+        .get_domain_with_info(updated_domain)
+        .await?;
 
     Ok((
         StatusCode::OK,
-        Json(CustomDomainResponse::from(domain_with_info)),
+        Json(CustomDomainResponse::from(CustomDomainWithInfo::from(
+            domain_with_info,
+        ))),
     ))
 }
 
@@ -605,63 +661,36 @@ pub async fn link_custom_domain_to_certificate(
         .link_certificate(domain_id, certificate_id)
         .await?;
 
-    let domain_with_info = get_domain_with_info(&state, updated_domain).await?;
+    let domain_with_info = state
+        .custom_domain_service
+        .get_domain_with_info(updated_domain)
+        .await?;
 
     Ok((
         StatusCode::OK,
-        Json(CustomDomainResponse::from(domain_with_info)),
+        Json(CustomDomainResponse::from(CustomDomainWithInfo::from(
+            domain_with_info,
+        ))),
     ))
 }
 
-// Helper function to get domain with additional info
-async fn get_domain_with_info(
-    state: &Arc<AppState>,
-    custom_domain: project_custom_domains::Model,
-) -> Result<CustomDomainWithInfo, Problem> {
-    let db = state.project_service.db.as_ref();
-
-    // Get domain info if certificate_id is present
-    let domain_info = if let Some(cert_id) = custom_domain.certificate_id {
-        domains::Entity::find_by_id(cert_id)
-            .one(db)
-            .await
-            .map_err(|e| {
-                error!("Failed to get domain info: {}", e);
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Failed to get domain info")
-                    .with_detail(e.to_string())
-            })?
-            .map(|d| DomainInfo {
-                id: d.id,
-                domain: d.domain,
-                expiration_time: d.expiration_time,
-                last_renewed: d.last_renewed,
-            })
-    } else {
-        None
-    };
-
-    // Get environment info
-    let environment = environments::Entity::find_by_id(custom_domain.environment_id)
-        .one(db)
-        .await
-        .map_err(|e| {
-            error!("Failed to get environment info: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Failed to get environment info")
-                .with_detail(e.to_string())
-        })?
-        .map(|e| DomainEnvironment {
-            id: e.id,
-            name: e.name,
-            slug: e.slug,
-        });
-
-    Ok(CustomDomainWithInfo {
-        custom_domain,
-        domain_info,
-        environment,
-    })
+impl From<CustomDomainEnrichment> for CustomDomainWithInfo {
+    fn from(value: CustomDomainEnrichment) -> Self {
+        Self {
+            custom_domain: value.custom_domain,
+            domain_info: value.certificate.map(|certificate| DomainInfo {
+                id: certificate.id,
+                domain: certificate.domain,
+                expiration_time: certificate.expiration_time,
+                last_renewed: certificate.last_renewed,
+            }),
+            environment: value.environment.map(|environment| DomainEnvironment {
+                id: environment.id,
+                name: environment.name,
+                slug: environment.slug,
+            }),
+        }
+    }
 }
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
@@ -692,28 +721,260 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_reassign_custom_domain_handler_checks_source_and_target_project_permissions() {
-        let source = include_str!("custom_domains.rs");
-        let start = source
-            .find("pub async fn reassign_custom_domain")
-            .expect("reassign_custom_domain handler must exist");
-        let remainder = &source[start + 1..];
-        let end = remainder.find("pub async fn").unwrap_or(remainder.len());
-        let handler = &source[start..start + 1 + end];
+    use super::*;
+    use sea_orm::{ActiveModelTrait, Set};
+    use std::sync::Mutex;
+    use temps_core::{AuditLogger, AuditOperation};
+    use temps_entities::{environments, projects, upstream_config::UpstreamList};
+    use temps_presets::PresetType;
 
-        let source_guard = handler
-            .find("source_project_id,\n        state.project_access_checker")
-            .expect("handler must authorize write access to the source project");
-        let target_guard = handler
-            .find("request.target_project_id,\n        state.project_access_checker")
-            .expect("handler must authorize write access to the target project");
-        let mutation = handler
-            .find(".reassign_custom_domain(")
-            .expect("handler must call the reassignment service");
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        operations: Mutex<Vec<String>>,
+        fail_requested: bool,
+    }
 
-        assert!(source_guard < mutation);
-        assert!(target_guard < mutation);
+    #[temps_core::async_trait::async_trait]
+    impl AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> Result<(), temps_core::anyhow::Error> {
+            if self.fail_requested && operation.operation_type().ends_with("REQUESTED") {
+                return Err(temps_core::anyhow::anyhow!("audit unavailable"));
+            }
+            self.operations
+                .lock()
+                .expect("audit recorder lock must not be poisoned")
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    async fn test_database() -> Option<temps_database::test_utils::TestDatabase> {
+        match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                println!("Docker not available, skipping");
+                None
+            }
+            Err(error) => panic!("failed to create migrated test database: {error}"),
+        }
+    }
+
+    async fn insert_project_environment(
+        db: &sea_orm::DatabaseConnection,
+        name: &str,
+    ) -> (projects::Model, environments::Model) {
+        let slug = name.to_ascii_lowercase().replace(' ', "-");
+        let project = projects::ActiveModel {
+            name: Set(name.to_string()),
+            slug: Set(slug.clone()),
+            repo_name: Set(format!("{slug}-repo")),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(PresetType::Static),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("test project must be inserted");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set(slug.clone()),
+            host: Set(format!("{slug}.temps.dev")),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("test environment must be inserted");
+        (project, environment)
+    }
+
+    fn requested_audit(
+        domain_id: i32,
+        source_project_id: i32,
+        target_project_id: i32,
+        target_environment_id: i32,
+    ) -> CustomDomainReassignmentRequestedAudit {
+        CustomDomainReassignmentRequestedAudit {
+            context: AuditContext {
+                user_id: 1,
+                ip_address: Some("127.0.0.1".to_string()),
+                user_agent: "custom-domain-reassignment-test".to_string(),
+            },
+            custom_domain_id: domain_id,
+            source_project_id,
+            target_project_id,
+            target_environment_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn reassignment_persists_requested_then_completed_audits() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = crate::services::custom_domains::CustomDomainService::new(test_db.db.clone());
+        let (source_project, source_environment) =
+            insert_project_environment(test_db.db.as_ref(), "Audit Source").await;
+        let (target_project, target_environment) =
+            insert_project_environment(test_db.db.as_ref(), "Audit Target").await;
+        let domain = service
+            .create_custom_domain(
+                source_project.id,
+                source_environment.id,
+                "audit-order.example.com".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("test domain must be created");
+        let audit_logger = RecordingAuditLogger::default();
+
+        let updated = execute_reassignment(
+            &service,
+            &audit_logger,
+            requested_audit(
+                domain.id,
+                source_project.id,
+                target_project.id,
+                target_environment.id,
+            ),
+        )
+        .await
+        .expect("valid reassignment must succeed");
+
+        assert_eq!(updated.project_id, target_project.id);
+        assert_eq!(
+            *audit_logger
+                .operations
+                .lock()
+                .expect("audit recorder lock must not be poisoned"),
+            vec![
+                "CUSTOM_DOMAIN_REASSIGNMENT_REQUESTED".to_string(),
+                "CUSTOM_DOMAIN_REASSIGNED".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn requested_audit_failure_prevents_reassignment() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = crate::services::custom_domains::CustomDomainService::new(test_db.db.clone());
+        let (source_project, source_environment) =
+            insert_project_environment(test_db.db.as_ref(), "Failing Audit Source").await;
+        let (target_project, target_environment) =
+            insert_project_environment(test_db.db.as_ref(), "Failing Audit Target").await;
+        let domain = service
+            .create_custom_domain(
+                source_project.id,
+                source_environment.id,
+                "audit-failure.example.com".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("test domain must be created");
+        let audit_logger = RecordingAuditLogger {
+            fail_requested: true,
+            ..Default::default()
+        };
+
+        let result = execute_reassignment(
+            &service,
+            &audit_logger,
+            requested_audit(
+                domain.id,
+                source_project.id,
+                target_project.id,
+                target_environment.id,
+            ),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(CustomDomainError::AuditIntentFailed { .. })
+        ));
+        let persisted = service
+            .get_custom_domain(domain.id)
+            .await
+            .expect("domain lookup must succeed")
+            .expect("domain must still exist");
+        assert_eq!(persisted.project_id, source_project.id);
+        assert_eq!(persisted.environment_id, source_environment.id);
+        assert!(audit_logger
+            .operations
+            .lock()
+            .expect("audit recorder lock must not be poisoned")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn foreign_target_environment_is_rejected_before_audit() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = crate::services::custom_domains::CustomDomainService::new(test_db.db.clone());
+        let (source_project, source_environment) =
+            insert_project_environment(test_db.db.as_ref(), "Scoped Audit Source").await;
+        let (target_project, _) =
+            insert_project_environment(test_db.db.as_ref(), "Scoped Audit Target").await;
+        let (_, foreign_environment) =
+            insert_project_environment(test_db.db.as_ref(), "Scoped Audit Foreign").await;
+        let domain = service
+            .create_custom_domain(
+                source_project.id,
+                source_environment.id,
+                "scoped-audit.example.com".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("test domain must be created");
+        let audit_logger = RecordingAuditLogger::default();
+
+        let result = execute_reassignment(
+            &service,
+            &audit_logger,
+            requested_audit(
+                domain.id,
+                source_project.id,
+                target_project.id,
+                foreign_environment.id,
+            ),
+        )
+        .await;
+
+        assert!(matches!(result, Err(CustomDomainError::NotFound(_))));
+        assert!(audit_logger
+            .operations
+            .lock()
+            .expect("audit recorder lock must not be poisoned")
+            .is_empty());
+        let persisted = service
+            .get_custom_domain(domain.id)
+            .await
+            .expect("domain lookup must succeed")
+            .expect("domain must still exist");
+        assert_eq!(persisted.project_id, source_project.id);
+        assert_eq!(persisted.environment_id, source_environment.id);
     }
 
     #[test]

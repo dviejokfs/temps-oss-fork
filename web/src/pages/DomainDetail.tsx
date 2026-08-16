@@ -6,7 +6,7 @@ import {
   getDomainOrderOptions,
   getEnvironmentsOptions,
   getHttpChallengeDebugOptions,
-  getProjectsOptions,
+  getProjectsInfiniteOptions,
   getPublicIpOptions,
   getVisibleCustomDomainByHostnameOptions,
   listCustomDomainsForProjectOptions,
@@ -65,6 +65,7 @@ import {
 } from '@/lib/domain-status'
 import {
   useIsFetching,
+  useInfiniteQuery,
   useMutation,
   useQuery,
   useQueryClient,
@@ -134,8 +135,13 @@ export function DomainDetail() {
     retry: false,
   })
 
-  const projectsQuery = useQuery({
-    ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
+  const projectsQuery = useInfiniteQuery({
+    ...getProjectsInfiniteOptions({ query: { per_page: 100 } }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => {
+      const loaded = lastPage.page * lastPage.per_page
+      return loaded < lastPage.total ? lastPage.page + 1 : undefined
+    },
     enabled: isReassignOpen && !!assignmentQuery.data,
   })
 
@@ -147,9 +153,9 @@ export function DomainDetail() {
     enabled: isReassignOpen && selectedTargetProjectId > 0,
   })
 
-  const targetProjects = (projectsQuery.data?.projects ?? []).filter(
-    (project) => project.id !== assignmentQuery.data?.project_id
-  )
+  const targetProjects = (projectsQuery.data?.pages ?? [])
+    .flatMap((page) => page.projects)
+    .filter((project) => project.id !== assignmentQuery.data?.project_id)
   const targetProject = targetProjects.find(
     (project) => project.id === selectedTargetProjectId
   )
@@ -1184,6 +1190,23 @@ export function DomainDetail() {
                     ))}
                   </SelectContent>
                 </Select>
+                {projectsQuery.hasNextPage && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="w-full"
+                    onClick={() => projectsQuery.fetchNextPage()}
+                    disabled={
+                      projectsQuery.isFetchingNextPage ||
+                      reassignDomain.isPending
+                    }
+                  >
+                    {projectsQuery.isFetchingNextPage
+                      ? 'Loading more projects…'
+                      : 'Load more projects'}
+                  </Button>
+                )}
                 {!projectsQuery.isPending &&
                   !projectsQuery.isError &&
                   targetProjects.length === 0 && (
