@@ -5,82 +5,24 @@ import { useDashboardHealth } from '@/hooks/useDashboardHealth'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboarding'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
-import { MetricCard } from '@/components/dashboard/MetricCard'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
-import { MetricCardSkeleton } from '@/components/skeletons/MetricCardSkeleton'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
-  getGeneralStatsOptions,
+  getApiTimeseriesOptions,
   getProjectsOptions,
   listGitProvidersOptions,
-  revenueMetricsGlobalMrrOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { useQuery } from '@tanstack/react-query'
+import { useQueries, useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
-import {
-  ArrowRight,
-  DollarSign,
-  Eye,
-  FolderGit2,
-  Minus,
-  TrendingDown,
-  TrendingUp,
-  UploadCloud,
-  Users,
-} from 'lucide-react'
+import { ArrowRight, UploadCloud } from 'lucide-react'
 import { Link, useNavigate } from 'react-router'
 import { SourceLogo } from '@/components/imports/SourceLogo'
 import {
   TOP_MIGRATION_SOURCES,
   importHref,
 } from '@/components/imports/migration-sources'
-
-function formatTrendChange(trendPercentage: number | null | undefined): {
-  change: string
-  changeDisplay: {
-    icon: React.ReactNode
-    className: string
-    isPositive?: boolean
-  }
-} | null {
-  if (trendPercentage == null) return null
-
-  const rounded = Math.round(trendPercentage)
-
-  if (rounded === 0) {
-    return {
-      change: '0% vs prev. period',
-      changeDisplay: {
-        icon: <Minus className="mr-1 h-3 w-3" />,
-        className: 'text-xs text-muted-foreground flex items-center mt-1',
-      },
-    }
-  }
-
-  if (rounded > 0) {
-    return {
-      change: `+${rounded}% vs prev. period`,
-      changeDisplay: {
-        icon: <TrendingUp className="mr-1 h-3 w-3" />,
-        className:
-          'text-xs text-emerald-600 dark:text-emerald-400 flex items-center mt-1',
-        isPositive: true,
-      },
-    }
-  }
-
-  return {
-    change: `${rounded}% vs prev. period`,
-    changeDisplay: {
-      icon: <TrendingDown className="mr-1 h-3 w-3" />,
-      className:
-        'text-xs text-red-600 dark:text-red-400 flex items-center mt-1',
-      isPositive: false,
-    },
-  }
-}
 
 const ITEMS_PER_PAGE = 9
 
@@ -172,140 +114,21 @@ export function Projects() {
 
   const dashboardHealth = useDashboardHealth(projectIds)
 
-  // Stats for the header metric cards (merged in from the former Dashboard
-  // page). Only fetched when at least one project exists — the onboarding
-  // view replaces the metrics otherwise.
-  const hasProjects = (projectsData?.projects?.length || 0) > 0
-  const generalStatsQuery = useQuery({
-    ...getGeneralStatsOptions({
-      query: { start_date: startDate, end_date: endDate },
-    }),
-    enabled: hasProjects,
+  const apiTrafficQueries = useQueries({
+    queries: projectIds.map((projectId) => ({
+      ...getApiTimeseriesOptions({
+        path: { project_id: projectId },
+        query: {
+          start_date: startDate,
+          end_date: endDate,
+        },
+      }),
+      staleTime: 30_000,
+    })),
   })
-
-  const statsData = generalStatsQuery.data as
-    | (typeof generalStatsQuery.data & {
-        visitors_trend_percentage?: number | null
-        page_views_trend_percentage?: number | null
-      })
-    | undefined
-  const visitorsTrend = formatTrendChange(statsData?.visitors_trend_percentage)
-  const pageViewsTrend = formatTrendChange(
-    statsData?.page_views_trend_percentage
-  )
-
-  const globalMrrQuery = useQuery({
-    ...revenueMetricsGlobalMrrOptions(),
-    enabled: hasProjects,
-  })
-
-  const formattedMrr = useMemo(() => {
-    const minor = globalMrrQuery.data?.current_mrr_minor
-    if (minor == null) return null
-    return new Intl.NumberFormat(undefined, {
-      style: 'currency',
-      currency: (globalMrrQuery.data?.currency ?? 'usd').toUpperCase(),
-      maximumFractionDigits: 0,
-    }).format(minor / 100)
-  }, [globalMrrQuery.data])
-
-  const mrrTrend = formatTrendChange(globalMrrQuery.data?.change_percentage)
-  const mrrIsNewlyActive =
-    mrrTrend == null &&
-    (globalMrrQuery.data?.current_mrr_minor ?? 0) > 0 &&
-    (globalMrrQuery.data?.previous_mrr_minor ?? 0) === 0
-  const mrrChangeLabel = mrrTrend?.change
-    ?? (mrrIsNewlyActive ? '+100% vs yesterday' : 'No change vs yesterday')
-  const mrrChangeDisplay =
-    mrrTrend?.changeDisplay
-    ?? (mrrIsNewlyActive
-      ? {
-          icon: <TrendingUp className="mr-1 h-3 w-3" />,
-          className:
-            'text-xs text-emerald-600 dark:text-emerald-400 flex items-center mt-1',
-          isPositive: true,
-        }
-      : {
-          icon: <Minus className="mr-1 h-3 w-3" />,
-          className: 'text-xs text-muted-foreground flex items-center mt-1',
-        })
 
   return (
     <div className="p-4 sm:p-8 space-y-6">
-      {/* Metric cards (merged from former Dashboard page). Hidden on an empty
-          instance — with no projects every figure is zero, so the cards are
-          vanity data that pushes the recommended actions below the fold. The
-          stats/MRR queries are already gated on `hasProjects`, so nothing is
-          fetched while this is hidden. */}
-      {hasProjects && (
-      <div className="grid gap-3 grid-cols-2 sm:gap-4 md:grid-cols-4 md:gap-6">
-        {generalStatsQuery.isLoading ? (
-          <MetricCardSkeleton />
-        ) : (
-          <MetricCard
-            title="Projects"
-            value={
-              generalStatsQuery.data?.total_projects ??
-              projectsData?.total ??
-              0
-            }
-            change=""
-            icon={<FolderGit2 className="h-5 w-5" />}
-          />
-        )}
-
-        {generalStatsQuery.isLoading ? (
-          <MetricCardSkeleton />
-        ) : (
-          <MetricCard
-            title="Visitors"
-            value={
-              generalStatsQuery.data?.total_unique_visitors?.toLocaleString() ??
-              (generalStatsQuery.error ? 'N/A' : 0)
-            }
-            change={visitorsTrend?.change ?? 'vs prev. period'}
-            changeDisplay={visitorsTrend?.changeDisplay}
-            icon={<Users className="h-5 w-5" />}
-          />
-        )}
-
-        {generalStatsQuery.isLoading ? (
-          <MetricCardSkeleton />
-        ) : (
-          <MetricCard
-            title="Page Views"
-            value={
-              generalStatsQuery.data?.total_page_views?.toLocaleString() ??
-              (generalStatsQuery.error ? 'N/A' : 0)
-            }
-            change={pageViewsTrend?.change ?? 'vs prev. period'}
-            changeDisplay={pageViewsTrend?.changeDisplay}
-            icon={<Eye className="h-5 w-5" />}
-          />
-        )}
-
-        {globalMrrQuery.isLoading ? (
-          <MetricCardSkeleton />
-        ) : (
-          <Link
-            to="/revenue"
-            className="block rounded-xl outline-none ring-offset-background transition-transform hover:-translate-y-0.5 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-          >
-            <MetricCard
-              title="MRR"
-              value={
-                globalMrrQuery.error || formattedMrr == null ? '—' : formattedMrr
-              }
-              change={mrrChangeLabel}
-              changeDisplay={mrrChangeDisplay}
-              icon={<DollarSign className="h-5 w-5" />}
-              error={!!globalMrrQuery.error}
-            />
-          </Link>
-        )}
-      </div>
-      )}
-
       {/* Header */}
       <ProjectsHeader
         actions={
@@ -322,24 +145,23 @@ export function Projects() {
         }
       />
 
-      {/* Projects Grid */}
-      <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-        {isLoading || gitProvidersLoading ? (
-          <>
-            {Array.from({ length: ITEMS_PER_PAGE }).map((_, i) => (
-              <ProjectCardSkeleton key={i} />
-            ))}
-          </>
-        ) : projectsData?.projects.length === 0 ? (
-          // First-run onboarding. The component is context-aware: when a Git
-          // provider is already connected it routes straight into the import
-          // wizard (skipping the connect step), and it always surfaces the
-          // "deploy a project with a database" and CLI paths.
-          <FirstProjectOnboarding
-            gitConnected={!!gitProviders && gitProviders.length > 0}
-          />
-        ) : (
-          <>
+      {isLoading || gitProvidersLoading ? (
+        <div className="overflow-hidden rounded-xl border bg-card divide-y">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <ProjectCardSkeleton key={i} />
+          ))}
+        </div>
+      ) : projectsData?.projects.length === 0 ? (
+        // First-run onboarding. The component is context-aware: when a Git
+        // provider is already connected it routes straight into the import
+        // wizard (skipping the connect step), and it always surfaces the
+        // "deploy a project with a database" and CLI paths.
+        <FirstProjectOnboarding
+          gitConnected={!!gitProviders && gitProviders.length > 0}
+        />
+      ) : (
+        <div className="overflow-hidden rounded-xl border bg-card">
+          <div className="divide-y">
             {projectsData?.projects.map((project, index) => (
               <ProjectCard
                 key={project.id}
@@ -350,14 +172,15 @@ export function Projects() {
                 }
                 analyticsLoading={dashboardAnalytics.isLoading}
                 analyticsError={dashboardAnalytics.isError}
-                health={
-                  dashboardHealth.data?.projects?.[String(project.id)]
-                }
+                apiRequests={apiTrafficQueries[index]?.data?.total_requests}
+                apiTrafficLoading={apiTrafficQueries[index]?.isPending}
+                apiTrafficError={apiTrafficQueries[index]?.isError}
+                health={dashboardHealth.data?.projects?.[String(project.id)]}
               />
             ))}
-          </>
-        )}
-      </div>
+          </div>
+        </div>
+      )}
 
       {/* Pagination - Only show if there are projects */}
       {projectsData && projectsData.projects.length > 0 && (
