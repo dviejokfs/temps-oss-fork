@@ -1154,6 +1154,30 @@ mod tests {
     }
 
     #[test]
+    fn test_build_filter_clause_with_project_and_environment_scope() {
+        let db = sea_orm::DatabaseConnection::Disconnected;
+        let service = UsageService::new(Arc::new(db));
+        let from = Utc::now() - chrono::Duration::hours(1);
+        let to = Utc::now();
+        let filter = UsageFilter {
+            project_id: Some(7),
+            environment_id: Some(11),
+            ..Default::default()
+        };
+
+        let (clause, values) = service.build_filter_clause(from, to, &filter);
+        // $1/$2 are the time range; project_id and environment_id follow in
+        // struct-declaration order (governance's scope filters, wired in via
+        // UsageQueryParams for /ai/usage/summary and /ai/usage/by-provider).
+        assert!(clause.contains("project_id = $3"));
+        assert!(clause.contains("environment_id = $4"));
+        assert_eq!(values.len(), 4);
+
+        assert!(matches!(values[2], sea_orm::Value::Int(Some(7))));
+        assert!(matches!(values[3], sea_orm::Value::Int(Some(11))));
+    }
+
+    #[test]
     fn test_build_filter_clause_with_status_and_cost_bounds() {
         let db = sea_orm::DatabaseConnection::Disconnected;
         let service = UsageService::new(Arc::new(db));

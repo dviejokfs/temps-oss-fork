@@ -316,13 +316,14 @@ impl GovernanceService {
         Ok(())
     }
 
-    /// Remove rate events older than one minute and convert expired cost
-    /// reservations into durable conservative debits instead of releasing them.
+    /// Remove rate events older than the 60-second RPM window (plus a small
+    /// buffer) and convert expired cost reservations into durable
+    /// conservative debits instead of releasing them.
     async fn cleanup_expired_state(&self, txn: &DatabaseTransaction) -> Result<(), AiGatewayError> {
         let month_start = current_month_start()?;
         txn.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "DELETE FROM ai_gateway_rate_events WHERE occurred_at < NOW() - INTERVAL '1 hour'",
+            "DELETE FROM ai_gateway_rate_events WHERE occurred_at < NOW() - INTERVAL '2 minutes'",
             [],
         ))
         .await?;

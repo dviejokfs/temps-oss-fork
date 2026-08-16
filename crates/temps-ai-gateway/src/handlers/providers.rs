@@ -76,7 +76,7 @@ impl From<AiGatewayError> for Problem {
                     .with_detail(error.to_string())
             }
             AiGatewayError::InvalidGovernanceConfig { .. } => {
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid AI Gateway Configuration")
                     .with_detail(error.to_string())
             }

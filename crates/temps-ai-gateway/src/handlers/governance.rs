@@ -8,13 +8,38 @@ use axum::{
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, permissions::Role, AuthContext, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
-use temps_core::problemdetails::{Problem, ProblemDetails};
+use temps_core::error_builder::ErrorBuilder;
+use temps_core::problemdetails::{PermissionDenialKind, Problem, ProblemDetails};
 use temps_core::RequestMetadata;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::handlers::types::AiGatewayAppState;
+
+/// AI gateway governance policies (model allowlists, RPM limits, budgets) are
+/// operator-only, by design: they apply to every request in a scope
+/// regardless of who owns the project, so `AiGatewayWrite` alone is too broad
+/// a gate — `Role::User` holds it for their own projects' day-to-day AI usage,
+/// not for setting platform-wide or another tenant's spend limits. Require
+/// instance-administrator privileges on top of the permission check, the same
+/// bar `project_access_guard!` already uses for instance-scoped bypasses.
+fn require_operator(auth: &AuthContext) -> Result<(), Problem> {
+    if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
+        return Ok(());
+    }
+    Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+        .type_("https://temps.sh/probs/insufficient-permissions")
+        .title("Operator Privileges Required")
+        .detail(
+            "AI gateway governance policies are operator-only: configuring or viewing them \
+             requires an instance administrator, regardless of AI gateway write access on your \
+             own projects.",
+        )
+        .value("user_role", auth.effective_role.to_string())
+        .permission_denial(PermissionDenialKind::InsufficientPermission, None)
+        .build())
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -133,6 +158,7 @@ async fn list_governance_configs(
     // Governance policies expose budget and allowlist details and therefore
     // use the same operator-only permission as mutations.
     permission_guard!(auth, AiGatewayWrite);
+    require_operator(&auth)?;
     let configs = app_state.governance_service.list_configs().await?;
     Ok(Json(
         configs
@@ -164,6 +190,7 @@ async fn upsert_governance_config(
     Json(request): Json<UpsertGovernanceConfigRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayWrite);
+    require_operator(&auth)?;
 
     let allowed_models = request
         .allowed_models
@@ -202,6 +229,7 @@ async fn delete_governance_config(
     Path(scope): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayWrite);
+    require_operator(&auth)?;
     app_state.governance_service.delete_config(&scope).await?;
     audit_change(&app_state, &auth, &metadata, "DELETED", &scope).await;
     Ok(StatusCode::NO_CONTENT)

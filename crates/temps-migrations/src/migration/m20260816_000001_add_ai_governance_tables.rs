@@ -37,6 +37,11 @@ impl MigrationTrait for Migration {
                             .primary_key(),
                     )
                     .col(
+                        ColumnDef::new(AiGatewayRateEvents::RequestId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
                         ColumnDef::new(AiGatewayRateEvents::Scope)
                             .string_len(200)
                             .not_null(),
@@ -252,6 +257,7 @@ impl MigrationTrait for Migration {
 enum AiGatewayRateEvents {
     Table,
     Id,
+    RequestId,
     Scope,
     OccurredAt,
 }
