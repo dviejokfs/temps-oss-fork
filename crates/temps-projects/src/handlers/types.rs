@@ -509,6 +509,12 @@ pub struct CustomDomainRequest {
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
+pub struct ReassignCustomDomainRequest {
+    pub target_project_id: i32,
+    pub target_environment_id: i32,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct DomainEnvironmentResponse {
     pub id: i32,
     pub name: String,
@@ -1051,6 +1057,26 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
                     .with_title("Invalid Redirect URL")
                     .with_detail(msg)
             }
+            CustomDomainError::AssignmentChanged {
+                domain_id,
+                source_project_id,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Domain Assignment Changed")
+                .with_detail(format!(
+                    "Custom domain {domain_id} is no longer assigned to source project {source_project_id}; refresh and try again"
+                )),
+            CustomDomainError::AuditIntentFailed {
+                domain_id,
+                source_project_id,
+                target_project_id,
+                ..
+            } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Domain Reassignment Audit Failed")
+                    .with_detail(format!(
+                        "Custom domain {domain_id} could not be reassigned from project {source_project_id} to project {target_project_id} because the required audit record could not be persisted; no ownership change was made"
+                    ))
+            }
             CustomDomainError::Internal(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -1136,4 +1162,33 @@ pub struct ReinstallWebhookResponse {
     pub hook_id: i32,
     /// Human-readable status message.
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::custom_domains::CustomDomainError;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn test_custom_domain_error_assignment_changed_maps_to_conflict_with_context() {
+        let problem: Problem = CustomDomainError::AssignmentChanged {
+            domain_id: 41,
+            source_project_id: 7,
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("title"),
+            Some(&serde_json::json!("Domain Assignment Changed"))
+        );
+        assert_eq!(
+            problem.body.get("detail"),
+            Some(&serde_json::json!(
+                "Custom domain 41 is no longer assigned to source project 7; refresh and try again"
+            ))
+        );
+        assert_eq!(problem.into_response().status(), StatusCode::CONFLICT);
+    }
 }

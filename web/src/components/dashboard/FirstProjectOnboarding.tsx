@@ -310,7 +310,7 @@ function EmptyStateDropCard() {
   const continueToDrop = (files: ReturnType<typeof filesFromInput>) => {
     if (files.length === 0) return
     handOffDropFiles(files)
-    navigate('/drop')
+    navigate('/projects/new?source=drop')
   }
 
   return (
@@ -338,7 +338,7 @@ function EmptyStateDropCard() {
           if (files.length === 0)
             throw new Error('Choose a project folder or ZIP')
           handOffDropFiles(files)
-          navigate('/drop')
+          navigate('/projects/new?source=drop')
         } catch (caught) {
           setError(
             caught instanceof Error
@@ -391,7 +391,7 @@ function EmptyStateDropCard() {
 
       {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
       <Button asChild variant="ghost" size="sm" className="mt-2">
-        <Link to="/drop">Open Drop without files</Link>
+        <Link to="/projects/new?source=drop">Open Drop without files</Link>
       </Button>
 
       <input

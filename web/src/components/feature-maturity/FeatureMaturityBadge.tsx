@@ -11,9 +11,11 @@ import {
 export function FeatureMaturityBadge({
   featureKey,
   compact = false,
+  className,
 }: {
   featureKey?: string
   compact?: boolean
+  className?: string
 }) {
   const { feature } = useFeatureMaturity(featureKey)
 
@@ -32,7 +34,8 @@ export function FeatureMaturityBadge({
             compact ? 'px-1.5 py-0.5 text-[9px]' : 'px-2 py-1 text-[10px]',
             experimental
               ? 'border-amber-500/35 bg-amber-500/8 text-amber-700 dark:text-amber-300'
-              : 'border-blue-500/30 bg-blue-500/8 text-blue-700 dark:text-blue-300'
+              : 'border-blue-500/30 bg-blue-500/8 text-blue-700 dark:text-blue-300',
+            className
           )}
           aria-label={`${label} feature: ${feature.reason}`}
         >

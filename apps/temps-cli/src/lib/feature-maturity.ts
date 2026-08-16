@@ -1,15 +1,10 @@
 import type { Command } from 'commander'
-import { config, credentials } from '../config/store.js'
-import { normalizeApiUrl } from './api-client.js'
+import { credentials } from '../config/store.js'
+import { getFeatureMaturity } from '../api/sdk.gen.js'
+import type { FeatureMaturity } from '../api/types.gen.js'
+import { setupClient } from './api-client.js'
 
-type Maturity = 'stable' | 'beta' | 'experimental'
-
-export interface FeatureMaturity {
-  key: string
-  maturity: Maturity
-  reason: string
-  docs_path: string
-}
+export type { FeatureMaturity } from '../api/types.gen.js'
 
 const COMMAND_FEATURE_KEYS: Readonly<Record<string, string>> = {
   analytics: 'web-analytics',
@@ -68,18 +63,12 @@ async function loadFeatureMaturity(): Promise<FeatureMaturity[] | undefined> {
   if (!apiKey) return undefined
 
   try {
-    const response = await fetch(
-      `${normalizeApiUrl(config.get('apiUrl'))}/v1/platform/feature-maturity`,
-      {
-        headers: {
-          Accept: 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        signal: AbortSignal.timeout(1_500),
-      }
-    )
-    if (!response.ok) return undefined
-    return (await response.json()) as FeatureMaturity[]
+    await setupClient()
+    const { data, error } = await getFeatureMaturity({
+      signal: AbortSignal.timeout(1_500),
+    })
+    if (error || !data) return undefined
+    return data
   } catch {
     // Older servers do not expose maturity metadata. Never make the target
     // command fail merely because its informational notice is unavailable.

@@ -211,7 +211,7 @@ const mainNavItems: NavigationItem[] = [
   },
   {
     title: 'Drop Project Files',
-    url: '/drop',
+    url: '/projects/new?source=drop',
     icon: Upload,
     keywords: ['drop', 'upload', 'zip', 'folder', 'deploy', 'no git'],
   },

@@ -1,9 +1,14 @@
 use super::types::{
     AppState, CustomDomainRequest, CustomDomainResponse, CustomDomainWithInfo, DomainEnvironment,
-    DomainInfo, ListCustomDomainsResponse, UpdateCustomDomainRequest,
+    DomainInfo, ListCustomDomainsResponse, ReassignCustomDomainRequest, UpdateCustomDomainRequest,
 };
+use super::{
+    audit::AuditContext, audit::CustomDomainReassignedAudit,
+    audit::CustomDomainReassignmentRequestedAudit,
+};
+use crate::services::custom_domains::CustomDomainError;
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -11,9 +16,13 @@ use axum::{
 };
 use sea_orm::EntityTrait;
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, project_permission_guard, RequireAuth};
+use temps_auth::{
+    deny_deployment_token, permission_guard, project_access_guard, project_permission_guard,
+    RequireAuth,
+};
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
+use temps_core::RequestMetadata;
 use temps_entities::{domains, environments, project_custom_domains};
 use tracing::{error, info};
 use utoipa::OpenApi;
@@ -25,6 +34,8 @@ use utoipa::OpenApi;
         get_custom_domain,
         list_custom_domains_for_project,
         update_custom_domain,
+        get_custom_domain_by_hostname,
+        reassign_custom_domain,
         delete_custom_domain,
         link_custom_domain_to_certificate,
     ),
@@ -33,6 +44,7 @@ use utoipa::OpenApi;
             CustomDomainRequest,
             CustomDomainResponse,
             UpdateCustomDomainRequest,
+            ReassignCustomDomainRequest,
             ListCustomDomainsResponse,
         )
     ),
@@ -209,6 +221,160 @@ pub async fn list_custom_domains_for_project(
             domains: domain_responses,
             total,
         }),
+    ))
+}
+
+/// Find the project assignment for a certificate hostname.
+#[utoipa::path(
+    get,
+    path = "/custom-domains/by-host/{hostname}",
+    operation_id = "get_visible_custom_domain_by_hostname",
+    responses(
+        (status = 200, description = "Custom domain assignment retrieved", body = CustomDomainResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Project access denied"),
+        (status = 404, description = "Domain is not assigned to a project")
+    ),
+    params(("hostname" = String, Path, description = "Domain hostname")),
+    tag = "Custom Domains",
+    security(("bearer_auth" = []))
+)]
+pub async fn get_custom_domain_by_hostname(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(hostname): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    let hidden_project_ids = super::handlers::resolve_hidden_projects(&state, &auth).await?;
+
+    let custom_domain = state
+        .custom_domain_service
+        .get_visible_custom_domain_by_hostname(&hostname, &hidden_project_ids)
+        .await?
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Domain is not assigned")
+                .with_detail(format!(
+                    "Domain {hostname} is not currently assigned to a project environment"
+                ))
+        })?;
+
+    let domain_with_info = get_domain_with_info(&state, custom_domain).await?;
+    Ok((
+        StatusCode::OK,
+        Json(CustomDomainResponse::from(domain_with_info)),
+    ))
+}
+
+/// Move a domain between projects without deleting its route or certificate.
+#[utoipa::path(
+    put,
+    path = "/{source_project_id}/custom-domains/{domain_id}/assignment",
+    operation_id = "reassign_project_custom_domain",
+    request_body = ReassignCustomDomainRequest,
+    responses(
+        (status = 200, description = "Domain assignment updated atomically", body = CustomDomainResponse),
+        (status = 400, description = "Target environment does not belong to the target project"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Write access required for both projects"),
+        (status = 404, description = "Custom domain not found"),
+        (status = 409, description = "Domain assignment changed; refresh and retry")
+    ),
+    params(
+        ("source_project_id" = i32, Path, description = "Current project ID"),
+        ("domain_id" = i32, Path, description = "Custom domain ID")
+    ),
+    tag = "Custom Domains",
+    security(("bearer_auth" = []))
+)]
+pub async fn reassign_custom_domain(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((source_project_id, domain_id)): Path<(i32, i32)>,
+    Json(request): Json<ReassignCustomDomainRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        source_project_id,
+        state.project_access_checker
+    );
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        request.target_project_id,
+        state.project_access_checker
+    );
+
+    // Persist a forensic intent before changing ownership. Audit backends may
+    // fail independently from the project database, so mutation must not begin
+    // until this record is durable. The operation deliberately says
+    // REQUESTED: it remains accurate if row locking or validation later fails.
+    let audit = CustomDomainReassignmentRequestedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent,
+        },
+        custom_domain_id: domain_id,
+        source_project_id,
+        target_project_id: request.target_project_id,
+        target_environment_id: request.target_environment_id,
+    };
+    state
+        .audit_service
+        .create_audit_log(&audit)
+        .await
+        .map_err(|audit_error| {
+            error!(
+                domain_id,
+                source_project_id,
+                target_project_id = request.target_project_id,
+                error = %audit_error,
+                "Failed to persist required custom-domain reassignment audit intent"
+            );
+            CustomDomainError::AuditIntentFailed {
+                domain_id,
+                source_project_id,
+                target_project_id: request.target_project_id,
+                reason: audit_error.to_string(),
+            }
+        })?;
+
+    let updated_domain = state
+        .custom_domain_service
+        .reassign_custom_domain(
+            domain_id,
+            source_project_id,
+            request.target_project_id,
+            request.target_environment_id,
+        )
+        .await?;
+
+    let completed_audit = CustomDomainReassignedAudit {
+        context: audit.context,
+        custom_domain_id: updated_domain.id,
+        domain: updated_domain.domain.clone(),
+        source_project_id,
+        target_project_id: request.target_project_id,
+        target_environment_id: request.target_environment_id,
+    };
+    if let Err(audit_error) = state.audit_service.create_audit_log(&completed_audit).await {
+        error!(
+            domain_id,
+            source_project_id,
+            target_project_id = request.target_project_id,
+            error = %audit_error,
+            "Failed to persist custom-domain reassignment completion audit"
+        );
+    }
+
+    let domain_with_info = get_domain_with_info(&state, updated_domain).await?;
+    Ok((
+        StatusCode::OK,
+        Json(CustomDomainResponse::from(domain_with_info)),
     ))
 }
 
@@ -501,8 +667,16 @@ async fn get_domain_with_info(
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route(
+            "/projects/custom-domains/by-host/{hostname}",
+            get(get_custom_domain_by_hostname),
+        )
+        .route(
             "/projects/{project_id}/custom-domains",
             post(create_custom_domain).get(list_custom_domains_for_project),
+        )
+        .route(
+            "/projects/{source_project_id}/custom-domains/{domain_id}/assignment",
+            axum::routing::put(reassign_custom_domain),
         )
         .route(
             "/projects/{project_id}/custom-domains/{domain_id}",
@@ -514,4 +688,55 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/projects/{project_id}/custom-domains/{domain_id}/link-certificate/{certificate_id}",
             post(link_custom_domain_to_certificate),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_reassign_custom_domain_handler_checks_source_and_target_project_permissions() {
+        let source = include_str!("custom_domains.rs");
+        let start = source
+            .find("pub async fn reassign_custom_domain")
+            .expect("reassign_custom_domain handler must exist");
+        let remainder = &source[start + 1..];
+        let end = remainder.find("pub async fn").unwrap_or(remainder.len());
+        let handler = &source[start..start + 1 + end];
+
+        let source_guard = handler
+            .find("source_project_id,\n        state.project_access_checker")
+            .expect("handler must authorize write access to the source project");
+        let target_guard = handler
+            .find("request.target_project_id,\n        state.project_access_checker")
+            .expect("handler must authorize write access to the target project");
+        let mutation = handler
+            .find(".reassign_custom_domain(")
+            .expect("handler must call the reassignment service");
+
+        assert!(source_guard < mutation);
+        assert!(target_guard < mutation);
+    }
+
+    #[test]
+    fn test_get_custom_domain_by_hostname_handler_filters_inaccessible_projects_before_lookup() {
+        let source = include_str!("custom_domains.rs");
+        let start = source
+            .find("pub async fn get_custom_domain_by_hostname")
+            .expect("hostname handler must exist");
+        let remainder = &source[start + 1..];
+        let end = remainder.find("pub async fn").unwrap_or(remainder.len());
+        let handler = &source[start..start + 1 + end];
+
+        let deny_token = handler
+            .find("deny_deployment_token!(auth)")
+            .expect("hostname lookup must reject a deployment token without a visible-project set");
+        let hidden_projects = handler
+            .find("resolve_hidden_projects(&state, &auth)")
+            .expect("hostname lookup must resolve projects hidden from the caller");
+        let scoped_lookup = handler
+            .find(".get_visible_custom_domain_by_hostname(&hostname, &hidden_project_ids)")
+            .expect("hostname lookup must exclude hidden projects in its database query");
+
+        assert!(deny_token < scoped_lookup);
+        assert!(hidden_projects < scoped_lookup);
+    }
 }

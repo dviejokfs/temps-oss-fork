@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
@@ -9,15 +9,15 @@ import { ProjectCard } from '@/components/dashboard/ProjectCard'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
+import { Input } from '@/components/ui/input'
 import {
-  getApiTimeseriesOptions,
   getProjectsOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { useQueries, useQuery } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
-import { ArrowRight, UploadCloud } from 'lucide-react'
-import { Link, useNavigate } from 'react-router'
+import { ArrowRight, Search, X } from 'lucide-react'
+import { Link } from 'react-router'
 import { SourceLogo } from '@/components/imports/SourceLogo'
 import {
   TOP_MIGRATION_SOURCES,
@@ -25,17 +25,24 @@ import {
 } from '@/components/imports/migration-sources'
 
 const ITEMS_PER_PAGE = 9
+const SEARCH_CATALOG_LIMIT = 50
+const SEARCH_RESULTS_LIMIT = 18
 
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const navigate = useNavigate()
   const [page, setPage] = useState(1)
+  const [projectSearch, setProjectSearch] = useState('')
+  const normalizedProjectSearch = projectSearch.trim().toLowerCase()
 
   const { data: rawProjectsData, isLoading } = useQuery({
     ...getProjectsOptions({
       query: {
-        page,
-        per_page: ITEMS_PER_PAGE,
+        page: normalizedProjectSearch ? 1 : page,
+        // The list endpoint has no text filter, so search a deliberately
+        // bounded catalogue and cap rendered cards below.
+        per_page: normalizedProjectSearch
+          ? SEARCH_CATALOG_LIMIT
+          : ITEMS_PER_PAGE,
       },
     }),
   })
@@ -51,45 +58,21 @@ export function Projects() {
     ? ({ ...rawProjectsData, projects: [], total: 0 } as typeof rawProjectsData)
     : rawProjectsData
   const gitProviders = SIMULATE_EMPTY_INSTALL ? [] : rawGitProviders
+  const visibleProjects = useMemo(() => {
+    const projects = projectsData?.projects ?? []
+    if (!normalizedProjectSearch) return projects
+    return projects
+      .filter(
+        (project) =>
+          project.name.toLowerCase().includes(normalizedProjectSearch) ||
+          project.slug.toLowerCase().includes(normalizedProjectSearch)
+      )
+      .slice(0, SEARCH_RESULTS_LIMIT)
+  }, [normalizedProjectSearch, projectsData?.projects])
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Projects' }])
   }, [setBreadcrumbs])
-
-  // Keyboard shortcut: N to create new project
-
-  // Keyboard shortcuts: Ctrl+1 through Ctrl+9 to navigate to projects
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Check if user is typing in an input field
-      const target = e.target as HTMLElement
-      const isTyping =
-        target.tagName === 'INPUT' ||
-        target.tagName === 'TEXTAREA' ||
-        target.isContentEditable
-
-      // Only trigger if Ctrl (or Cmd on Mac) is pressed with a number key
-      if (
-        !isTyping &&
-        (e.ctrlKey || e.metaKey) &&
-        !e.altKey &&
-        !e.shiftKey &&
-        e.key >= '1' &&
-        e.key <= '9'
-      ) {
-        const index = parseInt(e.key, 10) - 1
-        const projects = projectsData?.projects || []
-
-        if (projects[index]) {
-          e.preventDefault()
-          navigate(`/projects/${projects[index].slug}`)
-        }
-      }
-    }
-
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [projectsData?.projects, navigate])
 
   usePageTitle('Projects')
 
@@ -102,8 +85,8 @@ export function Projects() {
   }, [])
 
   const projectIds = useMemo(
-    () => projectsData?.projects?.map((p: { id: number }) => p.id) ?? [],
-    [projectsData?.projects]
+    () => visibleProjects.map((project) => project.id),
+    [visibleProjects]
   )
 
   const dashboardAnalytics = useDashboardAnalytics(
@@ -112,20 +95,22 @@ export function Projects() {
     endDate
   )
 
-  const dashboardHealth = useDashboardHealth(projectIds)
+  const dashboardHealth = useDashboardHealth(projectIds, startDate, endDate)
 
-  const apiTrafficQueries = useQueries({
-    queries: projectIds.map((projectId) => ({
-      ...getApiTimeseriesOptions({
-        path: { project_id: projectId },
-        query: {
-          start_date: startDate,
-          end_date: endDate,
-        },
-      }),
-      staleTime: 30_000,
-    })),
-  })
+  const renderProjectCards = () =>
+    visibleProjects.map((project) => (
+      <ProjectCard
+        key={project.id}
+        project={project}
+        layout="compact"
+        analytics={dashboardAnalytics.data?.projects?.[String(project.id)]}
+        analyticsLoading={dashboardAnalytics.isLoading}
+        analyticsError={dashboardAnalytics.isError}
+        healthLoading={dashboardHealth.isLoading}
+        healthError={dashboardHealth.isError}
+        health={dashboardHealth.data?.projects?.[String(project.id)]}
+      />
+    ))
 
   return (
     <div className="p-4 sm:p-8 space-y-6">
@@ -133,13 +118,13 @@ export function Projects() {
       <ProjectsHeader
         actions={
           <>
+            {(projectsData?.projects.length ?? 0) > 0 && (
+              <ProjectSearch
+                value={projectSearch}
+                onChange={setProjectSearch}
+              />
+            )}
             <PlatformStrip />
-            <Button asChild variant="outline">
-              <Link to="/drop">
-                <UploadCloud className="mr-2 size-4" />
-                Drop files
-              </Link>
-            </Button>
             <CreateActionButton to="/projects/new" label="New Project" />
           </>
         }
@@ -159,53 +144,115 @@ export function Projects() {
         <FirstProjectOnboarding
           gitConnected={!!gitProviders && gitProviders.length > 0}
         />
+      ) : visibleProjects.length === 0 ? (
+        <div className="rounded-xl border border-dashed px-6 py-12 text-center">
+          <p className="font-medium">No matching projects</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            No project name or slug contains “{projectSearch.trim()}”.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-4"
+            onClick={() => setProjectSearch('')}
+          >
+            Clear filter
+          </Button>
+        </div>
       ) : (
-        <div className="overflow-hidden rounded-xl border bg-card">
-          <div className="divide-y">
-            {projectsData?.projects.map((project, index) => (
-              <ProjectCard
-                key={project.id}
-                project={project}
-                shortcutNumber={index < 9 ? index + 1 : undefined}
-                analytics={
-                  dashboardAnalytics.data?.projects?.[String(project.id)]
-                }
-                analyticsLoading={dashboardAnalytics.isLoading}
-                analyticsError={dashboardAnalytics.isError}
-                apiRequests={apiTrafficQueries[index]?.data?.total_requests}
-                apiTrafficLoading={apiTrafficQueries[index]?.isPending}
-                apiTrafficError={apiTrafficQueries[index]?.isError}
-                health={dashboardHealth.data?.projects?.[String(project.id)]}
-              />
-            ))}
-          </div>
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {renderProjectCards()}
         </div>
       )}
 
       {/* Pagination - Only show if there are projects */}
-      {projectsData && projectsData.projects.length > 0 && (
-        <div className="flex items-center justify-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setPage((p) => Math.max(1, p - 1))}
-            disabled={page === 1}
-          >
-            Previous
-          </Button>
-          <span className="text-sm text-muted-foreground">
-            Page {page} of {Math.ceil(projectsData.total / ITEMS_PER_PAGE)}
-          </span>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setPage((p) => p + 1)}
-            disabled={page >= Math.ceil(projectsData.total / ITEMS_PER_PAGE)}
-          >
-            Next
-          </Button>
-        </div>
-      )}
+      {projectsData &&
+        projectsData.projects.length > 0 &&
+        !normalizedProjectSearch && (
+          <div className="flex items-center justify-center gap-2 pt-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page === 1}
+            >
+              Previous
+            </Button>
+            <span className="text-sm text-muted-foreground">
+              Page {page} of {Math.ceil(projectsData.total / ITEMS_PER_PAGE)}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setPage((p) => p + 1)}
+              disabled={page >= Math.ceil(projectsData.total / ITEMS_PER_PAGE)}
+            >
+              Next
+            </Button>
+          </div>
+        )}
+    </div>
+  )
+}
+
+function ProjectSearch({
+  value,
+  onChange,
+}: {
+  value: string
+  onChange: (value: string) => void
+}) {
+  const [isExpanded, setIsExpanded] = useState(Boolean(value))
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (isExpanded) inputRef.current?.focus()
+  }, [isExpanded])
+
+  if (!isExpanded) {
+    return (
+      <Button
+        type="button"
+        variant="outline"
+        size="icon"
+        onClick={() => setIsExpanded(true)}
+        aria-label="Filter projects"
+        aria-expanded={false}
+        title="Filter projects"
+      >
+        <Search />
+      </Button>
+    )
+  }
+
+  return (
+    <div className="relative w-full sm:w-64 xl:w-72">
+      <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+      <Input
+        ref={inputRef}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') {
+            onChange('')
+            setIsExpanded(false)
+          }
+        }}
+        placeholder="Filter projects…"
+        aria-label="Filter projects by name or slug"
+        className="pl-9 pr-9"
+      />
+      <button
+        type="button"
+        onClick={() => {
+          onChange('')
+          setIsExpanded(false)
+        }}
+        className="absolute right-2 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+        aria-label="Close project filter"
+      >
+        <X className="size-4" />
+      </button>
     </div>
   )
 }
@@ -223,7 +270,9 @@ function ProjectsHeader({ actions }: { actions: React.ReactNode }) {
           Manage your projects and their settings
         </p>
       </div>
-      <div className="flex flex-wrap gap-2">{actions}</div>
+      <div className="flex flex-1 flex-wrap justify-start gap-2 sm:justify-end">
+        {actions}
+      </div>
     </div>
   )
 }

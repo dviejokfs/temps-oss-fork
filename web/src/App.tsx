@@ -63,9 +63,6 @@ const PlatformTools = lazy(() =>
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
 )
-const Drop = lazy(() =>
-  import('./pages/Drop').then((m) => ({ default: m.Drop }))
-)
 const Revenue = lazy(() =>
   import('./pages/Revenue').then((m) => ({ default: m.Revenue }))
 )
@@ -546,7 +543,12 @@ const FullAppRoutes = () => {
                     <Route path="/setup/ai" element={<AiOnboarding />} />
                     <Route path="/tools" element={<PlatformTools />} />
                     <Route path="/projects" element={<Projects />} />
-                    <Route path="/drop" element={<Drop />} />
+                    <Route
+                      path="/drop"
+                      element={
+                        <Navigate to="/projects/new?source=drop" replace />
+                      }
+                    />
                     <Route path="/revenue" element={<Revenue />} />
                     <Route path="/sandboxes" element={<Sandboxes />} />
                     <Route
@@ -555,6 +557,10 @@ const FullAppRoutes = () => {
                     />
                     <Route path="/monitoring" element={<Monitoring />}>
                       <Route index element={<Navigate to="alerts" replace />} />
+                      <Route
+                        path="resources"
+                        element={<Navigate to="/proxy" replace />}
+                      />
                       <Route
                         path="providers/add"
                         element={

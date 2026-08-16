@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   deploymentLabel,
+  projectBuildSource,
   projectPresetLabel,
   projectRepository,
 } from './project-card-data'
@@ -62,5 +63,53 @@ describe('projectRepository', () => {
         repo_name: null,
       })
     ).toBeNull()
+  })
+})
+
+describe('projectBuildSource', () => {
+  test('identifies GitHub and GitLab repository builds', () => {
+    expect(
+      projectBuildSource({
+        source_type: 'git',
+        git_url: 'https://github.com/gotempsh/temps.git',
+        repo_owner: 'gotempsh',
+        repo_name: 'temps',
+      })
+    ).toEqual({ kind: 'github', label: 'GitHub' })
+
+    expect(
+      projectBuildSource({
+        source_type: 'git',
+        git_url: 'https://gitlab.com/team/api.git',
+        repo_owner: 'team',
+        repo_name: 'api',
+      })
+    ).toEqual({ kind: 'gitlab', label: 'GitLab' })
+  })
+
+  test('distinguishes images from uploaded source', () => {
+    expect(
+      projectBuildSource({
+        source_type: 'docker_image',
+        git_url: null,
+        repo_owner: null,
+        repo_name: null,
+      })
+    ).toEqual({ kind: 'docker', label: 'Docker image' })
+
+    for (const source_type of [
+      'static_files',
+      'uploaded_source',
+      'manual',
+    ] as const) {
+      expect(
+        projectBuildSource({
+          source_type,
+          git_url: null,
+          repo_owner: null,
+          repo_name: null,
+        })
+      ).toEqual({ kind: 'source', label: 'Source upload' })
+    }
   })
 })

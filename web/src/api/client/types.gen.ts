@@ -13988,6 +13988,11 @@ export type ReadRowsQuery = {
     sort_order?: string | null;
 };
 
+export type ReassignCustomDomainRequest = {
+    target_environment_id: number;
+    target_project_id: number;
+};
+
 /**
  * Query parameters for recent activity endpoint
  */
@@ -38315,6 +38320,42 @@ export type GetProjectBySlugResponses = {
 
 export type GetProjectBySlugResponse = GetProjectBySlugResponses[keyof GetProjectBySlugResponses];
 
+export type GetVisibleCustomDomainByHostnameData = {
+    body?: never;
+    path: {
+        /**
+         * Domain hostname
+         */
+        hostname: string;
+    };
+    query?: never;
+    url: '/projects/custom-domains/by-host/{hostname}';
+};
+
+export type GetVisibleCustomDomainByHostnameErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Project access denied
+     */
+    403: unknown;
+    /**
+     * Domain is not assigned to a project
+     */
+    404: unknown;
+};
+
+export type GetVisibleCustomDomainByHostnameResponses = {
+    /**
+     * Custom domain assignment retrieved
+     */
+    200: CustomDomainResponse;
+};
+
+export type GetVisibleCustomDomainByHostnameResponse = GetVisibleCustomDomainByHostnameResponses[keyof GetVisibleCustomDomainByHostnameResponses];
+
 export type CreateProjectFromTemplateData = {
     body: CreateProjectFromTemplateRequest;
     path?: never;
@@ -48013,6 +48054,54 @@ export type WorkflowDryRunResponses = {
 };
 
 export type WorkflowDryRunResponse = WorkflowDryRunResponses[keyof WorkflowDryRunResponses];
+
+export type ReassignProjectCustomDomainData = {
+    body: ReassignCustomDomainRequest;
+    path: {
+        /**
+         * Current project ID
+         */
+        source_project_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/projects/{source_project_id}/custom-domains/{domain_id}/assignment';
+};
+
+export type ReassignProjectCustomDomainErrors = {
+    /**
+     * Target environment does not belong to the target project
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Write access required for both projects
+     */
+    403: unknown;
+    /**
+     * Custom domain not found
+     */
+    404: unknown;
+    /**
+     * Domain assignment changed; refresh and retry
+     */
+    409: unknown;
+};
+
+export type ReassignProjectCustomDomainResponses = {
+    /**
+     * Domain assignment updated atomically
+     */
+    200: CustomDomainResponse;
+};
+
+export type ReassignProjectCustomDomainResponse = ReassignProjectCustomDomainResponses[keyof ReassignProjectCustomDomainResponses];
 
 export type GetProxyLogsData = {
     body?: never;

@@ -256,7 +256,7 @@ pub fn feature_key_for_api_path(path: &str) -> Option<&'static str> {
     if path.contains("/error-") || path.contains("error-groups") {
         return Some("error-tracking");
     }
-    if path.starts_with("/otel") || path.contains("/metrics") {
+    if path.starts_with("/otel/") {
         return Some("otel-traces-metrics");
     }
     if path.starts_with("/performance") {
@@ -274,7 +274,15 @@ pub fn feature_key_for_api_path(path: &str) -> Option<&'static str> {
     if path.starts_with("/notification-") || path.contains("/webhooks") {
         return Some("notifications-webhooks");
     }
-    if path.starts_with("/email-tracking") {
+    if path == "/emails/events"
+        || path == "/emails/events/stats"
+        || path.starts_with("/emails/{email_id}/events")
+        || path.starts_with("/emails/{email_id}/track/")
+        || path.starts_with("/emails/{id}/tracking")
+        || path.starts_with("/email-providers/{id}/tracking/")
+        || path.starts_with("/t/pixel/")
+        || path.starts_with("/t/click/")
+    {
         return Some("email-tracking");
     }
     if path.starts_with("/teams") || path.contains("/access/{team_id}") {
@@ -285,6 +293,11 @@ pub fn feature_key_for_api_path(path: &str) -> Option<&'static str> {
     }
     if path.starts_with("/imports") || path.starts_with("/external-services/import") {
         return Some("competitor-importers");
+    }
+    // Node runtime metrics are part of stable monitoring; only node-control
+    // and worker-join surfaces inherit the multi-node maturity warning.
+    if path == "/nodes/{id}/metrics" {
+        return None;
     }
     if path.starts_with("/nodes") {
         return Some("multi-node-worker-join");
@@ -385,5 +398,47 @@ mod tests {
             Some("error-tracking")
         );
         assert_eq!(feature_key_for_api_path("/projects"), None);
+    }
+
+    #[test]
+    fn test_feature_key_for_api_path_stable_runtime_metrics_remain_stable() {
+        for path in [
+            "/deployments/{id}/metrics",
+            "/deployments/{id}/metrics/latest",
+            "/nodes/{id}/metrics",
+            "/external-services/{id}/metrics",
+            "/external-services/{id}/metrics/latest",
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics",
+        ] {
+            assert_eq!(
+                feature_key_for_api_path(path),
+                None,
+                "stable runtime metrics path must not receive an x-maturity warning: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_feature_key_for_api_path_email_tracking_receives_beta_maturity() {
+        for path in [
+            "/emails/events",
+            "/emails/events/stats",
+            "/emails/{email_id}/events",
+            "/emails/{email_id}/track/open",
+            "/emails/{id}/tracking",
+            "/email-providers/{id}/tracking/status",
+            "/t/pixel/{token}",
+            "/t/click/{token}",
+        ] {
+            let feature_key = feature_key_for_api_path(path);
+            assert_eq!(feature_key, Some("email-tracking"), "path: {path}");
+            assert_eq!(
+                feature_key
+                    .and_then(feature_maturity)
+                    .map(|entry| entry.maturity),
+                Some(Maturity::Beta),
+                "email tracking path must carry the beta compatibility warning: {path}"
+            );
+        }
     }
 }

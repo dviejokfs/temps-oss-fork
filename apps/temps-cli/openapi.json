@@ -30643,6 +30643,23 @@
         },
         "type": "object"
       },
+      "ReassignCustomDomainRequest": {
+        "properties": {
+          "target_environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_project_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "target_project_id",
+          "target_environment_id"
+        ],
+        "type": "object"
+      },
       "RecentActivityQuery": {
         "description": "Query parameters for recent activity endpoint",
         "properties": {
@@ -55821,8 +55838,7 @@
         "summary": "Fetch a time-series range for a single metric on a deployment.",
         "tags": [
           "Metrics"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/deployments/{id}/metrics/enable": {
@@ -55876,8 +55892,7 @@
         "summary": "Enable or disable OTLP metric ingestion for a deployment.",
         "tags": [
           "Metrics"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/deployments/{id}/metrics/latest": {
@@ -55931,8 +55946,7 @@
         "summary": "Fetch the most-recent metric values for a deployment.",
         "tags": [
           "Metrics"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/dns-providers": {
@@ -58426,7 +58440,8 @@
         "summary": "One-click AWS-side setup of SES event tracking (SNS topic + webhook\nsubscription + SESv2 event destination), using the provider's stored\ncredentials.",
         "tags": [
           "Email Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/email-providers/{id}/tracking/status": {
@@ -58473,7 +58488,8 @@
         "summary": "Live status of SES event tracking for a provider",
         "tags": [
           "Email Providers"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails": {
@@ -58690,7 +58706,8 @@
         "summary": "GET /emails/events",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/events/stats": {
@@ -58719,7 +58736,8 @@
         "summary": "GET /emails/events/stats",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/stats": {
@@ -58853,7 +58871,8 @@
         "summary": "Track email link click - redirects to original URL",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/{email_id}/track/open": {
@@ -58882,7 +58901,8 @@
         "summary": "Track email open - returns a 1x1 transparent GIF",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/{id}": {
@@ -58977,7 +58997,8 @@
         "summary": "Get email tracking summary",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/{id}/tracking/events": {
@@ -59035,7 +59056,8 @@
         "summary": "Get email tracking events",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/emails/{id}/tracking/links": {
@@ -59084,7 +59106,8 @@
         "summary": "Get tracked links for an email",
         "tags": [
           "Email Tracking"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/external-services": {
@@ -60268,8 +60291,7 @@
         "summary": "Fetch a time-series range for a single metric on an external service.",
         "tags": [
           "Metrics"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/external-services/{id}/metrics/alert-rules": {
@@ -60551,8 +60573,7 @@
         "summary": "Return the latest per-database metric values for a Postgres service.",
         "tags": [
           "Metrics"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/external-services/{id}/metrics/enable": {
@@ -60609,8 +60630,7 @@
         "summary": "Enable or disable metric collection for an external service.",
         "tags": [
           "Metrics"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/external-services/{id}/metrics/latest": {
@@ -60664,8 +60684,7 @@
         "summary": "Fetch the most-recent value for every tracked metric on an external service.",
         "tags": [
           "Metrics"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/external-services/{id}/metrics/status": {
@@ -60707,8 +60726,7 @@
         "summary": "Return the freshness status (last-received timestamp) for a service.",
         "tags": [
           "Metrics"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/external-services/{id}/parameters/{param_name}": {
@@ -68137,8 +68155,7 @@
         "summary": "Fetch a time-series range for a single metric on a node.",
         "tags": [
           "Metrics"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/notification-preferences": {
@@ -70103,7 +70120,8 @@
         "summary": "List all registered OTel span attribute facets.",
         "tags": [
           "OTel Facets"
-        ]
+        ],
+        "x-maturity": "beta"
       },
       "post": {
         "description": "Assigns the key to the lowest available slot column (1..=20) and inserts\nthe mapping into Postgres with `status: pending`. Returns immediately —\nthe historical backfill (populating the slot column for spans already\ningested before this call) runs entirely in the background, advanced by a\nperiodic poller; poll `GET /otel/facets` and check the returned `status`\n(`pending` -> `running` -> `completed`/`failed`) to track progress. New\nspans start getting the attribute written into the slot column right\naway, independent of backfill progress.",
@@ -70188,7 +70206,8 @@
         "summary": "Register an OTel attribute key as a facet.",
         "tags": [
           "OTel Facets"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/facets/{key}": {
@@ -70259,7 +70278,8 @@
         "summary": "Remove a registered OTel span attribute facet.",
         "tags": [
           "OTel Facets"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/facets/{key}/retry": {
@@ -70347,7 +70367,8 @@
         "summary": "Retry a failed OTel span attribute facet backfill.",
         "tags": [
           "OTel Facets"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/genai/traces": {
@@ -74126,6 +74147,52 @@
         ]
       }
     },
+    "/projects/custom-domains/by-host/{hostname}": {
+      "get": {
+        "operationId": "get_visible_custom_domain_by_hostname",
+        "parameters": [
+          {
+            "description": "Domain hostname",
+            "in": "path",
+            "name": "hostname",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomDomainResponse"
+                }
+              }
+            },
+            "description": "Custom domain assignment retrieved"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Project access denied"
+          },
+          "404": {
+            "description": "Domain is not assigned to a project"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Find the project assignment for a certificate hostname.",
+        "tags": [
+          "Custom Domains"
+        ]
+      }
+    },
     "/projects/from-template": {
       "post": {
         "description": "Creates a new repository from a template and sets up the project with the\nspecified configuration. The template is cloned to a new repository under\nthe authenticated user's account or specified organization.",
@@ -77108,7 +77175,8 @@
         "summary": "Report whether the current principal may drill into a project's proxy logs.",
         "tags": [
           "Proxy Logs"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/api-analytics/query": {
@@ -81723,8 +81791,7 @@
         "summary": "Get metrics/stats for a specific container",
         "tags": [
           "Containers"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/history": {
@@ -81815,8 +81882,7 @@
         "summary": "Fetch a time-series range for a single container resource metric\n(recorded by the container health monitor every ~30s).",
         "tags": [
           "Containers"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/stream": {
@@ -81878,8 +81944,7 @@
         "summary": "Stream container metrics via Server-Sent Events (SSE)",
         "tags": [
           "Containers"
-        ],
-        "x-maturity": "beta"
+        ]
       }
     },
     "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/restart": {
@@ -89350,6 +89415,79 @@
         ],
         "tags": [
           "Workflows"
+        ]
+      }
+    },
+    "/projects/{source_project_id}/custom-domains/{domain_id}/assignment": {
+      "put": {
+        "operationId": "reassign_project_custom_domain",
+        "parameters": [
+          {
+            "description": "Current project ID",
+            "in": "path",
+            "name": "source_project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Custom domain ID",
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReassignCustomDomainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomDomainResponse"
+                }
+              }
+            },
+            "description": "Domain assignment updated atomically"
+          },
+          "400": {
+            "description": "Target environment does not belong to the target project"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Write access required for both projects"
+          },
+          "404": {
+            "description": "Custom domain not found"
+          },
+          "409": {
+            "description": "Domain assignment changed; refresh and retry"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Move a domain between projects without deleting its route or certificate.",
+        "tags": [
+          "Custom Domains"
         ]
       }
     },

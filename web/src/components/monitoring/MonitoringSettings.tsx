@@ -43,7 +43,6 @@ import {
   type WeeklyDigestFormData,
 } from './schemas'
 import { AlertRulesManagement } from './AlertRulesManagement'
-import { ResourceMonitoring } from './ResourceMonitoring'
 import { Alarms } from '@/pages/Alarms'
 
 interface AlertComponentProps<T> {
@@ -842,7 +841,7 @@ function WeeklyDigest({
 export function MonitoringSettings() {
   const navigate = useNavigate()
   const { section } = useParams()
-  const currentSection = section || 'resources'
+  const currentSection = section || 'alerts'
 
   const { data: preferences, isLoading } = useQuery({
     queryKey: ['preferences'],
@@ -857,7 +856,6 @@ export function MonitoringSettings() {
   }
 
   const settingsSections = [
-    { id: 'resources', label: 'Health' },
     { id: 'alerts', label: 'Alerts' },
     { id: 'alarms', label: 'Alarms' },
     { id: 'notifications', label: 'Notifications' },
@@ -1020,11 +1018,6 @@ export function MonitoringSettings() {
   }
 
   const renderContent = () => {
-    // Health tab doesn't depend on preferences
-    if (currentSection === 'resources') {
-      return <ResourceMonitoring />
-    }
-
     if (isLoading) {
       return (
         <div className="flex items-center justify-center py-6">
@@ -1098,8 +1091,6 @@ export function MonitoringSettings() {
     }
 
     switch (currentSection) {
-      case 'resources':
-        return <ResourceMonitoring /> // handled by early return above, kept for switch exhaustiveness
       case 'alerts':
         return (
           <div className="space-y-8">

@@ -1,25 +1,9 @@
 import { useQuery } from '@tanstack/react-query'
-import type { FeatureMaturity } from '@/lib/feature-maturity'
-
-const QUERY_KEY = ['platform', 'feature-maturity'] as const
-
-async function fetchFeatureMaturity(): Promise<FeatureMaturity[]> {
-  const response = await fetch('/api/v1/platform/feature-maturity', {
-    credentials: 'same-origin',
-    headers: { Accept: 'application/json' },
-  })
-  if (!response.ok) {
-    throw new Error(
-      `Unable to load feature maturity metadata (${response.status})`
-    )
-  }
-  return (await response.json()) as FeatureMaturity[]
-}
+import { getFeatureMaturityOptions } from '@/api/client/@tanstack/react-query.gen'
 
 export function useFeatureMaturity(featureKey?: string) {
   const query = useQuery({
-    queryKey: QUERY_KEY,
-    queryFn: fetchFeatureMaturity,
+    ...getFeatureMaturityOptions(),
     staleTime: Infinity,
     retry: false,
   })

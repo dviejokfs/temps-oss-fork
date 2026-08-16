@@ -10,6 +10,11 @@ export type RepositoryInfo = {
   provider: 'github' | 'gitlab' | 'git'
 }
 
+export type ProjectBuildSource = {
+  label: string
+  kind: 'github' | 'gitlab' | 'git' | 'docker' | 'source'
+}
+
 export function projectPresetLabel(preset?: string | null): string {
   if (!preset) return 'Not configured'
 
@@ -46,6 +51,32 @@ export function projectRepository(
       : 'git'
 
   return { label: `${owner}/${name}`, provider }
+}
+
+export function projectBuildSource(
+  project: Pick<
+    ProjectResponse,
+    'source_type' | 'git_url' | 'repo_name' | 'repo_owner'
+  >
+): ProjectBuildSource {
+  if (project.source_type === 'git') {
+    const provider = projectRepository(project)?.provider ?? 'git'
+    return {
+      kind: provider,
+      label:
+        provider === 'github'
+          ? 'GitHub'
+          : provider === 'gitlab'
+            ? 'GitLab'
+            : 'Git repository',
+    }
+  }
+
+  if (project.source_type === 'docker_image') {
+    return { kind: 'docker', label: 'Docker image' }
+  }
+
+  return { kind: 'source', label: 'Source upload' }
 }
 
 /**

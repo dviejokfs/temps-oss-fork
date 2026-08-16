@@ -643,7 +643,7 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
 async fn get_feature_maturity(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, SettingsRead);
+    permission_guard!(auth, PlatformInfoRead);
     Ok((
         [(header::CACHE_CONTROL, "private, max-age=3600")],
         Json(temps_core::feature_maturity::FEATURE_MATURITY),

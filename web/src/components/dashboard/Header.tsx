@@ -218,7 +218,7 @@ export function Header() {
               })}
             </BreadcrumbList>
           </Breadcrumb>
-          <FeatureMaturityBadge featureKey={featureKey} />
+          <FeatureMaturityBadge featureKey={featureKey} className="ml-2" />
         </div>
         <div className="ml-auto flex shrink-0 items-center space-x-2">
           {headerActions?.map((action) => (
