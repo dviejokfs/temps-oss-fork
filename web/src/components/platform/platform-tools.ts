@@ -41,7 +41,7 @@ export interface PlatformToolGroup {
 
 export const platformToolGroups: PlatformToolGroup[] = [
   {
-    label: 'Build and run',
+    label: 'Applications and runtimes',
     description: 'Deploy applications and use isolated development runtimes.',
     icon: Rocket,
     items: [
