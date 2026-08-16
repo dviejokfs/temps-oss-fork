@@ -326,7 +326,7 @@ struct FailureState {
 /// Hard cap on distinct (ip, sandbox_hex) pairs tracked concurrently.
 /// An attacker spraying unique IPs/hex labels can no longer grow this map
 /// without bound — at the cap we sweep expired entries, and if that fails
-/// to free space we drop the oldest entry.
+/// to free space we drop an arbitrary entry in constant time.
 const MAX_TRACKED_ENTRIES: usize = 65_536;
 
 #[derive(Debug)]
@@ -1005,6 +1005,37 @@ mod tests {
         assert!(
             limiter.failures.len() <= MAX_TRACKED_ENTRIES,
             "limiter grew beyond cap: {}",
+            limiter.failures.len()
+        );
+    }
+
+    #[test]
+    fn rate_limiter_hard_cap_holds_during_concurrent_flood() {
+        let limiter = Arc::new(PreviewAuthLimiter::new());
+        let worker_count = 8;
+        let attempts_per_worker = (MAX_TRACKED_ENTRIES / worker_count) + 512;
+
+        std::thread::scope(|scope| {
+            for worker in 0..worker_count {
+                let limiter = Arc::clone(&limiter);
+                scope.spawn(move || {
+                    for attempt in 0..attempts_per_worker {
+                        let index = worker * attempts_per_worker + attempt;
+                        let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                            10,
+                            ((index >> 16) & 0xff) as u8,
+                            ((index >> 8) & 0xff) as u8,
+                            (index & 0xff) as u8,
+                        ));
+                        limiter.record_failure(ip, &format!("hex{index:08x}"));
+                    }
+                });
+            }
+        });
+
+        assert!(
+            limiter.failures.len() <= MAX_TRACKED_ENTRIES,
+            "concurrent admission grew beyond cap: {}",
             limiter.failures.len()
         );
     }
