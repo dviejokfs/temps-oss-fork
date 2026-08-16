@@ -74,6 +74,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`errors`](#errors) - Manage error tracking and error groups
 - [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
 - [`traces`](#traces) - Inspect distributed traces and operation latency
+- [`facets`](#facets) - Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
 - [`kv`](#kv) - KV store commands (coming soon)
 - [`flags`](#flags) - Manage feature flags (runtime config that changes without a redeploy)
@@ -3376,6 +3377,58 @@ Rank operations by time spent, latency percentiles, or inconsistency
 | `--sort-order <order>` | asc or desc | `desc` | No |
 | `--limit <n>` | Rows to show (max 100) | `20` | No |
 | `--offset <n>` | Page offset | - | No |
+| `--json` | Output in JSON format | - | No |
+
+## `facets`
+
+Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
+
+**Subcommands:**
+
+- `list` (`ls`) - List registered span attribute facets
+- `create` - Register an attribute key as a facet, making it fast to filter on across all traces. Backfills existing spans that carry the attribute. Capped at 20 facets platform-wide.
+- `remove` (`rm`) - Remove a registered facet, freeing its slot for reuse
+- `retry` - Retry a failed historical backfill. Only valid when the facet's status is "failed" — resets progress and lets the background poller re-attempt from the beginning.
+
+### `facets list` (alias: `ls`)
+
+List registered span attribute facets
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `facets create`
+
+Register an attribute key as a facet, making it fast to filter on across all traces. Backfills existing spans that carry the attribute. Capped at 20 facets platform-wide.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `facets remove` (alias: `rm`)
+
+Remove a registered facet, freeing its slot for reuse
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+### `facets retry`
+
+Retry a failed historical backfill. Only valid when the facet's status is "failed" — resets progress and lets the background poller re-attempt from the beginning.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
 ## `otel-forward`

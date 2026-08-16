@@ -3838,6 +3838,17 @@ export type CreateExternalServiceRequest = {
     version?: string | null;
 };
 
+/**
+ * Request body for registering a new facet.
+ */
+export type CreateFacetRequest = {
+    /**
+     * The OTel attribute key to facet (e.g. `enduser.id`, `galachain.contract`).
+     * Must be non-empty, ≤200 characters, and not already registered.
+     */
+    attribute_key: string;
+};
+
 export type CreateFlagRequest = {
     /**
      * Whether the flag may be exposed on the unauthenticated same-origin
@@ -7749,6 +7760,53 @@ export type ExternalServiceSummary = {
      * Service type string (e.g. "postgres", "redis", "mongodb").
      */
     service_type: string;
+};
+
+/**
+ * Which storage engine a facet was created against. A deployment only ever
+ * runs one backend at a time (see `plugin.rs`'s storage selection), but
+ * stamping it on each row keeps the status fields unambiguous.
+ */
+export type FacetBackendKind = 'clickhouse' | 'timescaledb';
+
+/**
+ * Public representation of a registered span attribute facet.
+ */
+export type FacetInfo = {
+    /**
+     * The OTel attribute key, e.g. `enduser.id` or `galachain.contract`.
+     */
+    attribute_key: string;
+    backend: FacetBackendKind;
+    created_at: string;
+    /**
+     * Populated when `status = failed`, explaining why.
+     */
+    error_message?: string | null;
+    /**
+     * Rows backfilled so far. Only meaningful for the `timescaledb` backend
+     * — the `clickhouse` backend's mutation doesn't expose a row count
+     * until it's done, so this stays 0 there even while running.
+     */
+    rows_backfilled: number;
+    /**
+     * The slot column index 1..=20 (`facet_attr_N`).
+     */
+    slot: number;
+    status: FacetStatus;
+};
+
+/**
+ * Backfill/delete-clear lifecycle for a facet. See the module docs for how
+ * the poller advances a facet through these states.
+ */
+export type FacetStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deleting';
+
+/**
+ * Response body for facet list.
+ */
+export type FacetsResponse = {
+    data: Array<FacetInfo>;
 };
 
 export type FailureReportPreviewResponse = {
@@ -36134,6 +36192,168 @@ export type UpdateDashboardResponses = {
 
 export type UpdateDashboardResponse = UpdateDashboardResponses[keyof UpdateDashboardResponses];
 
+export type ListFacetsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/otel/facets';
+};
+
+export type ListFacetsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListFacetsError = ListFacetsErrors[keyof ListFacetsErrors];
+
+export type ListFacetsResponses = {
+    /**
+     * Registered facets
+     */
+    200: FacetsResponse;
+};
+
+export type ListFacetsResponse = ListFacetsResponses[keyof ListFacetsResponses];
+
+export type CreateFacetData = {
+    body: CreateFacetRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/facets';
+};
+
+export type CreateFacetErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Already registered or capacity exceeded
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateFacetError = CreateFacetErrors[keyof CreateFacetErrors];
+
+export type CreateFacetResponses = {
+    /**
+     * Facet registered
+     */
+    201: FacetInfo;
+};
+
+export type CreateFacetResponse = CreateFacetResponses[keyof CreateFacetResponses];
+
+export type DeleteFacetData = {
+    body?: never;
+    path: {
+        /**
+         * The OTel attribute key (URL-encoded)
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/otel/facets/{key}';
+};
+
+export type DeleteFacetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Facet not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteFacetError = DeleteFacetErrors[keyof DeleteFacetErrors];
+
+export type DeleteFacetResponses = {
+    /**
+     * Facet deleted
+     */
+    204: void;
+};
+
+export type DeleteFacetResponse = DeleteFacetResponses[keyof DeleteFacetResponses];
+
+export type RetryFacetBackfillData = {
+    body?: never;
+    path: {
+        /**
+         * The OTel attribute key (URL-encoded)
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/otel/facets/{key}/retry';
+};
+
+export type RetryFacetBackfillErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Facet not found
+     */
+    404: ProblemDetails;
+    /**
+     * Facet is not in a failed state
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RetryFacetBackfillError = RetryFacetBackfillErrors[keyof RetryFacetBackfillErrors];
+
+export type RetryFacetBackfillResponses = {
+    /**
+     * Backfill retry scheduled
+     */
+    200: FacetInfo;
+};
+
+export type RetryFacetBackfillResponse = RetryFacetBackfillResponses[keyof RetryFacetBackfillResponses];
+
 export type QueryGenaiTracesData = {
     body?: never;
     path?: never;
@@ -36935,6 +37155,10 @@ export type QueryTraceSummariesData = {
          * Filter by deployment ID
          */
         deployment_id?: number;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string;
         /**
          * Filter by span name pattern (ILIKE)
          */
