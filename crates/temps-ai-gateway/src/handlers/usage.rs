@@ -94,6 +94,10 @@ pub struct UsageQueryParams {
     pub model: Option<String>,
     /// Filter by provider name
     pub provider: Option<String>,
+    /// Filter by project ID (matches the governance policy scope `project:<id>`)
+    pub project_id: Option<i32>,
+    /// Filter by environment ID (matches the governance policy scope `environment:<id>`)
+    pub environment_id: Option<i32>,
 }
 
 impl UsageQueryParams {
@@ -104,6 +108,8 @@ impl UsageQueryParams {
             tags: self.tags.clone(),
             model: self.model.clone(),
             provider: self.provider.clone(),
+            project_id: self.project_id,
+            environment_id: self.environment_id,
             ..Default::default()
         }
     }
@@ -310,6 +316,8 @@ fn parse_time_range(
     params(
         ("from" = Option<String>, Query, description = "ISO 8601 start time (defaults to 24h ago)"),
         ("to" = Option<String>, Query, description = "ISO 8601 end time (defaults to now)"),
+        ("project_id" = Option<i32>, Query, description = "Filter by project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
     ),
     responses(
         (status = 200, description = "Usage summary for the time range", body = UsageSummary),
@@ -343,6 +351,8 @@ async fn get_usage_summary(
     params(
         ("from" = Option<String>, Query, description = "ISO 8601 start time (defaults to 24h ago)"),
         ("to" = Option<String>, Query, description = "ISO 8601 end time (defaults to now)"),
+        ("project_id" = Option<i32>, Query, description = "Filter by project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
     ),
     responses(
         (status = 200, description = "Usage broken down by provider", body = Vec<ProviderUsage>),
