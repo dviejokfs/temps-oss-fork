@@ -26,6 +26,7 @@ use argon2::password_hash::PasswordHash;
 use argon2::{Argon2, PasswordVerifier};
 use dashmap::DashMap;
 use moka::future::Cache;
+use parking_lot::Mutex;
 use sea_orm::EntityTrait;
 use temps_core::CookieCrypto;
 use temps_database::DbConnection;
@@ -328,10 +329,27 @@ struct FailureState {
 /// to free space we drop the oldest entry.
 const MAX_TRACKED_ENTRIES: usize = 65_536;
 
+#[derive(Debug)]
+struct LimiterAdmissionState {
+    last_expiry_sweep: Instant,
+}
+
 /// In-memory rate limiter for preview auth failures.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PreviewAuthLimiter {
     failures: DashMap<(IpAddr, String), FailureState>,
+    admission: Mutex<LimiterAdmissionState>,
+}
+
+impl Default for PreviewAuthLimiter {
+    fn default() -> Self {
+        Self {
+            failures: DashMap::new(),
+            admission: Mutex::new(LimiterAdmissionState {
+                last_expiry_sweep: Instant::now(),
+            }),
+        }
+    }
 }
 
 impl PreviewAuthLimiter {
@@ -354,23 +372,48 @@ impl PreviewAuthLimiter {
 
     pub fn record_failure(&self, ip: IpAddr, hex: &str) {
         let key = (ip, hex.to_string());
-        // Cap enforcement: opportunistically evict before insert so the map
-        // cannot be weaponized as an unbounded memory sink.
-        if !self.failures.contains_key(&key) && self.failures.len() >= MAX_TRACKED_ENTRIES {
-            self.evict_expired();
+        if let Some(mut entry) = self.failures.get_mut(&key) {
+            Self::increment_failure(&mut entry);
+            return;
+        }
+
+        // Serialize admission of new keys so concurrent requests cannot race
+        // past the hard cap. Once full, sweep at most once per rate-limit
+        // window; scanning the whole map for every unique attacker turns the
+        // limiter itself into a CPU-amplification vector. If nothing expired,
+        // evict an arbitrary entry in constant time before admitting the new
+        // key. The limiter is best-effort at the cap either way, while memory
+        // and per-request work remain bounded.
+        let mut admission = self.admission.lock();
+        if let Some(mut entry) = self.failures.get_mut(&key) {
+            Self::increment_failure(&mut entry);
+            return;
+        }
+
+        if self.failures.len() >= MAX_TRACKED_ENTRIES {
+            if admission.last_expiry_sweep.elapsed() >= RATE_LIMIT_WINDOW {
+                self.evict_expired();
+                admission.last_expiry_sweep = Instant::now();
+            }
+
             if self.failures.len() >= MAX_TRACKED_ENTRIES {
-                if let Some(victim) = self
-                    .failures
-                    .iter()
-                    .min_by_key(|e| e.value().window_start)
-                    .map(|e| e.key().clone())
-                {
+                let victim = self.failures.iter().next().map(|entry| entry.key().clone());
+                if let Some(victim) = victim {
                     self.failures.remove(&victim);
                 }
             }
         }
 
-        let mut entry = self.failures.entry(key).or_default();
+        self.failures.insert(
+            key,
+            FailureState {
+                count: 1,
+                window_start: Some(Instant::now()),
+            },
+        );
+    }
+
+    fn increment_failure(entry: &mut FailureState) {
         let now = Instant::now();
         match entry.window_start {
             Some(start) if start.elapsed() <= RATE_LIMIT_WINDOW => {
