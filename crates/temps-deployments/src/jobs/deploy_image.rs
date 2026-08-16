@@ -278,7 +278,7 @@ fn has_explicit_placement_constraints(
     target_node_ids: Option<&[i32]>,
     target_labels: Option<&serde_json::Value>,
 ) -> bool {
-    target_node_ids.is_some()
+    crate::services::node_scheduler::placement_node_ids(target_node_ids).is_some()
         || target_labels
             .is_some_and(|labels| !labels.as_object().is_some_and(serde_json::Map::is_empty))
 }
@@ -3333,7 +3333,11 @@ mod tests {
             None,
             Some(&serde_json::json!({}))
         ));
-        assert!(has_explicit_placement_constraints(Some(&[]), None));
+        // Empty selectors of either kind name nothing, so they constrain
+        // nothing — the two must agree, and an empty label object has always
+        // read that way.
+        assert!(!has_explicit_placement_constraints(Some(&[]), None));
+        assert!(has_explicit_placement_constraints(Some(&[1]), None));
         assert!(has_explicit_placement_constraints(
             None,
             Some(&serde_json::json!({"region": "eu"}))

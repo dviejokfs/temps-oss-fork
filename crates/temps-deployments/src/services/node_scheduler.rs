@@ -311,6 +311,7 @@ impl NodeScheduler {
             return Ok(Vec::new());
         };
 
+        let target_node_ids = placement_node_ids(target_node_ids);
         let active_nodes = self
             .node_service
             .list_active(self.heartbeat_threshold_secs)
@@ -451,6 +452,7 @@ impl NodeScheduler {
         exclude_node_ids: &[i32],
         image_platforms: &[String],
     ) -> Result<SchedulingOutcome, NodeError> {
+        let target_node_ids = placement_node_ids(target_node_ids);
         let active_nodes = self
             .node_service
             .list_active(self.heartbeat_threshold_secs)
@@ -779,6 +781,24 @@ impl NodeScheduler {
         }
         assignments
     }
+}
+
+/// Normalize a `target_nodes` selector: an empty list names no node, so it
+/// expresses *no* constraint — exactly how an empty `target_labels` object is
+/// already treated a few lines below where both are applied.
+///
+/// Without this, `target_nodes: []` filters every node out of the pool and the
+/// deployment fails as unschedulable while blaming nodes it never named. It
+/// also matters for unpinning: `PUT .../settings` reads `None` as "leave
+/// unchanged", so an empty list is the only way an operator (or a UI node
+/// picker with everything deselected) can clear a pin. Treating that as "pin to
+/// nothing" would strand the environment permanently.
+///
+/// This is not a way around the placement hardening: a caller that can send an
+/// empty list can equally omit the field, and both mean unconstrained
+/// scheduling. A list that *does* name nodes is still honoured strictly.
+pub(crate) fn placement_node_ids(target_node_ids: Option<&[i32]>) -> Option<&[i32]> {
+    target_node_ids.filter(|ids| !ids.is_empty())
 }
 
 /// Entry in the scheduling pool with optional resource load score.
@@ -1218,6 +1238,84 @@ mod tests {
                 1,
                 Some(&selector),
                 None,
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NodeError::PlacementConstraintsUnsatisfied { .. }
+        ));
+    }
+
+    /// An empty `target_nodes` list names no node, so it constrains nothing —
+    /// the same reading an empty `target_labels` object already gets. Treating
+    /// it as "pin to nothing" made the environment unschedulable and reported a
+    /// placement failure listing no nodes.
+    #[tokio::test]
+    async fn test_empty_target_nodes_is_not_a_placement_constraint() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-amd", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(
+                1,
+                None,
+                Some(&[]),
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .expect("an empty pin must schedule like an absent one, not fail");
+
+        assert_eq!(assignments.assignments.len(), 1);
+    }
+
+    /// The drain deadlock: an environment is unpinned (empty list) so its
+    /// workload can move, then the only worker goes `draining` and drops out of
+    /// the active pool. The redeploy must land on the control plane. Failing
+    /// here leaves the old container on the node forever, so `drain_complete`
+    /// never arrives and the node can never be removed.
+    #[tokio::test]
+    async fn test_empty_target_nodes_falls_back_to_local_when_pool_is_empty() {
+        let scheduler = scheduler_with_nodes(vec![], "linux/amd64");
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(
+                1,
+                None,
+                Some(&[]),
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .expect("unpinned workload must be placeable on the control plane");
+
+        assert_eq!(assignments.assignments.len(), 1);
+        assert!(
+            assignments.assignments.iter().all(NodeAssignment::is_local),
+            "the control plane is the only place left to run it"
+        );
+    }
+
+    /// The hardening itself is untouched: a list that actually names nodes is
+    /// still enforced strictly, with no control-plane fallback.
+    #[tokio::test]
+    async fn test_non_empty_target_nodes_still_refuses_local_fallback() {
+        let scheduler = scheduler_with_nodes(vec![], "linux/amd64");
+
+        let err = scheduler
+            .schedule_replicas_excluding(
+                1,
+                None,
+                Some(&[1]),
                 false,
                 &[],
                 &["linux/amd64".to_string()],
