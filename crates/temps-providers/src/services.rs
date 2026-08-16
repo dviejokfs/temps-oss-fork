@@ -11737,7 +11737,7 @@ mod tests {
         params.insert("port".to_string(), JsonValue::String(port.to_string()));
         params.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:17-bookworm".to_string()),
+            JsonValue::String("gotempsh/postgres-walg:17-bookworm".to_string()),
         );
         let svc = manager
             .create_service(CreateExternalServiceRequest {
@@ -11781,8 +11781,8 @@ mod tests {
                 service_id: Set(svc.id),
                 from_version: Set("17".to_string()),
                 to_version: Set("18".to_string()),
-                from_image: Set("postgres:17-bookworm".to_string()),
-                to_image: Set("postgres:18-bookworm".to_string()),
+                from_image: Set("gotempsh/postgres-walg:17-bookworm".to_string()),
+                to_image: Set("gotempsh/postgres-walg:18-bookworm".to_string()),
                 status: Set(status::PENDING.to_string()),
                 phase: Set(status::PENDING.to_string()),
                 pre_upgrade_backup_id: Set(None),
@@ -12861,13 +12861,12 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_upgrade_postgres_image_parameter_update() {
-        // This test verifies that the docker_image parameter can be updated.
-        // Uses same-major-version update (18 -> 18-alpine) to avoid data format
-        // incompatibility issues that occur with cross-major-version upgrades.
+        // This test verifies that an allowlisted docker_image parameter can be
+        // supplied again through the update path without changing major version.
         let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
 
-        // Step 1: Create a PostgreSQL service with postgres:18
+        // Step 1: Create a PostgreSQL service with the managed PostgreSQL 18 image.
         let mut params = HashMap::new();
         params.insert(
             "database".to_string(),
@@ -12892,7 +12891,7 @@ mod tests {
         params.insert("max_connections".to_string(), JsonValue::Number(100.into()));
         params.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:18".to_string()),
+            JsonValue::String("gotempsh/postgres-walg:18-bookworm".to_string()),
         );
 
         let request = CreateExternalServiceRequest {
@@ -12916,11 +12915,11 @@ mod tests {
         let initial_params = initial_details.current_parameters.unwrap();
         assert_eq!(
             initial_params.get("docker_image").and_then(|v| v.as_str()),
-            Some("postgres:18"),
-            "Initial docker_image should be postgres:18"
+            Some("gotempsh/postgres-walg:18-bookworm"),
+            "Initial docker_image should be gotempsh/postgres-walg:18-bookworm"
         );
 
-        // Step 2: Update docker_image parameter to gotempsh/postgres-walg:18-bookworm (same major version, different variant).
+        // Step 2: Exercise the image update path with the same allowlisted image.
         // Only include updateable parameters - readonly params (database, username, password, host)
         // are rejected by validate_for_update().
         let mut update_params = HashMap::new();
@@ -13322,7 +13321,7 @@ mod tests {
         // Explicitly set docker_image so the test is deterministic
         params.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:18".to_string()),
+            JsonValue::String("gotempsh/postgres-walg:18-bookworm".to_string()),
         );
 
         let request = CreateExternalServiceRequest {
@@ -13341,9 +13340,7 @@ mod tests {
             .expect("Failed to create service");
         let service_id = service.id;
 
-        // Update docker_image to a compatible variant (same major version, different tag).
-        // Changing to a different major version (e.g., 18 -> 17) would fail because
-        // PostgreSQL data files are not backward-compatible across major versions.
+        // Exercise an idempotent update with the allowlisted managed image.
         let update_params = HashMap::new();
 
         let update_request = UpdateExternalServiceRequest {

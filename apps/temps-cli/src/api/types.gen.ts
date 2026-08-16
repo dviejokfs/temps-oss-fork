@@ -3803,7 +3803,7 @@ export type CreateEnvironmentRequest = {
 export type CreateEnvironmentVariableRequest = {
     environment_ids: Array<number>;
     /**
-     * Include this environment variable in preview environments (default: true)
+     * Include this environment variable in preview environments (default: false)
      */
     include_in_preview?: boolean;
     /**
@@ -4300,7 +4300,7 @@ export type CreateProjectRequest = {
 export type CreateProjectSecretRequest = {
     environment_ids?: Array<number>;
     /**
-     * Include this secret in preview environments.
+     * Include this secret in preview environments (default: false).
      */
     include_in_preview?: boolean;
     /**
@@ -8070,7 +8070,7 @@ export type GatewayStatus = {
     host_port?: number | null;
     /**
      * Image reference the container was created with (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway:latest`).
+     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`).
      */
     image?: string | null;
     /**
@@ -19211,12 +19211,14 @@ export type UpdateEnvironmentSettingsRequest = {
     sse_idle_timeout_seconds?: number | null;
     /**
      * Label selector for node-based scheduling (overrides project-level setting).
+     * Send an empty object to clear the environment-level override.
      * Same key with array value -> OR, different keys -> AND.
      * Example: `{"region": ["us", "asia"], "gpu": "true"}`
      */
     target_labels?: unknown;
     /**
-     * Optional list of node IDs to deploy to (overrides project-level setting)
+     * Optional list of node IDs to deploy to (overrides project-level setting).
+     * Send an empty list to clear the environment-level override.
      */
     target_nodes?: Array<number> | null;
     /**
@@ -19810,7 +19812,7 @@ export type UpgradeExternalServiceRequest = {
 export type UpgradeRequest = {
     /**
      * Image reference to pull and run (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway:latest`). Empty resets to default.
+     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`). Empty resets to default.
      */
     image: string;
 };
