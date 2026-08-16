@@ -5383,14 +5383,31 @@ export function GovernanceSettings() {
 
   const monthStart = useMemo(() => governanceMonthStartIso(), [])
   const { data: monthSummary, isLoading: spendLoading } = useQuery({
-    queryKey: ['aiUsage', 'summary', 'governance-month', monthStart],
+    queryKey: [
+      'aiUsage',
+      'summary',
+      'governance-month',
+      monthStart,
+      scopeKind,
+      selectedProjectId,
+      selectedEnvironmentId,
+    ],
     queryFn: () =>
       fetchJson<UsageSummary>(
         buildUsageUrl('summary', {
           from: monthStart,
           to: new Date().toISOString(),
+          project_id:
+            scopeKind === 'project' || scopeKind === 'environment'
+              ? selectedProjectId?.toString()
+              : undefined,
+          environment_id:
+            scopeKind === 'environment'
+              ? selectedEnvironmentId?.toString()
+              : undefined,
         })
       ),
+    enabled: scopeKind === 'instance' || !!scope,
   })
 
   const upsertMutation = useMutation({
@@ -5796,7 +5813,9 @@ export function GovernanceSettings() {
               <CardDescription>
                 {scopeKind === 'instance'
                   ? 'Total AI gateway spend across the whole instance, this calendar month.'
-                  : "Instance-wide spend, shown for context — the Usage API doesn't yet break cost down per project or environment. Use the Usage tab to filter individual requests."}
+                  : scope
+                    ? `AI gateway spend for this ${scopeKind}, this calendar month.`
+                    : `Select a ${scopeKind} above to see its spend.`}
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
