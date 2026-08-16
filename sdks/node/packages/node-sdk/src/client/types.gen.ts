@@ -2845,6 +2845,13 @@ export type EmailDomainResponse = {
     verification_error?: string | null;
 };
 
+/** A project authorized to send email through a sender domain. */
+export type AuthorizedEmailDomainProjectResponse = {
+    id: number;
+    name: string;
+    slug: string;
+};
+
 export type EmailDomainWithDnsResponse = {
     dns_records: Array<DnsRecordResponse>;
     domain: EmailDomainResponse;
@@ -15669,6 +15676,39 @@ export type GetDomainDnsRecordsResponses = {
 };
 
 export type GetDomainDnsRecordsResponse = GetDomainDnsRecordsResponses[keyof GetDomainDnsRecordsResponses];
+
+export type ListEmailDomainProjectsData = {
+    body?: never;
+    path: { id: number };
+    query?: never;
+    url: '/email-domains/{id}/projects';
+};
+
+export type ListEmailDomainProjectsErrors = { 404: unknown };
+export type ListEmailDomainProjectsResponses = { 200: Array<AuthorizedEmailDomainProjectResponse> };
+export type ListEmailDomainProjectsResponse = ListEmailDomainProjectsResponses[keyof ListEmailDomainProjectsResponses];
+
+export type RevokeEmailDomainProjectData = {
+    body?: never;
+    path: { id: number; project_id: number };
+    query?: never;
+    url: '/email-domains/{id}/projects/{project_id}';
+};
+
+export type RevokeEmailDomainProjectErrors = { 404: unknown };
+export type RevokeEmailDomainProjectResponses = { 204: void };
+export type RevokeEmailDomainProjectResponse = RevokeEmailDomainProjectResponses[keyof RevokeEmailDomainProjectResponses];
+
+export type AuthorizeEmailDomainProjectData = {
+    body?: never;
+    path: { id: number; project_id: number };
+    query?: never;
+    url: '/email-domains/{id}/projects/{project_id}';
+};
+
+export type AuthorizeEmailDomainProjectErrors = { 404: unknown };
+export type AuthorizeEmailDomainProjectResponses = { 204: void };
+export type AuthorizeEmailDomainProjectResponse = AuthorizeEmailDomainProjectResponses[keyof AuthorizeEmailDomainProjectResponses];
 
 export type SetupDnsData = {
     body: SetupDnsRequest;

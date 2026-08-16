@@ -29286,6 +29286,133 @@
                     }
                 ]
             }
+        },
+        "/email-domains/{id}/projects": {
+            "get": {
+                "tags": [
+                    "Email Domains"
+                ],
+                "operationId": "list_email_domain_projects",
+                "parameters": [
+                    {
+                        "name": "id",
+                        "in": "path",
+                        "description": "Email domain ID",
+                        "required": true,
+                        "schema": {
+                            "type": "integer",
+                            "format": "int32"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Projects authorized to use this sender domain",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "$ref": "#/components/schemas/AuthorizedEmailDomainProjectResponse"
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Domain not found"
+                    }
+                },
+                "security": [
+                    {
+                        "bearer_auth": []
+                    }
+                ]
+            }
+        },
+        "/email-domains/{id}/projects/{project_id}": {
+            "post": {
+                "tags": [
+                    "Email Domains"
+                ],
+                "operationId": "authorize_email_domain_project",
+                "parameters": [
+                    {
+                        "name": "id",
+                        "in": "path",
+                        "description": "Email domain ID",
+                        "required": true,
+                        "schema": {
+                            "type": "integer",
+                            "format": "int32"
+                        }
+                    },
+                    {
+                        "name": "project_id",
+                        "in": "path",
+                        "description": "Project allowed to send from this domain",
+                        "required": true,
+                        "schema": {
+                            "type": "integer",
+                            "format": "int32"
+                        }
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "Project authorized"
+                    },
+                    "404": {
+                        "description": "Domain or project not found"
+                    }
+                },
+                "security": [
+                    {
+                        "bearer_auth": []
+                    }
+                ]
+            },
+            "delete": {
+                "tags": [
+                    "Email Domains"
+                ],
+                "operationId": "revoke_email_domain_project",
+                "parameters": [
+                    {
+                        "name": "id",
+                        "in": "path",
+                        "description": "Email domain ID",
+                        "required": true,
+                        "schema": {
+                            "type": "integer",
+                            "format": "int32"
+                        }
+                    },
+                    {
+                        "name": "project_id",
+                        "in": "path",
+                        "description": "Project whose authorization is revoked",
+                        "required": true,
+                        "schema": {
+                            "type": "integer",
+                            "format": "int32"
+                        }
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "Project authorization revoked"
+                    },
+                    "404": {
+                        "description": "Domain not found"
+                    }
+                },
+                "security": [
+                    {
+                        "bearer_auth": []
+                    }
+                ]
+            }
         }
     },
     "components": {
@@ -55996,6 +56123,27 @@
                         "items": {
                             "$ref": "#/components/schemas/DnsZone"
                         }
+                    }
+                }
+            },
+            "AuthorizedEmailDomainProjectResponse": {
+                "type": "object",
+                "description": "A project authorized to send email through a sender domain.",
+                "required": [
+                    "id",
+                    "name",
+                    "slug"
+                ],
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "format": "int32"
+                    },
+                    "name": {
+                        "type": "string"
+                    },
+                    "slug": {
+                        "type": "string"
                     }
                 }
             }

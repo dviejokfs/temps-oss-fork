@@ -182,6 +182,33 @@ impl DomainService {
         Ok(())
     }
 
+    /// List the active projects currently allowed to send through a domain.
+    pub async fn list_authorized_projects(
+        &self,
+        domain_id: i32,
+    ) -> Result<Vec<projects::Model>, EmailError> {
+        self.get(domain_id).await?;
+
+        let project_ids = email_domain_projects::Entity::find()
+            .filter(email_domain_projects::Column::DomainId.eq(domain_id))
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|authorization| authorization.project_id)
+            .collect::<Vec<_>>();
+
+        if project_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        Ok(projects::Entity::find()
+            .filter(projects::Column::Id.is_in(project_ids))
+            .filter(projects::Column::IsDeleted.eq(false))
+            .order_by_asc(projects::Column::Name)
+            .all(self.db.as_ref())
+            .await?)
+    }
+
     /// Whether a project-scoped deployment credential may send through this domain.
     pub async fn is_authorized_for_project(
         &self,
@@ -771,6 +798,45 @@ mod tests {
         assert!(result.is_ok());
         let domains = result.unwrap();
         assert!(domains.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_authorized_projects_returns_empty_for_domain_without_grants() {
+        let now = chrono::Utc::now();
+        let domain = email_domains::Model {
+            id: 17,
+            provider_id: 1,
+            domain: "mail.example.com".to_string(),
+            status: "verified".to_string(),
+            spf_record_name: None,
+            spf_record_value: None,
+            dkim_selector: None,
+            dkim_record_name: None,
+            dkim_record_value: None,
+            mx_record_name: None,
+            mx_record_value: None,
+            mx_record_priority: None,
+            provider_identity_id: None,
+            last_verified_at: Some(now),
+            verification_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![domain]])
+                .append_query_results([Vec::<email_domain_projects::Model>::new()])
+                .into_connection(),
+        );
+        let provider_service = Arc::new(ProviderService::new(
+            db.clone(),
+            create_test_encryption_service(),
+        ));
+        let service = DomainService::new(db, provider_service);
+
+        let projects = service.list_authorized_projects(17).await.unwrap();
+
+        assert!(projects.is_empty());
     }
 
     #[tokio::test]

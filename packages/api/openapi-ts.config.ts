@@ -10,6 +10,9 @@ export default defineConfig({
     path: 'src',
     format: 'prettier',
   },
-  client: '@hey-api/client-fetch',
-  plugins: ['@hey-api/sdk', '@hey-api/typescript'],
+  plugins: [
+    '@hey-api/client-fetch',
+    '@hey-api/sdk',
+    '@hey-api/typescript',
+  ],
 })

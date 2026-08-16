@@ -360,6 +360,24 @@ pub struct EmailDomainWithDnsResponse {
     pub dns_records: Vec<DnsRecordResponse>,
 }
 
+/// A project authorized to send email through a sender domain.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuthorizedEmailDomainProjectResponse {
+    pub id: i32,
+    pub name: String,
+    pub slug: String,
+}
+
+impl From<temps_entities::projects::Model> for AuthorizedEmailDomainProjectResponse {
+    fn from(project: temps_entities::projects::Model) -> Self {
+        Self {
+            id: project.id,
+            name: project.name,
+            slug: project.slug,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 pub struct ListDomainsQuery {
     /// Only return domains belonging to this provider

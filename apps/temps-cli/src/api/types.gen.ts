@@ -1723,6 +1723,15 @@ export type AuthTokenResponse = {
 };
 
 /**
+ * A project authorized to send email through a sender domain.
+ */
+export type AuthorizedEmailDomainProjectResponse = {
+    id: number;
+    name: string;
+    slug: string;
+};
+
+/**
  * Auto-watch (Watchdog-style) detector parameters (stub — not evaluated).
  */
 export type AutoWatchParams = {
@@ -28028,6 +28037,98 @@ export type GetDomainDnsRecordsResponses = {
 };
 
 export type GetDomainDnsRecordsResponse = GetDomainDnsRecordsResponses[keyof GetDomainDnsRecordsResponses];
+
+export type ListEmailDomainProjectsData = {
+    body?: never;
+    path: {
+        /**
+         * Email domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/projects';
+};
+
+export type ListEmailDomainProjectsErrors = {
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type ListEmailDomainProjectsResponses = {
+    /**
+     * Projects authorized to use this sender domain
+     */
+    200: Array<AuthorizedEmailDomainProjectResponse>;
+};
+
+export type ListEmailDomainProjectsResponse = ListEmailDomainProjectsResponses[keyof ListEmailDomainProjectsResponses];
+
+export type RevokeEmailDomainProjectData = {
+    body?: never;
+    path: {
+        /**
+         * Email domain ID
+         */
+        id: number;
+        /**
+         * Project whose authorization is revoked
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/projects/{project_id}';
+};
+
+export type RevokeEmailDomainProjectErrors = {
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type RevokeEmailDomainProjectResponses = {
+    /**
+     * Project authorization revoked
+     */
+    204: void;
+};
+
+export type RevokeEmailDomainProjectResponse = RevokeEmailDomainProjectResponses[keyof RevokeEmailDomainProjectResponses];
+
+export type AuthorizeEmailDomainProjectData = {
+    body?: never;
+    path: {
+        /**
+         * Email domain ID
+         */
+        id: number;
+        /**
+         * Project allowed to send from this domain
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/projects/{project_id}';
+};
+
+export type AuthorizeEmailDomainProjectErrors = {
+    /**
+     * Domain or project not found
+     */
+    404: unknown;
+};
+
+export type AuthorizeEmailDomainProjectResponses = {
+    /**
+     * Project authorized
+     */
+    204: void;
+};
+
+export type AuthorizeEmailDomainProjectResponse = AuthorizeEmailDomainProjectResponses[keyof AuthorizeEmailDomainProjectResponses];
 
 export type SetupDnsData = {
     body: SetupDnsRequest;

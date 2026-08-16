@@ -3529,6 +3529,27 @@
         ],
         "type": "object"
       },
+      "AuthorizedEmailDomainProjectResponse": {
+        "description": "A project authorized to send email through a sender domain.",
+        "properties": {
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug"
+        ],
+        "type": "object"
+      },
       "AutoWatchParams": {
         "description": "Auto-watch (Watchdog-style) detector parameters (stub — not evaluated).",
         "properties": {
@@ -57860,6 +57881,133 @@
           }
         ],
         "summary": "Get DNS records for an email domain",
+        "tags": [
+          "Email Domains"
+        ]
+      }
+    },
+    "/email-domains/{id}/projects": {
+      "get": {
+        "operationId": "list_email_domain_projects",
+        "parameters": [
+          {
+            "description": "Email domain ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AuthorizedEmailDomainProjectResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Projects authorized to use this sender domain"
+          },
+          "404": {
+            "description": "Domain not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Email Domains"
+        ]
+      }
+    },
+    "/email-domains/{id}/projects/{project_id}": {
+      "delete": {
+        "operationId": "revoke_email_domain_project",
+        "parameters": [
+          {
+            "description": "Email domain ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Project whose authorization is revoked",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Project authorization revoked"
+          },
+          "404": {
+            "description": "Domain not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Email Domains"
+        ]
+      },
+      "post": {
+        "operationId": "authorize_email_domain_project",
+        "parameters": [
+          {
+            "description": "Email domain ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Project allowed to send from this domain",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Project authorized"
+          },
+          "404": {
+            "description": "Domain or project not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Email Domains"
         ]

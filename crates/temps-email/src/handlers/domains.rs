@@ -11,7 +11,7 @@ use axum::{
 };
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
-    error_builder::{bad_request, internal_server_error, not_found},
+    error_builder::{bad_request, forbidden, internal_server_error, not_found},
     problemdetails::{self, Problem},
     AuditContext, RequestMetadata,
 };
@@ -23,9 +23,9 @@ use super::audit::{
     EmailDomainProjectRevokedAudit, EmailDomainVerifiedAudit,
 };
 use super::types::{
-    AppState, CreateEmailDomainRequest, DnsRecordResponse, DnsRecordSetupResult,
-    EmailDomainResponse, EmailDomainWithDnsResponse, ListDomainsQuery, SetupDnsRequest,
-    SetupDnsResponse,
+    AppState, AuthorizedEmailDomainProjectResponse, CreateEmailDomainRequest, DnsRecordResponse,
+    DnsRecordSetupResult, EmailDomainResponse, EmailDomainWithDnsResponse, ListDomainsQuery,
+    SetupDnsRequest, SetupDnsResponse,
 };
 use crate::errors::EmailError;
 use crate::services::CreateDomainRequest;
@@ -102,9 +102,39 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/email-domains/{id}/verify", post(verify_domain))
         .route("/email-domains/{id}/setup-dns", post(setup_dns))
         .route(
-            "/email-domains/{id}/projects/{project_id}",
-            post(authorize_project).delete(revoke_project),
+            "/email-domains/{id}/projects",
+            get(list_email_domain_projects),
         )
+        .route(
+            "/email-domains/{id}/projects/{project_id}",
+            post(authorize_email_domain_project).delete(revoke_email_domain_project),
+        )
+}
+
+#[utoipa::path(
+    tag = "Email Domains",
+    get,
+    path = "/email-domains/{id}/projects",
+    params(("id" = i32, Path, description = "Email domain ID")),
+    responses(
+        (status = 200, description = "Projects authorized to use this sender domain", body = [AuthorizedEmailDomainProjectResponse]),
+        (status = 404, description = "Domain not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_email_domain_projects(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<Json<Vec<AuthorizedEmailDomainProjectResponse>>, Problem> {
+    permission_guard!(auth, EmailDomainsRead);
+    let projects = state
+        .domain_service
+        .list_authorized_projects(id)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(projects.into_iter().map(Into::into).collect()))
 }
 
 #[utoipa::path(
@@ -121,13 +151,14 @@ pub fn routes() -> Router<Arc<AppState>> {
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn authorize_project(
+pub async fn authorize_email_domain_project(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     axum::Extension(metadata): axum::Extension<RequestMetadata>,
     Path((id, project_id)): Path<(i32, i32)>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, EmailDomainsWrite);
+    require_same_origin_session(&auth, &metadata)?;
     let result = state.domain_service.authorize_project(id, project_id).await;
     let audit = EmailDomainProjectAuthorizedAudit {
         context: AuditContext {
@@ -160,13 +191,14 @@ pub async fn authorize_project(
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn revoke_project(
+pub async fn revoke_email_domain_project(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     axum::Extension(metadata): axum::Extension<RequestMetadata>,
     Path((id, project_id)): Path<(i32, i32)>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, EmailDomainsWrite);
+    require_same_origin_session(&auth, &metadata)?;
     let result = state.domain_service.revoke_project(id, project_id).await;
     let audit = EmailDomainProjectRevokedAudit {
         context: AuditContext {
@@ -183,6 +215,48 @@ pub async fn revoke_project(
     }
     result.map_err(Problem::from)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Browser sessions carry ambient cookie credentials, so unsafe requests must
+/// originate from the exact console origin. A sibling deployment such as
+/// `attacker.example.com` is same-site and can receive `SameSite=Strict`
+/// cookies, but it is not same-origin. Bearer-authenticated API/CLI clients do
+/// not use ambient credentials and therefore do not need browser origin
+/// headers.
+fn require_same_origin_session(
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+) -> Result<(), Problem> {
+    if !auth.is_session() || request_is_same_origin(metadata) {
+        return Ok(());
+    }
+
+    Err(forbidden()
+        .detail("Browser session requests that change email-domain project access must originate from this Temps console")
+        .build())
+}
+
+fn request_is_same_origin(metadata: &RequestMetadata) -> bool {
+    let expected_origin = metadata.base_url.trim_end_matches('/');
+    if metadata
+        .headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| origin.trim_end_matches('/') == expected_origin)
+    {
+        return true;
+    }
+
+    metadata
+        .headers
+        .get("referer")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|referer| {
+            referer == expected_origin
+                || referer
+                    .strip_prefix(expected_origin)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
 }
 
 /// Create a new email domain
@@ -833,5 +907,55 @@ async fn create_dns_record(
                 message: format!("Failed to create record: {}", e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_is_same_origin;
+    use axum::http::{HeaderMap, HeaderValue};
+    use temps_core::RequestMetadata;
+
+    fn metadata_with_header(name: &'static str, value: &'static str) -> RequestMetadata {
+        let mut headers = HeaderMap::new();
+        headers.insert(name, HeaderValue::from_static(value));
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "test".to_string(),
+            headers,
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "https://app.example.com".to_string(),
+            scheme: "https".to_string(),
+            host: "app.example.com".to_string(),
+            is_secure: true,
+        }
+    }
+
+    #[test]
+    fn accepts_exact_console_origin() {
+        let metadata = metadata_with_header("origin", "https://app.example.com");
+        assert!(request_is_same_origin(&metadata));
+    }
+
+    #[test]
+    fn rejects_same_site_sibling_origin() {
+        let metadata = metadata_with_header("origin", "https://attacker.example.com");
+        assert!(!request_is_same_origin(&metadata));
+    }
+
+    #[test]
+    fn accepts_same_origin_referer_fallback() {
+        let metadata = metadata_with_header(
+            "referer",
+            "https://app.example.com/settings/email/domains/7",
+        );
+        assert!(request_is_same_origin(&metadata));
+    }
+
+    #[test]
+    fn rejects_missing_browser_origin_evidence() {
+        let metadata = metadata_with_header("accept", "application/json");
+        assert!(!request_is_same_origin(&metadata));
     }
 }
