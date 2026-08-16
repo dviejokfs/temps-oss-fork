@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
+import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboarding'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
@@ -96,6 +97,7 @@ export function Projects() {
   )
 
   const dashboardHealth = useDashboardHealth(projectIds, startDate, endDate)
+  const latestDeploymentMedia = useLatestDeploymentMedia(projectIds)
 
   const renderProjectCards = () =>
     visibleProjects.map((project) => (
@@ -109,6 +111,9 @@ export function Projects() {
         healthLoading={dashboardHealth.isLoading}
         healthError={dashboardHealth.isError}
         health={dashboardHealth.data?.projects?.[String(project.id)]}
+        latestDeploymentMedia={
+          latestDeploymentMedia.data?.projects?.[String(project.id)]
+        }
       />
     ))
 
