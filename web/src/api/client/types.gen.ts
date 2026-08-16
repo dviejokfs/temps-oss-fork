@@ -3812,7 +3812,7 @@ export type CreateEnvironmentRequest = {
 export type CreateEnvironmentVariableRequest = {
     environment_ids: Array<number>;
     /**
-     * Include this environment variable in preview environments (default: true)
+     * Include this environment variable in preview environments (default: false)
      */
     include_in_preview?: boolean;
     /**
@@ -4309,7 +4309,7 @@ export type CreateProjectRequest = {
 export type CreateProjectSecretRequest = {
     environment_ids?: Array<number>;
     /**
-     * Include this secret in preview environments.
+     * Include this secret in preview environments (default: false).
      */
     include_in_preview?: boolean;
     /**
@@ -7835,6 +7835,13 @@ export type FailureReportPreviewResponse = {
     reporting_enabled: boolean;
 };
 
+export type FeatureMaturity = {
+    docs_path: string;
+    key: string;
+    maturity: Maturity;
+    reason: string;
+};
+
 export type FieldResponse = {
     /**
      * Field type (Int32, String, Timestamp, etc.)
@@ -8079,7 +8086,7 @@ export type GatewayStatus = {
     host_port?: number | null;
     /**
      * Image reference the container was created with (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway:latest`).
+     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`).
      */
     image?: string | null;
     /**
@@ -10256,6 +10263,8 @@ export type ManualAction = {
  * When a manual action needs to happen relative to migration
  */
 export type ManualActionTiming = 'before-migration' | 'after-migration' | 'within-hours';
+
+export type Maturity = 'stable' | 'beta' | 'experimental';
 
 export type McpDefinitionResponse = {
     config: {
@@ -13986,6 +13995,11 @@ export type ReadRowsQuery = {
      * Sort order (asc/desc)
      */
     sort_order?: string | null;
+};
+
+export type ReassignCustomDomainRequest = {
+    target_environment_id: number;
+    target_project_id: number;
 };
 
 /**
@@ -19220,12 +19234,14 @@ export type UpdateEnvironmentSettingsRequest = {
     sse_idle_timeout_seconds?: number | null;
     /**
      * Label selector for node-based scheduling (overrides project-level setting).
+     * Send an empty object to clear the environment-level override.
      * Same key with array value -> OR, different keys -> AND.
      * Example: `{"region": ["us", "asia"], "gpu": "true"}`
      */
     target_labels?: unknown;
     /**
-     * Optional list of node IDs to deploy to (overrides project-level setting)
+     * Optional list of node IDs to deploy to (overrides project-level setting).
+     * Send an empty list to clear the environment-level override.
      */
     target_nodes?: Array<number> | null;
     /**
@@ -19819,7 +19835,7 @@ export type UpgradeExternalServiceRequest = {
 export type UpgradeRequest = {
     /**
      * Image reference to pull and run (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway:latest`). Empty resets to default.
+     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`). Empty resets to default.
      */
     image: string;
 };
@@ -38407,6 +38423,42 @@ export type GetProjectBySlugResponses = {
 
 export type GetProjectBySlugResponse = GetProjectBySlugResponses[keyof GetProjectBySlugResponses];
 
+export type GetVisibleCustomDomainByHostnameData = {
+    body?: never;
+    path: {
+        /**
+         * Domain hostname
+         */
+        hostname: string;
+    };
+    query?: never;
+    url: '/projects/custom-domains/by-host/{hostname}';
+};
+
+export type GetVisibleCustomDomainByHostnameErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Project access denied
+     */
+    403: unknown;
+    /**
+     * Domain is not assigned to a project
+     */
+    404: unknown;
+};
+
+export type GetVisibleCustomDomainByHostnameResponses = {
+    /**
+     * Custom domain assignment retrieved
+     */
+    200: CustomDomainResponse;
+};
+
+export type GetVisibleCustomDomainByHostnameResponse = GetVisibleCustomDomainByHostnameResponses[keyof GetVisibleCustomDomainByHostnameResponses];
+
 export type CreateProjectFromTemplateData = {
     body: CreateProjectFromTemplateRequest;
     path?: never;
@@ -48106,6 +48158,54 @@ export type WorkflowDryRunResponses = {
 
 export type WorkflowDryRunResponse = WorkflowDryRunResponses[keyof WorkflowDryRunResponses];
 
+export type ReassignProjectCustomDomainData = {
+    body: ReassignCustomDomainRequest;
+    path: {
+        /**
+         * Current project ID
+         */
+        source_project_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/projects/{source_project_id}/custom-domains/{domain_id}/assignment';
+};
+
+export type ReassignProjectCustomDomainErrors = {
+    /**
+     * Target environment does not belong to the target project
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Write access required for both projects
+     */
+    403: unknown;
+    /**
+     * Custom domain not found
+     */
+    404: unknown;
+    /**
+     * Domain assignment changed; refresh and retry
+     */
+    409: unknown;
+};
+
+export type ReassignProjectCustomDomainResponses = {
+    /**
+     * Domain assignment updated atomically
+     */
+    200: CustomDomainResponse;
+};
+
+export type ReassignProjectCustomDomainResponse = ReassignProjectCustomDomainResponses[keyof ReassignProjectCustomDomainResponses];
+
 export type GetProxyLogsData = {
     body?: never;
     path?: never;
@@ -51850,6 +51950,33 @@ export type RemoveRoleResponses = {
 };
 
 export type RemoveRoleResponse = RemoveRoleResponses[keyof RemoveRoleResponses];
+
+export type GetFeatureMaturityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/platform/feature-maturity';
+};
+
+export type GetFeatureMaturityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetFeatureMaturityResponses = {
+    /**
+     * Feature maturity registry for this build
+     */
+    200: Array<FeatureMaturity>;
+};
+
+export type GetFeatureMaturityResponse = GetFeatureMaturityResponses[keyof GetFeatureMaturityResponses];
 
 export type ListSnapshotsData = {
     body?: never;
