@@ -52,6 +52,8 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         domains::verify_domain,
         domains::delete_email_domain,
         domains::setup_dns,
+        domains::authorize_project,
+        domains::revoke_project,
         // Emails
         emails::send_email,
         emails::list_emails,

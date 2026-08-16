@@ -1,11 +1,11 @@
 //! Domain service for managing email sending domains
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
+    EntityTrait, QueryFilter, QueryOrder,
 };
 use std::sync::Arc;
-use temps_entities::email_domains;
+use temps_entities::{email_domain_projects, email_domains, projects};
 use tracing::{debug, error, info, warn};
 
 use crate::errors::EmailError;
@@ -134,6 +134,66 @@ impl DomainService {
             .await?;
 
         Ok(domain)
+    }
+
+    /// Allow one project-scoped deployment credential to use a verified sender domain.
+    pub async fn authorize_project(
+        &self,
+        domain_id: i32,
+        project_id: i32,
+    ) -> Result<(), EmailError> {
+        self.get(domain_id).await?;
+        let project_exists = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !project_exists {
+            return Err(EmailError::ProjectNotFound(project_id));
+        }
+
+        email_domain_projects::Entity::insert(email_domain_projects::ActiveModel {
+            domain_id: Set(domain_id),
+            project_id: Set(project_id),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::columns([
+                email_domain_projects::Column::DomainId,
+                email_domain_projects::Column::ProjectId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec(self.db.as_ref())
+        .await?;
+
+        Ok(())
+    }
+
+    /// Remove a project's permission to use a sender domain.
+    pub async fn revoke_project(&self, domain_id: i32, project_id: i32) -> Result<(), EmailError> {
+        self.get(domain_id).await?;
+        email_domain_projects::Entity::delete_many()
+            .filter(email_domain_projects::Column::DomainId.eq(domain_id))
+            .filter(email_domain_projects::Column::ProjectId.eq(project_id))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    /// Whether a project-scoped deployment credential may send through this domain.
+    pub async fn is_authorized_for_project(
+        &self,
+        domain_id: i32,
+        project_id: i32,
+    ) -> Result<bool, EmailError> {
+        Ok(
+            email_domain_projects::Entity::find_by_id((domain_id, project_id))
+                .one(self.db.as_ref())
+                .await?
+                .is_some(),
+        )
     }
 
     /// Get a domain with its DNS records (fetches fresh verification status from provider)

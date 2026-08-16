@@ -188,6 +188,7 @@ mod m20260811_000001_create_renewal_attempts;
 mod m20260813_000001_add_ai_api_traffic_summary_enabled;
 mod m20260814_000001_create_ai_provider_models;
 mod m20260814_000002_add_ai_summary_preference;
+mod m20260816_000001_project_scoped_email_delivery;
 
 pub struct Migrator;
 
@@ -402,6 +403,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260813_000001_add_ai_api_traffic_summary_enabled::Migration),
             Box::new(m20260814_000001_create_ai_provider_models::Migration),
             Box::new(m20260814_000002_add_ai_summary_preference::Migration),
+            Box::new(m20260816_000001_project_scoped_email_delivery::Migration),
         ]
     }
 }

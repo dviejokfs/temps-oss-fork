@@ -2,11 +2,13 @@
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder,
+    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
 };
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use temps_entities::emails;
+use temps_entities::{email_idempotency_keys, emails};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -70,6 +72,17 @@ pub struct ListEmailsOptions {
     pub page_size: Option<u64>,
 }
 
+enum IdempotencyDecision {
+    New,
+    Return(SendEmailResponse),
+    Resume(Box<emails::Model>),
+}
+
+// Keep this shorter than the Cloud outbox retry horizon. A process crash after
+// the claim commit must become recoverable before the caller exhausts its
+// retries, while still preventing concurrent provider calls.
+const DELIVERY_LEASE_SECONDS: i64 = 30;
+
 impl EmailService {
     pub fn new(
         db: Arc<DatabaseConnection>,
@@ -103,6 +116,28 @@ impl EmailService {
     /// 4. If domain is configured and verified, send via provider and mark as "sent"
     /// 5. If domain is not configured or not verified, mark as "captured" (Mailhog-like behavior)
     pub async fn send(&self, request: SendEmailRequest) -> Result<SendEmailResponse, EmailError> {
+        self.send_with_context(request, None).await
+    }
+
+    /// Send from a deployment token's project scope.
+    ///
+    /// The domain must have been explicitly authorized for the project, and a
+    /// durable idempotency claim is committed before the provider is called.
+    pub async fn send_for_project(
+        &self,
+        request: SendEmailRequest,
+        project_id: i32,
+        idempotency_key: String,
+    ) -> Result<SendEmailResponse, EmailError> {
+        self.send_with_context(request, Some((project_id, idempotency_key)))
+            .await
+    }
+
+    async fn send_with_context(
+        &self,
+        request: SendEmailRequest,
+        project_context: Option<(i32, String)>,
+    ) -> Result<SendEmailResponse, EmailError> {
         debug!("Sending email from {} to {:?}", request.from, request.to);
 
         // Extract domain from 'from' address
@@ -115,8 +150,51 @@ impl EmailService {
         // Look up domain by extracted domain name
         let domain = self.domain_service.find_by_domain_name(from_domain).await?;
 
-        // Generate email ID
-        let email_id = Uuid::new_v4();
+        if let Some((project_id, _)) = project_context.as_ref() {
+            let Some(domain) = domain.as_ref() else {
+                return Err(EmailError::DomainNotAuthorized {
+                    domain: from_domain.to_string(),
+                    project_id: *project_id,
+                });
+            };
+            if !self
+                .domain_service
+                .is_authorized_for_project(domain.id, *project_id)
+                .await?
+            {
+                return Err(EmailError::DomainNotAuthorized {
+                    domain: domain.domain.clone(),
+                    project_id: *project_id,
+                });
+            }
+        }
+
+        let payload_hash = project_context
+            .as_ref()
+            .map(|_| email_payload_hash(&request));
+        let resume_email = if let (Some((project_id, idempotency_key)), Some(payload_hash)) =
+            (project_context.as_ref(), payload_hash.as_ref())
+        {
+            match self
+                .idempotency_decision(*project_id, idempotency_key, payload_hash)
+                .await?
+            {
+                IdempotencyDecision::Return(existing) => return Ok(existing),
+                IdempotencyDecision::Resume(email) => Some(*email),
+                IdempotencyDecision::New => None,
+            }
+        } else {
+            None
+        };
+
+        // A stale lease resumes with the original stable ID. At-least-once
+        // delivery is deliberate: a crash after the provider accepted the
+        // email but before status persistence can produce one duplicate, but
+        // it cannot silently lose an operational alert forever.
+        let email_id = resume_email
+            .as_ref()
+            .map(|email| email.id)
+            .unwrap_or_else(Uuid::new_v4);
 
         // Apply tracking transformations if enabled
         let track_opens = request.track_opens;
@@ -139,7 +217,7 @@ impl EmailService {
         let email = emails::ActiveModel {
             id: Set(email_id),
             domain_id: Set(domain.as_ref().map(|d| d.id)),
-            project_id: Set(None),
+            project_id: Set(project_context.as_ref().map(|(project_id, _)| *project_id)),
             from_address: Set(request.from.clone()),
             from_name: Set(request.from_name.clone()),
             to_addresses: Set(serde_json::to_value(&request.to)?),
@@ -168,7 +246,41 @@ impl EmailService {
             ..Default::default()
         };
 
-        let email_model = email.insert(self.db.as_ref()).await?;
+        let email_model = if let Some(email) = resume_email {
+            email
+        } else if let (Some((project_id, idempotency_key)), Some(payload_hash)) =
+            (project_context.as_ref(), payload_hash.as_ref())
+        {
+            let transaction = self.db.begin().await?;
+            let email_model = email.insert(&transaction).await?;
+            let claim = email_idempotency_keys::ActiveModel {
+                project_id: Set(*project_id),
+                idempotency_key: Set(idempotency_key.clone()),
+                payload_hash: Set(payload_hash.clone()),
+                email_id: Set(email_id),
+                lease_expires_at: Set(
+                    Utc::now() + chrono::Duration::seconds(DELIVERY_LEASE_SECONDS)
+                ),
+                ..Default::default()
+            };
+
+            if let Err(insert_error) = claim.insert(&transaction).await {
+                transaction.rollback().await?;
+                match self
+                    .idempotency_decision(*project_id, idempotency_key, payload_hash)
+                    .await?
+                {
+                    IdempotencyDecision::Return(existing) => return Ok(existing),
+                    IdempotencyDecision::Resume(email) => *email,
+                    IdempotencyDecision::New => return Err(insert_error.into()),
+                }
+            } else {
+                transaction.commit().await?;
+                email_model
+            }
+        } else {
+            email.insert(self.db.as_ref()).await?
+        };
 
         // Store extracted links for click tracking
         if !extracted_links.is_empty() {
@@ -429,6 +541,74 @@ impl EmailService {
         }
     }
 
+    async fn idempotency_decision(
+        &self,
+        project_id: i32,
+        idempotency_key: &str,
+        payload_hash: &str,
+    ) -> Result<IdempotencyDecision, EmailError> {
+        let Some(claim) =
+            email_idempotency_keys::Entity::find_by_id((project_id, idempotency_key.to_string()))
+                .one(self.db.as_ref())
+                .await?
+        else {
+            return Ok(IdempotencyDecision::New);
+        };
+
+        if claim.payload_hash != payload_hash {
+            return Err(EmailError::IdempotencyConflict {
+                key: idempotency_key.to_string(),
+            });
+        }
+
+        let email = emails::Entity::find_by_id(claim.email_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                EmailError::EmailNotFound(format!(
+                    "idempotency claim for project {project_id} references {}",
+                    claim.email_id
+                ))
+            })?;
+        let retryable = email.status == "queued"
+            || (email.status == "captured"
+                && !email
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|message| message.starts_with("Recipient(s) suppressed")));
+        if !retryable {
+            return Ok(IdempotencyDecision::Return(SendEmailResponse {
+                id: email.id,
+                status: email.status,
+                provider_message_id: email.provider_message_id,
+            }));
+        }
+
+        let now = Utc::now();
+        let acquired = email_idempotency_keys::Entity::update_many()
+            .col_expr(
+                email_idempotency_keys::Column::LeaseExpiresAt,
+                Expr::value(now + chrono::Duration::seconds(DELIVERY_LEASE_SECONDS)),
+            )
+            .filter(email_idempotency_keys::Column::ProjectId.eq(project_id))
+            .filter(email_idempotency_keys::Column::IdempotencyKey.eq(idempotency_key.to_string()))
+            .filter(email_idempotency_keys::Column::LeaseExpiresAt.lte(now))
+            .exec(self.db.as_ref())
+            .await?
+            .rows_affected
+            == 1;
+
+        if acquired {
+            Ok(IdempotencyDecision::Resume(Box::new(email)))
+        } else {
+            Ok(IdempotencyDecision::Return(SendEmailResponse {
+                id: email.id,
+                status: email.status,
+                provider_message_id: email.provider_message_id,
+            }))
+        }
+    }
+
     /// Get an email by ID
     pub async fn get(&self, id: Uuid) -> Result<emails::Model, EmailError> {
         emails::Entity::find_by_id(id)
@@ -513,6 +693,33 @@ impl EmailService {
     }
 }
 
+fn email_payload_hash(request: &SendEmailRequest) -> String {
+    let headers = request.headers.as_ref().map(|headers| {
+        headers
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>()
+    });
+    let payload = serde_json::json!({
+        "from": request.from,
+        "from_name": request.from_name,
+        "to": request.to,
+        "cc": request.cc,
+        "bcc": request.bcc,
+        "reply_to": request.reply_to,
+        "subject": request.subject,
+        "html": request.html,
+        "text": request.text,
+        "headers": headers,
+        "tags": request.tags,
+        "track_opens": request.track_opens,
+        "track_clicks": request.track_clicks,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(payload.to_string().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// Email statistics
 #[derive(Debug, Clone)]
 pub struct EmailStats {
@@ -559,6 +766,24 @@ mod tests {
     use crate::services::TrackingService;
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
+
+    fn test_send_request(subject: &str) -> SendEmailRequest {
+        SendEmailRequest {
+            from: "sender@test-pending.example.com".to_string(),
+            from_name: Some("Test Sender".to_string()),
+            to: vec!["recipient@test.com".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: subject.to_string(),
+            html: Some("<p>Test</p>".to_string()),
+            text: Some("Test".to_string()),
+            headers: None,
+            tags: None,
+            track_opens: false,
+            track_clicks: false,
+        }
+    }
 
     // Helper to create a test encryption service
     fn create_test_encryption_service() -> Arc<EncryptionService> {
@@ -920,6 +1145,22 @@ mod tests {
         assert_eq!(domain, Some("mail.example.com"));
     }
 
+    #[test]
+    fn idempotency_hash_is_stable_across_header_insertion_order() {
+        let mut first = test_send_request("same payload");
+        first.headers = Some(std::collections::HashMap::from([
+            ("X-B".to_string(), "2".to_string()),
+            ("X-A".to_string(), "1".to_string()),
+        ]));
+        let mut second = test_send_request("same payload");
+        second.headers = Some(std::collections::HashMap::from([
+            ("X-A".to_string(), "1".to_string()),
+            ("X-B".to_string(), "2".to_string()),
+        ]));
+
+        assert_eq!(email_payload_hash(&first), email_payload_hash(&second));
+    }
+
     // ============================================
     // Integration Tests (Require Docker)
     // ============================================
@@ -990,6 +1231,173 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status, "captured");
+    }
+
+    #[tokio::test]
+    async fn deployment_send_requires_domain_grant_and_replays_without_a_second_email() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        let (db, email_service, provider_service, domain_service) = setup_test_env().await;
+        let provider = create_test_provider(&provider_service).await;
+        let domain = create_test_domain(&db.db, provider.id, "test-pending.example.com").await;
+        let project_slug = format!("email-project-{}", Uuid::new_v4());
+        let project_row = db
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO projects \
+                     (name,repo_name,repo_owner,directory,main_branch,preset,created_at,updated_at,slug) \
+                     VALUES ('Email Test','email-test','tests','.','main','python',now(),now(),'{project_slug}') \
+                     RETURNING id"
+                ),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let project_id: i32 = project_row.try_get("", "id").unwrap();
+
+        let denied = email_service
+            .send_for_project(test_send_request("first"), project_id, "delivery-1".into())
+            .await;
+        assert!(matches!(
+            denied,
+            Err(EmailError::DomainNotAuthorized { .. })
+        ));
+
+        domain_service
+            .authorize_project(domain.id, project_id)
+            .await
+            .unwrap();
+        let first = email_service
+            .send_for_project(test_send_request("first"), project_id, "delivery-1".into())
+            .await
+            .unwrap();
+        let replay = email_service
+            .send_for_project(test_send_request("first"), project_id, "delivery-1".into())
+            .await
+            .unwrap();
+        assert_eq!(first.id, replay.id);
+        assert_eq!(first.status, "captured");
+
+        // `captured` is retryable for deployment sends unless the recipient is
+        // permanently suppressed. Once the short delivery lease expires, the
+        // same request resumes the same email instead of being suppressed
+        // forever by its idempotency claim.
+        email_idempotency_keys::Entity::update_many()
+            .col_expr(
+                email_idempotency_keys::Column::LeaseExpiresAt,
+                Expr::value(Utc::now() - chrono::Duration::seconds(1)),
+            )
+            .filter(email_idempotency_keys::Column::ProjectId.eq(project_id))
+            .filter(email_idempotency_keys::Column::IdempotencyKey.eq("delivery-1"))
+            .exec(db.db.as_ref())
+            .await
+            .unwrap();
+        let resumed = email_service
+            .send_for_project(test_send_request("first"), project_id, "delivery-1".into())
+            .await
+            .unwrap();
+        assert_eq!(first.id, resumed.id);
+        assert_eq!(resumed.status, "captured");
+
+        let email_count = emails::Entity::find()
+            .filter(emails::Column::ProjectId.eq(project_id))
+            .count(db.db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(email_count, 1, "an HTTP retry must not enqueue twice");
+
+        let conflict = email_service
+            .send_for_project(
+                test_send_request("different"),
+                project_id,
+                "delivery-1".into(),
+            )
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(EmailError::IdempotencyConflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_delivery_lease_resumes_after_crash_without_creating_a_second_email() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        let (db, email_service, provider_service, domain_service) = setup_test_env().await;
+        let provider = create_test_provider(&provider_service).await;
+        let domain = create_test_domain(&db.db, provider.id, "test-pending.example.com").await;
+        let project_slug = format!("email-resume-{}", Uuid::new_v4());
+        let project_row = db
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO projects \
+                     (name,repo_name,repo_owner,directory,main_branch,preset,created_at,updated_at,slug) \
+                     VALUES ('Email Resume','email-resume','tests','.','main','python',now(),now(),'{project_slug}') \
+                     RETURNING id"
+                ),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let project_id: i32 = project_row.try_get("", "id").unwrap();
+        domain_service
+            .authorize_project(domain.id, project_id)
+            .await
+            .unwrap();
+
+        let request = test_send_request("resume after crash");
+        let email_id = Uuid::new_v4();
+        emails::ActiveModel {
+            id: Set(email_id),
+            domain_id: Set(Some(domain.id)),
+            project_id: Set(Some(project_id)),
+            from_address: Set(request.from.clone()),
+            from_name: Set(request.from_name.clone()),
+            to_addresses: Set(serde_json::to_value(&request.to).unwrap()),
+            subject: Set(request.subject.clone()),
+            html_body: Set(request.html.clone()),
+            text_body: Set(request.text.clone()),
+            status: Set("queued".to_string()),
+            track_opens: Set(false),
+            track_clicks: Set(false),
+            open_count: Set(0),
+            click_count: Set(0),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        email_idempotency_keys::ActiveModel {
+            project_id: Set(project_id),
+            idempotency_key: Set("crashed-delivery".to_string()),
+            payload_hash: Set(email_payload_hash(&request)),
+            email_id: Set(email_id),
+            lease_expires_at: Set(Utc::now() - chrono::Duration::seconds(1)),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let resumed = email_service
+            .send_for_project(request, project_id, "crashed-delivery".into())
+            .await
+            .unwrap();
+
+        assert_eq!(resumed.id, email_id);
+        assert_eq!(resumed.status, "captured");
+        assert_eq!(
+            emails::Entity::find()
+                .filter(emails::Column::ProjectId.eq(project_id))
+                .count(db.db.as_ref())
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

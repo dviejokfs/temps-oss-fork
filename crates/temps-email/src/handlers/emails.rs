@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
-    error_builder::{bad_request, internal_server_error, not_found},
+    error_builder::{bad_request, conflict, forbidden, internal_server_error, not_found},
     problemdetails::Problem,
     AuditContext, RequestMetadata,
 };
@@ -52,6 +52,7 @@ pub async fn send_email(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    headers: HeaderMap,
     Json(request): Json<SendEmailRequestBody>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailsSend);
@@ -85,13 +86,28 @@ pub async fn send_email(
         track_clicks: request.track_clicks.unwrap_or(false),
     };
 
-    let result = state.email_service.send(send_request).await.map_err(|e| {
+    let result = if let Some(deployment) = auth.deployment_token_info() {
+        let idempotency_key = deployment_idempotency_key(&headers)?;
+        state
+            .email_service
+            .send_for_project(send_request, deployment.project_id, idempotency_key)
+            .await
+    } else {
+        state.email_service.send(send_request).await
+    }
+    .map_err(|e| {
         error!("Failed to send email: {}", e);
         match &e {
             crate::errors::EmailError::DomainNotVerified(msg) => {
                 bad_request().detail(msg.clone()).build()
             }
             crate::errors::EmailError::Validation(msg) => bad_request().detail(msg.clone()).build(),
+            crate::errors::EmailError::DomainNotAuthorized { .. } => {
+                forbidden().detail(e.to_string()).build()
+            }
+            crate::errors::EmailError::IdempotencyConflict { .. } => {
+                conflict().detail(e.to_string()).build()
+            }
             _ => internal_server_error()
                 .detail(format!("Failed to send email: {}", e))
                 .build(),
@@ -122,6 +138,38 @@ pub async fn send_email(
     };
 
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+fn deployment_idempotency_key(headers: &HeaderMap) -> Result<String, Problem> {
+    const HEADER: &str = "idempotency-key";
+    let value = headers
+        .get(HEADER)
+        .ok_or_else(|| {
+            bad_request()
+                .detail("Deployment-token email requests require an Idempotency-Key header")
+                .build()
+        })?
+        .to_str()
+        .map_err(|_| {
+            bad_request()
+                .detail("Idempotency-Key must contain visible ASCII characters")
+                .build()
+        })?;
+
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
+    {
+        return Err(bad_request()
+            .detail(
+                "Idempotency-Key must be 1-128 characters using letters, digits, '-', '_', ':' or '.'",
+            )
+            .build());
+    }
+
+    Ok(value.to_string())
 }
 
 /// List emails with optional filtering
@@ -343,5 +391,30 @@ fn parse_json_map(value: serde_json::Value) -> Option<std::collections::HashMap<
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_idempotency_key_is_required_and_bounded() {
+        let mut headers = HeaderMap::new();
+        assert!(deployment_idempotency_key(&headers).is_err());
+
+        headers.insert(
+            "idempotency-key",
+            "notification:tenant.delivery".parse().unwrap(),
+        );
+        assert_eq!(
+            deployment_idempotency_key(&headers).unwrap(),
+            "notification:tenant.delivery"
+        );
+
+        headers.insert("idempotency-key", "contains spaces".parse().unwrap());
+        assert!(deployment_idempotency_key(&headers).is_err());
+        headers.insert("idempotency-key", "x".repeat(129).parse().unwrap());
+        assert!(deployment_idempotency_key(&headers).is_err());
     }
 }

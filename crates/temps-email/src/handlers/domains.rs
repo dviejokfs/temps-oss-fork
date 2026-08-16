@@ -18,7 +18,10 @@ use temps_core::{
 use temps_dns::providers::{DnsProvider, DnsRecordContent, DnsRecordRequest};
 use tracing::{error, info, warn};
 
-use super::audit::{EmailDomainCreatedAudit, EmailDomainDeletedAudit, EmailDomainVerifiedAudit};
+use super::audit::{
+    EmailDomainCreatedAudit, EmailDomainDeletedAudit, EmailDomainProjectAuthorizedAudit,
+    EmailDomainProjectRevokedAudit, EmailDomainVerifiedAudit,
+};
 use super::types::{
     AppState, CreateEmailDomainRequest, DnsRecordResponse, DnsRecordSetupResult,
     EmailDomainResponse, EmailDomainWithDnsResponse, ListDomainsQuery, SetupDnsRequest,
@@ -38,12 +41,21 @@ impl From<EmailError> for Problem {
         match error {
             EmailError::DomainNotFound(_)
             | EmailError::ProviderNotFound(_)
-            | EmailError::EmailNotFound(_) => problemdetails::new(StatusCode::NOT_FOUND)
+            | EmailError::EmailNotFound(_)
+            | EmailError::ProjectNotFound(_) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Resource Not Found")
                 .with_detail(error.to_string()),
 
             EmailError::DomainNotVerified(_) => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Domain Not Verified")
+                .with_detail(error.to_string()),
+
+            EmailError::DomainNotAuthorized { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Sender Domain Not Authorized")
+                .with_detail(error.to_string()),
+
+            EmailError::IdempotencyConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Idempotency Key Conflict")
                 .with_detail(error.to_string()),
 
             EmailError::Validation(_) | EmailError::InvalidProviderType(_) => {
@@ -89,6 +101,88 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/email-domains/{id}/verify", post(verify_domain))
         .route("/email-domains/{id}/setup-dns", post(setup_dns))
+        .route(
+            "/email-domains/{id}/projects/{project_id}",
+            post(authorize_project).delete(revoke_project),
+        )
+}
+
+#[utoipa::path(
+    tag = "Email Domains",
+    post,
+    path = "/email-domains/{id}/projects/{project_id}",
+    params(
+        ("id" = i32, Path, description = "Email domain ID"),
+        ("project_id" = i32, Path, description = "Project allowed to send from this domain")
+    ),
+    responses(
+        (status = 204, description = "Project authorized"),
+        (status = 404, description = "Domain or project not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn authorize_project(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    Path((id, project_id)): Path<(i32, i32)>,
+) -> Result<StatusCode, Problem> {
+    permission_guard!(auth, EmailDomainsWrite);
+    let result = state.domain_service.authorize_project(id, project_id).await;
+    let audit = EmailDomainProjectAuthorizedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        domain_id: id,
+        project_id,
+        success: result.is_ok(),
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to audit email-domain project authorization: {error}");
+    }
+    result.map_err(Problem::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    tag = "Email Domains",
+    delete,
+    path = "/email-domains/{id}/projects/{project_id}",
+    params(
+        ("id" = i32, Path, description = "Email domain ID"),
+        ("project_id" = i32, Path, description = "Project whose authorization is revoked")
+    ),
+    responses(
+        (status = 204, description = "Project authorization revoked"),
+        (status = 404, description = "Domain not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn revoke_project(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    Path((id, project_id)): Path<(i32, i32)>,
+) -> Result<StatusCode, Problem> {
+    permission_guard!(auth, EmailDomainsWrite);
+    let result = state.domain_service.revoke_project(id, project_id).await;
+    let audit = EmailDomainProjectRevokedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        domain_id: id,
+        project_id,
+        success: result.is_ok(),
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to audit email-domain project revocation: {error}");
+    }
+    result.map_err(Problem::from)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Create a new email domain

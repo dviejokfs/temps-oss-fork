@@ -236,6 +236,66 @@ pub struct EmailDomainDeletedAudit {
     pub domain: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailDomainProjectAuthorizedAudit {
+    pub context: AuditContext,
+    pub domain_id: i32,
+    pub project_id: i32,
+    pub success: bool,
+}
+
+impl AuditOperation for EmailDomainProjectAuthorizedAudit {
+    fn operation_type(&self) -> String {
+        "EMAIL_DOMAIN_PROJECT_AUTHORIZED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailDomainProjectRevokedAudit {
+    pub context: AuditContext,
+    pub domain_id: i32,
+    pub project_id: i32,
+    pub success: bool,
+}
+
+impl AuditOperation for EmailDomainProjectRevokedAudit {
+    fn operation_type(&self) -> String {
+        "EMAIL_DOMAIN_PROJECT_REVOKED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
 impl AuditOperation for EmailDomainDeletedAudit {
     fn operation_type(&self) -> String {
         "EMAIL_DOMAIN_DELETED".to_string()
@@ -290,5 +350,50 @@ impl AuditOperation for EmailSentAudit {
 
     fn serialize(&self) -> anyhow::Result<String> {
         serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> AuditContext {
+        AuditContext {
+            user_id: 7,
+            ip_address: Some("127.0.0.1".to_string()),
+            user_agent: "audit-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn project_sender_grants_and_revocations_are_distinct_attributable_events() {
+        let authorized = EmailDomainProjectAuthorizedAudit {
+            context: context(),
+            domain_id: 2,
+            project_id: 70,
+            success: true,
+        };
+        let revoked = EmailDomainProjectRevokedAudit {
+            context: context(),
+            domain_id: 2,
+            project_id: 70,
+            success: false,
+        };
+
+        assert_eq!(
+            authorized.operation_type(),
+            "EMAIL_DOMAIN_PROJECT_AUTHORIZED"
+        );
+        assert_eq!(revoked.operation_type(), "EMAIL_DOMAIN_PROJECT_REVOKED");
+        let authorized_json = AuditOperation::serialize(&authorized).unwrap();
+        let revoked_json = AuditOperation::serialize(&revoked).unwrap();
+        for serialized in [&authorized_json, &revoked_json] {
+            assert!(serialized.contains("\"domain_id\":2"));
+            assert!(serialized.contains("\"project_id\":70"));
+            assert!(serialized.contains("\"user_id\":7"));
+            assert!(serialized.contains("127.0.0.1"));
+        }
+        assert!(authorized_json.contains("\"success\":true"));
+        assert!(revoked_json.contains("\"success\":false"));
     }
 }
