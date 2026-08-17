@@ -274,6 +274,12 @@ export function DnsVerificationSummary({ records }: { records: DnsRecord[] }) {
 
   const allVerified = verifiedCount === totalCount && totalCount > 0
 
+  // Nothing to summarize for domains with no DNS records to manage (e.g.
+  // an SMTP-imported domain) — the empty state below already explains that.
+  if (totalCount === 0) {
+    return null
+  }
+
   if (allVerified) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-900 dark:bg-emerald-950/30">
@@ -318,7 +324,11 @@ export function DnsVerificationSummary({ records }: { records: DnsRecord[] }) {
 
 export function DnsRecordsTable({ records }: { records: DnsRecord[] }) {
   if (!records || records.length === 0) {
-    return <p className="text-sm text-muted-foreground">No DNS records available.</p>
+    return (
+      <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+        No DNS records to manage for this domain.
+      </div>
+    )
   }
 
   return (
@@ -673,8 +683,8 @@ export function EmailDomainsManagement() {
           <DialogHeader>
             <DialogTitle>Add email domain</DialogTitle>
             <DialogDescription>
-              Add a domain for sending emails. You'll need to configure DNS records
-              after adding.
+              Add a domain for sending emails. You&apos;ll need to configure DNS
+              records after adding.
             </DialogDescription>
           </DialogHeader>
 

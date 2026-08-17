@@ -67,15 +67,11 @@ import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
-  Archive,
   ArrowLeft,
   CheckCircle2,
-  Clock,
   Globe,
   KeyRound,
   Loader2,
-  Mail,
-  MailX,
   RefreshCw,
   Settings2,
   Trash2,
@@ -139,41 +135,48 @@ async function fetchProjects(): Promise<ProjectResponse[]> {
   return response.data?.projects ?? []
 }
 
-function StatCard({
-  title,
-  value,
-  icon: Icon,
-}: {
-  title: string
-  value: number
-  icon: React.ComponentType<{ className?: string }>
-}) {
+const STAT_DIVIDER_CLASSES = cn(
+  // Mobile: 2 columns — vertical divider on the right column, horizontal
+  // divider once a second row starts (items 3+, since there are 5 items).
+  '[&:nth-child(2n)]:border-l',
+  '[&:nth-child(n+3)]:border-t',
+  // Desktop: single row of 5 — only a vertical divider between siblings,
+  // no leftover horizontal divider from the mobile layout.
+  '@min-3xl:border-t-0',
+  '@min-3xl:[&:not(:first-child)]:border-l',
+  '@min-3xl:[&:nth-child(2n)]:border-l'
+)
+
+function StatPanel({ stats }: { stats: { label: string; value: number }[] }) {
   return (
-    <Card>
-      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-        <CardTitle className="text-sm font-medium">{title}</CardTitle>
-        <Icon className="h-4 w-4 text-muted-foreground" />
-      </CardHeader>
-      <CardContent>
-        <div className="text-2xl font-bold">{value.toLocaleString()}</div>
-      </CardContent>
-    </Card>
+    <div className="@container rounded-lg border">
+      <dl className="grid grid-cols-2 @min-3xl:grid-cols-5">
+        {stats.map((stat) => (
+          <div key={stat.label} className={cn('space-y-1 p-4', STAT_DIVIDER_CLASSES)}>
+            <dt className="truncate text-sm font-medium text-muted-foreground">
+              {stat.label}
+            </dt>
+            <dd className="text-2xl font-semibold tabular-nums">
+              {stat.value.toLocaleString()}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </div>
   )
 }
 
 function StatsSkeleton() {
   return (
-    <div className="grid gap-4 grid-cols-2 md:grid-cols-5">
-      {[1, 2, 3, 4, 5].map((i) => (
-        <Card key={i}>
-          <CardHeader className="pb-2">
+    <div className="@container rounded-lg border">
+      <dl className="grid grid-cols-2 @min-3xl:grid-cols-5">
+        {[1, 2, 3, 4, 5].map((i) => (
+          <div key={i} className={cn('space-y-2 p-4', STAT_DIVIDER_CLASSES)}>
             <Skeleton className="h-4 w-16" />
-          </CardHeader>
-          <CardContent>
-            <Skeleton className="h-8 w-12" />
-          </CardContent>
-        </Card>
-      ))}
+            <Skeleton className="h-7 w-12" />
+          </div>
+        ))}
+      </dl>
     </div>
   )
 }
@@ -567,13 +570,15 @@ export function EmailDomainDetail() {
           </Alert>
         ) : (
           emailStats && (
-            <div className="grid gap-4 grid-cols-2 md:grid-cols-5">
-              <StatCard title="Total Emails" value={emailStats.total} icon={Mail} />
-              <StatCard title="Sent" value={emailStats.sent} icon={CheckCircle2} />
-              <StatCard title="Captured" value={emailStats.captured} icon={Archive} />
-              <StatCard title="Queued" value={emailStats.queued} icon={Clock} />
-              <StatCard title="Failed" value={emailStats.failed} icon={MailX} />
-            </div>
+            <StatPanel
+              stats={[
+                { label: 'Total Emails', value: emailStats.total },
+                { label: 'Sent', value: emailStats.sent },
+                { label: 'Captured', value: emailStats.captured },
+                { label: 'Queued', value: emailStats.queued },
+                { label: 'Failed', value: emailStats.failed },
+              ]}
+            />
           )
         )}
 
@@ -611,7 +616,7 @@ export function EmailDomainDetail() {
                         Automatic DNS setup
                       </CardTitle>
                       <CardDescription>
-                        If you've connected a DNS provider in Temps, we can create
+                        If you&apos;ve connected a DNS provider in Temps, we can create
                         these records for you.
                       </CardDescription>
                     </CardHeader>
@@ -820,6 +825,7 @@ export function EmailDomainDetail() {
                     </SelectContent>
                   </Select>
                   <Button
+                    variant="outline"
                     onClick={() => authorizeProjectMutation.mutate(Number(selectedProjectId))}
                     disabled={!selectedProjectId || authorizeProjectMutation.isPending}
                   >
@@ -904,8 +910,8 @@ export function EmailDomainDetail() {
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="grid grid-cols-3 gap-3 py-2.5 text-sm first:pt-0 last:pb-0">
-      <dt className="text-muted-foreground">{label}</dt>
-      <dd className="col-span-2 min-w-0">{children}</dd>
+      <dt className="font-medium">{label}</dt>
+      <dd className="col-span-2 min-w-0 text-muted-foreground">{children}</dd>
     </div>
   )
 }
