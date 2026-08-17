@@ -5280,7 +5280,8 @@ function isInsufficientPermissionsError(error: unknown): boolean {
   return (
     !!error &&
     typeof error === 'object' &&
-    (error as { title?: string }).title === 'Insufficient Permissions'
+    (error as { type?: string }).type ===
+      'https://temps.sh/probs/insufficient-permissions'
   )
 }
 
