@@ -8830,8 +8830,15 @@
         "type": "object"
       },
       "CreateProjectSecretRequest": {
-        "description": "Request to create a new project secret.\n\nProject secrets are mounted into the container as files under\n`/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.\nValues are always encrypted at rest and never returned in plaintext from\nthe API after create. Distinct from agent secrets (global `/settings/secrets`).",
+        "description": "Request to create a new project secret.\n\nProject secrets are mounted into the container as files under\n`/run/secrets/<KEY>` as a read-only mount, instead of as environment\nvariables, so they do not appear in `docker inspect`.\nValues are always encrypted at rest and never returned in plaintext from\nthe API after create. Distinct from agent secrets (global `/settings/secrets`).",
         "properties": {
+          "compose_services": {
+            "description": "Docker Compose services allowed to read this secret, by compose\nservice name. Empty (the default) delivers it to every service in the\nstack, which is how secrets behaved before scoping existed.\n\nIgnored by non-Compose presets: those deploy a single container, which\nalways receives every secret in scope for its environment.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "environment_ids": {
             "items": {
               "format": "int32",
@@ -28886,6 +28893,13 @@
       "ProjectSecretResponse": {
         "description": "Project secret metadata. There is deliberately no `value` field — secret\nplaintext is never returned after creation. Callers that need the value\nmust read it from the mounted file inside the container.",
         "properties": {
+          "compose_services": {
+            "description": "Compose services this secret is restricted to. Empty means every\nservice in the stack.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "created_at": {
             "format": "int64",
             "type": "integer"
@@ -28922,7 +28936,8 @@
           "include_in_preview",
           "created_at",
           "updated_at",
-          "environments"
+          "environments",
+          "compose_services"
         ],
         "type": "object"
       },
@@ -42947,6 +42962,13 @@
       "UpdateProjectSecretRequest": {
         "description": "Request to update a project secret. The `value` field is optional — omit it\nto rotate only the environment scoping / preview flag without touching the\nciphertext.",
         "properties": {
+          "compose_services": {
+            "description": "Docker Compose services allowed to read this secret, by compose\nservice name. Empty (the default) delivers it to every service in the\nstack, which is how secrets behaved before scoping existed.\n\nIgnored by non-Compose presets: those deploy a single container, which\nalways receives every secret in scope for its environment.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "environment_ids": {
             "items": {
               "format": "int32",
