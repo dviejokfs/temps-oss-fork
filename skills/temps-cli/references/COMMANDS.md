@@ -6569,7 +6569,7 @@ Create or update a governance policy for a scope. Only the fields you pass are c
 | `--monthly-budget <dollars>` | Max spend per calendar month, in dollars (e.g. `50.00`) | - | No |
 | `--json` | Output in JSON format | - | No |
 
-Example: `bunx @temps-sdk/cli ai governance set instance --rpm 100 --monthly-budget 50.00`
+Example: `bunx @temps-sdk/cli@0.1.33 ai governance set instance --rpm 100 --monthly-budget 50.00`
 
 #### `ai governance unset <scope>`
 
