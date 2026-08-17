@@ -23,9 +23,11 @@ pub enum AiGatewayError {
         retry_after_seconds: u64,
     },
 
-    #[error(
-        "AI gateway monthly budget exceeded for scope '{scope}': spent {spent_microcents} of {limit_microcents} microcents"
-    )]
+    /// Exact amounts are intentionally omitted from the Display (and therefore
+    /// from HTTP error responses) to prevent leaking the operator's configured
+    /// budget and current spend to untrusted deployment-token callers.
+    /// Use structured tracing fields for server-side diagnostics.
+    #[error("Monthly budget exceeded for scope '{scope}'")]
     MonthlyBudgetExceeded {
         scope: String,
         spent_microcents: i64,

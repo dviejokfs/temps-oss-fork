@@ -264,6 +264,276 @@ async fn audit_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use temps_auth::permissions::{Permission, Role};
+    use temps_auth::RequireAuth;
+    use temps_core::telemetry::NoopTelemetryReporter;
+    use temps_core::EncryptionService;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn test_user(id: i32) -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id,
+            name: "Test User".to_string(),
+            email: format!("user{id}@example.com"),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn user_auth_with_role(role: Role) -> temps_auth::AuthContext {
+        temps_auth::AuthContext::new_session(test_user(1), role)
+    }
+
+    /// Returns an AuthContext that has `AiGatewayWrite` explicitly granted but is
+    /// not an admin or platform-admin.  We use an API-key context with an
+    /// explicit permission list because `Role::User` does NOT include
+    /// `AiGatewayWrite` in its built-in permission set; only `Admin` and
+    /// `PlatformAdmin` carry it by default.  The API-key path lets us grant the
+    /// single permission without elevating the caller to an operator role, which
+    /// is exactly the case `require_operator` must reject.
+    fn non_admin_ai_write_auth() -> temps_auth::AuthContext {
+        temps_auth::AuthContext::new_api_key(
+            test_user(1),
+            None, // no role → effective_role = Role::Custom, not admin
+            Some(vec![Permission::AiGatewayWrite]),
+            "test-ai-write-key".to_string(),
+            1,
+        )
+    }
+
+    struct NoopAuditLogger;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for NoopAuditLogger {
+        async fn create_audit_log(&self, _: &dyn temps_core::AuditOperation) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Minimal stub `AiService` that reports itself as unavailable.
+    struct StubAiService;
+
+    #[async_trait::async_trait]
+    impl temps_ai::service::AiService for StubAiService {
+        async fn is_available(&self) -> bool {
+            false
+        }
+
+        async fn complete(
+            &self,
+            _: temps_ai::service::AiRequest,
+        ) -> Result<temps_ai::service::AiResponse, temps_ai::service::AiError> {
+            Err(temps_ai::service::AiError::NotAvailable)
+        }
+
+        async fn chat_stream(
+            &self,
+            _: temps_ai::streaming::ChatTurnRequest,
+        ) -> Result<temps_ai::streaming::TokenStream, temps_ai::service::AiError> {
+            Err(temps_ai::service::AiError::NotAvailable)
+        }
+    }
+
+    /// Build a minimal `AiGatewayAppState` backed by a disconnected database.
+    /// Auth guard checks happen before any service method is called, so the
+    /// disconnected DB never triggers an actual query in these tests.
+    fn minimal_state() -> Arc<crate::handlers::types::AiGatewayAppState> {
+        use crate::services::{
+            GatewayService, GovernanceService, ProviderKeyService, ProviderModelService,
+            ProviderPreferenceService, StructuredOutputService, UsageService,
+        };
+
+        let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+        let encryption = Arc::new(EncryptionService::new_from_password(
+            "test-key-for-governance-tests",
+        ));
+        let provider_key_service = Arc::new(ProviderKeyService::new(db.clone(), encryption));
+        let gateway_service = Arc::new(GatewayService::new(provider_key_service.clone()));
+        let provider_model_service = Arc::new(ProviderModelService::new(
+            db.clone(),
+            provider_key_service.clone(),
+            gateway_service.clone(),
+        ));
+        let provider_preference_service = Arc::new(ProviderPreferenceService::new(
+            db.clone(),
+            provider_key_service.clone(),
+        ));
+        let usage_service = Arc::new(UsageService::new(db.clone()));
+        let governance_service = Arc::new(GovernanceService::new(db.clone()));
+        let audit_service = Arc::new(NoopAuditLogger) as Arc<dyn temps_core::AuditLogger>;
+        let telemetry =
+            Arc::new(NoopTelemetryReporter) as Arc<dyn temps_core::telemetry::TelemetryReporter>;
+        let structured_output_service =
+            Arc::new(StructuredOutputService::new(Arc::new(StubAiService)));
+
+        Arc::new(crate::handlers::types::AiGatewayAppState {
+            db,
+            gateway_service,
+            provider_key_service,
+            provider_model_service,
+            provider_preference_service,
+            usage_service,
+            governance_service,
+            audit_service,
+            telemetry,
+            provider_status_cache: Arc::new(
+                crate::handlers::provider_status::AiProviderStatusCache::default(),
+            ),
+            structured_output_service,
+            project_access_checker: None,
+        })
+    }
+
+    fn assert_problem_status(problem: &Problem, expected_status: axum::http::StatusCode) {
+        use axum::response::IntoResponse;
+        let resp = problem.clone().into_response();
+        assert_eq!(
+            resp.status(),
+            expected_status,
+            "expected HTTP {expected_status}"
+        );
+    }
+
+    // ── require_operator unit tests ───────────────────────────────────────────
+
+    #[test]
+    fn require_operator_allows_admin() {
+        let auth = user_auth_with_role(Role::Admin);
+        assert!(require_operator(&auth).is_ok());
+    }
+
+    #[test]
+    fn require_operator_allows_platform_admin() {
+        let auth = user_auth_with_role(Role::PlatformAdmin);
+        assert!(require_operator(&auth).is_ok());
+    }
+
+    #[test]
+    fn require_operator_rejects_regular_user() {
+        let auth = user_auth_with_role(Role::User);
+        match require_operator(&auth) {
+            Err(ref problem) => assert_problem_status(problem, axum::http::StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected Err(403) but got Ok"),
+        }
+    }
+
+    // ── handler-level auth tests ──────────────────────────────────────────────
+
+    /// A regular user (Role::User) has `AiGatewayWrite` permission on their own
+    /// projects but must be denied governance endpoints because they are not an
+    /// instance administrator.
+    #[tokio::test]
+    async fn list_governance_configs_rejects_non_admin_with_ai_gateway_write() {
+        let auth = non_admin_ai_write_auth();
+        // Confirm the auth context DOES have AiGatewayWrite (so permission_guard
+        // passes) but is NOT an admin (so require_operator rejects it).
+        assert!(auth.has_permission(&Permission::AiGatewayWrite));
+        assert!(!auth.is_admin());
+
+        match list_governance_configs(RequireAuth(auth), State(minimal_state())).await {
+            Err(ref problem) => assert_problem_status(problem, axum::http::StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected Err(403) but got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_governance_config_rejects_non_admin_with_ai_gateway_write() {
+        let auth = non_admin_ai_write_auth();
+        let metadata = temps_core::RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: String::new(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "https://localhost".to_string(),
+            scheme: "https".to_string(),
+            host: "localhost".to_string(),
+            is_secure: true,
+        };
+
+        match upsert_governance_config(
+            RequireAuth(auth),
+            State(minimal_state()),
+            Extension(metadata),
+            Path("instance".to_string()),
+            Json(UpsertGovernanceConfigRequest {
+                allowed_models: None,
+                max_requests_per_minute: None,
+                max_cost_per_month_microcents: None,
+            }),
+        )
+        .await
+        {
+            Err(ref problem) => assert_problem_status(problem, axum::http::StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected Err(403) but got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_governance_config_rejects_non_admin_with_ai_gateway_write() {
+        let auth = non_admin_ai_write_auth();
+        let metadata = temps_core::RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: String::new(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "https://localhost".to_string(),
+            scheme: "https".to_string(),
+            host: "localhost".to_string(),
+            is_secure: true,
+        };
+
+        match delete_governance_config(
+            RequireAuth(auth),
+            State(minimal_state()),
+            Extension(metadata),
+            Path("instance".to_string()),
+        )
+        .await
+        {
+            Err(ref problem) => assert_problem_status(problem, axum::http::StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected Err(403) but got Ok"),
+        }
+    }
+
+    /// A user with no permissions at all gets 403 from `permission_guard!` (which
+    /// enforces `AiGatewayWrite`) before `require_operator` even runs.
+    #[tokio::test]
+    async fn list_governance_configs_rejects_user_without_ai_gateway_write() {
+        // Role::Custom with no permissions has no AiGatewayWrite.
+        let auth = temps_auth::AuthContext::new_api_key(
+            test_user(2),
+            None,
+            Some(vec![]), // explicit empty permission list
+            "empty-key".to_string(),
+            99,
+        );
+        assert!(!auth.has_permission(&Permission::AiGatewayWrite));
+
+        match list_governance_configs(RequireAuth(auth), State(minimal_state())).await {
+            Err(ref problem) => assert_problem_status(problem, axum::http::StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected Err(403) but got Ok"),
+        }
+    }
+
+    // ── existing struct test ──────────────────────────────────────────────────
 
     #[test]
     fn config_response_preserves_scope_and_limits() {

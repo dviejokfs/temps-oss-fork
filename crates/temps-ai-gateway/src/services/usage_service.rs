@@ -393,7 +393,7 @@ impl UsageService {
             record.insert(&txn).await?;
             txn.execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "DELETE FROM ai_gateway_cost_reservations WHERE request_id = $1::uuid",
+                "DELETE FROM ai_gateway_cost_reservations WHERE request_id = $1",
                 [reservation.request_id().into()],
             ))
             .await?;

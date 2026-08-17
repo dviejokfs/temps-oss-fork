@@ -9,6 +9,7 @@ use sea_orm::{
 
 use crate::error::AiGatewayError;
 use crate::handlers::pricing::estimate_cost_microcents;
+use tracing::warn;
 
 use super::AiUsageAttribution;
 
@@ -196,10 +197,14 @@ impl GovernanceService {
         &self,
         reservation: &GovernanceReservation,
     ) -> Result<(), AiGatewayError> {
+        // Guard: only delete if the reservation has NOT already been promoted to
+        // a conservative debit by `cleanup_expired_state`. A slow request that
+        // errors after cleanup ran would otherwise silently erase a durable
+        // debit, defeating the point of making it durable.
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "DELETE FROM ai_gateway_cost_reservations WHERE request_id = $1",
+                "DELETE FROM ai_gateway_cost_reservations WHERE request_id = $1 AND is_conservative_debit = FALSE",
                 [reservation.request_id.clone().into()],
             ))
             .await?;
@@ -452,6 +457,13 @@ impl GovernanceService {
             .unwrap_or(CostRow { cost: Some(0) });
             let spent = row.cost.unwrap_or(0);
             if spent.saturating_add(projected_cost) > limit {
+                warn!(
+                    scope = %config.scope,
+                    spent_microcents = spent,
+                    limit_microcents = limit,
+                    projected_cost_microcents = projected_cost,
+                    "AI gateway monthly budget exceeded"
+                );
                 return Err(AiGatewayError::MonthlyBudgetExceeded {
                     scope: config.scope.clone(),
                     spent_microcents: spent,

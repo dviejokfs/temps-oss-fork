@@ -815,10 +815,18 @@ async fn embeddings(
     let attribution = usage_attribution(&auth);
     let is_byok_header = byok.api_key.is_some();
 
-    // Embeddings have no output tokens; max_output_tokens is None.
+    // Embeddings have no output tokens; pass Some(0) so budget projection can
+    // proceed using only input tokens. Passing None would cause BudgetRequiresMaxTokens
+    // when any non-BYOK budget scope covers embedding traffic.
     let reservation = match app_state
         .governance_service
-        .check_request(&attribution, &request.model, is_byok_header, Some(1), None)
+        .check_request(
+            &attribution,
+            &request.model,
+            is_byok_header,
+            Some(1),
+            Some(0),
+        )
         .await
     {
         Ok(r) => r,

@@ -59,6 +59,7 @@ impl MigrationTrait for Migration {
         manager
             .create_index(
                 Index::create()
+                    .if_not_exists()
                     .table(AiGatewayRateEvents::Table)
                     .name("idx_ai_gateway_rate_events_scope_occurred_at")
                     .col(AiGatewayRateEvents::Scope)
@@ -76,18 +77,32 @@ impl MigrationTrait for Migration {
                     .col(
                         ColumnDef::new(AiGatewayCostReservations::RequestId)
                             .string_len(64)
-                            .not_null()
-                            .primary_key(),
+                            .not_null(),
                     )
                     .col(
                         ColumnDef::new(AiGatewayCostReservations::Scope)
                             .string_len(200)
                             .not_null(),
                     )
+                    // Composite PK: one row per (request_id, scope) pair.
+                    // A single request may generate one reservation per
+                    // budget-limited scope (instance, project, environment, token),
+                    // so a single-column PK on request_id alone would cause
+                    // a primary-key violation when two scopes both have budgets.
+                    .primary_key(
+                        Index::create()
+                            .name("pk_ai_gateway_cost_reservations")
+                            .col(AiGatewayCostReservations::RequestId)
+                            .col(AiGatewayCostReservations::Scope)
+                            .primary(),
+                    )
                     .col(
                         ColumnDef::new(AiGatewayCostReservations::ReservedMicrocents)
                             .big_integer()
-                            .not_null(),
+                            .not_null()
+                            .check(
+                                Expr::col(AiGatewayCostReservations::ReservedMicrocents).gte(0i64),
+                            ),
                     )
                     .col(
                         ColumnDef::new(AiGatewayCostReservations::BillingPeriod)
@@ -118,6 +133,7 @@ impl MigrationTrait for Migration {
         manager
             .create_index(
                 Index::create()
+                    .if_not_exists()
                     .table(AiGatewayCostReservations::Table)
                     .name("idx_ai_gateway_cost_reservations_scope_billing_period")
                     .col(AiGatewayCostReservations::Scope)
@@ -129,6 +145,7 @@ impl MigrationTrait for Migration {
         manager
             .create_index(
                 Index::create()
+                    .if_not_exists()
                     .table(AiGatewayCostReservations::Table)
                     .name("idx_ai_gateway_cost_reservations_expires_at")
                     .col(AiGatewayCostReservations::ExpiresAt)
@@ -182,6 +199,45 @@ impl MigrationTrait for Migration {
                 Table::alter()
                     .table(AiUsageLogs::Table)
                     .add_column(ColumnDef::new(AiUsageLogs::BillingPeriod).date().null())
+                    .to_owned(),
+            )
+            .await?;
+
+        // Indexes on the new attribution columns to support the budget roll-up
+        // queries in check_budgets_and_reserve, which always filter by
+        // billing_period alongside one of these scope columns.
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .table(AiUsageLogs::Table)
+                    .name("idx_ai_usage_logs_billing_period_project_id")
+                    .col(AiUsageLogs::BillingPeriod)
+                    .col(AiUsageLogs::ProjectId)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .table(AiUsageLogs::Table)
+                    .name("idx_ai_usage_logs_billing_period_environment_id")
+                    .col(AiUsageLogs::BillingPeriod)
+                    .col(AiUsageLogs::EnvironmentId)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .table(AiUsageLogs::Table)
+                    .name("idx_ai_usage_logs_billing_period_deployment_token_id")
+                    .col(AiUsageLogs::BillingPeriod)
+                    .col(AiUsageLogs::DeploymentTokenId)
                     .to_owned(),
             )
             .await?;
