@@ -1,8 +1,8 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -12,7 +12,7 @@ use std::time::Instant;
 use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
 use temps_core::problemdetails::Problem;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
 use crate::error::AiGatewayError;
@@ -332,7 +332,18 @@ pub fn configure_gateway_routes() -> Router<Arc<AiGatewayAppState>> {
 // Error conversion to OpenAI-compatible JSON errors
 // ============================================================================
 
-fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
+fn error_to_response(error: AiGatewayError) -> Response {
+    // Captured separately from the message text below: the retry hint belongs
+    // in a `Retry-After` header (RFC 6585), not the response body, and the
+    // exact configured limit must not reach the caller (see the message text
+    // for `RateLimitExceeded` below).
+    let retry_after_seconds = match &error {
+        AiGatewayError::RateLimitExceeded {
+            retry_after_seconds,
+            ..
+        } => Some(*retry_after_seconds),
+        _ => None,
+    };
     let (status, body) = match &error {
         AiGatewayError::ModelNotFound { model } => (
             StatusCode::NOT_FOUND,
@@ -384,17 +395,22 @@ fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
         AiGatewayError::RateLimitExceeded {
             scope,
             limit_per_minute,
-            ..
-        } => (
-            StatusCode::TOO_MANY_REQUESTS,
-            OpenAiErrorResponse::server_error(
-                format!(
-                    "Rate limit exceeded for scope '{}': {} requests/minute allowed.",
-                    scope, limit_per_minute
+            retry_after_seconds,
+        } => {
+            warn!(
+                scope = %scope,
+                limit_per_minute = limit_per_minute,
+                retry_after_seconds = retry_after_seconds,
+                "AI gateway rate limit exceeded"
+            );
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                OpenAiErrorResponse::server_error(
+                    format!("Rate limit exceeded for scope '{}'.", scope),
+                    "rate_limit_exceeded",
                 ),
-                "rate_limit_exceeded",
-            ),
-        ),
+            )
+        }
         AiGatewayError::MonthlyBudgetExceeded { scope, .. } => (
             StatusCode::PAYMENT_REQUIRED,
             OpenAiErrorResponse::server_error(
@@ -419,8 +435,30 @@ fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
                 "max_tokens_required",
             ),
         ),
+        AiGatewayError::InvalidGovernanceConfig {
+            scope,
+            field,
+            value,
+        } => {
+            // The stored config value/field name are operator-internal detail
+            // (only reachable via DB corruption or a direct manual write,
+            // since the write path validates non-negativity) -- log them
+            // server-side, but never echo them to a deployment-token caller.
+            error!(
+                scope = %scope,
+                field = %field,
+                value = value,
+                "AI gateway governance config is invalid"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                OpenAiErrorResponse::server_error(
+                    "AI gateway configuration error.".to_string(),
+                    "governance_error",
+                ),
+            )
+        }
         AiGatewayError::BudgetProjectionUnavailable { .. }
-        | AiGatewayError::InvalidGovernanceConfig { .. }
         | AiGatewayError::InvalidGovernanceScope { .. }
         | AiGatewayError::GovernanceConfigNotFound { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -432,7 +470,13 @@ fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
         ),
     };
 
-    (status, Json(body))
+    let mut response = (status, Json(body)).into_response();
+    if let Some(retry_after_seconds) = retry_after_seconds {
+        if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+    }
+    response
 }
 
 // ============================================================================
@@ -960,6 +1004,57 @@ mod tests {
         };
         // Just verify it doesn't panic
         let _ = error_to_response(err);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_exceeded_response_does_not_leak_configured_limit() {
+        let err = AiGatewayError::RateLimitExceeded {
+            scope: "project:7".to_string(),
+            limit_per_minute: 42,
+            retry_after_seconds: 13,
+        };
+        let response = error_to_response(err);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("13"),
+            "Retry-After header must carry the retry hint"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !body_str.contains("42"),
+            "response body must not leak the operator-configured RPM limit: {body_str}"
+        );
+        assert!(body_str.contains("project:7"));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_governance_config_response_does_not_leak_field_or_value() {
+        let err = AiGatewayError::InvalidGovernanceConfig {
+            scope: "instance".to_string(),
+            field: "max_requests_per_minute",
+            value: -5,
+        };
+        let response = error_to_response(err);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !body_str.contains("max_requests_per_minute") && !body_str.contains("-5"),
+            "response body must not leak the invalid config's field name or value: {body_str}"
+        );
+        assert!(
+            !body_str.contains("instance"),
+            "response body should not even echo the scope for this internal-error class: {body_str}"
+        );
     }
 
     #[test]
