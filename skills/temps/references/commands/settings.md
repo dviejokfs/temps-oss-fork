@@ -46,6 +46,9 @@ Update platform settings
 | `--default-http-timeout <seconds>` | Default timeout for regular HTTP requests, in seconds | - | No |
 | `--default-sse-idle-timeout <seconds>` | Default idle timeout for SSE streams, in seconds | - | No |
 | `--default-websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | No |
+| `--max-memory-limit-mb <mb>` | Ceiling on a project/environment memory limit override, in MB (0 = no ceiling) | - | No |
+| `--max-concurrent-connections-ceiling <count>` | Ceiling on a project/environment concurrent-connection override (0 = no ceiling) | - | No |
+| `--allow-unlimited-timeouts <enabled>` | Whether projects may set a timeout of 0, i.e. no timeout (true/false) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `settings set-external-url`
