@@ -530,6 +530,12 @@ impl ProxyCommand {
             // its plugins — there is nothing here to register an alternative
             // resolver.
             Arc::new(temps_core::FixedRetentionResolver),
+            // Same reasoning, for the same structural cause: a
+            // project's IP restriction is not enforced when the proxy runs
+            // as this standalone process, because there are no plugins here
+            // to claim the gate. Accepted, documented limitation — see
+            // `temps_core::project_ip_gate`'s module doc — not an oversight.
+            Arc::new(temps_core::OpenIpGate),
         ) {
             Ok(_) => {
                 info!("Proxy server exited");

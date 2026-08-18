@@ -236,6 +236,13 @@ pub fn setup_proxy_server(
     // standalone `temps proxy` binary (no console, ever) passes a fixed
     // default.
     retention_resolver: Arc<dyn temps_core::RetentionResolver>,
+    // Same reasoning as `retention_resolver` immediately above.
+    // Single-binary `temps serve` passes the `ProjectIpGateSlot` its
+    // `ProxyPlugin` pre-registered, which a plugin may have claimed by the
+    // time this runs; the standalone `temps proxy` binary passes a fresh,
+    // never-claimed slot — see the module doc on `temps_core::project_ip_gate`
+    // for why that is an accepted limitation rather than a bug.
+    project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> Result<()> {
     // Setup plugin system (async operation in sync context)
     let context = tokio::runtime::Runtime::new()?
@@ -357,6 +364,7 @@ pub fn setup_proxy_server(
         db.clone(),
         config_service.clone(),
         ip_access_control_service,
+        project_ip_gate,
         challenge_service,
         cert_host_cache,
         proxy_config.disable_https_redirect,
@@ -532,6 +540,7 @@ pub fn create_proxy_service(
     route_table: Arc<CachedPeerTable>,
     config: Arc<ServerConfig>,
     retention_resolver: Arc<dyn temps_core::RetentionResolver>,
+    project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> Result<LoadBalancer> {
     // Setup plugin system (async operation in sync context)
     let context = tokio::runtime::Runtime::new()?
@@ -643,6 +652,7 @@ pub fn create_proxy_service(
         db,
         config_service,
         ip_access_control_service,
+        project_ip_gate,
         challenge_service,
         cert_host_cache,
         proxy_config.disable_https_redirect,

@@ -1208,6 +1208,21 @@ pub struct ConsoleApiParams {
     /// connection handling. Any future object shared this same way requires an
     /// explicit security review before being added here.
     pub retention_resolver_slot: Arc<temps_core::RetentionResolverSlot>,
+    /// Shared per-project/environment IP-restriction gate. Uses the exact
+    /// same cross-context shared-slot mechanism as `retention_resolver_slot`
+    /// immediately above — for the same structural reason: the Pingora
+    /// proxy bootstraps in a wholly separate plugin context and has no
+    /// other way to see something a plugin registered into the console's
+    /// registry.
+    ///
+    /// **This is explicitly the category of object the guardrail above says
+    /// requires review, not an exception to it.** `ProjectIpGate` decides
+    /// which requests reach a deployed project/environment at all — it is a
+    /// routing/authorization decision, not inert metadata. It is wired this
+    /// way pending a security review, not because the guardrail was judged
+    /// not to apply. Do not treat this as a second precedent for adding
+    /// further objects to the shared-slot pattern without their own review.
+    pub project_ip_gate_slot: Arc<temps_core::ProjectIpGateSlot>,
     /// Shared "a newer release exists" slot. Owned by the caller
     /// (`commands/serve/mod.rs`), which spawns the background update
     /// notifier that writes into it; registered into the service registry
@@ -2087,6 +2102,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         admin_gate_service: provided_admin_gate_service,
         admin_gate_handle: provided_admin_gate_handle,
         retention_resolver_slot,
+        project_ip_gate_slot,
         update_status,
         self_updater,
     } = params;
@@ -2193,6 +2209,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // slot instance instead of creating its own — see the field doc on
     // `ConsoleApiParams::retention_resolver_slot`.
     service_context.register_service(retention_resolver_slot.clone());
+    // Same pre-registration reasoning as retention_resolver_slot above —
+    // see the field doc on `ConsoleApiParams::project_ip_gate_slot` (ADR
+    // 0022) for why this is flagged for security review rather than a
+    // routine addition.
+    service_context.register_service(project_ip_gate_slot.clone());
     // Update-notifier slot: the background loop in serve/mod.rs writes into
     // it; ConfigPlugin's `GET /settings/update-status` reads it so the web
     // console can render the upgrade banner.

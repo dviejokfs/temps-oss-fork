@@ -91,6 +91,7 @@ pub fn start_proxy_server(
     on_demand_manager: Option<Arc<OnDemandManager>>,
     admin_gate: Option<temps_core::admin_gate::AdminGateHandle>,
     retention_resolver: Arc<dyn temps_core::RetentionResolver>,
+    project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
     // Create tokio runtime to fetch preview_domain from config service
@@ -231,6 +232,7 @@ pub fn start_proxy_server(
         on_demand_manager,
         admin_gate,
         retention_resolver,
+        project_ip_gate,
     ) {
         Ok(_) => {
             info!("Proxy server exited");

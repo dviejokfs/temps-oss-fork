@@ -746,6 +746,12 @@ pub struct LoadBalancer {
     db: Arc<DbConnection>,
     config_service: Arc<temps_config::ConfigService>,
     ip_access_control_service: Arc<IpAccessControlService>,
+    /// Per-project/environment IP restriction. Defaults to an always-allow
+    /// gate (`temps_core::OpenIpGate`) via the write-once `ProjectIpGateSlot`
+    /// handoff — see the module doc on `temps_core::project_ip_gate` for why
+    /// this is a plain required field here rather than an `Option`: a gate
+    /// value always exists, whether or not a plugin claimed the slot.
+    project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
     challenge_service: Arc<ChallengeService>,
     /// In-memory snapshot of domains that have a TLS certificate. Used by the
     /// HTTP→HTTPS redirect check instead of issuing 2 DB queries per request.
@@ -809,6 +815,7 @@ impl LoadBalancer {
         db: Arc<DbConnection>,
         config_service: Arc<temps_config::ConfigService>,
         ip_access_control_service: Arc<IpAccessControlService>,
+        project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
         challenge_service: Arc<ChallengeService>,
         cert_host_cache: Arc<CertHostCache>,
         disable_https_redirect: bool,
@@ -827,6 +834,7 @@ impl LoadBalancer {
             db,
             config_service,
             ip_access_control_service,
+            project_ip_gate,
             challenge_service,
             cert_host_cache,
             disable_https_redirect,
@@ -4292,6 +4300,43 @@ impl ProxyHttp for LoadBalancer {
                         .await?;
                     session.write_response_body(Some(body_bytes), true).await?;
                     ctx.routing_status = "connection_limit_exceeded".to_string();
+                    return Ok(true);
+                }
+            }
+
+            // Per-project/environment IP restriction. Synchronous,
+            // lock-free — see temps_core::ProjectIpGate's contract. Denial
+            // is a generic 403 with no detail: an unauthenticated caller
+            // must not be able to distinguish "this project doesn't exist"
+            // from "this project is restricted and you're not on the
+            // allowlist" by response shape.
+            if let Some(ip) = ctx
+                .ip_address
+                .as_deref()
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            {
+                if !self.project_ip_gate.is_allowed(
+                    project_ctx.project.id,
+                    project_ctx.environment.id,
+                    ip,
+                ) {
+                    warn!(
+                        environment_id = project_ctx.environment.id,
+                        project_id = project_ctx.project.id,
+                        ip = %ip,
+                        "Request denied by project IP restriction"
+                    );
+                    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
+                        .await?;
+                    ctx.routing_status = "project_ip_restricted".to_string();
                     return Ok(true);
                 }
             }

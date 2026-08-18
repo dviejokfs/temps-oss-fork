@@ -27,6 +27,12 @@ pub struct ProxyPlugin {
     /// gets a chance to provide a resolver — same two-phase handoff
     /// `DeploymentsPlugin` uses for `DeploymentGate`.
     retention_resolver_slot: tokio::sync::OnceCell<Arc<temps_core::RetentionResolverSlot>>,
+    /// Same two-phase handoff as `retention_resolver_slot`, for
+    /// `ProjectIpGate`. See the field doc on
+    /// `ConsoleApiParams::project_ip_gate_slot` for the security-review
+    /// flag on this object — it is authorization-relevant, unlike
+    /// `retention_resolver_slot`.
+    project_ip_gate_slot: tokio::sync::OnceCell<Arc<temps_core::ProjectIpGateSlot>>,
 }
 
 impl TempsPlugin for ProxyPlugin {
@@ -70,6 +76,9 @@ impl TempsPlugin for ProxyPlugin {
             // later-registered plugin) has finished registering.
             let retention_slot = context.require_service::<temps_core::RetentionResolverSlot>();
             let _ = self.retention_resolver_slot.set(retention_slot.clone());
+
+            let ip_gate_slot = context.require_service::<temps_core::ProjectIpGateSlot>();
+            let _ = self.project_ip_gate_slot.set(ip_gate_slot.clone());
 
             // Create LB service
             let lb_service = Arc::new(LbService::new(db.clone()));
@@ -151,6 +160,25 @@ impl TempsPlugin for ProxyPlugin {
                     }
                 }
             }
+
+            // Same handoff for ProjectIpGate. Absent a registered plugin,
+            // the slot stays on OpenIpGate — every project remains
+            // unrestricted, matching a build with no such plugin present.
+            if let Some(slot) = self.project_ip_gate_slot.get() {
+                if let Some(gate) = context.get_service::<dyn temps_core::ProjectIpGate>() {
+                    if slot.set(gate) {
+                        tracing::debug!(
+                            "proxy: ProjectIpGate wired in from a registered plugin"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "proxy: ProjectIpGate slot was already claimed; \
+                             this plugin's gate was NOT installed. \
+                             Check plugin registration order."
+                        );
+                    }
+                }
+            }
             Ok(())
         })
     }
@@ -210,6 +238,7 @@ impl ProxyPlugin {
     pub fn new() -> Self {
         Self {
             retention_resolver_slot: tokio::sync::OnceCell::new(),
+            project_ip_gate_slot: tokio::sync::OnceCell::new(),
         }
     }
 }

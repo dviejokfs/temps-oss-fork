@@ -46,6 +46,7 @@ mod integration_tests {
             route_table,
             config,
             Arc::new(temps_core::FixedRetentionResolver),
+            Arc::new(temps_core::OpenIpGate),
         )?;
 
         // Verify the proxy service was created successfully
@@ -93,6 +94,7 @@ mod integration_tests {
             route_table,
             config,
             Arc::new(temps_core::FixedRetentionResolver),
+            Arc::new(temps_core::OpenIpGate),
         )?;
 
         // Test custom route resolution
@@ -135,6 +137,7 @@ mod integration_tests {
             route_table,
             config,
             Arc::new(temps_core::FixedRetentionResolver),
+            Arc::new(temps_core::OpenIpGate),
         )?;
 
         // Test project context resolution
