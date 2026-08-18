@@ -12,11 +12,14 @@ import { Label } from '@/components/ui/label'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
+import { Switch } from '@/components/ui/switch'
 import type {
   RequestTimeoutSettings,
   ConnectionLimitSettings,
+  TenantResourceCeilings,
 } from '@/api/client/types.gen'
-import { AlertCircle, Gauge, Loader2, Save, Timer } from 'lucide-react'
+import { AlertCircle, Gauge, Loader2, Save, ShieldCheck, Timer } from 'lucide-react'
+import { Controller } from 'react-hook-form'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -24,6 +27,7 @@ import { toast } from 'sonner'
 interface RequestTimeoutsFormData {
   request_timeouts: RequestTimeoutSettings
   connection_limits: ConnectionLimitSettings
+  tenant_resource_ceilings: TenantResourceCeilings
 }
 
 const DEFAULTS: RequestTimeoutSettings = {
@@ -35,6 +39,18 @@ const DEFAULTS: RequestTimeoutSettings = {
 
 const CONNECTION_LIMIT_DEFAULTS: ConnectionLimitSettings = {
   default_max_concurrent_connections: 0,
+}
+
+/**
+ * Unenforced, deliberately. The defaults above are *instance defaults* a
+ * project can override — including overriding them to "unlimited". These
+ * ceilings are the bound on those overrides, and leaving them off means an
+ * upgrade changes nothing for anyone.
+ */
+const CEILING_DEFAULTS: TenantResourceCeilings = {
+  max_memory_limit_mb: 0,
+  max_concurrent_connections: 0,
+  allow_unlimited_request_timeouts: true,
 }
 
 /**
@@ -53,6 +69,7 @@ export function RequestTimeoutsPage() {
 
   const {
     register,
+    control,
     handleSubmit,
     formState: { isDirty, isSubmitting, errors },
     reset,
@@ -60,6 +77,7 @@ export function RequestTimeoutsPage() {
     defaultValues: {
       request_timeouts: DEFAULTS,
       connection_limits: CONNECTION_LIMIT_DEFAULTS,
+      tenant_resource_ceilings: CEILING_DEFAULTS,
     },
   })
 
@@ -78,6 +96,8 @@ export function RequestTimeoutsPage() {
         request_timeouts: settings.request_timeouts || DEFAULTS,
         connection_limits:
           settings.connection_limits || CONNECTION_LIMIT_DEFAULTS,
+        tenant_resource_ceilings:
+          settings.tenant_resource_ceilings || CEILING_DEFAULTS,
       })
     }
   }, [settings, reset])
@@ -274,6 +294,101 @@ export function RequestTimeoutsPage() {
                 Must be 0 (unlimited) or greater
               </p>
             )}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <ShieldCheck className="h-5 w-5" />
+            Project Override Ceilings
+          </CardTitle>
+          <CardDescription>
+            The two settings above are <em>defaults</em> — anyone who can edit a
+            project or environment&apos;s Deployment Config can override them,
+            including overriding them to unlimited. These ceilings bound those
+            overrides. All three are off by default, so nothing changes until
+            you set one, and holders of the Settings write permission are never
+            blocked by them. An override that breaks a ceiling is rejected with
+            an explanation, never silently reduced.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <div className="grid gap-6 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="max_memory_limit_mb">
+                Max memory limit (MB)
+              </Label>
+              <Input
+                id="max_memory_limit_mb"
+                type="number"
+                min={0}
+                {...register('tenant_resource_ceilings.max_memory_limit_mb', {
+                  valueAsNumber: true,
+                  required: true,
+                  min: 0,
+                })}
+              />
+              <p className="text-xs text-muted-foreground">
+                0 = no ceiling (default). When set, a project cannot request
+                more than this, nor set its memory limit to unlimited.
+              </p>
+              {errors.tenant_resource_ceilings?.max_memory_limit_mb && (
+                <p className="text-xs text-destructive">
+                  Must be 0 (no ceiling) or greater
+                </p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="max_concurrent_connections">
+                Max concurrent connections
+              </Label>
+              <Input
+                id="max_concurrent_connections"
+                type="number"
+                min={0}
+                {...register(
+                  'tenant_resource_ceilings.max_concurrent_connections',
+                  { valueAsNumber: true, required: true, min: 0 }
+                )}
+              />
+              <p className="text-xs text-muted-foreground">
+                0 = no ceiling (default). Bounds the per-project override of the
+                connection limit above.
+              </p>
+              {errors.tenant_resource_ceilings?.max_concurrent_connections && (
+                <p className="text-xs text-destructive">
+                  Must be 0 (no ceiling) or greater
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="flex items-start justify-between gap-4">
+            <div className="space-y-1">
+              <Label htmlFor="allow_unlimited_request_timeouts">
+                Allow projects to disable timeouts
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                On by default. Turn it off to stop a project from setting its
+                request, SSE, or WebSocket timeout to 0 — the value that opts
+                out of the hard ceiling above entirely. Timeouts a project sets
+                to a real number are already clamped to that ceiling.
+              </p>
+            </div>
+            <Controller
+              control={control}
+              name="tenant_resource_ceilings.allow_unlimited_request_timeouts"
+              render={({ field }) => (
+                <Switch
+                  id="allow_unlimited_request_timeouts"
+                  checked={field.value}
+                  onCheckedChange={field.onChange}
+                />
+              )}
+            />
           </div>
         </CardContent>
       </Card>

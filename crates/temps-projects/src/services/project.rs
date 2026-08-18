@@ -2882,10 +2882,13 @@ impl ProjectService {
         Ok(ProjectStatistics { total_count })
     }
 
+    /// See [`Self::update_project_deployment_config`] for what
+    /// `bypass_resource_ceilings` means.
     pub async fn update_deployment_settings(
         &self,
         project_id_or_slug: &str,
         settings: UpdateDeploymentSettingsRequest,
+        bypass_resource_ceilings: bool,
     ) -> Result<Project, ProjectError> {
         // Find project by ID or slug
         let project = if let Ok(project_id_int) = project_id_or_slug.parse::<i32>() {
@@ -2917,6 +2920,20 @@ impl ProjectService {
         deployment_config.cpu_limit = settings.cpu_limit;
         deployment_config.memory_request = settings.memory_request;
         deployment_config.memory_limit = settings.memory_limit;
+
+        if !bypass_resource_ceilings {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id_or_slug}: {e}"
+                ))
+            })?;
+            if let Err(violations) = deployment_config
+                .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
+            {
+                return Err(ProjectError::InvalidInput(violations.join("; ")));
+            }
+        }
+
         active_project.deployment_config = Set(Some(deployment_config));
 
         let updated_project = active_project.update(self.db.as_ref()).await?;
@@ -2943,10 +2960,18 @@ impl ProjectService {
     }
 
     /// Update deployment configuration for a project
+    /// Update a project's deployment config.
+    ///
+    /// `bypass_resource_ceilings` is the caller's `SettingsWrite` permission:
+    /// whoever can raise the instance-wide ceilings is by definition allowed to
+    /// exceed them, so the check would be theatre for them. Everyone else is
+    /// held to `AppSettings.tenant_resource_ceilings`, which is unenforced
+    /// until an operator configures it.
     pub async fn update_project_deployment_config(
         &self,
         project_id: i32,
         config: UpdateDeploymentConfigRequest,
+        bypass_resource_ceilings: bool,
     ) -> Result<Project, ProjectError> {
         // Find project by ID or slug
         let project = projects::Entity::find_by_id(project_id)
@@ -3013,6 +3038,22 @@ impl ProjectService {
         deployment_config
             .validate()
             .map_err(|e| ProjectError::InvalidInput(format!("Invalid deployment config: {}", e)))?;
+
+        // Checked on the merged config, not on the request, so clearing an
+        // override back to "inherit" is judged by what the project will
+        // actually run with.
+        if !bypass_resource_ceilings {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id}: {e}"
+                ))
+            })?;
+            if let Err(violations) = deployment_config
+                .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
+            {
+                return Err(ProjectError::InvalidInput(violations.join("; ")));
+            }
+        }
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.clone().into();

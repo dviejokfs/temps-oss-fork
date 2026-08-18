@@ -93,4 +93,53 @@ describe('buildAutomationSettingsUpdate', () => {
       },
     })
   })
+  test('a single ceiling flag carries the other ceilings forward', () => {
+    const result = buildAutomationSettingsUpdate(
+      { maxMemoryLimitMb: '4096' },
+      {
+        tenant_resource_ceilings: {
+          max_memory_limit_mb: 0,
+          max_concurrent_connections: 200,
+          allow_unlimited_request_timeouts: false,
+        },
+      },
+    )
+    expect(result).toEqual({
+      updates: {
+        tenant_resource_ceilings: {
+          max_memory_limit_mb: 4096,
+          // Would silently become 0 ("no ceiling") if not carried forward.
+          max_concurrent_connections: 200,
+          allow_unlimited_request_timeouts: false,
+        },
+      },
+    })
+  })
+
+  test('ceilings default to unenforced when the server has none set', () => {
+    const result = buildAutomationSettingsUpdate({ maxMemoryLimitMb: '512' }, undefined)
+    expect(result).toEqual({
+      updates: {
+        tenant_resource_ceilings: {
+          max_memory_limit_mb: 512,
+          max_concurrent_connections: 0,
+          allow_unlimited_request_timeouts: true,
+        },
+      },
+    })
+  })
+
+  test('rejects a negative ceiling instead of writing it', () => {
+    const result = buildAutomationSettingsUpdate({ maxMemoryLimitMb: '-1' }, undefined)
+    expect(result).toEqual({
+      error: '--max-memory-limit-mb must be a non-negative number (0 = no ceiling), got "-1"',
+    })
+  })
+
+  test('rejects a non-boolean --allow-unlimited-timeouts', () => {
+    const result = buildAutomationSettingsUpdate({ allowUnlimitedTimeouts: 'yes' }, undefined)
+    expect(result).toEqual({
+      error: '--allow-unlimited-timeouts must be true or false, got "yes"',
+    })
+  })
 })

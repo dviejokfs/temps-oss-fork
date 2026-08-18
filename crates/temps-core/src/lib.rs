@@ -105,6 +105,7 @@ pub use app_settings::{
     MetricsStoreKind, MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
     ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
     RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
+    TenantResourceCeilings,
 };
 pub use async_trait;
 pub use chrono;

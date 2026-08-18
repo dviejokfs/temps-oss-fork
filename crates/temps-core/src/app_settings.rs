@@ -80,6 +80,12 @@ pub struct AppSettings {
     #[serde(default)]
     pub connection_limits: ConnectionLimitSettings,
 
+    /// Ceilings the operator places on what a *tenant* may configure for
+    /// their own project/environment. Entirely unenforced by default, so an
+    /// upgrade never changes what an existing config means.
+    #[serde(default)]
+    pub tenant_resource_ceilings: TenantResourceCeilings,
+
     /// Skip TLS certificate verification on outbound HTTP clients built by the
     /// server (deployer, agent, remote service client). Strictly opt-in for
     /// operators running self-signed control plane / worker certs on a trusted
@@ -365,6 +371,81 @@ pub struct ConnectionLimitSettings {
     /// `RequestTimeoutSettings`.
     #[schema(minimum = 0, example = 200)]
     pub default_max_concurrent_connections: u32,
+}
+
+/// Ceilings on the resource overrides a *tenant* may set for their own
+/// project or environment.
+///
+/// The knobs these bound (`memory_limit`, `max_concurrent_connections`, the
+/// request/idle timeouts) are deliberately uncapped-by-sentinel: `0` means
+/// "unlimited". That is the right default for a single-team self-hosted
+/// install, where the person editing a project *is* the operator. It is the
+/// wrong default on a shared host, where it lets one project opt out of the
+/// operator's protection and take the node — or the shared proxy's connection
+/// budget — down with it.
+///
+/// Every ceiling here is therefore **off by default**, and turning one on is
+/// what makes the corresponding tenant override enforceable. A caller holding
+/// `Permission::SettingsWrite` (operators: `Admin`/`PlatformAdmin`, never
+/// `Role::User`) may still exceed them — the ceiling constrains tenants, not
+/// the operator who set it.
+///
+/// Violations are **rejected, not clamped**: silently rewriting a value the
+/// user asked for leaves them debugging a limit they believe they removed,
+/// and self-hosted operators have no support channel to ask.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct TenantResourceCeilings {
+    /// Largest `memory_limit` (MB) a project/environment may set for its
+    /// containers. `0` (the default) leaves it unenforced.
+    ///
+    /// A project value of `0` means "no cgroup limit at all", so it is
+    /// refused whenever this ceiling is set — that is the case that OOMs the
+    /// host, not merely a large number.
+    #[schema(minimum = 0, example = 4096)]
+    pub max_memory_limit_mb: u32,
+
+    /// Largest `max_concurrent_connections` a project/environment may set.
+    /// `0` (the default) leaves it unenforced.
+    ///
+    /// As with memory, a project value of `0` means unlimited and is refused
+    /// whenever this ceiling is set.
+    #[schema(minimum = 0, example = 200)]
+    pub max_concurrent_connections: u32,
+
+    /// Whether a project/environment may set a request, SSE or WebSocket
+    /// timeout of `0` ("no timeout"). `true` (the default) preserves current
+    /// behaviour.
+    ///
+    /// Nonzero tenant timeouts need no ceiling here: they are already clamped
+    /// to [`RequestTimeoutSettings::ceiling`] at resolution time. `0` escapes
+    /// that clamp by construction — it means "no timeout is configured", so
+    /// there is nothing to clamp — which is precisely the hole this closes.
+    pub allow_unlimited_request_timeouts: bool,
+}
+
+/// Hand-written rather than derived: `#[derive(Default)]` would make
+/// `allow_unlimited_request_timeouts` **false**, which is the opposite of the
+/// "an upgrade changes nothing" contract — it would start rejecting the `0`
+/// timeouts that are currently the documented default for every traffic class.
+impl Default for TenantResourceCeilings {
+    fn default() -> Self {
+        Self {
+            max_memory_limit_mb: 0,
+            max_concurrent_connections: 0,
+            allow_unlimited_request_timeouts: true,
+        }
+    }
+}
+
+impl TenantResourceCeilings {
+    /// True when no ceiling is configured, i.e. tenants are unconstrained and
+    /// validation can be skipped entirely.
+    pub fn is_unenforced(&self) -> bool {
+        self.max_memory_limit_mb == 0
+            && self.max_concurrent_connections == 0
+            && self.allow_unlimited_request_timeouts
+    }
 }
 
 /// Control-plane build resource limits.
@@ -1086,6 +1167,7 @@ impl Default for AppSettings {
             ai_chat_limits: AiChatLimitsSettings::default(),
             request_timeouts: RequestTimeoutSettings::default(),
             connection_limits: ConnectionLimitSettings::default(),
+            tenant_resource_ceilings: TenantResourceCeilings::default(),
             build_limits: BuildLimitsSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),

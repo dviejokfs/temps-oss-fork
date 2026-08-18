@@ -3030,6 +3030,19 @@
             "default": false,
             "description": "Set to `true` by `temps setup` (all modes) once initial configuration\nhas been applied. The web onboarding wizard reads this from the server\nand skips itself when true, preventing the \"Configure Base Domain\" wall\nfrom appearing on installs that were already configured via the CLI.",
             "type": "boolean"
+          },
+          "tenant_resource_ceilings": {
+            "default": {
+              "allow_unlimited_request_timeouts": true,
+              "max_concurrent_connections": 0,
+              "max_memory_limit_mb": 0
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TenantResourceCeilings",
+                "description": "Ceilings the operator places on what a *tenant* may configure for\ntheir own project/environment. Entirely unenforced by default, so an\nupgrade never changes what an existing config means."
+              }
+            ]
           }
         },
         "type": "object"
@@ -3167,6 +3180,10 @@
           "setup_complete": {
             "description": "Whether `temps setup` has been run at least once. The web onboarding\nwizard checks this field on load and skips itself when true.",
             "type": "boolean"
+          },
+          "tenant_resource_ceilings": {
+            "$ref": "#/components/schemas/TenantResourceCeilings",
+            "description": "Upper bounds a project/environment override may not exceed. No\nsensitive content — this is operator policy the settings UI edits\ndirectly. Unenforced by default."
           }
         },
         "required": [
@@ -3197,6 +3214,7 @@
           "ai_chat_limits",
           "request_timeouts",
           "connection_limits",
+          "tenant_resource_ceilings",
           "self_update",
           "image_retention"
         ],
@@ -39869,6 +39887,33 @@
           "env_vars",
           "is_featured"
         ],
+        "type": "object"
+      },
+      "TenantResourceCeilings": {
+        "description": "Ceilings on the resource overrides a *tenant* may set for their own\nproject or environment.\n\nThe knobs these bound (`memory_limit`, `max_concurrent_connections`, the\nrequest/idle timeouts) are deliberately uncapped-by-sentinel: `0` means\n\"unlimited\". That is the right default for a single-team self-hosted\ninstall, where the person editing a project *is* the operator. It is the\nwrong default on a shared host, where it lets one project opt out of the\noperator's protection and take the node — or the shared proxy's connection\nbudget — down with it.\n\nEvery ceiling here is therefore **off by default**, and turning one on is\nwhat makes the corresponding tenant override enforceable. A caller holding\n`Permission::SettingsWrite` (operators: `Admin`/`PlatformAdmin`, never\n`Role::User`) may still exceed them — the ceiling constrains tenants, not\nthe operator who set it.\n\nViolations are **rejected, not clamped**: silently rewriting a value the\nuser asked for leaves them debugging a limit they believe they removed,\nand self-hosted operators have no support channel to ask.",
+        "properties": {
+          "allow_unlimited_request_timeouts": {
+            "default": true,
+            "description": "Whether a project/environment may set a request, SSE or WebSocket\ntimeout of `0` (\"no timeout\"). `true` (the default) preserves current\nbehaviour.\n\nNonzero tenant timeouts need no ceiling here: they are already clamped\nto [`RequestTimeoutSettings::ceiling`] at resolution time. `0` escapes\nthat clamp by construction — it means \"no timeout is configured\", so\nthere is nothing to clamp — which is precisely the hole this closes.",
+            "type": "boolean"
+          },
+          "max_concurrent_connections": {
+            "default": 0,
+            "description": "Largest `max_concurrent_connections` a project/environment may set.\n`0` (the default) leaves it unenforced.\n\nAs with memory, a project value of `0` means unlimited and is refused\nwhenever this ceiling is set.",
+            "example": 200,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_memory_limit_mb": {
+            "default": 0,
+            "description": "Largest `memory_limit` (MB) a project/environment may set for its\ncontainers. `0` (the default) leaves it unenforced.\n\nA project value of `0` means \"no cgroup limit at all\", so it is\nrefused whenever this ceiling is set — that is the case that OOMs the\nhost, not merely a large number.",
+            "example": 4096,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "TestEmailRequest": {

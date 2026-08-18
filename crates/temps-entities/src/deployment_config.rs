@@ -715,6 +715,82 @@ impl DeploymentConfig {
 
         Ok(())
     }
+
+    /// Check this config against the operator's tenant resource ceilings.
+    ///
+    /// Three of the per-project overrides above use `Some(0)` as an explicit
+    /// "unlimited" sentinel that beats the instance-wide default: memory limit,
+    /// concurrent-connection cap, and the request/SSE/WebSocket timeouts. That
+    /// is deliberate — a dedicated workload sometimes needs it — but on a
+    /// shared instance it also means anyone who can edit a project's config can
+    /// opt that project out of the operator's global guardrails.
+    ///
+    /// Ceilings close that off *only when an operator has set them*. Every
+    /// field defaults to unenforced, so an upgrade changes nothing until the
+    /// operator opts in. Violations are **rejected with a reason**, never
+    /// silently clamped, so the user sees why their value did not take.
+    ///
+    /// Returns every violation rather than the first, so a form with two bad
+    /// fields does not need two round trips to fix.
+    pub fn check_against_tenant_ceilings(
+        &self,
+        ceilings: &temps_core::TenantResourceCeilings,
+    ) -> Result<(), Vec<String>> {
+        let mut violations = Vec::new();
+
+        if ceilings.max_memory_limit_mb > 0 {
+            let ceiling = ceilings.max_memory_limit_mb as i64;
+            match self.memory_limit {
+                // The uncapped sentinel: exceeds any finite ceiling.
+                Some(0) => violations.push(format!(
+                    "Memory limit cannot be set to unlimited: this instance caps it at {ceiling} MB"
+                )),
+                Some(mb) if i64::from(mb) > ceiling => violations.push(format!(
+                    "Memory limit {mb} MB exceeds this instance's maximum of {ceiling} MB"
+                )),
+                _ => {}
+            }
+        }
+
+        if ceilings.max_concurrent_connections > 0 {
+            let ceiling = ceilings.max_concurrent_connections as i64;
+            match self.max_concurrent_connections {
+                Some(0) => violations.push(format!(
+                    "Concurrent connections cannot be set to unlimited: this instance caps them at {ceiling}"
+                )),
+                Some(n) if i64::from(n) > ceiling => violations.push(format!(
+                    "Concurrent connection limit {n} exceeds this instance's maximum of {ceiling}"
+                )),
+                _ => {}
+            }
+        }
+
+        // Nonzero timeouts need no ceiling here — they are already clamped to
+        // `request_timeouts.max_*` at resolution time. Only the `Some(0)`
+        // "no timeout" sentinel escapes that clamp, so that is all this checks.
+        if !ceilings.allow_unlimited_request_timeouts {
+            for (name, value) in [
+                ("Request timeout", self.request_timeout_seconds),
+                ("SSE idle timeout", self.sse_idle_timeout_seconds),
+                (
+                    "WebSocket idle timeout",
+                    self.websocket_idle_timeout_seconds,
+                ),
+            ] {
+                if value == Some(0) {
+                    violations.push(format!(
+                        "{name} cannot be set to unlimited (0) on this instance"
+                    ));
+                }
+            }
+        }
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
 }
 
 impl DeploymentConfigSnapshot {
@@ -1103,6 +1179,100 @@ mod tests {
             ..Default::default()
         };
         assert!(invalid_port.validate().is_err());
+    }
+
+    /// The whole contract of the default ceilings: an instance that has never
+    /// configured them accepts exactly what it accepted before, including the
+    /// `0 = unlimited` sentinels.
+    #[test]
+    fn default_ceilings_accept_every_unlimited_sentinel() {
+        let ceilings = temps_core::TenantResourceCeilings::default();
+        let config = DeploymentConfig {
+            memory_limit: Some(0),
+            max_concurrent_connections: Some(0),
+            request_timeout_seconds: Some(0),
+            sse_idle_timeout_seconds: Some(0),
+            websocket_idle_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+
+        assert!(config.check_against_tenant_ceilings(&ceilings).is_ok());
+    }
+
+    #[test]
+    fn configured_ceilings_reject_unlimited_and_over_ceiling_values() {
+        let ceilings = temps_core::TenantResourceCeilings {
+            max_memory_limit_mb: 4096,
+            max_concurrent_connections: 200,
+            allow_unlimited_request_timeouts: false,
+        };
+
+        // `0` means "opt out of the global cap" — the exact thing a ceiling exists to stop.
+        let unlimited = DeploymentConfig {
+            memory_limit: Some(0),
+            max_concurrent_connections: Some(0),
+            request_timeout_seconds: Some(0),
+            sse_idle_timeout_seconds: Some(0),
+            websocket_idle_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        let violations = unlimited
+            .check_against_tenant_ceilings(&ceilings)
+            .expect_err("unlimited overrides must be rejected under ceilings");
+        // All five reported at once, not just the first.
+        assert_eq!(violations.len(), 5, "got: {violations:?}");
+
+        let over = DeploymentConfig {
+            memory_limit: Some(8192),
+            max_concurrent_connections: Some(500),
+            ..Default::default()
+        };
+        let violations = over
+            .check_against_tenant_ceilings(&ceilings)
+            .expect_err("values above the ceiling must be rejected");
+        assert_eq!(violations.len(), 2, "got: {violations:?}");
+        // The message has to name the ceiling, or the user cannot pick a legal value.
+        assert!(violations[0].contains("4096"), "got: {violations:?}");
+        assert!(violations[1].contains("200"), "got: {violations:?}");
+    }
+
+    #[test]
+    fn configured_ceilings_accept_values_at_and_below_the_ceiling() {
+        let ceilings = temps_core::TenantResourceCeilings {
+            max_memory_limit_mb: 4096,
+            max_concurrent_connections: 200,
+            allow_unlimited_request_timeouts: false,
+        };
+
+        let at_ceiling = DeploymentConfig {
+            memory_limit: Some(4096),
+            max_concurrent_connections: Some(200),
+            // Nonzero timeouts are clamped at resolution time, not here.
+            request_timeout_seconds: Some(3600),
+            ..Default::default()
+        };
+        assert!(at_ceiling.check_against_tenant_ceilings(&ceilings).is_ok());
+
+        // `None` = inherit the instance default, which is always within the ceiling.
+        let inheriting = DeploymentConfig::default();
+        assert!(inheriting.check_against_tenant_ceilings(&ceilings).is_ok());
+    }
+
+    /// Ceilings are independent: setting one must not start enforcing the others.
+    #[test]
+    fn ceilings_are_enforced_independently() {
+        let memory_only = temps_core::TenantResourceCeilings {
+            max_memory_limit_mb: 4096,
+            ..temps_core::TenantResourceCeilings::default()
+        };
+        let config = DeploymentConfig {
+            memory_limit: Some(1024),
+            max_concurrent_connections: Some(0),
+            request_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+
+        assert!(config.check_against_tenant_ceilings(&memory_only).is_ok());
     }
 
     #[test]

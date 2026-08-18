@@ -657,11 +657,19 @@ impl EnvironmentService {
         Ok(environment)
     }
 
+    /// Update an environment's settings.
+    ///
+    /// `bypass_resource_ceilings` is the caller's `SettingsWrite` permission:
+    /// whoever can raise the instance-wide ceilings is by definition allowed to
+    /// exceed them, so the check would be theatre for them. Everyone else is
+    /// held to `AppSettings.tenant_resource_ceilings`, which is unenforced
+    /// until an operator configures it.
     pub async fn update_environment_settings(
         &self,
         project_id_param: i32,
         env_id: i32,
         settings: crate::handlers::UpdateEnvironmentSettingsRequest,
+        bypass_resource_ceilings: bool,
     ) -> Result<environments::Model, EnvironmentError> {
         // First get the environment to verify it exists and belongs to the project
         let environment = self.get_environment(project_id_param, env_id).await?;
@@ -785,6 +793,22 @@ impl EnvironmentService {
         deployment_config.validate().map_err(|e| {
             EnvironmentError::InvalidInput(format!("Invalid deployment config: {}", e))
         })?;
+
+        // Checked on the merged config, not on the request, so clearing an
+        // override back to "inherit" is judged by what the environment will
+        // actually run with.
+        if !bypass_resource_ceilings {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                EnvironmentError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for environment {env_id}: {e}"
+                ))
+            })?;
+            if let Err(violations) = deployment_config
+                .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
+            {
+                return Err(EnvironmentError::InvalidInput(violations.join("; ")));
+            }
+        }
 
         // Multiple environments can track the same branch (Vercel-like model).
 
@@ -1437,6 +1461,9 @@ mod tests {
                     max_concurrent_connections: None,
                     password: None,
                 },
+                // These fixtures assert merge/persistence behaviour, not policy;
+                // bypassing the ceiling check keeps their mock query sequence intact.
+                true,
             )
             .await;
 
@@ -1543,6 +1570,9 @@ mod tests {
                     max_concurrent_connections: None,
                     password: None,
                 },
+                // These fixtures assert merge/persistence behaviour, not policy;
+                // bypassing the ceiling check keeps their mock query sequence intact.
+                true,
             )
             .await;
         assert!(
@@ -1560,6 +1590,178 @@ mod tests {
             !log.contains("requestTimeoutSeconds"),
             "cleared field must be omitted from the persisted deployment_config JSON, got: {log}"
         );
+    }
+
+    /// An `UpdateEnvironmentSettingsRequest` that changes nothing, so a test
+    /// can set exactly the one field it is about.
+    fn empty_settings_request() -> crate::handlers::UpdateEnvironmentSettingsRequest {
+        crate::handlers::UpdateEnvironmentSettingsRequest {
+            branch: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
+            replicas: None,
+            exposed_port: None,
+            automatic_deploy: None,
+            performance_metrics_enabled: None,
+            session_recording_enabled: None,
+            security: None,
+            target_nodes: None,
+            target_labels: None,
+            anti_affinity: None,
+            cross_architecture_builds: None,
+            protected: None,
+            attack_mode: None,
+            force_https: None,
+            on_demand: None,
+            idle_timeout_seconds: None,
+            wake_timeout_seconds: None,
+            request_timeout_seconds: None,
+            sse_idle_timeout_seconds: None,
+            websocket_idle_timeout_seconds: None,
+            max_concurrent_connections: None,
+            password: None,
+        }
+    }
+
+    fn service_with_ceilings(
+        db: Arc<sea_orm::DatabaseConnection>,
+        ceilings: temps_core::TenantResourceCeilings,
+    ) -> EnvironmentService {
+        let app_settings = temps_core::AppSettings {
+            tenant_resource_ceilings: ceilings,
+            ..Default::default()
+        };
+        let settings_row = temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::to_value(app_settings).expect("AppSettings serializes"),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let settings_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row]])
+            .into_connection();
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(settings_db),
+        ));
+        EnvironmentService::new(db, config_service)
+    }
+
+    fn env_for_ceiling_test() -> environments::Model {
+        environments::Model {
+            id: 1,
+            name: "production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "my-project-production".to_string(),
+            branch: Some("main".to_string()),
+            project_id: 10,
+            host: String::new(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_deployment: None,
+            current_deployment_id: None,
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: false,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            force_https: None,
+            last_activity_at: None,
+        }
+    }
+
+    /// `memory_limit: 0` is the "run me uncapped" sentinel. With an operator
+    /// ceiling configured it must be refused, and the message must name the
+    /// ceiling so the user can pick a value that works.
+    #[tokio::test]
+    async fn update_settings_rejects_unlimited_memory_under_an_operator_ceiling() {
+        let env = env_for_ceiling_test();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![env]])
+                .into_connection(),
+        );
+        let svc = service_with_ceilings(
+            db,
+            temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 2048,
+                ..Default::default()
+            },
+        );
+
+        let error = svc
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    memory_limit: Some(Some(0)),
+                    ..empty_settings_request()
+                },
+                false,
+            )
+            .await
+            .expect_err("unlimited memory must be refused under a ceiling");
+
+        assert!(
+            matches!(&error, EnvironmentError::InvalidInput(msg) if msg.contains("2048")),
+            "got: {error}"
+        );
+    }
+
+    /// The `SettingsWrite` escape hatch: an operator who can raise the ceiling
+    /// is not blocked by it.
+    #[tokio::test]
+    async fn update_settings_lets_settings_writers_past_the_ceiling() {
+        let env = env_for_ceiling_test();
+        let updated = environments::Model {
+            deployment_config: Some(temps_entities::deployment_config::DeploymentConfig {
+                memory_limit: Some(0),
+                ..Default::default()
+            }),
+            ..env.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![env]])
+                .append_query_results(vec![vec![updated]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = service_with_ceilings(
+            db,
+            temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 2048,
+                ..Default::default()
+            },
+        );
+
+        let result = svc
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    memory_limit: Some(Some(0)),
+                    ..empty_settings_request()
+                },
+                true,
+            )
+            .await;
+
+        assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
     fn make_env_model(on_demand: bool, sleeping: bool) -> environments::Model {
