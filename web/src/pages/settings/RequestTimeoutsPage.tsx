@@ -312,6 +312,13 @@ export function RequestTimeoutsPage() {
             you set one, and holders of the Settings write permission are never
             blocked by them. An override that breaks a ceiling is rejected with
             an explanation, never silently reduced.
+            <br />
+            <br />
+            <strong>Applied when a config is saved, not retroactively.</strong>{' '}
+            Setting a ceiling here does not change projects that already exceed
+            it — they keep running as configured until someone next edits them.
+            Note also that the memory ceiling is per container, so a project
+            with several replicas can still total more than the ceiling.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">

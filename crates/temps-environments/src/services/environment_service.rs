@@ -794,9 +794,16 @@ impl EnvironmentService {
             EnvironmentError::InvalidInput(format!("Invalid deployment config: {}", e))
         })?;
 
-        // Checked on the merged config, not on the request, so clearing an
-        // override back to "inherit" is judged by what the environment will
-        // actually run with.
+        // Checked on the environment's stored config with the request applied,
+        // not on the request alone, so a partial update is judged against the
+        // values it leaves in place rather than only the ones it names.
+        //
+        // Not merged with the *project's* config: an environment that clears an
+        // override back to `None` inherits the project value, and the project
+        // write path enforces the same ceiling, so the inherited value is
+        // already bounded — except for configs written before the operator set
+        // the ceiling, which no write path revisits (see the PR discussion on
+        // retroactive enforcement).
         if !bypass_resource_ceilings {
             let app_settings = self.config_service.get_settings().await.map_err(|e| {
                 EnvironmentError::Other(format!(

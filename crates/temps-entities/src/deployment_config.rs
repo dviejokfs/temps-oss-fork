@@ -642,6 +642,25 @@ impl DeploymentConfig {
             }
         }
 
+        // Negative values are never meaningful here, and for `memory_limit` a
+        // negative is actively dangerous: `parse_memory_mb` rejects it and the
+        // deployer then leaves Docker's memory cgroup unset, so `-1` runs the
+        // container *uncapped* while reading like a tighter limit than `0`.
+        for (name, value) in [
+            ("CPU request", self.cpu_request),
+            ("CPU limit", self.cpu_limit),
+            ("Memory request", self.memory_request),
+            ("Memory limit", self.memory_limit),
+        ] {
+            if let Some(value) = value {
+                if value < 0 {
+                    return Err(format!(
+                        "{name} cannot be negative, got {value} (use 0 for unlimited)"
+                    ));
+                }
+            }
+        }
+
         // Memory request should not exceed memory limit. A limit of 0 is the
         // explicit "uncapped" sentinel, so it never constrains the request.
         if let (Some(request), Some(limit)) = (self.memory_request, self.memory_limit) {
@@ -738,11 +757,17 @@ impl DeploymentConfig {
     ) -> Result<(), Vec<String>> {
         let mut violations = Vec::new();
 
+        // `<= 0`, not `== 0`, on both of these. `validate()` rejects negatives,
+        // but the ceiling must not depend on that: a negative memory limit is
+        // *also* uncapped in practice — `parse_memory_mb` returns `None` for
+        // anything below zero and the deployer then leaves Docker's cgroup cap
+        // unset entirely. Matching only the `0` sentinel would let `-1` through
+        // as "some finite value below the ceiling" and produce exactly the
+        // unlimited container the ceiling exists to prevent.
         if ceilings.max_memory_limit_mb > 0 {
             let ceiling = ceilings.max_memory_limit_mb as i64;
             match self.memory_limit {
-                // The uncapped sentinel: exceeds any finite ceiling.
-                Some(0) => violations.push(format!(
+                Some(mb) if mb <= 0 => violations.push(format!(
                     "Memory limit cannot be set to unlimited: this instance caps it at {ceiling} MB"
                 )),
                 Some(mb) if i64::from(mb) > ceiling => violations.push(format!(
@@ -755,7 +780,7 @@ impl DeploymentConfig {
         if ceilings.max_concurrent_connections > 0 {
             let ceiling = ceilings.max_concurrent_connections as i64;
             match self.max_concurrent_connections {
-                Some(0) => violations.push(format!(
+                Some(n) if n <= 0 => violations.push(format!(
                     "Concurrent connections cannot be set to unlimited: this instance caps them at {ceiling}"
                 )),
                 Some(n) if i64::from(n) > ceiling => violations.push(format!(
@@ -1256,6 +1281,69 @@ mod tests {
         // `None` = inherit the instance default, which is always within the ceiling.
         let inheriting = DeploymentConfig::default();
         assert!(inheriting.check_against_tenant_ceilings(&ceilings).is_ok());
+    }
+
+    /// Regression: a negative limit is uncapped in practice, so it must not be
+    /// able to slip past a ceiling by looking like "a small finite value".
+    ///
+    /// `-1` formats to `"-1Mi"`, `parse_memory_mb` returns `None` for anything
+    /// below zero, and the deployer leaves Docker's memory cgroup unset — the
+    /// exact outcome `Some(0)` is refused for.
+    #[test]
+    fn negative_limits_are_treated_as_unlimited_by_the_ceiling() {
+        let ceilings = temps_core::TenantResourceCeilings {
+            max_memory_limit_mb: 4096,
+            max_concurrent_connections: 200,
+            ..temps_core::TenantResourceCeilings::default()
+        };
+        let negative = DeploymentConfig {
+            memory_limit: Some(-1),
+            max_concurrent_connections: Some(-1),
+            ..Default::default()
+        };
+
+        let violations = negative
+            .check_against_tenant_ceilings(&ceilings)
+            .expect_err("a negative limit is uncapped and must be refused");
+        assert_eq!(violations.len(), 2, "got: {violations:?}");
+        assert!(violations[0].contains("unlimited"), "got: {violations:?}");
+    }
+
+    /// Defence in depth for the same hole: a negative never reaches the ceiling
+    /// check because it is not a storable value in the first place.
+    #[test]
+    fn validation_rejects_negative_resource_values() {
+        for config in [
+            DeploymentConfig {
+                memory_limit: Some(-1),
+                ..Default::default()
+            },
+            DeploymentConfig {
+                memory_request: Some(-1),
+                ..Default::default()
+            },
+            DeploymentConfig {
+                cpu_limit: Some(-1),
+                ..Default::default()
+            },
+            DeploymentConfig {
+                cpu_request: Some(-1),
+                ..Default::default()
+            },
+        ] {
+            let error = config
+                .validate()
+                .expect_err("negative resource values must be rejected");
+            assert!(error.contains("cannot be negative"), "got: {error}");
+        }
+
+        // `0` stays valid — it is the documented "unlimited" sentinel.
+        let uncapped = DeploymentConfig {
+            memory_limit: Some(0),
+            cpu_limit: Some(0),
+            ..Default::default()
+        };
+        assert!(uncapped.validate().is_ok());
     }
 
     /// Ceilings are independent: setting one must not start enforcing the others.
