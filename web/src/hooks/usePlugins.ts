@@ -1,8 +1,28 @@
 import { client } from '@/api/client/client.gen'
+import { useAuth } from '@/contexts/AuthContext'
 import type { PluginManifest } from '@/types/plugins'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 export const PLUGINS_QUERY_KEY = ['external-plugins']
+
+/**
+ * Roles that carry the `system:admin` permission (see
+ * `crates/temps-auth/src/permissions.rs`, `Role::Admin` and
+ * `Role::PlatformAdmin`) — the same roles `GET /x/plugins/registry` and
+ * `POST /x/plugins/install` are `permission_guard!`-ed to on the backend.
+ */
+const PLUGIN_MANAGE_ROLES = ['admin', 'platform_admin']
+
+/**
+ * Whether the current user may install/manage plugins. Used to hide or
+ * disable install controls for non-admins, so the UI doesn't offer an
+ * action that will always 403 — the availability/install endpoints are
+ * admin-gated on the backend, unlike the read-only status endpoint.
+ */
+export function useCanManagePlugins(): boolean {
+  const { user } = useAuth()
+  return !!user && PLUGIN_MANAGE_ROLES.includes(user.role)
+}
 
 /**
  * Fetch the list of external plugin manifests from /api/x/plugins.
@@ -132,8 +152,10 @@ export const PLUGIN_STATUS_QUERY_KEY = (name: string) => [
  *
  * SystemAdmin-gated on the backend: a non-admin viewer of the Plugins page
  * gets a 403 here, which the caller should render as-is rather than retry.
+ * Pass `enabled: false` for non-admin viewers so the UI doesn't fire a
+ * request it already knows will 403 — see [[useCanManagePlugins]].
  */
-export function usePluginRegistry() {
+export function usePluginRegistry(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: PLUGIN_REGISTRY_QUERY_KEY,
     queryFn: async (): Promise<PluginRegistryEntry[]> => {
@@ -145,6 +167,7 @@ export function usePluginRegistry() {
     },
     staleTime: 60 * 1000,
     retry: false,
+    enabled: options?.enabled ?? true,
   })
 }
 
@@ -154,8 +177,8 @@ export function usePluginRegistry() {
  * — `data` is `undefined` both while loading and if `name` isn't a known
  * installable plugin, so callers should check `isLoading` to distinguish.
  */
-export function usePluginAvailability(name: string) {
-  const registry = usePluginRegistry()
+export function usePluginAvailability(name: string, options?: { enabled?: boolean }) {
+  const registry = usePluginRegistry(options)
   return {
     ...registry,
     data: registry.data?.find((entry) => entry.name === name),

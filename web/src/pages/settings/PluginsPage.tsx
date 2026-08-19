@@ -15,6 +15,7 @@ import {
   usePluginStatus,
   useInstallPlugin,
   useReloadPlugins,
+  useCanManagePlugins,
 } from '@/hooks/usePlugins'
 import { problemMessage } from '@/components/settings/oidc-provider-constants'
 import {
@@ -194,8 +195,11 @@ const VIBETEMPS_PLUGIN_NAME = 'vibetemps'
  * an unconfigured feature must onboard the operator, not disappear.
  */
 function VibeTempsInstallCard() {
+  const canManagePlugins = useCanManagePlugins()
   const statusQuery = usePluginStatus(VIBETEMPS_PLUGIN_NAME)
-  const availabilityQuery = usePluginAvailability(VIBETEMPS_PLUGIN_NAME)
+  const availabilityQuery = usePluginAvailability(VIBETEMPS_PLUGIN_NAME, {
+    enabled: canManagePlugins,
+  })
   const installMutation = useInstallPlugin(VIBETEMPS_PLUGIN_NAME)
 
   const configured = statusQuery.data?.configured ?? false
@@ -282,26 +286,33 @@ function VibeTempsInstallCard() {
                 </AlertDescription>
               </Alert>
             )}
-            <div className="flex items-center gap-2">
-              <Button
-                onClick={handleInstall}
-                disabled={installMutation.isPending}
-              >
-                {installMutation.isPending ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Installing…
-                  </>
-                ) : (
-                  'Install VibeTemps'
+            {canManagePlugins ? (
+              <div className="flex items-center gap-2">
+                <Button
+                  onClick={handleInstall}
+                  disabled={installMutation.isPending}
+                >
+                  {installMutation.isPending ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Installing…
+                    </>
+                  ) : (
+                    'Install VibeTemps'
+                  )}
+                </Button>
+                {availabilityQuery.data?.reason && (
+                  <span className="text-xs text-muted-foreground">
+                    {availabilityQuery.data.reason}
+                  </span>
                 )}
-              </Button>
-              {availabilityQuery.data?.reason && (
-                <span className="text-xs text-muted-foreground">
-                  {availabilityQuery.data.reason}
-                </span>
-              )}
-            </div>
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                Only platform administrators can install plugins. Ask an
+                admin to install VibeTemps from this page.
+              </p>
+            )}
           </div>
         )}
       </CardContent>
