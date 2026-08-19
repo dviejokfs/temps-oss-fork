@@ -1724,10 +1724,17 @@ fn ai_read_allowlist() -> Vec<String> {
         "list_routes",
         "get_route",
         // ── OpenTelemetry: cross-project traces, span stats ──
-        // Both require OtelRead and deny deployment tokens, matching the existing
-        // `get_trace` / `query_traces` entries above.
+        // `getCrossProjectTraceSiblings` requires OtelRead + denies deployment
+        // tokens; its response (`CrossProjectTraceResponse`) is genuinely
+        // metadata-only — project id/name/slug/first_seen timestamp, no span
+        // content. `getUnifiedTrace` is intentionally NOT included: it embeds
+        // the full `SpanRecord` per span, whose `attributes` field is
+        // documented as "raw key/value pairs exactly as reported by the
+        // instrumenting library" plus raw `events` — same risk class as the
+        // already-excluded observability span attributes, but fanned out
+        // across up to 20 projects instead of one. Flagged in security review
+        // on PR #732 (Greptile, 5th pass).
         "getCrossProjectTraceSiblings",
-        "getUnifiedTrace",
         // Span statistics ranked by latency/volume (aggregates, no span payloads).
         "query_span_stats",
         // ── Alarms ──
@@ -1906,12 +1913,15 @@ fn ai_read_allowlist() -> Vec<String> {
         // `LogsRead` permission gate, unlike `get_container_logs`'s
         // container-scoped equivalent. Flagged in security review on PR #732
         // (Greptile, 4th pass).
-        // ── Preview gateway: settings + status + logs ──
+        // ── Preview gateway: settings + status (NOT logs) ──
         // Settings expose image tag, host port, auto-upgrade flag — no shared_secret
         // (that is masked as a boolean in the response struct).
+        // `get_preview_gateway_logs` is intentionally NOT included: it
+        // returns `LogsResponse { lines }` straight from `tail_logs` —
+        // raw Docker container stdout/stderr, zero redaction. Flagged in
+        // security review on PR #732 (Greptile, 5th pass).
         "get_preview_gateway_settings",
         "get_preview_gateway_status",
-        "get_preview_gateway_logs",
         // ── External plugins ──
         "list_external_plugins",
         // ── Analytics: event entry list — excluded ──
@@ -1928,14 +1938,14 @@ fn ai_read_allowlist() -> Vec<String> {
         // `user_context` verbatim — raw agent execution content, not
         // metadata. `job_status` is also excluded: `JobStatusResponse`
         // returns raw `stdout`/`stderr` from a detached sandbox command.
-        // `list_jobs`/`get_cmd` stay — their DTOs (`JobSummaryResponse`,
-        // `CmdInner`) carry only id/status/exit_code/cmd-name/args, no
-        // captured output. Flagged in security review on PR #732 (Greptile,
-        // 4th pass, plus job_status found during that same audit).
+        // `list_jobs`/`get_cmd` are ALSO now excluded (previously kept —
+        // wrong call): their DTOs (`JobSummaryResponse.cmd`,
+        // `CmdInner.args`) carry the full invoked command line, which can
+        // itself embed a secret passed as a CLI argument (e.g. `mysql
+        // -p'...'`, `curl -H "Authorization: Bearer ..."`). Flagged in
+        // security review on PR #732 (Greptile, 4th + 5th pass).
         "get_sandbox",
         "list_sandboxes",
-        "list_jobs",
-        "get_cmd",
         // Sandbox event list — lifecycle events (created, started, stopped).
         "list_events",
     ]
