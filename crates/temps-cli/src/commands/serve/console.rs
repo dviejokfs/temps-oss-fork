@@ -1665,6 +1665,245 @@ fn ai_read_allowlist() -> Vec<String> {
         // ── Import ──
         "list_sources",
         "get_import_status",
+        // ── Container metrics history ──
+        // Same class as `get_container_metrics` (already allowlisted); returns
+        // time-series data points with no secrets.
+        "ContainerMetricsGetHistory",
+        // ── Projects: single-project read (metadata, no secrets) ──
+        // `get_project` / `get_project_by_slug` mirror `get_projects` but for a
+        // specific ID/slug. Both enforce permission_guard + project_scope_guard +
+        // project_access_guard — same three-layer check the list endpoint uses.
+        "get_project",
+        "get_project_by_slug",
+        // ── External services: detail + masked env vars ──
+        // `get_service` / `get_service_by_slug` call `get_service_details`, which
+        // runs `mask_sensitive_parameter_values` before returning — sensitive params
+        // are replaced with "***" and listed in `sensitive_parameters`.
+        // The `get_service_environment_variables` bulk endpoint explicitly sets
+        // `mask_sensitive: true`; `get_project_service_environment_variables` calls
+        // `mask_environment_variable_values` before responding. Preview env var
+        // endpoints return names only or masked values by design.
+        "get_service",
+        "get_service_by_slug",
+        "get_service_environment_variables",
+        "get_project_service_environment_variables",
+        "get_service_preview_environment_variable_names",
+        "get_service_preview_environment_variables_masked",
+        // Provider type catalog and schema metadata — no stored values.
+        "get_provider_metadata",
+        "get_providers_metadata",
+        // Available Docker images for external services (name, version tags).
+        "list_available_containers",
+        // AI data-access toggle — boolean (enabled/disabled) per service.
+        "get_ai_data_access",
+        // Slow-query statistics from pg_stat_statements — parameterised query
+        // text ($1/$2 placeholders), execution counts, timing. No data values.
+        "get_slow_queries",
+        // ── AI traffic analytics (proxy-log aggregates, no raw rows) ──
+        // These endpoints return aggregated breakdowns and time-series counts
+        // derived from proxy logs — agent names, page paths, HTTP status buckets,
+        // request counts, latencies. No full request/response bodies are included.
+        "get_ai_agent_breakdown",
+        "get_ai_agent_pages",
+        "get_ai_agent_timeline",
+        "get_ai_page_breakdown",
+        "get_ai_status_breakdown",
+        // Time-bucketed request aggregates (counts, error rates, p50/p95 latency).
+        // Same privacy class as `get_api_timeseries` (already allowlisted).
+        "get_time_bucket_stats",
+        // Proxy route table — hostname→environment mapping, no credentials.
+        "list_routes",
+        "get_route",
+        // ── OpenTelemetry: cross-project traces, span stats ──
+        // Both require OtelRead and deny deployment tokens, matching the existing
+        // `get_trace` / `query_traces` entries above.
+        "getCrossProjectTraceSiblings",
+        "getUnifiedTrace",
+        // Span statistics ranked by latency/volume (aggregates, no span payloads).
+        "query_span_stats",
+        // ── Alarms ──
+        // Project-scoped alarm list and summary counts; permission_guard DeploymentsRead.
+        "listProjectAlarms",
+        "getProjectAlarmsSummary",
+        // ── Observability event store ──
+        // Raw OTel event records gated by OtelRead; no credentials.
+        "observability_list_events",
+        "observability_full_event",
+        // ── IP access control ──
+        // Access-rule list and single-IP block check; no secrets.
+        "check_ip_blocked",
+        "get_ip_access_control",
+        "list_ip_access_control",
+        // Geolocation lookup for an IP — country/city, no PII beyond what the
+        // caller already knows (the IP itself). Gated by AnalyticsRead.
+        "get_ip_geolocation",
+        // ── AI chat: conversations + pending actions ──
+        // Conversations are the operator's own chat history. Pending actions are
+        // proposed (not yet executed) write operations waiting for confirmation.
+        // Both are scoped to the current user's projects via ProjectsRead.
+        "get_conversation",
+        "find_conversation",
+        "list_conversations",
+        "list_all_conversations",
+        "get_pending_action",
+        "list_pending_actions",
+        // Readiness booleans: ai_configured, chat_enabled, write_actions_enabled.
+        "get_chat_readiness",
+        // ── OTel dashboards ──
+        // Dashboard config (queries, panel layout) — no secrets. Gated OtelRead.
+        "get_dashboard",
+        "list_dashboards",
+        // ── Platform info + update status ──
+        // OS type, architecture, and supported platform strings — no secrets.
+        "get_platform_info",
+        // Server's externally-reachable public IP as detected at startup.
+        "get_public_ip",
+        // Whether an in-place binary update is possible and what version is available.
+        "get_update_capability",
+        "get_update_status",
+        // ── Email provider (masked credentials) + tracking ──
+        // `get_email_provider` / `list_email_providers` call `get_masked_credentials`
+        // before responding — the actual SMTP/SES credentials are replaced with "***".
+        "get_email_provider",
+        "list_email_providers",
+        // Whether email sending is configured (boolean). Unauthenticated endpoint.
+        "email_status",
+        // Tracking pixel / click-through status booleans — not the raw events.
+        "get_email_tracking_status",
+        // ── DNS providers (masked credentials) + domain orders ──
+        // `get_dns_provider` / `list_dns_providers` call `get_masked_credentials`
+        // before responding — the actual provider API key is replaced with "***".
+        "get_dns_provider",
+        "list_dns_providers",
+        // Domain lookups — metadata only, no signing secrets.
+        "get_domain_by_host",
+        "get_domain_by_id",
+        "get_domain_order",
+        "list_orders",
+        "list_on_demand_certs",
+        // DNS provider zone list (zone IDs and names for domain selection).
+        "list_provider_zones",
+        // Live DNS A-record lookup for a hostname — diagnostic read.
+        "lookup_dns_a_records",
+        // Flat vs. wildcard subdomain preview mode for DNS providers.
+        "preview_hostname_mode",
+        // ── User preferences + cluster metadata ──
+        // Notification preferences for the current user — no credentials.
+        "get_preferences",
+        // Boolean: whether a cluster join token is set (not the token itself).
+        "get_join_token_status",
+        // Enrollment token metadata (expiry, use count, bound node). Token values
+        // are never returned; the response only contains `EnrollmentTokenInfo`.
+        "list_enrollment_tokens",
+        // Static list of all available permission names — not sensitive.
+        "get_api_key_permissions",
+        // ── Teams + project access ──
+        // Team and membership metadata scoped by UsersRead permission.
+        "list_teams",
+        "get_team",
+        "list_team_members",
+        "list_team_projects",
+        "list_project_access",
+        // ── Agent secrets + AI provider status ──
+        // Agent secrets always return value masked as "***" in responses.
+        "list_secrets",
+        // Project secrets — metadata only (key names + environment scoping).
+        // Values are never returned by this endpoint; see its doc comment.
+        "listProjectSecrets",
+        // AI provider list — reports installed/authenticated booleans and
+        // available models; actual credentials are never included.
+        "list_ai_providers",
+        // Known AI agent identifiers (name catalogue, no credentials).
+        "list_known_ai_agents",
+        // ── Feature flags ──
+        "get_flag",
+        "get_flag_snapshot",
+        "list_flags",
+        // ── Project presets + templates ──
+        // Built-in and community preset catalogue — no secrets.
+        "list_presets",
+        "get_project_template",
+        "list_project_templates",
+        "list_project_template_tags",
+        // Detect applicable presets from a public repository URL.
+        // Makes read-only calls to public git provider APIs (same as
+        // `get_public_branches` / `get_public_repository` already allowlisted).
+        "detect_public_presets",
+        // ── Static files + source maps + releases (error tracking) ──
+        // Error-tracking release metadata (version strings, file lists).
+        // No stored values; same permission class as list_error_groups.
+        "list_releases",
+        "list_release_files",
+        "list_static_bundles",
+        "get_static_bundle",
+        "list_source_maps",
+        "list_source_files",
+        // Remote external image metadata (registry ref + description). No credentials.
+        "get_remote_external_image",
+        "list_remote_external_images",
+        // ── Deployment tokens (masked prefix only) ──
+        // `DeploymentTokenResponse` exposes only `token_prefix` (first few chars),
+        // not the full token — same masking class as `get_api_key` (already listed).
+        "get_deployment_token",
+        "list_deployment_tokens",
+        // ── Backup metadata ──
+        // Alert thresholds and child backup records — no S3 credentials (those
+        // are in `get_s3_source` / `list_s3_sources`, which are excluded).
+        "list_backup_alerts",
+        "list_backup_children",
+        "list_schedule_run_jobs",
+        "list_service_schedules",
+        "list_schedule_services",
+        // ── PostgreSQL major-version upgrade status ──
+        "get_pg_upgrade",
+        "get_pg_upgrade_logs",
+        "list_pg_upgrades",
+        // ── Git: repository / branch / tag reads ──
+        // Boolean safety check (can_delete + projects_in_use list).
+        "check_provider_deletion_safety",
+        // Boolean: whether a specific commit SHA exists in a repository.
+        "check_commit_exists",
+        // Repository and ref metadata; no OAuth tokens. Same class as
+        // `list_repositories_by_connection` already allowlisted.
+        "get_all_repositories_by_name",
+        "get_repository_by_id",
+        "get_branches_by_repository_id",
+        "get_tags_by_repository_id",
+        "list_commits_by_repository_id",
+        "get_repository_branches",
+        "get_repository_tags",
+        "get_repository_preset_live",
+        // Git connection metadata (connection IDs, names, provider type).
+        "get_provider_connections",
+        // ── Log aggregator: context window ──
+        // Returns a bounded window of log lines around a specific offset —
+        // same class as `get_container_logs` already allowlisted.
+        "get_log_context",
+        // ── Preview gateway: settings + status + logs ──
+        // Settings expose image tag, host port, auto-upgrade flag — no shared_secret
+        // (that is masked as a boolean in the response struct).
+        "get_preview_gateway_settings",
+        "get_preview_gateway_status",
+        "get_preview_gateway_logs",
+        // ── External plugins ──
+        "list_external_plugins",
+        // ── Analytics: event entry list ──
+        // Individual event rows that include IP and user_agent — same privacy
+        // class as `get_event_visitors` / `get_visitor_details` already allowlisted.
+        "get_event_entries",
+        // ── Agents + sandbox: run status, job metadata ──
+        // Run records and job metadata — no secrets. Gated by ProjectsRead.
+        "list_agent_runs",
+        "list_all_runs",
+        "get_run_with_logs",
+        "latest_run_for_source",
+        "get_sandbox",
+        "list_sandboxes",
+        "list_jobs",
+        "job_status",
+        "get_cmd",
+        // Sandbox event list — lifecycle events (created, started, stopped).
+        "list_events",
     ]
     .iter()
     .map(|s| s.to_string())
