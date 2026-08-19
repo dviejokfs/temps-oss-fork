@@ -215,7 +215,14 @@ describe("SessionRecorder", () => {
 
     // Wait for initialization
     await vi.runOnlyPendingTimersAsync();
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // Count the init call specifically: the total fetch count also picks up
+    // whatever the flush timer ships, which depends on how much rrweb has
+    // emitted by this point and is not what this test is about.
+    expect(
+      fetchSpy.mock.calls.filter((call) =>
+        String(call[0] ?? "").includes("/session-replay/init"),
+      ),
+    ).toHaveLength(1);
     expect(fetchSpy).toHaveBeenCalledWith(
       `${DEFAULT_BASE_PATH}/session-replay/init`,
       expect.any(Object)
@@ -474,7 +481,14 @@ describe("SessionRecorder", () => {
     );
 
     await vi.runOnlyPendingTimersAsync();
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // Count the init call specifically: the total fetch count also picks up
+    // whatever the flush timer ships, which depends on how much rrweb has
+    // emitted by this point and is not what this test is about.
+    expect(
+      fetchSpy.mock.calls.filter((call) =>
+        String(call[0] ?? "").includes("/session-replay/init"),
+      ),
+    ).toHaveLength(1);
 
     fetchSpy.mockClear();
 
