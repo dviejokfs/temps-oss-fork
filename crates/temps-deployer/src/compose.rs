@@ -192,6 +192,59 @@ pub enum ComposeError {
     Io(#[from] std::io::Error),
 }
 
+/// Compose filenames Temps generates itself inside the stack directory.
+///
+/// `compose_up` passes every one of these to `docker compose -f` purely
+/// because it exists on disk, and only the *user-supplied* override is run
+/// through `validate_compose_override`. A tenant compose file that names one
+/// of them as an `env_file:` target would therefore have Temps write
+/// attacker-influenced bytes to a path the daemon later parses as trusted
+/// Compose YAML — dotenv syntax and YAML syntax overlap enough (`#` comments,
+/// bare `key: value` lines) to smuggle a whole `services:` mapping past the
+/// dotenv reader. That is a sandbox escape, so referencing these names is
+/// rejected outright rather than silently skipped.
+///
+/// This is the *single* list. `validate_compose_path_not_generated` consumed a
+/// second, longer copy of it, and the two drifted: `TEMPS_SECRETS_OVERRIDE` was
+/// on that one but not here, even though it is passed to `docker compose -f` on
+/// sight exactly like the rest. Only write ordering kept that from being
+/// exploitable — the secrets override is written or deleted unconditionally
+/// after the `env_file` loop, unlike the labels override, which is written only
+/// when labels exist and was therefore reachable. One refactor making the
+/// secrets override conditional would have reopened the escape, so the lists
+/// are now the same list.
+pub(crate) const RESERVED_GENERATED_COMPOSE_FILES: &[&str] = &[
+    "docker-compose.temps-env.yml",
+    "docker-compose.temps-network.yml",
+    "docker-compose.temps-override.yml",
+    "docker-compose.temps-labels.yml",
+    "docker-compose.temps-security.yml",
+    TEMPS_SECRETS_OVERRIDE,
+];
+
+/// Whether `path` names one of the Compose files Temps generates.
+///
+/// Compares the final component only: `./docker-compose.temps-override.yml`
+/// and `docker-compose.temps-override.yml` resolve to the same file in the
+/// stack root, and a same-named file in a subdirectory is not passed to
+/// `docker compose -f`, so it is harmless.
+pub(crate) fn is_reserved_generated_compose_file(path: &Path) -> bool {
+    // Only the stack root is dangerous: `append_compose_file_args` looks for
+    // these names directly under the project directory.
+    if path.parent().is_some_and(|parent| {
+        !parent.as_os_str().is_empty() && parent != Path::new(".") && parent != Path::new("")
+    }) {
+        return false;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            RESERVED_GENERATED_COMPOSE_FILES
+                .iter()
+                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        })
+}
+
 /// Where the contents of a referenced `env_file` come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvFileSource {
@@ -678,15 +731,6 @@ impl ComposeExecutor {
     }
 
     /// Every override filename Temps writes into the stack directory itself.
-    const GENERATED_OVERRIDES: [&'static str; 6] = [
-        "docker-compose.temps-env.yml",
-        "docker-compose.temps-network.yml",
-        "docker-compose.temps-override.yml",
-        "docker-compose.temps-labels.yml",
-        "docker-compose.temps-security.yml",
-        TEMPS_SECRETS_OVERRIDE,
-    ];
-
     /// Reject a `compose_path` that names one of Temps' own generated
     /// overrides. Those files are written unconditionally, so pointing the
     /// project at one would have Temps overwrite the user's compose document
@@ -696,7 +740,7 @@ impl ComposeExecutor {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or(compose_path);
-        if Self::GENERATED_OVERRIDES.contains(&name) {
+        if RESERVED_GENERATED_COMPOSE_FILES.contains(&name) {
             return Err(ComposeError::InvalidComposePath {
                 field: "compose_path".to_string(),
                 path: compose_path.to_string(),
@@ -1286,6 +1330,20 @@ impl ComposeExecutor {
             .as_deref()
             .unwrap_or("docker-compose.yml");
         Self::validate_relative_path(compose_file, "compose_path")?;
+        // Same reasoning as the `env_file` guard below: these names are handed
+        // to `docker compose -f` on sight, so nothing user-selected may land on
+        // them. Here it would also mean the base compose file and a generated
+        // override silently clobber each other depending on write order.
+        if is_reserved_generated_compose_file(Path::new(compose_file)) {
+            return Err(ComposeError::SecurityPolicyViolation {
+                service: "<compose-files>".to_string(),
+                field: "compose_path".to_string(),
+                reason: format!(
+                    "'{compose_file}' is a Compose file name Temps generates; \
+                     choose a different compose file path."
+                ),
+            });
+        }
         let compose_path =
             Self::confined_write_path(project_dir, Path::new(compose_file), "compose_path")?;
 
@@ -1345,6 +1403,21 @@ impl ComposeExecutor {
         for plan in Self::plan_env_files(&request.compose_content, request.repo_dir.as_deref()) {
             if already_written_env && plan.path == ".env" {
                 continue;
+            }
+            // Fail closed rather than skipping: a stack that only works because
+            // Temps quietly declined to satisfy one of its `env_file:` entries
+            // is worse to debug than an explicit "rename this file" error.
+            if is_reserved_generated_compose_file(Path::new(&plan.path)) {
+                return Err(ComposeError::SecurityPolicyViolation {
+                    service: "<compose-files>".to_string(),
+                    field: "env_file".to_string(),
+                    reason: format!(
+                        "'{}' is a Compose file name Temps generates and passes to the Docker \
+                         daemon; an env_file may not target it. Rename the env file in your \
+                         compose configuration.",
+                        plan.path
+                    ),
+                });
             }
             let destination =
                 Self::confined_write_path(project_dir, Path::new(&plan.path), "env_file")?;
@@ -6017,6 +6090,181 @@ services:
     }
 
     #[test]
+    fn test_reserved_generated_compose_file_detection() {
+        for reserved in RESERVED_GENERATED_COMPOSE_FILES {
+            assert!(
+                is_reserved_generated_compose_file(Path::new(reserved)),
+                "{reserved} must be recognised as generated"
+            );
+            assert!(
+                is_reserved_generated_compose_file(&Path::new("./").join(reserved)),
+                "{reserved} must be recognised through a './' prefix"
+            );
+        }
+        // Case-insensitive: the stack directory may live on a case-insensitive
+        // filesystem, where `Docker-Compose.Temps-Override.yml` is the same file.
+        assert!(is_reserved_generated_compose_file(Path::new(
+            "Docker-Compose.Temps-Override.YML"
+        )));
+        // Only the stack root is passed to `docker compose -f`.
+        assert!(!is_reserved_generated_compose_file(Path::new(
+            "config/docker-compose.temps-override.yml"
+        )));
+        assert!(!is_reserved_generated_compose_file(Path::new(".env")));
+        assert!(!is_reserved_generated_compose_file(Path::new(
+            "docker-compose.yml"
+        )));
+    }
+
+    /// A tenant compose file must not be able to make Temps materialise an
+    /// `env_file` onto one of the generated Compose filenames: `compose_up`
+    /// passes those to the daemon unvalidated, so attacker-influenced bytes
+    /// there are a container-escape primitive, not just a config oddity.
+    #[tokio::test]
+    async fn test_write_compose_files_rejects_env_file_targeting_generated_override() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let project_dir = tempfile::tempdir().unwrap();
+        let request = ComposeDeployRequest {
+            project_name: "temps-test".to_string(),
+            compose_content: "services:\n  app:\n    image: nginx\n    env_file: \
+                              docker-compose.temps-override.yml\n"
+                .to_string(),
+            env_content: None,
+            work_dir: project_dir.path().to_path_buf(),
+            compose_path: None,
+            environment_vars: HashMap::from([("SECRET".to_string(), "value".to_string())]),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::new(),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: vec!["app".to_string()],
+        };
+
+        let err = executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(violation_field(err), "env_file");
+
+        // And the generated override must not carry tenant env-var content.
+        let generated = project_dir.path().join("docker-compose.temps-override.yml");
+        if generated.exists() {
+            let contents = tokio::fs::read_to_string(&generated).await.unwrap();
+            assert!(
+                !contents.contains("SECRET"),
+                "generated override must never contain env-file content: {contents}"
+            );
+        }
+    }
+
+    /// The long form (`env_file: [{{path: ...}}]`) reaches the same writer, so
+    /// it must be rejected identically.
+    #[tokio::test]
+    async fn test_write_compose_files_rejects_long_form_env_file_targeting_generated_file() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let project_dir = tempfile::tempdir().unwrap();
+        let request = ComposeDeployRequest {
+            project_name: "temps-test".to_string(),
+            compose_content: "services:\n  app:\n    image: nginx\n    env_file:\n      \
+                              - path: docker-compose.temps-security.yml\n        required: false\n"
+                .to_string(),
+            env_content: None,
+            work_dir: project_dir.path().to_path_buf(),
+            compose_path: None,
+            environment_vars: HashMap::from([("SECRET".to_string(), "value".to_string())]),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::new(),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: vec!["app".to_string()],
+        };
+
+        let err = executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(violation_field(err), "env_file");
+    }
+
+    /// `compose_path` comes from project settings, so it is user-selected too.
+    #[tokio::test]
+    async fn test_write_compose_files_rejects_compose_path_targeting_generated_file() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let project_dir = tempfile::tempdir().unwrap();
+        let request = ComposeDeployRequest {
+            project_name: "temps-test".to_string(),
+            compose_content: "services:\n  app:\n    image: nginx\n".to_string(),
+            env_content: None,
+            work_dir: project_dir.path().to_path_buf(),
+            compose_path: Some("docker-compose.temps-network.yml".to_string()),
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::new(),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: vec!["app".to_string()],
+        };
+
+        let err = executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(violation_field(err), "compose_path");
+    }
+
+    /// The guard must not break the ordinary case: a normal `env_file:` is
+    /// still materialised from the project's environment variables.
+    #[tokio::test]
+    async fn test_write_compose_files_still_materialises_normal_env_file() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let project_dir = tempfile::tempdir().unwrap();
+        let request = ComposeDeployRequest {
+            project_name: "temps-test".to_string(),
+            compose_content: "services:\n  app:\n    image: nginx\n    env_file: app.env\n"
+                .to_string(),
+            env_content: None,
+            work_dir: project_dir.path().to_path_buf(),
+            compose_path: None,
+            environment_vars: HashMap::from([("SECRET".to_string(), "value".to_string())]),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::new(),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: vec!["app".to_string()],
+        };
+
+        executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap();
+
+        let materialised = tokio::fs::read_to_string(project_dir.path().join("app.env"))
+            .await
+            .unwrap();
+        assert!(materialised.contains("SECRET"), "got: {materialised}");
+    }
+
+    #[test]
     fn test_generate_security_override_grants_relaxed_capabilities() {
         let docker = Docker::connect_with_defaults();
         if docker.is_err() {
@@ -6547,7 +6795,7 @@ services:
 
     #[test]
     fn test_compose_path_cannot_shadow_a_generated_override() {
-        for reserved in ComposeExecutor::GENERATED_OVERRIDES {
+        for reserved in RESERVED_GENERATED_COMPOSE_FILES.iter().copied() {
             assert!(
                 ComposeExecutor::validate_compose_path_not_generated(reserved).is_err(),
                 "{reserved} should be reserved"
