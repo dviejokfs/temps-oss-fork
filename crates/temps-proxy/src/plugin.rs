@@ -277,6 +277,8 @@ mod tests {
         // boot (commands/serve/mod.rs), before any plugin's register_services
         // runs — see the `retention_resolver_slot` field doc.
         context.register_service(Arc::new(temps_core::RetentionResolverSlot::new_default()));
+        // Likewise for the IP gate slot — see `project_ip_gate_slot`.
+        context.register_service(Arc::new(temps_core::ProjectIpGateSlot::new_default()));
 
         // No ConfigService is registered here: the plugin reads it via
         // `get_service` and, when absent, selects the default TimescaleDB
