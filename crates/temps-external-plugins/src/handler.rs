@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder;
@@ -13,14 +13,152 @@ use temps_core::external_plugin::{NavEntry, NavSection, PluginManifest, UiManife
 use temps_core::problemdetails::Problem;
 use utoipa::{OpenApi as OpenApiTrait, ToSchema};
 
-use crate::install::{PlatformAsset, PluginInstaller, PluginRegistryManifest};
+use crate::install::{InstallError, PlatformAsset, PluginInstaller, PluginRegistryManifest};
 
 use crate::service::ExternalPluginsService;
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
+/// Recorded on every successful plugin install.
+///
+/// Captures the resolved version and the SHA-256 actually verified, not just
+/// the plugin name: "who installed a plugin" is not enough to answer "which
+/// bytes are running on this host", which is the question that matters after
+/// a registry compromise.
+#[derive(Debug, Clone, Serialize)]
+struct PluginInstalledAudit {
+    context: temps_core::audit::AuditContext,
+    plugin_name: String,
+    version: String,
+    manifest_url: String,
+    platform: String,
+    sha256: String,
+    install_path: String,
+    process_started: bool,
+}
+
+impl temps_core::audit::AuditOperation for PluginInstalledAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_PLUGIN_INSTALLED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+/// Recorded on every plugin reload. Reloading restarts plugin processes, so it
+/// is a privileged write even though it installs nothing.
+#[derive(Debug, Clone, Serialize)]
+struct PluginsReloadedAudit {
+    context: temps_core::audit::AuditContext,
+    loaded: usize,
+    plugins: Vec<String>,
+}
+
+impl temps_core::audit::AuditOperation for PluginsReloadedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_PLUGINS_RELOADED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+/// Build the audit context from the authenticated caller and request metadata.
+fn audit_context(
+    auth: &temps_auth::AuthContext,
+    metadata: &temps_core::RequestMetadata,
+) -> temps_core::audit::AuditContext {
+    temps_core::audit::AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    }
+}
+
+/// Write an audit entry, logging but not propagating a failure.
+///
+/// A failed audit write must not roll back an install that already succeeded —
+/// the binary is on disk either way, and returning an error would tell the
+/// operator the opposite. The ERROR log is the escalation path.
+async fn record_audit(
+    state: &ExternalPluginsAppState,
+    operation: &dyn temps_core::audit::AuditOperation,
+) {
+    if let Err(e) = state.audit_service.create_audit_log(operation).await {
+        tracing::error!(
+            operation = %operation.operation_type(),
+            "Failed to write audit log: {e}"
+        );
+    }
+}
+
+/// Map a typed install failure to its HTTP status and title.
+///
+/// Matching on the variant rather than substring-matching the rendered message
+/// is what keeps the status codes stable when a message is reworded.
+fn install_problem(error: &InstallError) -> Problem {
+    use InstallError::*;
+    let (status, title) = match error {
+        UnsupportedPlatform { .. } | NoAssetForPlatform { .. } => {
+            (StatusCode::BAD_REQUEST, "Unsupported Platform")
+        }
+        // The registry published something we refuse to act on. It is not the
+        // caller's fault, and retrying will not help until it is republished.
+        InsecureAssetUrl { .. } => (StatusCode::BAD_GATEWAY, "Insecure Asset URL"),
+        ChecksumMismatch { .. } => (StatusCode::BAD_GATEWAY, "Checksum Verification Failed"),
+        EntryNotFound { .. } | Tarball { .. } => {
+            (StatusCode::BAD_GATEWAY, "Tarball Extraction Failed")
+        }
+        ManifestParse { .. } => (StatusCode::BAD_GATEWAY, "Malformed Manifest"),
+        TooLarge { .. } | ExtractedTooLarge { .. } => {
+            (StatusCode::BAD_GATEWAY, "Plugin Artifact Too Large")
+        }
+        DownloadStatus { .. } | Download { .. } => (StatusCode::BAD_GATEWAY, "Download Failed"),
+        Write { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "Plugin Install Failed"),
+    };
+    temps_core::problemdetails::new(status)
+        .with_title(title)
+        .with_detail(error.to_string())
+}
 
 /// Handler state for the external plugins API.
 #[derive(Clone)]
 pub struct ExternalPluginsAppState {
     pub service: Arc<ExternalPluginsService>,
+    /// Installing a plugin downloads and executes a binary on the host — the
+    /// most privileged write this API exposes — so it must leave a trail.
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 /// List all running external plugins and their manifests.
@@ -77,6 +215,7 @@ pub struct ReloadResponse {
 async fn reload_plugins(
     RequireAuth(auth): RequireAuth,
     State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
 ) -> Result<(StatusCode, Json<ReloadResponse>), Problem> {
     permission_guard!(auth, SystemAdmin);
 
@@ -85,6 +224,16 @@ async fn reload_plugins(
     let manifests = state.service.reload_plugins().await;
     let names: Vec<String> = manifests.iter().map(|m| m.name.clone()).collect();
     let count = names.len();
+
+    record_audit(
+        &state,
+        &PluginsReloadedAudit {
+            context: audit_context(&auth, &metadata),
+            loaded: count,
+            plugins: names.clone(),
+        },
+    )
+    .await;
 
     Ok((
         StatusCode::OK,
@@ -281,6 +430,7 @@ async fn list_plugin_registry(
 async fn install_plugin(
     RequireAuth(auth): RequireAuth,
     State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
     Json(request): Json<InstallPluginRequest>,
 ) -> Result<(StatusCode, Json<InstallPluginResponse>), Problem> {
     permission_guard!(auth, SystemAdmin);
@@ -296,45 +446,44 @@ async fn install_plugin(
             .build()
     })?;
 
+    // Version pinning is not implemented: the manifest URL always resolves to
+    // the current release. Honouring the field silently would be worse than
+    // refusing it — an operator pinning a known-good version would believe
+    // they had pinned it while receiving whatever the registry now serves.
+    if let Some(requested) = request
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return Err(error_builder::bad_request()
+            .title("Version Pinning Not Supported")
+            .detail(format!(
+                "Cannot install '{}' at version '{requested}': this instance always installs the \
+                 current release named by the registry manifest. Omit `version` to proceed.",
+                known.name
+            ))
+            .build());
+    }
+
     let manifest = PluginInstaller::fetch_manifest(known.manifest_url)
         .await
-        .map_err(|e| {
-            error_builder::internal_server_error()
-                .title("Manifest Fetch Failed")
-                .detail(format!(
-                    "Could not fetch {} manifest: {}. Check network connectivity and try again.",
-                    known.name, e
-                ))
-                .build()
-        })?;
+        .map_err(|e| install_problem(&e))?;
 
     let plugins_dir = state.service.manager().config().plugins_dir.clone();
     let installer = PluginInstaller::new();
 
+    let platform = crate::install::platform_target().map_err(|e| install_problem(&e))?;
+    let sha256 = manifest
+        .platforms
+        .get(&platform)
+        .map(|asset| asset.sha256.clone())
+        .unwrap_or_default();
+
     let installed_path = installer
         .install(known.binary_name, &manifest, &plugins_dir)
         .await
-        .map_err(|e| {
-            // Surface distinct error types with actionable messages.
-            let detail = e.to_string();
-            let title = if detail.contains("Checksum mismatch") {
-                "Checksum Verification Failed"
-            } else if detail.contains("unsupported platform")
-                || detail.contains("no release for platform")
-            {
-                "Unsupported Platform"
-            } else if detail.contains("not found in tarball") {
-                "Tarball Extraction Failed"
-            } else if detail.contains("HTTP") {
-                "Download Failed"
-            } else {
-                "Plugin Install Failed"
-            };
-            error_builder::internal_server_error()
-                .title(title)
-                .detail(detail)
-                .build()
-        })?;
+        .map_err(|e| install_problem(&e))?;
 
     // Start or reload the plugin process — non-fatal on failure (binary is
     // installed; operator can trigger a manual reload). `manifest.name` (the
@@ -343,9 +492,15 @@ async fn install_plugin(
     // `known.binary_name` — so it must be the identity passed here for
     // is_running/reload to find the right entry. `known.binary_name` is only
     // needed for the fresh-start filesystem path.
+    //
+    // The identity passed here is `known.name`, the compile-time constant —
+    // NOT `manifest.name`, which is remote data. Keying the running-process
+    // lookup on a field the registry controls means a manifest declaring
+    // another plugin's name would reload *that* plugin and leave the binary
+    // just installed here unstarted, while still reporting success.
     let reloaded = match state
         .service
-        .start_or_reload_plugin(&manifest.name, known.binary_name)
+        .start_or_reload_plugin(known.name, known.binary_name)
         .await
     {
         Ok(_) => true,
@@ -359,6 +514,24 @@ async fn install_plugin(
             false
         }
     };
+
+    record_audit(
+        &state,
+        &PluginInstalledAudit {
+            context: audit_context(&auth, &metadata),
+            // The registry-declared name is recorded alongside the local
+            // identity: if they ever diverge, the audit trail is where that
+            // shows up.
+            plugin_name: known.name.to_string(),
+            version: manifest.version.clone(),
+            manifest_url: known.manifest_url.to_string(),
+            platform,
+            sha256,
+            install_path: installed_path.display().to_string(),
+            process_started: reloaded,
+        },
+    )
+    .await;
 
     Ok((
         StatusCode::OK,
@@ -510,14 +683,54 @@ mod tests {
         Arc::new(sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection())
     }
 
-    fn test_state() -> ExternalPluginsAppState {
+    /// Captures audit operations so tests can assert a privileged write was
+    /// actually recorded, not merely that it returned 200.
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        operations: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> anyhow::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    fn test_state() -> (ExternalPluginsAppState, Arc<RecordingAuditLogger>) {
         let config = ExternalPluginConfig::new(
             std::env::temp_dir().join("temps-external-plugins-handler-test"),
             "postgres://localhost/test".to_string(),
         );
-        ExternalPluginsAppState {
-            service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
-        }
+        let audit = Arc::new(RecordingAuditLogger::default());
+        (
+            ExternalPluginsAppState {
+                service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+                audit_service: audit.clone(),
+            },
+            audit,
+        )
+    }
+
+    fn test_metadata() -> Extension<temps_core::RequestMetadata> {
+        Extension(temps_core::RequestMetadata {
+            ip_address: "203.0.113.7".to_string(),
+            user_agent: "test-agent".to_string(),
+            headers: Default::default(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        })
     }
 
     fn test_user(id: i32) -> users::Model {
@@ -556,20 +769,145 @@ mod tests {
 
     #[tokio::test]
     async fn reload_plugins_rejects_non_admin() {
-        let state = test_state();
-        let err = reload_plugins(user_auth(Role::User), State(state))
+        let (state, audit) = test_state();
+        let err = reload_plugins(user_auth(Role::User), State(state), test_metadata())
             .await
             .expect_err("a plain User role must not be able to reload plugins");
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+        assert!(
+            audit.operations.lock().unwrap().is_empty(),
+            "a rejected reload must not be recorded as one that happened"
+        );
     }
 
     #[tokio::test]
     async fn reload_plugins_allows_platform_admin() {
-        let state = test_state();
-        let (status, _) = reload_plugins(user_auth(Role::PlatformAdmin), State(state))
-            .await
-            .expect("a PlatformAdmin must be able to reload plugins");
+        let (state, audit) = test_state();
+        let (status, _) = reload_plugins(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            test_metadata(),
+        )
+        .await
+        .expect("a PlatformAdmin must be able to reload plugins");
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            audit.operations.lock().unwrap().as_slice(),
+            ["EXTERNAL_PLUGINS_RELOADED"],
+            "restarting plugin processes must leave an audit trail"
+        );
+    }
+
+    /// Version pinning is unimplemented, and silently ignoring the field would
+    /// leave an operator believing they had pinned a known-good release.
+    #[tokio::test]
+    async fn install_rejects_a_version_pin() {
+        let (state, audit) = test_state();
+        let err = install_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            test_metadata(),
+            Json(InstallPluginRequest {
+                name: "vibetemps".to_string(),
+                version: Some("1.2.3".to_string()),
+            }),
+        )
+        .await
+        .expect_err("a version pin must be refused rather than silently ignored");
+        assert_eq!(err.status_code, StatusCode::BAD_REQUEST);
+        assert!(
+            audit.operations.lock().unwrap().is_empty(),
+            "a refused install must not be audited as an install"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_rejects_unknown_plugin_name() {
+        let (state, _audit) = test_state();
+        let err = install_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            test_metadata(),
+            Json(InstallPluginRequest {
+                name: "../../etc/passwd".to_string(),
+                version: None,
+            }),
+        )
+        .await
+        .expect_err("only allowlisted plugin names are installable");
+        assert_eq!(err.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn install_rejects_non_admin() {
+        let (state, _audit) = test_state();
+        let err = install_plugin(
+            user_auth(Role::User),
+            State(state),
+            test_metadata(),
+            Json(InstallPluginRequest {
+                name: "vibetemps".to_string(),
+                version: None,
+            }),
+        )
+        .await
+        .expect_err("installing a binary must require SystemAdmin");
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+    }
+
+    /// The status→variant mapping replaced substring-matching on the rendered
+    /// message. Pin the classes so a reworded message can't silently change a
+    /// 502 into a 500.
+    #[test]
+    fn install_errors_map_to_stable_status_codes() {
+        let cases: Vec<(InstallError, StatusCode)> = vec![
+            (
+                InstallError::UnsupportedPlatform {
+                    os: "plan9".into(),
+                    arch: "sparc".into(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                InstallError::InsecureAssetUrl {
+                    plugin: "p".into(),
+                    url: "http://x".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                InstallError::ChecksumMismatch {
+                    plugin: "p".into(),
+                    version: "1".into(),
+                    platform: "linux-amd64".into(),
+                    reason: "r".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                InstallError::TooLarge {
+                    what: "Download",
+                    url: "https://x".into(),
+                    limit: 1,
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                InstallError::Write {
+                    plugin: "p".into(),
+                    path: "/tmp/x".into(),
+                    reason: "r".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                install_problem(&error).status_code,
+                expected,
+                "unexpected status for {error:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -579,7 +917,7 @@ mod tests {
         // unauthenticated (no session at all) callers should be rejected,
         // which `RequireAuth`'s extractor enforces at the HTTP layer before
         // this handler body ever runs.
-        let state = test_state();
+        let (state, _audit) = test_state();
         let Json(manifests) = list_external_plugins(user_auth(Role::User), State(state)).await;
         assert!(manifests.is_empty());
     }

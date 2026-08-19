@@ -11491,6 +11491,7 @@ dependencies = [
  "temps-core",
  "temps-entities",
  "temps-presets",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tower",

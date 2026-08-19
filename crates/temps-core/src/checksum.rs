@@ -24,6 +24,22 @@ pub fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Invalid checksum file format"))?
         .to_lowercase();
 
+    // Validate the shape before comparing. Without this, a manifest carrying a
+    // truncated or non-hex digest — or an empty one, where the filename token
+    // is what `split_whitespace` returns — reports a plain "mismatch", which
+    // reads as "the download was tampered with" rather than "the registry
+    // published a malformed entry". Both fail closed; only the diagnosis
+    // differs, and that difference decides whether an operator retries or
+    // escalates.
+    const SHA256_HEX_LEN: usize = 64;
+    if expected.len() != SHA256_HEX_LEN || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow::anyhow!(
+            "Malformed SHA-256 checksum: expected {} hex characters, got {:?}",
+            SHA256_HEX_LEN,
+            expected
+        ));
+    }
+
     if computed != expected {
         return Err(anyhow::anyhow!(
             "Checksum mismatch!\n  Expected: {}\n  Got:      {}",
@@ -70,6 +86,30 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Invalid checksum file format"));
+    }
+
+    #[test]
+    fn malformed_hash_is_reported_as_malformed_not_mismatch() {
+        // Too short, and non-hex. Both must be distinguishable from a genuine
+        // mismatch so an operator knows the registry is wrong, not the wire.
+        for bad in ["abc123  f.txt", "zzzz  f.txt"] {
+            let err = verify_checksum(b"data", bad).unwrap_err().to_string();
+            assert!(
+                err.contains("Malformed SHA-256 checksum"),
+                "expected a malformed-checksum error for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_hash_field_does_not_fall_through_to_the_filename() {
+        // `format!("{}  {}", "", name)` leaves leading whitespace, so the
+        // first token is the *filename*. It must be rejected as malformed
+        // rather than silently compared against the digest.
+        let err = verify_checksum(b"data", "  my-plugin-binary")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Malformed SHA-256 checksum"), "got: {err}");
     }
 
     #[test]
