@@ -208,7 +208,11 @@ function VibeTempsInstallCard() {
   const manifest = availabilityQuery.data?.manifest
 
   const handleInstall = () => {
-    installMutation.mutate(manifest?.version, {
+    // No version argument: the manifest URL always resolves to the current
+    // release, so `version` on the request is a pin the server cannot honour
+    // and rejects outright. Echoing the version we happen to have just read
+    // would fail every install with "Version Pinning Not Supported".
+    installMutation.mutate(undefined, {
       onSuccess: (result) => {
         toast.success(result.message)
       },
