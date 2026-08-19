@@ -1897,10 +1897,15 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_repository_preset_live",
         // Git connection metadata (connection IDs, names, provider type).
         "get_provider_connections",
-        // ── Log aggregator: context window ──
-        // Returns a bounded window of log lines around a specific offset —
-        // same class as `get_container_logs` already allowlisted.
-        "get_log_context",
+        // ── Log aggregator: context window — excluded ──
+        // `get_log_context` is intentionally NOT included. It returns raw
+        // `message`/`fields` from application stdout/stderr (arbitrary
+        // developer-controlled content), and its resolver
+        // (temps-log-aggregator/src/services/search.rs `get_context`) has NO
+        // project-ownership check on `chunk_id` at all — only a global
+        // `LogsRead` permission gate, unlike `get_container_logs`'s
+        // container-scoped equivalent. Flagged in security review on PR #732
+        // (Greptile, 4th pass).
         // ── Preview gateway: settings + status + logs ──
         // Settings expose image tag, host port, auto-upgrade flag — no shared_secret
         // (that is masked as a boolean in the response struct).
@@ -1909,20 +1914,27 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_preview_gateway_logs",
         // ── External plugins ──
         "list_external_plugins",
-        // ── Analytics: event entry list ──
-        // Individual event rows that include IP and user_agent — same privacy
-        // class as `get_event_visitors` / `get_visitor_details` already allowlisted.
-        "get_event_entries",
+        // ── Analytics: event entry list — excluded ──
+        // `get_event_entries` is intentionally NOT included. Per its own doc
+        // comment: "raw occurrences of a specific event, including custom
+        // JSON properties" — same risk class as the already-excluded
+        // `get_property_breakdown`/`get_property_timeline`. Flagged in
+        // security review on PR #732 (Greptile, 4th pass).
         // ── Agents + sandbox: run status, job metadata ──
-        // Run records and job metadata — no secrets. Gated by ProjectsRead.
-        "list_agent_runs",
-        "list_all_runs",
-        "get_run_with_logs",
-        "latest_run_for_source",
+        // `list_agent_runs`, `list_all_runs`, `get_run_with_logs`, and
+        // `latest_run_for_source` are intentionally NOT included: they all
+        // serialize `AgentRunResponse`, which carries `ai_output`,
+        // `ai_reasoning`, `prompt_text`, `ephemeral_yaml`, `analysis`, and
+        // `user_context` verbatim — raw agent execution content, not
+        // metadata. `job_status` is also excluded: `JobStatusResponse`
+        // returns raw `stdout`/`stderr` from a detached sandbox command.
+        // `list_jobs`/`get_cmd` stay — their DTOs (`JobSummaryResponse`,
+        // `CmdInner`) carry only id/status/exit_code/cmd-name/args, no
+        // captured output. Flagged in security review on PR #732 (Greptile,
+        // 4th pass, plus job_status found during that same audit).
         "get_sandbox",
         "list_sandboxes",
         "list_jobs",
-        "job_status",
         "get_cmd",
         // Sandbox event list — lifecycle events (created, started, stopped).
         "list_events",
