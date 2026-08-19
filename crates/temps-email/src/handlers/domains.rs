@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth, Role};
 use temps_core::{
     error_builder::{bad_request, forbidden, internal_server_error, not_found},
     problemdetails::{self, Problem},
@@ -128,11 +128,35 @@ pub async fn list_email_domain_projects(
     Path(id): Path<i32>,
 ) -> Result<Json<Vec<AuthorizedEmailDomainProjectResponse>>, Problem> {
     permission_guard!(auth, EmailDomainsRead);
-    let projects = state
+    let mut projects = state
         .domain_service
         .list_authorized_projects(id)
         .await
         .map_err(Problem::from)?;
+    if !(auth.is_admin() || auth.has_role(&Role::PlatformAdmin)) {
+        if let (Some(checker), Some(user_id)) =
+            (state.project_access_checker.as_ref(), auth.user_id_opt())
+        {
+            let hidden = checker.hidden_project_ids(user_id).await.map_err(|error| {
+                error!(
+                    user_id,
+                    domain_id = id,
+                    error = %error,
+                    "Project visibility check failed while listing email-domain grants"
+                );
+                internal_server_error()
+                    .title("Project Access Check Failed")
+                    .detail(format!(
+                        "Could not verify project visibility for email domain {id}"
+                    ))
+                    .build()
+            })?;
+            if let Some(hidden) = hidden {
+                let hidden = hidden.into_iter().collect::<std::collections::HashSet<_>>();
+                projects.retain(|project| !hidden.contains(&project.id));
+            }
+        }
+    }
 
     Ok(Json(projects.into_iter().map(Into::into).collect()))
 }
@@ -158,6 +182,8 @@ pub async fn authorize_email_domain_project(
     Path((id, project_id)): Path<(i32, i32)>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, EmailDomainsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     require_same_origin_session(&auth, &metadata)?;
     let result = state.domain_service.authorize_project(id, project_id).await;
     let audit = EmailDomainProjectAuthorizedAudit {
@@ -198,6 +224,8 @@ pub async fn revoke_email_domain_project(
     Path((id, project_id)): Path<(i32, i32)>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, EmailDomainsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     require_same_origin_session(&auth, &metadata)?;
     let result = state.domain_service.revoke_project(id, project_id).await;
     let audit = EmailDomainProjectRevokedAudit {

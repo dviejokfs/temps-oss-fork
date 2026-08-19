@@ -324,11 +324,23 @@ impl AuditOperation for EmailDomainDeletedAudit {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EmailSentAudit {
-    pub context: AuditContext,
+    pub user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub deployment_principal: Option<DeploymentEmailPrincipal>,
     pub email_id: uuid::Uuid,
     pub from: String,
     pub to: Vec<String>,
     pub subject: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentEmailPrincipal {
+    pub token_id: i32,
+    pub token_name: String,
+    pub project_id: i32,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
 }
 
 impl AuditOperation for EmailSentAudit {
@@ -337,15 +349,15 @@ impl AuditOperation for EmailSentAudit {
     }
 
     fn user_id(&self) -> Option<i32> {
-        Some(self.context.user_id)
+        self.user_id
     }
 
     fn ip_address(&self) -> Option<String> {
-        self.context.ip_address.clone()
+        self.ip_address.clone()
     }
 
     fn user_agent(&self) -> &str {
-        &self.context.user_agent
+        &self.user_agent
     }
 
     fn serialize(&self) -> anyhow::Result<String> {
@@ -395,5 +407,32 @@ mod tests {
         }
         assert!(authorized_json.contains("\"success\":true"));
         assert!(revoked_json.contains("\"success\":false"));
+    }
+
+    #[test]
+    fn deployment_email_audit_uses_machine_principal_without_fake_user() {
+        let audit = EmailSentAudit {
+            user_id: None,
+            ip_address: Some("127.0.0.1".to_string()),
+            user_agent: "deployment-agent".to_string(),
+            deployment_principal: Some(DeploymentEmailPrincipal {
+                token_id: 9,
+                token_name: "production-mailer".to_string(),
+                project_id: 70,
+                environment_id: Some(4),
+                deployment_id: Some(12),
+            }),
+            email_id: uuid::Uuid::nil(),
+            from: "hello@example.test".to_string(),
+            to: vec!["recipient@example.test".to_string()],
+            subject: "Status update".to_string(),
+        };
+
+        assert_eq!(AuditOperation::user_id(&audit), None);
+        let serialized = AuditOperation::serialize(&audit).unwrap();
+        assert!(serialized.contains("\"user_id\":null"));
+        assert!(serialized.contains("\"token_id\":9"));
+        assert!(serialized.contains("\"project_id\":70"));
+        assert!(!serialized.contains("\"user_id\":0"));
     }
 }

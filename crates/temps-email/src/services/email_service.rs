@@ -3,7 +3,7 @@
 use chrono::Utc;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::errors::EmailError;
-use crate::providers::SendEmailRequest as ProviderSendRequest;
+use crate::providers::{EmailProvider, SendEmailRequest as ProviderSendRequest};
 use crate::services::{DomainService, ProviderService, SuppressionService, TrackingService};
 
 /// Trait for rewriting HTML to inject tracking (pixel + click links).
@@ -78,10 +78,55 @@ enum IdempotencyDecision {
     Resume(Box<emails::Model>),
 }
 
+enum DeliveryClaim {
+    Acquired(chrono::DateTime<Utc>),
+    Return(SendEmailResponse),
+}
+
 // Keep this shorter than the Cloud outbox retry horizon. A process crash after
 // the claim commit must become recoverable before the caller exhausts its
 // retries, while still preventing concurrent provider calls.
-const DELIVERY_LEASE_SECONDS: i64 = 30;
+const DELIVERY_LEASE_SECONDS: i64 = 60;
+const PROVIDER_SEND_TIMEOUT_SECONDS: u64 = 20;
+
+/// Validate caller-supplied headers before any authorization or provider work.
+///
+/// SMTP headers such as `From`, `To`, and `Bcc` are security-sensitive: lettre
+/// derives the delivery envelope from them, so allowing callers to replace
+/// those values after sender and suppression checks would bypass both checks.
+/// Only the Temps-owned `X-Temps-*` metadata namespace is accepted. Generic
+/// `X-*` headers are not safe: SMTP gateways such as SendGrid and Mailgun use
+/// provider-specific `X-*` headers to change routing and recipient behavior.
+fn validate_custom_headers(
+    headers: Option<&std::collections::HashMap<String, String>>,
+) -> Result<(), EmailError> {
+    let Some(headers) = headers else {
+        return Ok(());
+    };
+
+    for (name, value) in headers {
+        let valid_name = name.len() > "X-Temps-".len()
+            && name
+                .get(.."X-Temps-".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("X-Temps-"))
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+        if !valid_name {
+            return Err(EmailError::Validation(
+                "A custom email header is not allowed; only X-Temps-* metadata headers are accepted"
+                    .to_string(),
+            ));
+        }
+        if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+            return Err(EmailError::Validation(
+                "A custom email header contains a line break".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
 
 impl EmailService {
     pub fn new(
@@ -139,6 +184,8 @@ impl EmailService {
         project_context: Option<(i32, String)>,
     ) -> Result<SendEmailResponse, EmailError> {
         debug!("Sending email from {} to {:?}", request.from, request.to);
+
+        validate_custom_headers(request.headers.as_ref())?;
 
         // Extract domain from 'from' address
         let from_domain = request
@@ -497,6 +544,16 @@ impl EmailService {
             headers: request.headers,
         };
 
+        if project_context.is_some() {
+            return self
+                .send_project_email_with_fence(
+                    email_id,
+                    provider_instance.as_ref(),
+                    &provider_request,
+                )
+                .await;
+        }
+
         match provider_instance.send(&provider_request).await {
             Ok(response) => {
                 // Update email with success status
@@ -541,6 +598,160 @@ impl EmailService {
         }
     }
 
+    /// Deliver one project-scoped email with a durable, fenced attempt.
+    ///
+    /// Claiming and finalization use short row-lock transactions. The provider
+    /// call happens after the claim transaction commits, so slow or malicious
+    /// providers cannot consume a database-pool connection for their whole
+    /// timeout. The lease timestamp is also the fencing token: a stale attempt
+    /// cannot overwrite a newer retry's state.
+    async fn send_project_email_with_fence(
+        &self,
+        email_id: Uuid,
+        provider: &dyn EmailProvider,
+        request: &ProviderSendRequest,
+    ) -> Result<SendEmailResponse, EmailError> {
+        let attempt_token = match self.claim_project_email_delivery(email_id).await? {
+            DeliveryClaim::Acquired(token) => token,
+            DeliveryClaim::Return(response) => return Ok(response),
+        };
+
+        let provider_result = match tokio::time::timeout(
+            std::time::Duration::from_secs(PROVIDER_SEND_TIMEOUT_SECONDS),
+            provider.send(request),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(EmailError::ProviderError(format!(
+                "Provider send timed out after {PROVIDER_SEND_TIMEOUT_SECONDS} seconds for email {email_id}"
+            ))),
+        };
+
+        self.finalize_project_email_delivery(email_id, attempt_token, provider_result)
+            .await
+    }
+
+    /// Atomically move a retryable email into `sending` and return a freshly
+    /// renewed lease as its fencing token. No external I/O occurs in this
+    /// short transaction.
+    async fn claim_project_email_delivery(
+        &self,
+        email_id: Uuid,
+    ) -> Result<DeliveryClaim, EmailError> {
+        let transaction = self.db.begin().await?;
+        let claim = email_idempotency_keys::Entity::find()
+            .filter(email_idempotency_keys::Column::EmailId.eq(email_id))
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| {
+                EmailError::EmailNotFound(format!("delivery claim for project email {email_id}"))
+            })?;
+
+        let current = emails::Entity::find_by_id(email_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| EmailError::EmailNotFound(email_id.to_string()))?;
+
+        if !email_delivery_is_retryable(&current) {
+            transaction.commit().await?;
+            return Ok(DeliveryClaim::Return(SendEmailResponse {
+                id: current.id,
+                status: current.status,
+                provider_message_id: current.provider_message_id,
+            }));
+        }
+
+        // Refresh the token at the last possible moment before provider I/O.
+        // The original lease may have been consumed by HTML rewriting,
+        // suppression checks, or provider setup; this guarantees the entire
+        // provider timeout fits inside the new attempt's fence window.
+        let attempt_token = Utc::now() + chrono::Duration::seconds(DELIVERY_LEASE_SECONDS);
+        let mut active_claim: email_idempotency_keys::ActiveModel = claim.into();
+        active_claim.lease_expires_at = Set(attempt_token);
+        active_claim.update(&transaction).await?;
+
+        let mut active: emails::ActiveModel = current.into();
+        active.status = Set("sending".to_string());
+        active.update(&transaction).await?;
+        transaction.commit().await?;
+
+        Ok(DeliveryClaim::Acquired(attempt_token))
+    }
+
+    /// Persist a provider result only when the attempt still owns the lease it
+    /// claimed. A newer retry changes the lease before sending, fencing stale
+    /// completions out of the state transition.
+    async fn finalize_project_email_delivery(
+        &self,
+        email_id: Uuid,
+        attempt_token: chrono::DateTime<Utc>,
+        provider_result: Result<crate::providers::SendEmailResponse, EmailError>,
+    ) -> Result<SendEmailResponse, EmailError> {
+        let transaction = self.db.begin().await?;
+        let claim = email_idempotency_keys::Entity::find()
+            .filter(email_idempotency_keys::Column::EmailId.eq(email_id))
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| {
+                EmailError::EmailNotFound(format!("delivery claim for project email {email_id}"))
+            })?;
+        let current = emails::Entity::find_by_id(email_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| EmailError::EmailNotFound(email_id.to_string()))?;
+
+        if claim.lease_expires_at != attempt_token || current.status != "sending" {
+            transaction.commit().await?;
+            return Ok(SendEmailResponse {
+                id: current.id,
+                status: current.status,
+                provider_message_id: current.provider_message_id,
+            });
+        }
+
+        let response = match provider_result {
+            Ok(provider_response) => {
+                let mut active: emails::ActiveModel = current.into();
+                active.status = Set("sent".to_string());
+                active.provider_message_id = Set(Some(provider_response.message_id.clone()));
+                active.sent_at = Set(Some(Utc::now()));
+                active.update(&transaction).await?;
+
+                SendEmailResponse {
+                    id: email_id,
+                    status: "sent".to_string(),
+                    provider_message_id: Some(provider_response.message_id),
+                }
+            }
+            Err(error) => {
+                info!(
+                    email_id = %email_id,
+                    error = %error,
+                    "Project-scoped provider delivery failed; capturing for retry"
+                );
+                let mut active: emails::ActiveModel = current.into();
+                active.status = Set("captured".to_string());
+                active.error_message = Set(Some(format!("Send failed: {error}")));
+                active.sent_at = Set(Some(Utc::now()));
+                active.update(&transaction).await?;
+
+                SendEmailResponse {
+                    id: email_id,
+                    status: "captured".to_string(),
+                    provider_message_id: None,
+                }
+            }
+        };
+
+        transaction.commit().await?;
+        Ok(response)
+    }
+
     async fn idempotency_decision(
         &self,
         project_id: i32,
@@ -570,13 +781,9 @@ impl EmailService {
                     claim.email_id
                 ))
             })?;
-        let retryable = email.status == "queued"
-            || (email.status == "captured"
-                && !email
-                    .error_message
-                    .as_deref()
-                    .is_some_and(|message| message.starts_with("Recipient(s) suppressed")));
-        if !retryable {
+        let now = Utc::now();
+        let stale_sending_attempt = email.status == "sending" && claim.lease_expires_at <= now;
+        if !email_delivery_is_retryable(&email) && !stale_sending_attempt {
             return Ok(IdempotencyDecision::Return(SendEmailResponse {
                 id: email.id,
                 status: email.status,
@@ -584,23 +791,38 @@ impl EmailService {
             }));
         }
 
-        let now = Utc::now();
+        let new_lease = now + chrono::Duration::seconds(DELIVERY_LEASE_SECONDS);
+        let transaction = self.db.begin().await?;
         let acquired = email_idempotency_keys::Entity::update_many()
             .col_expr(
                 email_idempotency_keys::Column::LeaseExpiresAt,
-                Expr::value(now + chrono::Duration::seconds(DELIVERY_LEASE_SECONDS)),
+                Expr::value(new_lease),
             )
             .filter(email_idempotency_keys::Column::ProjectId.eq(project_id))
             .filter(email_idempotency_keys::Column::IdempotencyKey.eq(idempotency_key.to_string()))
             .filter(email_idempotency_keys::Column::LeaseExpiresAt.lte(now))
-            .exec(self.db.as_ref())
+            .exec(&transaction)
             .await?
             .rows_affected
             == 1;
 
         if acquired {
+            let mut email = email;
+            if email.status == "sending" {
+                let reset = emails::Entity::update_many()
+                    .col_expr(emails::Column::Status, Expr::value("queued"))
+                    .filter(emails::Column::Id.eq(email.id))
+                    .filter(emails::Column::Status.eq("sending"))
+                    .exec(&transaction)
+                    .await?;
+                if reset.rows_affected == 1 {
+                    email.status = "queued".to_string();
+                }
+            }
+            transaction.commit().await?;
             Ok(IdempotencyDecision::Resume(Box::new(email)))
         } else {
+            transaction.commit().await?;
             Ok(IdempotencyDecision::Return(SendEmailResponse {
                 id: email.id,
                 status: email.status,
@@ -693,6 +915,15 @@ impl EmailService {
     }
 }
 
+fn email_delivery_is_retryable(email: &emails::Model) -> bool {
+    email.status == "queued"
+        || (email.status == "captured"
+            && !email
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Recipient(s) suppressed")))
+}
+
 fn email_payload_hash(request: &SendEmailRequest) -> String {
     let headers = request.headers.as_ref().map(|headers| {
         headers
@@ -761,7 +992,7 @@ fn filter_suppressed_recipients(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{EmailProviderType, SesCredentials};
+    use crate::providers::{EmailProviderType, MockEmailProvider, SesCredentials};
     use crate::services::provider_service::{CreateProviderRequest, ProviderCredentials};
     use crate::services::TrackingService;
     use temps_core::EncryptionService;
@@ -792,8 +1023,15 @@ mod tests {
     }
 
     // Helper to setup test environment with real database
-    async fn setup_test_env() -> (TestDatabase, EmailService, ProviderService, DomainService) {
-        let db = TestDatabase::with_migrations().await.unwrap();
+    async fn setup_test_env() -> Option<(TestDatabase, EmailService, ProviderService, DomainService)>
+    {
+        let db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Skipping Docker-dependent email test: {error}");
+                return None;
+            }
+        };
         let encryption_service = create_test_encryption_service();
         let provider_service = ProviderService::new(db.db.clone(), encryption_service);
         let domain_service = DomainService::new(db.db.clone(), Arc::new(provider_service.clone()));
@@ -839,7 +1077,7 @@ mod tests {
             tracking_service,
             suppression_service,
         );
-        (db, email_service, provider_service, domain_service)
+        Some((db, email_service, provider_service, domain_service))
     }
 
     // Helper to create a test provider
@@ -905,7 +1143,7 @@ mod tests {
             html: Some("<h1>Hello</h1>".to_string()),
             text: Some("Hello".to_string()),
             headers: Some(std::collections::HashMap::from([(
-                "X-Custom-Header".to_string(),
+                "X-Temps-Custom".to_string(),
                 "value".to_string(),
             )])),
             tags: Some(vec!["tag1".to_string(), "tag2".to_string()]),
@@ -1149,16 +1387,58 @@ mod tests {
     fn idempotency_hash_is_stable_across_header_insertion_order() {
         let mut first = test_send_request("same payload");
         first.headers = Some(std::collections::HashMap::from([
-            ("X-B".to_string(), "2".to_string()),
-            ("X-A".to_string(), "1".to_string()),
+            ("X-Temps-B".to_string(), "2".to_string()),
+            ("X-Temps-A".to_string(), "1".to_string()),
         ]));
         let mut second = test_send_request("same payload");
         second.headers = Some(std::collections::HashMap::from([
-            ("X-A".to_string(), "1".to_string()),
-            ("X-B".to_string(), "2".to_string()),
+            ("X-Temps-A".to_string(), "1".to_string()),
+            ("X-Temps-B".to_string(), "2".to_string()),
         ]));
 
         assert_eq!(email_payload_hash(&first), email_payload_hash(&second));
+    }
+
+    #[test]
+    fn custom_headers_reject_envelope_and_routing_overrides() {
+        for protected in [
+            "From",
+            "to",
+            "CC",
+            "bcc",
+            "Reply-To",
+            "Subject",
+            "X-SMTPAPI",
+            "X-Mailgun-Recipient-Variables",
+            "X-SES-CONFIGURATION-SET",
+        ] {
+            let headers = std::collections::HashMap::from([(
+                protected.to_string(),
+                "attacker@example.test".to_string(),
+            )]);
+            assert!(matches!(
+                validate_custom_headers(Some(&headers)),
+                Err(EmailError::Validation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn custom_headers_allow_only_single_line_x_metadata() {
+        let accepted = std::collections::HashMap::from([
+            ("X-Temps-Trace-Id".to_string(), "trace-123".to_string()),
+            ("x-temps-campaign".to_string(), "welcome".to_string()),
+        ]);
+        assert!(validate_custom_headers(Some(&accepted)).is_ok());
+
+        let newline = std::collections::HashMap::from([(
+            "X-Temps-Trace-Id".to_string(),
+            "trace-123\r\nBcc: attacker@example.test".to_string(),
+        )]);
+        assert!(matches!(
+            validate_custom_headers(Some(&newline)),
+            Err(EmailError::Validation(_))
+        ));
     }
 
     // ============================================
@@ -1167,7 +1447,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_emails_empty() {
-        let (_db, email_service, _provider_service, _domain_service) = setup_test_env().await;
+        let Some((_db, email_service, _provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
 
         let options = ListEmailsOptions::default();
         let (emails, total) = email_service.list(options).await.unwrap();
@@ -1178,7 +1461,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_email_not_found() {
-        let (_db, email_service, _provider_service, _domain_service) = setup_test_env().await;
+        let Some((_db, email_service, _provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
 
         let email_id = Uuid::new_v4();
         let result = email_service.get(email_id).await;
@@ -1189,7 +1475,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_count_by_status_empty() {
-        let (_db, email_service, _provider_service, _domain_service) = setup_test_env().await;
+        let Some((_db, email_service, _provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
 
         let stats = email_service.count_by_status(None).await.unwrap();
 
@@ -1202,7 +1491,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_email_domain_not_verified() {
-        let (db, email_service, provider_service, _domain_service) = setup_test_env().await;
+        let Some((db, email_service, provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
 
         // Create a provider and domain (domain will be in pending status by default)
         let provider = create_test_provider(&provider_service).await;
@@ -1237,7 +1529,10 @@ mod tests {
     async fn deployment_send_requires_domain_grant_and_replays_without_a_second_email() {
         use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
-        let (db, email_service, provider_service, domain_service) = setup_test_env().await;
+        let Some((db, email_service, provider_service, domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
         let provider = create_test_provider(&provider_service).await;
         let domain = create_test_domain(&db.db, provider.id, "test-pending.example.com").await;
         let project_slug = format!("email-project-{}", Uuid::new_v4());
@@ -1325,7 +1620,10 @@ mod tests {
     async fn stale_delivery_lease_resumes_after_crash_without_creating_a_second_email() {
         use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
-        let (db, email_service, provider_service, domain_service) = setup_test_env().await;
+        let Some((db, email_service, provider_service, domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
         let provider = create_test_provider(&provider_service).await;
         let domain = create_test_domain(&db.db, provider.id, "test-pending.example.com").await;
         let project_slug = format!("email-resume-{}", Uuid::new_v4());
@@ -1361,7 +1659,7 @@ mod tests {
             subject: Set(request.subject.clone()),
             html_body: Set(request.html.clone()),
             text_body: Set(request.text.clone()),
-            status: Set("queued".to_string()),
+            status: Set("sending".to_string()),
             track_opens: Set(false),
             track_clicks: Set(false),
             open_count: Set(0),
@@ -1401,8 +1699,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_project_delivery_is_fenced_to_one_provider_call() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        let Some((db, email_service, _provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
+
+        let project_slug = format!("email-fence-{}", Uuid::new_v4());
+        let project_row = db
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO projects \
+                     (name,repo_name,repo_owner,directory,main_branch,preset,created_at,updated_at,slug) \
+                     VALUES ('Email Fence','email-fence','tests','.','main','python',now(),now(),'{project_slug}') \
+                     RETURNING id"
+                ),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let project_id: i32 = project_row.try_get("", "id").unwrap();
+        let email_id = Uuid::new_v4();
+        emails::ActiveModel {
+            id: Set(email_id),
+            domain_id: Set(None),
+            project_id: Set(Some(project_id)),
+            from_address: Set("sender@example.test".to_string()),
+            to_addresses: Set(serde_json::json!(["recipient@example.test"])),
+            subject: Set("fenced delivery".to_string()),
+            status: Set("queued".to_string()),
+            track_opens: Set(false),
+            track_clicks: Set(false),
+            open_count: Set(0),
+            click_count: Set(0),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        email_idempotency_keys::ActiveModel {
+            project_id: Set(project_id),
+            idempotency_key: Set("fenced-delivery".to_string()),
+            payload_hash: Set("fixture-payload-hash".to_string()),
+            email_id: Set(email_id),
+            lease_expires_at: Set(Utc::now() - chrono::Duration::seconds(1)),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let provider =
+            MockEmailProvider::new().with_send_delay(std::time::Duration::from_millis(200));
+        let request = ProviderSendRequest {
+            from: "sender@example.test".to_string(),
+            from_name: None,
+            to: vec!["recipient@example.test".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: "fenced delivery".to_string(),
+            html: None,
+            text: Some("body".to_string()),
+            headers: None,
+        };
+
+        let first = email_service.send_project_email_with_fence(email_id, &provider, &request);
+        let second = async {
+            while provider.send_call_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+            email_service
+                .send_project_email_with_fence(email_id, &provider, &request)
+                .await
+        };
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.unwrap().status, "sent");
+        assert!(matches!(
+            second.unwrap().status.as_str(),
+            "sending" | "sent"
+        ));
+        assert_eq!(
+            provider.send_call_count(),
+            1,
+            "a concurrent retry must not call the provider twice"
+        );
+    }
+
+    #[tokio::test]
     async fn test_send_email_no_domain_configured() {
-        let (_db, email_service, _provider_service, _domain_service) = setup_test_env().await;
+        let Some((_db, email_service, _provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
 
         // Try to send email from a domain that doesn't exist - should be captured
         let request = SendEmailRequest {
@@ -1431,7 +1825,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_emails_with_filters() {
-        let (_db, email_service, _provider_service, _domain_service) = setup_test_env().await;
+        let Some((_db, email_service, _provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
 
         // Test filtering by domain_id
         let options = ListEmailsOptions {

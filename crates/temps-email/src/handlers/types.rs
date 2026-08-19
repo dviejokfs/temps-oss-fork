@@ -8,7 +8,7 @@ use crate::services::{
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_core::AuditLogger;
+use temps_core::{AuditLogger, ProjectAccessChecker};
 use temps_dns::services::DnsProviderService;
 use utoipa::{IntoParams, ToSchema};
 
@@ -20,6 +20,9 @@ pub struct AppState {
     pub validation_service: Arc<ValidationService>,
     pub tracking_service: Arc<TrackingService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    /// Optional team/project visibility policy supplied by an extension plugin.
+    /// Plain OSS installations intentionally leave this unset.
+    pub project_access_checker: Option<Arc<dyn ProjectAccessChecker>>,
     /// DNS provider service for automatic DNS record setup
     pub dns_provider_service: Option<Arc<DnsProviderService>>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
