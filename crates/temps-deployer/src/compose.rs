@@ -51,6 +51,57 @@ const CONTAINER_SECRETS_DIR: &str = "/run/secrets";
 /// Maximum diagnostic text persisted into a deployment error. Full container
 /// logs remain available through the authenticated logs endpoint.
 const MAX_COMPOSE_DIAGNOSTIC_BYTES: usize = 32 * 1024;
+
+/// Where the console exposes the per-service "Elevated permissions" toggle.
+/// Named once here because two places quote it — the pre-deploy advisory in
+/// `temps-deployments::jobs::deploy_compose` and the post-failure remediation
+/// in [`ComposeExecutor::capability_denial_remediation`]. A UI reshuffle that
+/// updated only one of them would send half of users to a page that no longer
+/// exists.
+pub const ELEVATED_PERMISSIONS_SETTINGS_PATH: &str = "Project Settings → Git → Compose services";
+
+/// Keys an inline override may not set because [`ComposeExecutor`]'s
+/// deploy-time security policy rejects them outright, wherever they appear.
+/// Telling someone to move one of these into the repository compose file would
+/// be sending them to do work that fails later, at deploy, with a different
+/// error. Mirrors `temps-presets::docker_compose::NEVER_ALLOWED_SERVICE_KEYS`,
+/// which guards the same override on the preview path.
+const NEVER_ALLOWED_OVERRIDE_KEYS: &[&str] = &[
+    "privileged",
+    "cgroup_parent",
+    "cap_add",
+    "devices",
+    "device_cgroup_rules",
+    "security_opt",
+    "sysctls",
+    "volumes_from",
+    "group_add",
+    "runtime",
+    "oom_kill_disable",
+    "tmpfs",
+    "ulimits",
+];
+
+/// Keys an inline override may not set, but which the repository compose file
+/// legitimately can — [`ComposeExecutor::validate_compose_security_policy`]
+/// admits them subject to its own checks (bind-mount path confinement for
+/// `volumes`, byte caps for `shm_size`, host-namespace rejection for
+/// `pid`/`ipc`/`network_mode` and friends). Kept separate from
+/// [`NEVER_ALLOWED_OVERRIDE_KEYS`] so the error can point somewhere that
+/// actually works instead of issuing the same blanket "move it to the
+/// repository" advice for every key.
+const REPO_ONLY_OVERRIDE_KEYS: &[&str] = &[
+    "network_mode",
+    "pid",
+    "ipc",
+    "uts",
+    "cgroup",
+    "userns_mode",
+    "cap_drop",
+    "volumes",
+    "shm_size",
+    "labels",
+];
 const SAFE_DOCKER_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin";
 const DOCKER_BINARY_CANDIDATES: &[&str] = &[
     "/usr/local/bin/docker",
@@ -141,6 +192,59 @@ pub enum ComposeError {
     Io(#[from] std::io::Error),
 }
 
+/// Compose filenames Temps generates itself inside the stack directory.
+///
+/// `compose_up` passes every one of these to `docker compose -f` purely
+/// because it exists on disk, and only the *user-supplied* override is run
+/// through `validate_compose_override`. A tenant compose file that names one
+/// of them as an `env_file:` target would therefore have Temps write
+/// attacker-influenced bytes to a path the daemon later parses as trusted
+/// Compose YAML — dotenv syntax and YAML syntax overlap enough (`#` comments,
+/// bare `key: value` lines) to smuggle a whole `services:` mapping past the
+/// dotenv reader. That is a sandbox escape, so referencing these names is
+/// rejected outright rather than silently skipped.
+///
+/// This is the *single* list. `validate_compose_path_not_generated` consumed a
+/// second, longer copy of it, and the two drifted: `TEMPS_SECRETS_OVERRIDE` was
+/// on that one but not here, even though it is passed to `docker compose -f` on
+/// sight exactly like the rest. Only write ordering kept that from being
+/// exploitable — the secrets override is written or deleted unconditionally
+/// after the `env_file` loop, unlike the labels override, which is written only
+/// when labels exist and was therefore reachable. One refactor making the
+/// secrets override conditional would have reopened the escape, so the lists
+/// are now the same list.
+pub(crate) const RESERVED_GENERATED_COMPOSE_FILES: &[&str] = &[
+    "docker-compose.temps-env.yml",
+    "docker-compose.temps-network.yml",
+    "docker-compose.temps-override.yml",
+    "docker-compose.temps-labels.yml",
+    "docker-compose.temps-security.yml",
+    TEMPS_SECRETS_OVERRIDE,
+];
+
+/// Whether `path` names one of the Compose files Temps generates.
+///
+/// Compares the final component only: `./docker-compose.temps-override.yml`
+/// and `docker-compose.temps-override.yml` resolve to the same file in the
+/// stack root, and a same-named file in a subdirectory is not passed to
+/// `docker compose -f`, so it is harmless.
+pub(crate) fn is_reserved_generated_compose_file(path: &Path) -> bool {
+    // Only the stack root is dangerous: `append_compose_file_args` looks for
+    // these names directly under the project directory.
+    if path.parent().is_some_and(|parent| {
+        !parent.as_os_str().is_empty() && parent != Path::new(".") && parent != Path::new("")
+    }) {
+        return false;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            RESERVED_GENERATED_COMPOSE_FILES
+                .iter()
+                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        })
+}
+
 /// Where the contents of a referenced `env_file` come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvFileSource {
@@ -213,6 +317,50 @@ fn render_env_file(vars: &HashMap<String, String>) -> Result<String, ComposeErro
         rendered.push('\n');
     }
     Ok(rendered)
+}
+
+/// True when a container's log tail shows its entrypoint being denied a
+/// privileged startup operation — the signature of Temps' own `cap_drop: ALL`
+/// sandbox rather than a fault in the image or the user's configuration.
+///
+/// The official postgres/mysql/mariadb/mongo entrypoints (and others, e.g.
+/// Gitea) start as root, `chown`/`chmod` their data directory, then drop to a
+/// service user via `gosu`/`su-exec`. All three steps need capabilities the
+/// sandbox removes, so they fail with `EPERM` unless the service is listed in
+/// `relaxed_capability_services`.
+///
+/// Deliberately a two-factor match: "operation not permitted" on its own
+/// appears in plenty of ordinary application errors, and pointing those at a
+/// capability toggle that cannot help would be worse than saying nothing.
+/// Requiring a privileged-operation verb alongside it keeps the hint tied to
+/// the failure mode it actually explains.
+fn looks_like_capability_denial(logs: &str) -> bool {
+    const PRIVILEGED_OPERATIONS: [&str; 8] = [
+        "chmod",
+        "chown",
+        "setgroups",
+        "setuid",
+        "setgid",
+        "failed switching to",
+        "su-exec",
+        "gosu",
+    ];
+
+    let lower = logs.to_ascii_lowercase();
+    lower.contains("operation not permitted")
+        && PRIVILEGED_OPERATIONS
+            .iter()
+            .any(|operation| lower.contains(operation))
+}
+
+/// Render service names as a quoted, comma-separated list so a remediation
+/// message reads the same for one service as for several.
+fn quote_service_list(services: &[&String]) -> String {
+    services
+        .iter()
+        .map(|service| format!("'{service}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Every literal value a Compose deployment knows to be sensitive, gathered
@@ -583,15 +731,6 @@ impl ComposeExecutor {
     }
 
     /// Every override filename Temps writes into the stack directory itself.
-    const GENERATED_OVERRIDES: [&'static str; 6] = [
-        "docker-compose.temps-env.yml",
-        "docker-compose.temps-network.yml",
-        "docker-compose.temps-override.yml",
-        "docker-compose.temps-labels.yml",
-        "docker-compose.temps-security.yml",
-        TEMPS_SECRETS_OVERRIDE,
-    ];
-
     /// Reject a `compose_path` that names one of Temps' own generated
     /// overrides. Those files are written unconditionally, so pointing the
     /// project at one would have Temps overwrite the user's compose document
@@ -601,7 +740,7 @@ impl ComposeExecutor {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or(compose_path);
-        if Self::GENERATED_OVERRIDES.contains(&name) {
+        if RESERVED_GENERATED_COMPOSE_FILES.contains(&name) {
             return Err(ComposeError::InvalidComposePath {
                 field: "compose_path".to_string(),
                 path: compose_path.to_string(),
@@ -896,8 +1035,14 @@ impl ComposeExecutor {
         // If a user-provided `container_name` conflicts with an existing
         // container, let Compose report the conflict instead of deleting
         // containers outside this Temps project boundary.
-        self.compose_up(&effective_dir, &project_name, compose_file, &redact_values)
-            .await?;
+        self.compose_up(
+            &effective_dir,
+            &project_name,
+            compose_file,
+            &redact_values,
+            &request.relaxed_capability_services,
+        )
+        .await?;
 
         // 3b. `up -d` returns as soon as containers are created/started, not
         // once they're actually ready. Wait for every service to reach
@@ -909,6 +1054,7 @@ impl ComposeExecutor {
             &project_name,
             compose_file,
             &redact_values,
+            &request.relaxed_capability_services,
             COMPOSE_READY_TIMEOUT,
         )
         .await?;
@@ -1184,6 +1330,20 @@ impl ComposeExecutor {
             .as_deref()
             .unwrap_or("docker-compose.yml");
         Self::validate_relative_path(compose_file, "compose_path")?;
+        // Same reasoning as the `env_file` guard below: these names are handed
+        // to `docker compose -f` on sight, so nothing user-selected may land on
+        // them. Here it would also mean the base compose file and a generated
+        // override silently clobber each other depending on write order.
+        if is_reserved_generated_compose_file(Path::new(compose_file)) {
+            return Err(ComposeError::SecurityPolicyViolation {
+                service: "<compose-files>".to_string(),
+                field: "compose_path".to_string(),
+                reason: format!(
+                    "'{compose_file}' is a Compose file name Temps generates; \
+                     choose a different compose file path."
+                ),
+            });
+        }
         let compose_path =
             Self::confined_write_path(project_dir, Path::new(compose_file), "compose_path")?;
 
@@ -1243,6 +1403,21 @@ impl ComposeExecutor {
         for plan in Self::plan_env_files(&request.compose_content, request.repo_dir.as_deref()) {
             if already_written_env && plan.path == ".env" {
                 continue;
+            }
+            // Fail closed rather than skipping: a stack that only works because
+            // Temps quietly declined to satisfy one of its `env_file:` entries
+            // is worse to debug than an explicit "rename this file" error.
+            if is_reserved_generated_compose_file(Path::new(&plan.path)) {
+                return Err(ComposeError::SecurityPolicyViolation {
+                    service: "<compose-files>".to_string(),
+                    field: "env_file".to_string(),
+                    reason: format!(
+                        "'{}' is a Compose file name Temps generates and passes to the Docker \
+                         daemon; an env_file may not target it. Rename the env file in your \
+                         compose configuration.",
+                        plan.path
+                    ),
+                });
             }
             let destination =
                 Self::confined_write_path(project_dir, Path::new(&plan.path), "env_file")?;
@@ -3257,38 +3432,26 @@ impl ComposeExecutor {
             });
         };
 
-        const FORBIDDEN_SERVICE_KEYS: &[&str] = &[
-            "privileged",
-            "network_mode",
-            "pid",
-            "ipc",
-            "uts",
-            "cgroup",
-            "cgroup_parent",
-            "cap_add",
-            "cap_drop",
-            "devices",
-            "device_cgroup_rules",
-            "security_opt",
-            "sysctls",
-            "userns_mode",
-            "volumes",
-            "volumes_from",
-            "group_add",
-            "runtime",
-            "oom_kill_disable",
-            "shm_size",
-            "tmpfs",
-            "ulimits",
-            "labels",
-        ];
-
         for key in service.keys().filter_map(Self::yaml_key) {
-            if FORBIDDEN_SERVICE_KEYS.contains(&key.as_str()) {
+            if NEVER_ALLOWED_OVERRIDE_KEYS.contains(&key.as_str()) {
                 return Err(ComposeError::InvalidOverride {
                     project: project_name.to_string(),
                     reason: format!(
-                        "service '{service_name}' uses forbidden inline override key '{key}'; put host-affecting Compose settings in the repository compose file for review"
+                        "service '{service_name}' uses forbidden key '{key}', which Compose \
+                         deployments do not permit anywhere — the deploy-time security policy \
+                         rejects it in the repository compose file too, so moving it there \
+                         will not help"
+                    ),
+                });
+            }
+            if REPO_ONLY_OVERRIDE_KEYS.contains(&key.as_str()) {
+                return Err(ComposeError::InvalidOverride {
+                    project: project_name.to_string(),
+                    reason: format!(
+                        "service '{service_name}' cannot set '{key}' as an inline override; \
+                         declare it in the repository compose file instead, where it is \
+                         checked against the deployment security policy (host paths, host \
+                         namespaces and resource limits are still rejected there)"
                     ),
                 });
             }
@@ -3433,6 +3596,7 @@ impl ComposeExecutor {
         project_name: &str,
         compose_file: &str,
         redact_values: &[String],
+        relaxed_capability_services: &[String],
     ) -> Result<(), ComposeError> {
         let mut cmd = isolated_docker_command();
         cmd.args(["compose", "-p", project_name]);
@@ -3472,6 +3636,7 @@ impl ComposeExecutor {
                     project_name,
                     compose_file,
                     redact_values,
+                    relaxed_capability_services,
                 )
                 .await;
             let diagnostic = sanitize_compose_diagnostic(
@@ -3556,6 +3721,7 @@ impl ComposeExecutor {
         project_name: &str,
         compose_file: &str,
         redact_values: &[String],
+        relaxed_capability_services: &[String],
     ) -> String {
         let entries = match self
             .compose_ps(project_dir, project_name, compose_file)
@@ -3571,6 +3737,7 @@ impl ComposeExecutor {
         };
 
         let mut sections = Vec::new();
+        let mut capability_denied = Vec::new();
         for entry in &entries {
             let is_unhealthy = !entry.health.is_empty() && entry.health != "healthy";
             let is_not_running = entry.state != "running";
@@ -3582,6 +3749,9 @@ impl ComposeExecutor {
                 &self.container_log_tail(&entry.id).await,
                 redact_values,
             );
+            if looks_like_capability_denial(&logs) {
+                capability_denied.push(entry.service.clone());
+            }
             let health = if entry.health.is_empty() {
                 "n/a"
             } else {
@@ -3598,13 +3768,62 @@ impl ComposeExecutor {
         }
 
         if sections.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\nContainer logs for unhealthy/stopped services:\n\n{}",
-                sections.join("\n\n")
-            )
+            return String::new();
         }
+
+        format!(
+            "\n\nContainer logs for unhealthy/stopped services:\n\n{}{}",
+            sections.join("\n\n"),
+            Self::capability_denial_remediation(&capability_denied, relaxed_capability_services)
+        )
+    }
+
+    /// Turn a detected capability denial into the one instruction that fixes
+    /// it. Appended to the failure text rather than only logged, because the
+    /// advisory `deploy_compose` emits before the deploy is easy to miss under
+    /// hundreds of lines of image-pull progress — whereas the error is the one
+    /// thing the operator cannot avoid reading.
+    ///
+    /// A service that is *already* relaxed and still denied gets the opposite
+    /// message: the toggle is not the answer, so say so instead of sending the
+    /// operator to flip a switch that is on.
+    fn capability_denial_remediation(
+        denied_services: &[String],
+        relaxed_capability_services: &[String],
+    ) -> String {
+        if denied_services.is_empty() {
+            return String::new();
+        }
+
+        let (already_relaxed, needs_relaxing): (Vec<_>, Vec<_>) = denied_services
+            .iter()
+            .partition(|service| relaxed_capability_services.contains(service));
+
+        let mut hints = Vec::new();
+        if !needs_relaxing.is_empty() {
+            hints.push(format!(
+                "Service(s) {} failed with \"Operation not permitted\". Temps runs every \
+                 Compose service with all Linux capabilities dropped, and image entrypoints \
+                 that prepare a data directory and then drop from root to a service user \
+                 need {} to start. Enable \"Elevated permissions\" for them in {}, then \
+                 redeploy.",
+                quote_service_list(&needs_relaxing),
+                Self::RELAXED_CAPABILITIES.join(", "),
+                ELEVATED_PERMISSIONS_SETTINGS_PATH,
+            ));
+        }
+        if !already_relaxed.is_empty() {
+            hints.push(format!(
+                "Service(s) {} already have \"Elevated permissions\" enabled, so this denial \
+                 is not the Temps sandbox's capability drop — check whether the image needs a \
+                 capability outside the granted set ({}), or runs as a user that cannot write \
+                 its mounted data directory.",
+                quote_service_list(&already_relaxed),
+                Self::RELAXED_CAPABILITIES.join(", "),
+            ));
+        }
+
+        format!("\n\n{}", hints.join("\n\n"))
     }
 
     /// Fetches the last [`Self::FAILED_CONTAINER_LOG_TAIL`] lines (stdout +
@@ -3645,6 +3864,7 @@ impl ComposeExecutor {
         project_name: &str,
         compose_file: &str,
         redact_values: &[String],
+        relaxed_capability_services: &[String],
         timeout: std::time::Duration,
     ) -> Result<(), ComposeError> {
         let start = std::time::Instant::now();
@@ -3677,6 +3897,7 @@ impl ComposeExecutor {
                                 project_name,
                                 compose_file,
                                 redact_values,
+                                relaxed_capability_services,
                             )
                             .await;
                         return Err(ComposeError::ServicesNotReady {
@@ -3694,6 +3915,7 @@ impl ComposeExecutor {
                             project_name,
                             compose_file,
                             redact_values,
+                            relaxed_capability_services,
                         )
                         .await;
                     return Err(ComposeError::ServicesNotReady {
@@ -3710,6 +3932,7 @@ impl ComposeExecutor {
                                 project_name,
                                 compose_file,
                                 redact_values,
+                                relaxed_capability_services,
                             )
                             .await;
                         return Err(ComposeError::ServicesNotReady {
@@ -5062,11 +5285,154 @@ services:
                 &override_content,
             )
             .unwrap_err();
+            let key = dangerous_override.split(':').next().unwrap();
             assert!(
-                error.to_string().contains("forbidden inline override key"),
-                "expected {dangerous_override} to be rejected, got {error}"
+                matches!(error, ComposeError::InvalidOverride { .. }),
+                "expected {dangerous_override} to be rejected as an invalid override, got {error}"
+            );
+            assert!(
+                error.to_string().contains(key),
+                "expected the rejection of {dangerous_override} to name the key '{key}', got {error}"
             );
         }
+    }
+
+    /// The log tail an official postgres image leaves when the Temps sandbox
+    /// denies its entrypoint the capabilities it needs. Shape preserved from a
+    /// real failure; no identifying detail.
+    const POSTGRES_CAPABILITY_DENIAL_LOG: &str =
+        "chmod: /var/lib/postgresql/data: Operation not permitted\n\
+         chmod: /var/run/postgresql: Operation not permitted\n\
+         error: failed switching to 'postgres': operation not permitted\n";
+
+    #[test]
+    fn test_looks_like_capability_denial_detects_entrypoint_privilege_drop() {
+        assert!(looks_like_capability_denial(POSTGRES_CAPABILITY_DENIAL_LOG));
+        assert!(looks_like_capability_denial(
+            "su-exec: setgroups: Operation not permitted"
+        ));
+        assert!(looks_like_capability_denial(
+            "chown: changing ownership of '/data': Operation not permitted"
+        ));
+    }
+
+    /// The hint must not fire on ordinary application errors — sending someone
+    /// to a capability toggle that cannot fix their problem is worse than
+    /// leaving the raw logs to speak for themselves.
+    #[test]
+    fn test_looks_like_capability_denial_ignores_unrelated_failures() {
+        // "operation not permitted" with no privileged operation alongside it.
+        assert!(!looks_like_capability_denial(
+            "FATAL: password authentication failed for user 'app'"
+        ));
+        assert!(!looks_like_capability_denial(
+            "Error: connect ECONNREFUSED 127.0.0.1:5432"
+        ));
+        assert!(!looks_like_capability_denial(
+            "socket bind: Operation not permitted"
+        ));
+        // A privileged verb with no denial is just normal startup chatter.
+        assert!(!looks_like_capability_denial(
+            "chown: adjusting ownership of /var/lib/postgresql/data"
+        ));
+    }
+
+    #[test]
+    fn test_capability_denial_remediation_names_the_service_and_the_toggle() {
+        let remediation =
+            ComposeExecutor::capability_denial_remediation(&["postgres".to_string()], &[]);
+
+        assert!(remediation.contains("'postgres'"), "{remediation}");
+        assert!(
+            remediation.contains(ELEVATED_PERMISSIONS_SETTINGS_PATH),
+            "{remediation}"
+        );
+        assert!(remediation.contains("SETUID"), "{remediation}");
+    }
+
+    /// A service that is already relaxed and *still* denied needs the opposite
+    /// advice: the toggle is on, so it is not the answer.
+    #[test]
+    fn test_capability_denial_remediation_does_not_resend_already_relaxed_services() {
+        let remediation = ComposeExecutor::capability_denial_remediation(
+            &["postgres".to_string()],
+            &["postgres".to_string()],
+        );
+
+        assert!(
+            remediation.contains("already have \"Elevated permissions\" enabled"),
+            "{remediation}"
+        );
+        assert!(
+            !remediation.contains(ELEVATED_PERMISSIONS_SETTINGS_PATH),
+            "should not send the operator to a toggle that is already on: {remediation}"
+        );
+    }
+
+    #[test]
+    fn test_capability_denial_remediation_is_empty_without_a_denial() {
+        assert!(
+            ComposeExecutor::capability_denial_remediation(&[], &["postgres".to_string()])
+                .is_empty()
+        );
+    }
+
+    /// The two denylists must stay disjoint: a key in both would make the
+    /// "never allowed" message win by ordering alone, and silently reintroduce
+    /// the misleading advice the split exists to remove.
+    #[test]
+    fn test_override_key_denylists_are_disjoint() {
+        for key in NEVER_ALLOWED_OVERRIDE_KEYS {
+            assert!(
+                !REPO_ONLY_OVERRIDE_KEYS.contains(key),
+                "'{key}' is classified both as never-allowed and as repo-only"
+            );
+        }
+    }
+
+    /// A key the deploy-time policy rejects everywhere must not tell the user
+    /// to move it into the repository compose file — that advice costs them a
+    /// round trip and then fails with a different error.
+    #[test]
+    fn test_never_allowed_override_key_does_not_advise_moving_to_repository() {
+        let compose = "services:\n  web:\n    image: nginx\n";
+        let error = ComposeExecutor::validate_compose_override(
+            "temps-test",
+            compose,
+            "services:\n  web:\n    privileged: true\n",
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("do not permit anywhere"),
+            "expected an anywhere-forbidden message, got {message}"
+        );
+        assert!(
+            message.contains("will not help"),
+            "expected the message to rule out moving it to the repository, got {message}"
+        );
+    }
+
+    /// A key the repository compose file legitimately accepts must point there,
+    /// since that is the route that actually works.
+    #[test]
+    fn test_repo_only_override_key_points_at_the_repository_compose_file() {
+        let compose = "services:\n  web:\n    image: nginx\n";
+        let error = ComposeExecutor::validate_compose_override(
+            "temps-test",
+            compose,
+            "services:\n  web:\n    volumes: ['data:/var/lib/data']\n",
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("declare it in the repository compose file"),
+            "expected the message to point at the repository compose file, got {message}"
+        );
+        assert!(
+            !message.contains("do not permit anywhere"),
+            "'volumes' is accepted in the repository compose file, got {message}"
+        );
     }
 
     #[test]
@@ -5724,6 +6090,181 @@ services:
     }
 
     #[test]
+    fn test_reserved_generated_compose_file_detection() {
+        for reserved in RESERVED_GENERATED_COMPOSE_FILES {
+            assert!(
+                is_reserved_generated_compose_file(Path::new(reserved)),
+                "{reserved} must be recognised as generated"
+            );
+            assert!(
+                is_reserved_generated_compose_file(&Path::new("./").join(reserved)),
+                "{reserved} must be recognised through a './' prefix"
+            );
+        }
+        // Case-insensitive: the stack directory may live on a case-insensitive
+        // filesystem, where `Docker-Compose.Temps-Override.yml` is the same file.
+        assert!(is_reserved_generated_compose_file(Path::new(
+            "Docker-Compose.Temps-Override.YML"
+        )));
+        // Only the stack root is passed to `docker compose -f`.
+        assert!(!is_reserved_generated_compose_file(Path::new(
+            "config/docker-compose.temps-override.yml"
+        )));
+        assert!(!is_reserved_generated_compose_file(Path::new(".env")));
+        assert!(!is_reserved_generated_compose_file(Path::new(
+            "docker-compose.yml"
+        )));
+    }
+
+    /// A tenant compose file must not be able to make Temps materialise an
+    /// `env_file` onto one of the generated Compose filenames: `compose_up`
+    /// passes those to the daemon unvalidated, so attacker-influenced bytes
+    /// there are a container-escape primitive, not just a config oddity.
+    #[tokio::test]
+    async fn test_write_compose_files_rejects_env_file_targeting_generated_override() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let project_dir = tempfile::tempdir().unwrap();
+        let request = ComposeDeployRequest {
+            project_name: "temps-test".to_string(),
+            compose_content: "services:\n  app:\n    image: nginx\n    env_file: \
+                              docker-compose.temps-override.yml\n"
+                .to_string(),
+            env_content: None,
+            work_dir: project_dir.path().to_path_buf(),
+            compose_path: None,
+            environment_vars: HashMap::from([("SECRET".to_string(), "value".to_string())]),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::new(),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: vec!["app".to_string()],
+        };
+
+        let err = executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(violation_field(err), "env_file");
+
+        // And the generated override must not carry tenant env-var content.
+        let generated = project_dir.path().join("docker-compose.temps-override.yml");
+        if generated.exists() {
+            let contents = tokio::fs::read_to_string(&generated).await.unwrap();
+            assert!(
+                !contents.contains("SECRET"),
+                "generated override must never contain env-file content: {contents}"
+            );
+        }
+    }
+
+    /// The long form (`env_file: [{{path: ...}}]`) reaches the same writer, so
+    /// it must be rejected identically.
+    #[tokio::test]
+    async fn test_write_compose_files_rejects_long_form_env_file_targeting_generated_file() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let project_dir = tempfile::tempdir().unwrap();
+        let request = ComposeDeployRequest {
+            project_name: "temps-test".to_string(),
+            compose_content: "services:\n  app:\n    image: nginx\n    env_file:\n      \
+                              - path: docker-compose.temps-security.yml\n        required: false\n"
+                .to_string(),
+            env_content: None,
+            work_dir: project_dir.path().to_path_buf(),
+            compose_path: None,
+            environment_vars: HashMap::from([("SECRET".to_string(), "value".to_string())]),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::new(),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: vec!["app".to_string()],
+        };
+
+        let err = executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(violation_field(err), "env_file");
+    }
+
+    /// `compose_path` comes from project settings, so it is user-selected too.
+    #[tokio::test]
+    async fn test_write_compose_files_rejects_compose_path_targeting_generated_file() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let project_dir = tempfile::tempdir().unwrap();
+        let request = ComposeDeployRequest {
+            project_name: "temps-test".to_string(),
+            compose_content: "services:\n  app:\n    image: nginx\n".to_string(),
+            env_content: None,
+            work_dir: project_dir.path().to_path_buf(),
+            compose_path: Some("docker-compose.temps-network.yml".to_string()),
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::new(),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: vec!["app".to_string()],
+        };
+
+        let err = executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(violation_field(err), "compose_path");
+    }
+
+    /// The guard must not break the ordinary case: a normal `env_file:` is
+    /// still materialised from the project's environment variables.
+    #[tokio::test]
+    async fn test_write_compose_files_still_materialises_normal_env_file() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let project_dir = tempfile::tempdir().unwrap();
+        let request = ComposeDeployRequest {
+            project_name: "temps-test".to_string(),
+            compose_content: "services:\n  app:\n    image: nginx\n    env_file: app.env\n"
+                .to_string(),
+            env_content: None,
+            work_dir: project_dir.path().to_path_buf(),
+            compose_path: None,
+            environment_vars: HashMap::from([("SECRET".to_string(), "value".to_string())]),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::new(),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: vec!["app".to_string()],
+        };
+
+        executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap();
+
+        let materialised = tokio::fs::read_to_string(project_dir.path().join("app.env"))
+            .await
+            .unwrap();
+        assert!(materialised.contains("SECRET"), "got: {materialised}");
+    }
+
+    #[test]
     fn test_generate_security_override_grants_relaxed_capabilities() {
         let docker = Docker::connect_with_defaults();
         if docker.is_err() {
@@ -6254,7 +6795,7 @@ services:
 
     #[test]
     fn test_compose_path_cannot_shadow_a_generated_override() {
-        for reserved in ComposeExecutor::GENERATED_OVERRIDES {
+        for reserved in RESERVED_GENERATED_COMPOSE_FILES.iter().copied() {
             assert!(
                 ComposeExecutor::validate_compose_path_not_generated(reserved).is_err(),
                 "{reserved} should be reserved"
@@ -7393,9 +7934,7 @@ services:
         let error =
             ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
                 .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("forbidden inline override key 'runtime'"));
+        assert!(error.to_string().contains("forbidden key 'runtime'"));
     }
 
     #[test]

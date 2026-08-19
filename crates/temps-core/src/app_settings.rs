@@ -23,6 +23,27 @@ pub struct AppSettings {
     /// disables DNS record sync regardless of per-domain opt-in.
     pub edge_target: Option<String>,
 
+    /// Whether plain-HTTP requests to the console host (`external_url`) are
+    /// redirected to HTTPS. Same tri-state contract as an environment's
+    /// `force_https`:
+    ///
+    /// - `None` (default) — inherit the per-host heuristic: redirect only once
+    ///   the console hostname has actually completed TLS provisioning. An
+    ///   HTTP-only install, and an install whose TLS is terminated upstream,
+    ///   are both left alone.
+    /// - `Some(true)` — always redirect. For operators who terminate TLS at
+    ///   Temps but have not provisioned the cert through Temps.
+    /// - `Some(false)` — never redirect, even once a certificate exists.
+    ///
+    /// Deliberately operator-set rather than inferred. Temps cannot tell
+    /// "HTTPS terminated by an upstream CDN" apart from "plain HTTP" — both
+    /// arrive as a plaintext connection, and `X-Forwarded-Proto` is not
+    /// trustworthy from an arbitrary peer — so inferring `true` from an
+    /// `https://` `external_url` would 301 a CDN-fronted console into an
+    /// infinite redirect loop with no way out but the global kill switch.
+    #[serde(default)]
+    pub console_force_https: Option<bool>,
+
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
 
@@ -954,6 +975,23 @@ pub struct PreviewGatewaySettings {
     /// Pingora forwards `ws-*` traffic to this port after authenticating.
     #[schema(example = 8090)]
     pub host_port: u16,
+    /// Docker container name for this instance's gateway.
+    ///
+    /// A single Temps install owns the whole host, so the default is fine and
+    /// operators never need to touch this. It exists for the case where
+    /// several Temps instances share one Docker daemon — most obviously a
+    /// development machine with multiple checkouts running at once.
+    ///
+    /// Without it those instances silently fight: the `shared_secret` is
+    /// per-database, so each generates a different one, but they all
+    /// reconcile the *same* container name. Each start-up sees the other's
+    /// container as drifted, recreates it with its own secret, and every
+    /// other instance's previews start failing with "missing or invalid
+    /// X-Temps-Preview-Token". Giving each instance its own container name
+    /// (and `host_port`) makes them independent.
+    #[serde(default = "default_preview_gateway_container")]
+    #[schema(example = "temps-preview-gateway")]
+    pub container_name: String,
     /// When true (default), the supervisor will pull and apply the image
     /// pinned in the Temps binary on every startup. When false, the
     /// currently-running image is left alone — operators upgrade manually
@@ -971,11 +1009,19 @@ pub struct PreviewGatewaySettings {
     pub shared_secret: String,
 }
 
+/// Serde default for [`PreviewGatewaySettings::container_name`], so a settings
+/// row written before this field existed deserialises to today's name rather
+/// than to an empty string (which would mean "container named ''").
+fn default_preview_gateway_container() -> String {
+    "temps-preview-gateway".to_string()
+}
+
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
             image: "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9".to_string(),
             host_port: 8090,
+            container_name: default_preview_gateway_container(),
             auto_upgrade: true,
             shared_secret: String::new(),
         }
@@ -1177,6 +1223,7 @@ impl Default for AppSettings {
             internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             edge_target: None,
+            console_force_https: None,
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
             dns_provider: DnsProviderSettings::default(),

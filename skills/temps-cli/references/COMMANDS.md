@@ -262,6 +262,7 @@ Manage projects
 - `update` (`edit`) - Update project name and description
 - `settings` - Update project settings (slug, attack mode, preview environments, image retention)
 - `git` - Update git repository settings
+- `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a project
 
@@ -426,6 +427,20 @@ Update git repository settings
 | `--connection <id>` | Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts, use provided/existing values (for automation) | - | No |
+
+### `projects source`
+
+Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--type <type>` | Set the primary source: docker_image, static_files, uploaded_source or manual (use `projects git` to switch to git) | - | No |
+| `--allow-alternate` | Also accept an uploaded source archive from `drop`, keeping the current source as default | - | No |
+| `--no-allow-alternate` | Only deploy from the configured source | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `projects config`
 
@@ -2263,6 +2278,7 @@ Update platform settings
 | `--max-memory-limit-mb <mb>` | Ceiling on a project/environment memory limit override, in MB (0 = no ceiling) | - | No |
 | `--max-concurrent-connections-ceiling <count>` | Ceiling on a project/environment concurrent-connection override (0 = no ceiling) | - | No |
 | `--allow-unlimited-timeouts <enabled>` | Whether projects may set a timeout of 0, i.e. no timeout (true/false) | - | No |
+| `--console-force-https <mode>` | Redirect the console host to HTTPS: auto (once a cert exists), always, or never | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `settings set-external-url`

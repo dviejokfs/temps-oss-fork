@@ -17,6 +17,7 @@ Manage projects
 - `update` (`edit`) - Update project name and description
 - `settings` - Update project settings (slug, attack mode, preview environments, image retention)
 - `git` - Update git repository settings
+- `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a project
 
@@ -181,6 +182,20 @@ Update git repository settings
 | `--connection <id>` | Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts, use provided/existing values (for automation) | - | No |
+
+### `projects source`
+
+Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--type <type>` | Set the primary source: docker_image, static_files, uploaded_source or manual (use `projects git` to switch to git) | - | No |
+| `--allow-alternate` | Also accept an uploaded source archive from `drop`, keeping the current source as default | - | No |
+| `--no-allow-alternate` | Only deploy from the configured source | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `projects config`
 

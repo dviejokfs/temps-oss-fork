@@ -142,4 +142,25 @@ describe('buildAutomationSettingsUpdate', () => {
       error: '--allow-unlimited-timeouts must be true or false, got "yes"',
     })
   })
+
+  test('--console-force-https maps its three modes onto the tri-state', () => {
+    // `auto` must clear the override (null), not omit it — omitting would let
+    // `#[serde(default)]` decide, which is the same value but by accident.
+    expect(buildAutomationSettingsUpdate({ consoleForceHttps: 'auto' }, undefined)).toEqual({
+      updates: { console_force_https: null },
+    })
+    expect(buildAutomationSettingsUpdate({ consoleForceHttps: 'always' }, undefined)).toEqual({
+      updates: { console_force_https: true },
+    })
+    expect(buildAutomationSettingsUpdate({ consoleForceHttps: 'never' }, undefined)).toEqual({
+      updates: { console_force_https: false },
+    })
+  })
+
+  test('rejects an unknown --console-force-https mode', () => {
+    const result = buildAutomationSettingsUpdate({ consoleForceHttps: 'true' }, undefined)
+    expect(result).toEqual({
+      error: '--console-force-https must be auto, always or never, got "true"',
+    })
+  })
 })

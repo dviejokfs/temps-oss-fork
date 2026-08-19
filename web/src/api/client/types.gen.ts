@@ -1352,6 +1352,27 @@ export type AppSettings = {
      */
     connection_limits?: ConnectionLimitSettings;
     /**
+     * Whether plain-HTTP requests to the console host (`external_url`) are
+     * redirected to HTTPS. Same tri-state contract as an environment's
+     * `force_https`:
+     *
+     * - `None` (default) — inherit the per-host heuristic: redirect only once
+     * the console hostname has actually completed TLS provisioning. An
+     * HTTP-only install, and an install whose TLS is terminated upstream,
+     * are both left alone.
+     * - `Some(true)` — always redirect. For operators who terminate TLS at
+     * Temps but have not provisioned the cert through Temps.
+     * - `Some(false)` — never redirect, even once a certificate exists.
+     *
+     * Deliberately operator-set rather than inferred. Temps cannot tell
+     * "HTTPS terminated by an upstream CDN" apart from "plain HTTP" — both
+     * arrive as a plaintext connection, and `X-Forwarded-Proto` is not
+     * trustworthy from an arbitrary peer — so inferring `true` from an
+     * `https://` `external_url` would 301 a CDN-fronted console into an
+     * infinite redirect loop with no way out but the global kill switch.
+     */
+    console_force_https?: boolean | null;
+    /**
      * Binary version tag (e.g. "v0.1.0") of the *console* process
      * (`temps serve`, role=all or role=console) that last started. Written
      * on console startup; read by the standalone `temps proxy` to detect
@@ -1486,6 +1507,12 @@ export type AppSettingsResponse = {
      * customer app traffic. No sensitive content. See issue #646.
      */
     connection_limits: ConnectionLimitSettings;
+    /**
+     * Whether plain-HTTP requests to the console host are redirected to HTTPS.
+     * `None` inherits the per-host certificate heuristic; `Some(b)` is an
+     * explicit operator override. No sensitive content.
+     */
+    console_force_https?: boolean | null;
     container_logs: ContainerLogSettings;
     disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;
@@ -12877,6 +12904,23 @@ export type PreviewGatewaySettings = {
      */
     auto_upgrade?: boolean;
     /**
+     * Docker container name for this instance's gateway.
+     *
+     * A single Temps install owns the whole host, so the default is fine and
+     * operators never need to touch this. It exists for the case where
+     * several Temps instances share one Docker daemon — most obviously a
+     * development machine with multiple checkouts running at once.
+     *
+     * Without it those instances silently fight: the `shared_secret` is
+     * per-database, so each generates a different one, but they all
+     * reconcile the *same* container name. Each start-up sees the other's
+     * container as drifted, recreates it with its own secret, and every
+     * other instance's previews start failing with "missing or invalid
+     * X-Temps-Preview-Token". Giving each instance its own container name
+     * (and `host_port`) makes them independent.
+     */
+    container_name?: string;
+    /**
      * Host port to publish the gateway on (always bound to 127.0.0.1).
      * Pingora forwards `ws-*` traffic to this port after authenticating.
      */
@@ -13198,6 +13242,14 @@ export type ProjectResponse = {
      * Opt-in to AI propose-then-confirm write capability (false = off).
      */
     ai_write_actions_enabled: boolean;
+    /**
+     * Whether this project also accepts deployments from a source other than
+     * `source_type` — chiefly, whether a Git-backed project will take an
+     * uploaded source archive (`drop`). `null` or `false` means only the
+     * configured `source_type` (plus Docker images and static bundles, which
+     * every project accepts) may be deployed.
+     */
+    allow_alternate_sources?: boolean | null;
     /**
      * Attack mode - when enabled, requires CAPTCHA verification for all project environments
      */
@@ -16712,6 +16764,23 @@ export type SessionSummary = {
     requests_count: number;
     session_id: number;
     started_at: string;
+};
+
+/**
+ * Opt a project in or out of accepting deployments from a source other than
+ * its configured `source_type`.
+ *
+ * Unlike `ChangeProjectSourceRequest` this leaves `source_type` alone, so a
+ * Git project keeps its repository, branch, webhook auto-deploy and
+ * rollback-rebuild behaviour and merely gains the ability to also be deployed
+ * from an uploaded source archive.
+ */
+export type SetAlternateSourcesRequest = {
+    /**
+     * `true` to also accept uploaded source archives, `false` to restrict the
+     * project to its configured source again.
+     */
+    allow_alternate_sources: boolean;
 };
 
 export type SetFlagEnvironmentRequest = {
@@ -38853,6 +38922,46 @@ export type UpdateProjectResponses = {
 };
 
 export type UpdateProjectResponse = UpdateProjectResponses[keyof UpdateProjectResponses];
+
+export type SetAlternateSourcesData = {
+    body: SetAlternateSourcesRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/alternate-sources';
+};
+
+export type SetAlternateSourcesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetAlternateSourcesResponses = {
+    /**
+     * Alternate-source policy updated
+     */
+    200: ProjectResponse;
+};
+
+export type SetAlternateSourcesResponse = SetAlternateSourcesResponses[keyof SetAlternateSourcesResponses];
 
 export type GetProjectDeploymentsData = {
     body?: never;

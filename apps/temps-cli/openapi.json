@@ -2749,6 +2749,14 @@
               }
             ]
           },
+          "console_force_https": {
+            "default": null,
+            "description": "Whether plain-HTTP requests to the console host (`external_url`) are\nredirected to HTTPS. Same tri-state contract as an environment's\n`force_https`:\n\n- `None` (default) — inherit the per-host heuristic: redirect only once\n  the console hostname has actually completed TLS provisioning. An\n  HTTP-only install, and an install whose TLS is terminated upstream,\n  are both left alone.\n- `Some(true)` — always redirect. For operators who terminate TLS at\n  Temps but have not provisioned the cert through Temps.\n- `Some(false)` — never redirect, even once a certificate exists.\n\nDeliberately operator-set rather than inferred. Temps cannot tell\n\"HTTPS terminated by an upstream CDN\" apart from \"plain HTTP\" — both\narrive as a plaintext connection, and `X-Forwarded-Proto` is not\ntrustworthy from an arbitrary peer — so inferring `true` from an\n`https://` `external_url` would 301 a CDN-fronted console into an\ninfinite redirect loop with no way out but the global kill switch.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "console_version": {
             "default": null,
             "description": "Binary version tag (e.g. \"v0.1.0\") of the *console* process\n(`temps serve`, role=all or role=console) that last started. Written\non console startup; read by the standalone `temps proxy` to detect\nversion skew during a rolling upgrade (ADR-017 Phase 3). `None` on\ninstalls that never ran a console build carrying this field.\n\nThis is informational state written by the binary itself — NOT an\noperator-tunable setting. It is intentionally absent from\n`AppSettingsResponse` and the PATCH path so an operator cannot\naccidentally overwrite the self-recorded value.",
@@ -3071,6 +3079,13 @@
           "connection_limits": {
             "$ref": "#/components/schemas/ConnectionLimitSettings",
             "description": "Per-upstream concurrent-connection cap applied by the proxy to\ncustomer app traffic. No sensitive content. See issue #646."
+          },
+          "console_force_https": {
+            "description": "Whether plain-HTTP requests to the console host are redirected to HTTPS.\n`None` inherits the per-host certificate heuristic; `Some(b)` is an\nexplicit operator override. No sensitive content.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "container_logs": {
             "$ref": "#/components/schemas/ContainerLogSettings"
@@ -28733,6 +28748,14 @@
             "description": "Opt-in to AI propose-then-confirm write capability (false = off).",
             "type": "boolean"
           },
+          "allow_alternate_sources": {
+            "description": "Whether this project also accepts deployments from a source other than\n`source_type` — chiefly, whether a Git-backed project will take an\nuploaded source archive (`drop`). `null` or `false` means only the\nconfigured `source_type` (plus Docker images and static bundles, which\nevery project accepts) may be deployed.",
+            "example": false,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "attack_mode": {
             "description": "Attack mode - when enabled, requires CAPTCHA verification for all project environments",
             "type": "boolean"
@@ -36772,6 +36795,19 @@
           "requests_count",
           "is_bounced",
           "is_engaged"
+        ],
+        "type": "object"
+      },
+      "SetAlternateSourcesRequest": {
+        "description": "Opt a project in or out of accepting deployments from a source other than\nits configured `source_type`.\n\nUnlike `ChangeProjectSourceRequest` this leaves `source_type` alone, so a\nGit project keeps its repository, branch, webhook auto-deploy and\nrollback-rebuild behaviour and merely gains the ability to also be deployed\nfrom an uploaded source archive.",
+        "properties": {
+          "allow_alternate_sources": {
+            "description": "`true` to also accept uploaded source archives, `false` to restrict the\nproject to its configured source again.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "allow_alternate_sources"
         ],
         "type": "object"
       },
@@ -74839,6 +74875,67 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Projects"
+        ]
+      }
+    },
+    "/projects/{id}/alternate-sources": {
+      "patch": {
+        "description": "This leaves `source_type` untouched — a Git project keeps its repository,\nbranch, webhook-driven auto-deploy and rollback rebuild-from-source — and\nonly changes whether the project will additionally accept an uploaded\nsource archive (`drop`). Docker images and static bundles are accepted by\nevery project regardless of this flag.",
+        "operationId": "set_alternate_sources",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAlternateSourcesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Alternate-source policy updated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Opt a project in or out of accepting deployments from a source other than\nits configured `source_type`.",
         "tags": [
           "Projects"
         ]

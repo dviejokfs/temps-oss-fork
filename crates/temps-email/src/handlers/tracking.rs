@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{deny_deployment_token, permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, internal_server_error, not_found},
     problemdetails::Problem,
@@ -263,6 +263,15 @@ pub async fn get_global_events(
     Query(query): Query<GlobalEventsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailsRead);
+    // This endpoint is instance-wide by design (an operator view over every
+    // email's opens/clicks, including recipient IPs, user agents and clicked
+    // URLs) and carries no project_id to scope against. Deployment tokens are
+    // project-scoped machine credentials handed to deployed application code,
+    // so they must never reach it. Today `AuthContext::has_permission` already
+    // refuses to map any deployment-token permission onto `EmailsRead`; this
+    // states the requirement at the endpoint instead of relying on that
+    // allowlist never gaining an `EmailsRead` entry.
+    deny_deployment_token!(auth);
 
     let page = query.page.unwrap_or(1);
     let page_size = std::cmp::min(query.page_size.unwrap_or(20), 100);

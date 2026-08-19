@@ -459,6 +459,93 @@ pub fn validate_git_url(url: &str) -> Result<Url, UrlValidationError> {
     validate_external_url(url)
 }
 
+/// Database connection schemes an importer may be pointed at.
+const ALLOWED_DATABASE_SCHEMES: &[&str] = &[
+    "postgres",
+    "postgresql",
+    "mysql",
+    "mariadb",
+    "mongodb",
+    "mongodb+srv",
+    "redis",
+    "rediss",
+];
+
+/// Validate a **database** connection URL that came from an untrusted source
+/// (e.g. a remote platform's API response during an import).
+///
+/// [`validate_external_url`] only accepts `http`/`https`, so it cannot be used
+/// for connection strings. This applies the identical host/IP rules —
+/// rejecting loopback, RFC 1918, link-local, cloud-metadata, multicast,
+/// broadcast and other reserved addresses — while allowing database schemes.
+///
+/// This matters because the importer starts an official database client
+/// container with `network_mode=host` and passes the URL straight to
+/// `pg_dump`/`mariadb-dump`/`mongodump`. A source platform that reports
+/// `external_db_url: postgres://…@127.0.0.1:5432/…` would otherwise make Temps
+/// connect to a control-plane-internal database from the Docker host network
+/// and copy its contents into a project the caller owns.
+///
+/// Like `validate_external_url`, a non-literal hostname is only checked for
+/// obvious loopback names here; callers that can afford it should also await
+/// [`validate_domain_async`] on the host.
+///
+/// # Examples
+///
+/// ```
+/// use temps_core::url_validation::validate_external_database_url;
+///
+/// assert!(validate_external_database_url("postgres://u:p@db.example.com:5432/app").is_ok());
+/// assert!(validate_external_database_url("postgres://u:p@127.0.0.1:5432/app").is_err());
+/// assert!(validate_external_database_url("postgres://u:p@10.0.0.5:5432/app").is_err());
+/// assert!(validate_external_database_url("postgres://u:p@169.254.169.254/app").is_err());
+/// assert!(validate_external_database_url("file:///etc/passwd").is_err());
+/// ```
+pub fn validate_external_database_url(url: &str) -> Result<Url, UrlValidationError> {
+    let parsed =
+        Url::parse(url).map_err(|e| UrlValidationError::InvalidFormat(format!("{}", e)))?;
+
+    if !ALLOWED_DATABASE_SCHEMES.contains(&parsed.scheme()) {
+        return Err(UrlValidationError::InvalidScheme);
+    }
+
+    // NOTE: do not use `parsed.host()` here. The `url` crate only parses hosts
+    // into `Host::Ipv4`/`Host::Ipv6` for *special* schemes (http, https, ws,
+    // wss, ftp, file). Database schemes are not special, so
+    // `postgres://u:p@127.0.0.1/app` yields `Host::Domain("127.0.0.1")` and an
+    // IP-shaped host would sail straight past the domain branch. Parse the
+    // host string as an address ourselves.
+    let Some(host) = parsed.host_str() else {
+        return Err(UrlValidationError::InvalidFormat(
+            "database URL must have a valid host".to_string(),
+        ));
+    };
+
+    // `[::1]` — strip the brackets the URL form requires before parsing.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    match bare.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => validate_ipv4(&ip)?,
+        Ok(IpAddr::V6(ip)) => validate_ipv6(&ip)?,
+        Err(_) => {
+            let lower = bare.to_lowercase();
+            if lower.is_empty() {
+                return Err(UrlValidationError::InvalidFormat(
+                    "database URL must have a valid host".to_string(),
+                ));
+            }
+            if lower == "localhost" || lower.ends_with(".localhost") {
+                return Err(UrlValidationError::LoopbackIp);
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
 /// Redact the userinfo portion of a URL so it is safe to include in
 /// error messages and structured logs (Fix #12 — credentials in errors).
 ///
@@ -507,6 +594,42 @@ pub async fn validate_domain_async(domain: &str) -> Result<(), UrlValidationErro
     resolve_and_validate_domain(domain, 443).await.map(|_| ())
 }
 
+/// Async counterpart to [`validate_external_database_url`]: same checks, plus
+/// DNS resolution of a non-literal host.
+///
+/// The sync version can only reject IP *literals* and `localhost`. That is not
+/// enough when the URL comes from a remote platform the attacker controls,
+/// because they also control their own DNS: one A record pointing
+/// `db.attacker.tld` at `127.0.0.1` or `169.254.169.254` walks straight past a
+/// literal-only check. Any caller that can afford a DNS lookup — i.e. anything
+/// not on a request hot path — should use this instead.
+///
+/// A resolution failure is an error, not a pass: an unresolvable host cannot be
+/// dialled anyway, and treating "we could not check" as "it is fine" is how the
+/// literal-only gap got here.
+pub async fn validate_external_database_url_async(url: &str) -> Result<Url, UrlValidationError> {
+    let parsed = validate_external_database_url(url)?;
+
+    let Some(host) = parsed.host_str() else {
+        return Err(UrlValidationError::InvalidFormat(
+            "database URL must have a valid host".to_string(),
+        ));
+    };
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    // A literal was already fully validated above; only a name needs resolving.
+    if bare.parse::<IpAddr>().is_err() {
+        // Port is irrelevant to the address check — `resolve_and_validate_domain`
+        // needs one only to form a socket address.
+        resolve_and_validate_domain(bare, parsed.port().unwrap_or(443)).await?;
+    }
+
+    Ok(parsed)
+}
+
 /// Resolve `domain:port` and return the socket addresses, **rejecting the whole
 /// domain if any resolved IP is non-public** (loopback, RFC1918, link-local,
 /// etc.).
@@ -545,6 +668,73 @@ pub async fn resolve_and_validate_domain(
     }
 
     Ok(addrs)
+}
+
+#[cfg(test)]
+mod database_url_tests {
+    use super::validate_external_database_url;
+
+    /// The importer starts a database client container with
+    /// `network_mode=host` and hands it this URL, so an address the control
+    /// plane can reach but the public internet cannot is exactly the SSRF the
+    /// guard exists to stop.
+    #[test]
+    fn rejects_internal_targets() {
+        for url in [
+            "postgres://u:p@127.0.0.1:5432/app",
+            "postgres://u:p@localhost:5432/app",
+            "postgres://u:p@db.localhost:5432/app",
+            "postgres://u:p@10.1.2.3:5432/app",
+            "postgres://u:p@172.16.0.9:5432/app",
+            "postgres://u:p@192.168.1.10:5432/app",
+            "postgres://u:p@169.254.169.254:5432/app",
+            "mysql://u:p@127.0.0.1:3306/app",
+            "mongodb://u:p@10.0.0.1:27017/app",
+            "postgres://u:p@[::1]:5432/app",
+        ] {
+            assert!(
+                validate_external_database_url(url).is_err(),
+                "{url} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_public_database_endpoints() {
+        for url in [
+            "postgres://u:p@db.example.com:5432/app",
+            "postgresql://u:p@db.example.com/app",
+            "mysql://u:p@db.example.com:3306/app",
+            "mariadb://u:p@db.example.com:3306/app",
+            "mongodb://u:p@db.example.com:27017/app",
+            "mongodb+srv://u:p@cluster.example.com/app",
+            "redis://u:p@cache.example.com:6379",
+            "postgres://u:p@93.184.216.34:5432/app",
+        ] {
+            assert!(
+                validate_external_database_url(url).is_ok(),
+                "{url} must be accepted"
+            );
+        }
+    }
+
+    /// Non-database schemes must not slip through — `file://` would make the
+    /// dump container read the host filesystem.
+    #[test]
+    fn rejects_non_database_schemes() {
+        for url in [
+            "file:///etc/passwd",
+            "http://example.com",
+            "https://example.com",
+            "gopher://example.com",
+            "not a url",
+        ] {
+            assert!(
+                validate_external_database_url(url).is_err(),
+                "{url} must be rejected"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -868,5 +1058,41 @@ mod tests {
         // https + private IP must still be rejected via the IP host check.
         assert!(validate_git_url("https://169.254.169.254/repo.git").is_err());
         assert!(validate_git_url("https://localhost/repo.git").is_err());
+    }
+    /// Regression: the literal-only check is not enough when the attacker
+    /// controls the DNS for the hostname they hand us — which is exactly the
+    /// importer's threat model, where `source_url` comes out of the remote
+    /// platform's own API response.
+    #[tokio::test]
+    async fn async_database_url_validation_rejects_a_name_resolving_to_loopback() {
+        // `localhost` is the one name every machine resolves to loopback, so
+        // this exercises the resolution path without depending on the network.
+        // The sync check rejects this name by string match; force resolution to
+        // be the thing under test by using a form the string check misses.
+        let err =
+            validate_external_database_url_async("postgres://u:p@localhost.localdomain:5432/app")
+                .await;
+        // Either it resolved to loopback (rejected) or the name does not exist
+        // on this host (also rejected) — both are the safe outcome, and a pass
+        // would mean an unresolved name was treated as public.
+        assert!(
+            err.is_err(),
+            "a name that resolves to loopback (or not at all) must not be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_database_url_validation_still_rejects_literals_and_schemes() {
+        for hostile in [
+            "postgres://u:p@127.0.0.1:5432/app",
+            "postgres://u:p@10.0.0.5:5432/app",
+            "postgres://u:p@169.254.169.254/app",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                validate_external_database_url_async(hostile).await.is_err(),
+                "{hostile} must be rejected"
+            );
+        }
     }
 }
