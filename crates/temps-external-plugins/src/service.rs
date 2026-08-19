@@ -263,6 +263,29 @@ impl ExternalPluginsService {
             self.manager.start_plugin_by_path(&binary_path).await
         };
 
+        // `start_plugin` indexes the process under the name the *running
+        // binary* declares in its own manifest, but every later lookup —
+        // `is_running`, `reload_plugin`, the status endpoint — uses
+        // `plugin_name`. If the two disagree the process is live but
+        // unreachable through the only key we ever query: status reports
+        // "not configured" forever, and the next install takes the
+        // fresh-start branch and leaks another process on top.
+        //
+        // Fail loudly instead. The process is shut down via the name it
+        // actually registered under, so a wrong registry entry leaves
+        // nothing running rather than an orphan nobody can address.
+        if let Ok(ref manifest) = result {
+            if let Some(message) = identity_mismatch(plugin_name, &manifest.name, binary_name) {
+                error!(
+                    expected = %plugin_name,
+                    declared = %manifest.name,
+                    "Plugin declares a different name than its registry entry; shutting it down"
+                );
+                self.manager.shutdown_plugin(&manifest.name).await;
+                return Err(message);
+            }
+        }
+
         if let Ok(ref manifest) = result {
             // Rebuild the proxy router so the (re)started plugin is immediately reachable.
             let manifests = self.manager.manifests().await;
@@ -353,6 +376,70 @@ impl ExternalPluginsService {
                 manifests.iter().filter(|m| !m.events.is_empty()).count()
             );
             Some(listener)
+        }
+    }
+}
+
+/// Decide whether a freshly-started plugin registered under a usable identity.
+///
+/// `start_plugin` indexes the process under the name the running binary
+/// declares in its own manifest, while `is_running`, `reload_plugin` and the
+/// status endpoint all look it up by the name this instance knows it as. When
+/// those disagree the process is live but unaddressable, so the only safe
+/// outcome is to refuse it.
+///
+/// Split out from `start_or_reload_plugin` so the rule is testable without
+/// spawning a real plugin process — this identity conflation has already
+/// produced two separate bugs in this code path (first binary-filename vs
+/// manifest-name, then registry-declared vs locally-known), and it is silent
+/// every time: everything reports success while status reports "not
+/// installed".
+///
+/// Returns `None` when the identities agree, or the operator-facing
+/// explanation when they don't.
+fn identity_mismatch(expected: &str, declared: &str, binary_name: &str) -> Option<String> {
+    if expected == declared {
+        return None;
+    }
+    Some(format!(
+        "Plugin binary '{binary_name}' declares the name '{declared}', but this instance knows \
+         it as '{expected}'. The process was shut down because it would otherwise run \
+         unreachable — status would report it as not installed and reinstalling would start a \
+         second copy. This is a packaging mismatch: the registry entry and the plugin's own \
+         manifest must agree."
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::identity_mismatch;
+
+    #[test]
+    fn matching_identities_are_accepted() {
+        assert!(identity_mismatch("vibetemps", "vibetemps", "temps-vibetemps-plugin").is_none());
+    }
+
+    #[test]
+    fn a_differing_declared_name_is_refused_and_explained() {
+        let message = identity_mismatch("vibetemps", "something-else", "temps-vibetemps-plugin")
+            .expect("a name the manager will index differently must be refused");
+        // Both identities belong in the message: the operator has to know
+        // which side to correct, and "install failed" alone doesn't say.
+        assert!(message.contains("vibetemps"), "{message}");
+        assert!(message.contains("something-else"), "{message}");
+        assert!(message.contains("temps-vibetemps-plugin"), "{message}");
+    }
+
+    /// Names are compared exactly. The manager's process map is a plain
+    /// `HashMap` lookup, so a case or whitespace variant is a different key
+    /// and would strand the process just as effectively.
+    #[test]
+    fn near_miss_names_are_still_a_mismatch() {
+        for declared in ["VibeTemps", "vibetemps ", " vibetemps"] {
+            assert!(
+                identity_mismatch("vibetemps", declared, "bin").is_some(),
+                "{declared:?} must not be treated as equal to \"vibetemps\""
+            );
         }
     }
 }
