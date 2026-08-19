@@ -83,6 +83,17 @@ enum DeliveryClaim {
     Return(SendEmailResponse),
 }
 
+/// Result of a provider call as observed by Temps.
+///
+/// A timeout is deliberately distinct from a provider rejection. Once the
+/// request has left this process, a timeout cannot prove the provider rejected
+/// it; retrying that ambiguous result could deliver the same email twice.
+enum ProviderDeliveryOutcome {
+    Accepted(crate::providers::SendEmailResponse),
+    Rejected(EmailError),
+    TimedOut,
+}
+
 // Keep this shorter than the Cloud outbox retry horizon. A process crash after
 // the claim commit must become recoverable before the caller exhausts its
 // retries, while still preventing concurrent provider calls.
@@ -616,19 +627,18 @@ impl EmailService {
             DeliveryClaim::Return(response) => return Ok(response),
         };
 
-        let provider_result = match tokio::time::timeout(
+        let provider_outcome = match tokio::time::timeout(
             std::time::Duration::from_secs(PROVIDER_SEND_TIMEOUT_SECONDS),
             provider.send(request),
         )
         .await
         {
-            Ok(result) => result,
-            Err(_) => Err(EmailError::ProviderError(format!(
-                "Provider send timed out after {PROVIDER_SEND_TIMEOUT_SECONDS} seconds for email {email_id}"
-            ))),
+            Ok(Ok(response)) => ProviderDeliveryOutcome::Accepted(response),
+            Ok(Err(error)) => ProviderDeliveryOutcome::Rejected(error),
+            Err(_) => ProviderDeliveryOutcome::TimedOut,
         };
 
-        self.finalize_project_email_delivery(email_id, attempt_token, provider_result)
+        self.finalize_project_email_delivery(email_id, attempt_token, provider_outcome)
             .await
     }
 
@@ -688,7 +698,7 @@ impl EmailService {
         &self,
         email_id: Uuid,
         attempt_token: chrono::DateTime<Utc>,
-        provider_result: Result<crate::providers::SendEmailResponse, EmailError>,
+        provider_outcome: ProviderDeliveryOutcome,
     ) -> Result<SendEmailResponse, EmailError> {
         let transaction = self.db.begin().await?;
         let claim = email_idempotency_keys::Entity::find()
@@ -714,8 +724,8 @@ impl EmailService {
             });
         }
 
-        let response = match provider_result {
-            Ok(provider_response) => {
+        let response = match provider_outcome {
+            ProviderDeliveryOutcome::Accepted(provider_response) => {
                 let mut active: emails::ActiveModel = current.into();
                 active.status = Set("sent".to_string());
                 active.provider_message_id = Set(Some(provider_response.message_id.clone()));
@@ -728,7 +738,7 @@ impl EmailService {
                     provider_message_id: Some(provider_response.message_id),
                 }
             }
-            Err(error) => {
+            ProviderDeliveryOutcome::Rejected(error) => {
                 info!(
                     email_id = %email_id,
                     error = %error,
@@ -743,6 +753,27 @@ impl EmailService {
                 SendEmailResponse {
                     id: email_id,
                     status: "captured".to_string(),
+                    provider_message_id: None,
+                }
+            }
+            ProviderDeliveryOutcome::TimedOut => {
+                warn!(
+                    email_id = %email_id,
+                    timeout_seconds = PROVIDER_SEND_TIMEOUT_SECONDS,
+                    "Project-scoped provider delivery timed out with an unknown outcome; automatic retry disabled"
+                );
+                let message = format!(
+                    "Provider outcome unknown after {PROVIDER_SEND_TIMEOUT_SECONDS}-second timeout; automatic retry disabled to avoid duplicate delivery"
+                );
+                let mut active: emails::ActiveModel = current.into();
+                active.status = Set("delivery_unknown".to_string());
+                active.error_message = Set(Some(message));
+                active.sent_at = Set(Some(Utc::now()));
+                active.update(&transaction).await?;
+
+                SendEmailResponse {
+                    id: email_id,
+                    status: "delivery_unknown".to_string(),
                     provider_message_id: None,
                 }
             }
@@ -916,12 +947,13 @@ impl EmailService {
 }
 
 fn email_delivery_is_retryable(email: &emails::Model) -> bool {
-    email.status == "queued"
-        || (email.status == "captured"
-            && !email
-                .error_message
-                .as_deref()
-                .is_some_and(|message| message.starts_with("Recipient(s) suppressed")))
+    delivery_status_is_retryable(&email.status, email.error_message.as_deref())
+}
+
+fn delivery_status_is_retryable(status: &str, error_message: Option<&str>) -> bool {
+    status == "queued"
+        || (status == "captured"
+            && !error_message.is_some_and(|message| message.starts_with("Recipient(s) suppressed")))
 }
 
 fn email_payload_hash(request: &SendEmailRequest) -> String {
@@ -1441,6 +1473,16 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn ambiguous_provider_outcome_is_never_retryable() {
+        assert!(!delivery_status_is_retryable("delivery_unknown", None));
+        assert!(delivery_status_is_retryable("queued", None));
+        assert!(delivery_status_is_retryable(
+            "captured",
+            Some("Send failed: provider rejected request")
+        ));
+    }
+
     // ============================================
     // Integration Tests (Require Docker)
     // ============================================
@@ -1789,6 +1831,97 @@ mod tests {
             1,
             "a concurrent retry must not call the provider twice"
         );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_provider_timeout_is_terminal_to_prevent_duplicate_delivery() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        let Some((db, email_service, _provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
+
+        let project_slug = format!("email-timeout-{}", Uuid::new_v4());
+        let project_row = db
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO projects \
+                     (name,repo_name,repo_owner,directory,main_branch,preset,created_at,updated_at,slug) \
+                     VALUES ('Email Timeout','email-timeout','tests','.','main','python',now(),now(),'{project_slug}') \
+                     RETURNING id"
+                ),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let project_id: i32 = project_row.try_get("", "id").unwrap();
+        let email_id = Uuid::new_v4();
+        emails::ActiveModel {
+            id: Set(email_id),
+            project_id: Set(Some(project_id)),
+            from_address: Set("sender@example.test".to_string()),
+            to_addresses: Set(serde_json::json!(["recipient@example.test"])),
+            subject: Set("ambiguous provider timeout".to_string()),
+            status: Set("queued".to_string()),
+            track_opens: Set(false),
+            track_clicks: Set(false),
+            open_count: Set(0),
+            click_count: Set(0),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        email_idempotency_keys::ActiveModel {
+            project_id: Set(project_id),
+            idempotency_key: Set("ambiguous-timeout".to_string()),
+            payload_hash: Set("fixture-payload-hash".to_string()),
+            email_id: Set(email_id),
+            lease_expires_at: Set(Utc::now() - chrono::Duration::seconds(1)),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let attempt_token = match email_service
+            .claim_project_email_delivery(email_id)
+            .await
+            .unwrap()
+        {
+            DeliveryClaim::Acquired(token) => token,
+            DeliveryClaim::Return(_) => panic!("new queued delivery must acquire its lease"),
+        };
+        let response = email_service
+            .finalize_project_email_delivery(
+                email_id,
+                attempt_token,
+                ProviderDeliveryOutcome::TimedOut,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, "delivery_unknown");
+
+        let stored = emails::Entity::find_by_id(email_id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "delivery_unknown");
+        assert!(stored
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("avoid duplicate delivery")));
+        assert!(!email_delivery_is_retryable(&stored));
+
+        let replay = email_service
+            .idempotency_decision(project_id, "ambiguous-timeout", "fixture-payload-hash")
+            .await
+            .unwrap();
+        assert!(matches!(replay, IdempotencyDecision::Return(_)));
     }
 
     #[tokio::test]

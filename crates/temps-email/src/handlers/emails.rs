@@ -39,11 +39,15 @@ pub fn routes() -> Router<Arc<AppState>> {
     post,
     path = "/emails",
     request_body = SendEmailRequestBody,
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = "Required for deployment-token requests. Reusing a key with the same payload returns the original delivery; reusing it with a different payload returns 409.")
+    ),
     responses(
         (status = 201, description = "Email sent successfully", body = SendEmailResponseBody),
         (status = 400, description = "Invalid request or domain not verified"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "Idempotency key was already used with a different payload"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))

@@ -118,7 +118,10 @@ pub fn routes() -> Router<Arc<AppState>> {
     params(("id" = i32, Path, description = "Email domain ID")),
     responses(
         (status = 200, description = "Projects authorized to use this sender domain", body = [AuthorizedEmailDomainProjectResponse]),
-        (status = 404, description = "Domain not found")
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain not found"),
+        (status = 500, description = "Project visibility or database check failed")
     ),
     security(("bearer_auth" = []))
 )]
@@ -171,7 +174,10 @@ pub async fn list_email_domain_projects(
     ),
     responses(
         (status = 204, description = "Project authorized"),
-        (status = 404, description = "Domain or project not found")
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Only an instance administrator may change global sender-domain grants"),
+        (status = 404, description = "Domain or project not found"),
+        (status = 500, description = "Project access, audit, or database check failed")
     ),
     security(("bearer_auth" = []))
 )]
@@ -182,6 +188,7 @@ pub async fn authorize_email_domain_project(
     Path((id, project_id)): Path<(i32, i32)>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, EmailDomainsWrite);
+    require_global_sender_domain_authority(&auth)?;
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     require_same_origin_session(&auth, &metadata)?;
@@ -213,7 +220,10 @@ pub async fn authorize_email_domain_project(
     ),
     responses(
         (status = 204, description = "Project authorization revoked"),
-        (status = 404, description = "Domain not found")
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Only an instance administrator may change global sender-domain grants"),
+        (status = 404, description = "Domain not found"),
+        (status = 500, description = "Project access, audit, or database check failed")
     ),
     security(("bearer_auth" = []))
 )]
@@ -224,6 +234,7 @@ pub async fn revoke_email_domain_project(
     Path((id, project_id)): Path<(i32, i32)>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, EmailDomainsWrite);
+    require_global_sender_domain_authority(&auth)?;
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     require_same_origin_session(&auth, &metadata)?;
@@ -243,6 +254,23 @@ pub async fn revoke_email_domain_project(
     }
     result.map_err(Problem::from)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sender domains are instance-global resources. Project membership proves a
+/// caller may operate a project, but it does not prove authority over an
+/// arbitrary verified sender domain. Until domains have an explicit owner,
+/// only an instance administrator may change domain-to-project grants.
+fn require_global_sender_domain_authority(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+    if auth.is_admin() {
+        return Ok(());
+    }
+
+    Err(forbidden()
+        .title("Sender Domain Authority Required")
+        .detail(
+            "Only an instance administrator may change project access to a global sender domain",
+        )
+        .build())
 }
 
 /// Browser sessions carry ambient cookie credentials, so unsafe requests must
@@ -983,9 +1011,37 @@ async fn create_dns_record(
 
 #[cfg(test)]
 mod tests {
-    use super::request_is_same_origin;
-    use axum::http::{HeaderMap, HeaderValue};
+    use super::{request_is_same_origin, require_global_sender_domain_authority};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use temps_auth::{AuthContext, Role};
     use temps_core::RequestMetadata;
+
+    fn auth_with_role(role: Role) -> AuthContext {
+        let now = chrono::Utc::now();
+        AuthContext::new_session(
+            temps_entities::users::Model {
+                id: 42,
+                name: "Domain Operator".to_string(),
+                email: "operator@example.test".to_string(),
+                password_hash: None,
+                email_verified: true,
+                email_verification_token: None,
+                email_verification_expires: None,
+                password_reset_token: None,
+                password_reset_expires: None,
+                must_change_password: false,
+                deleted_at: None,
+                mfa_secret: None,
+                mfa_enabled: false,
+                mfa_recovery_codes: None,
+                oidc_subject: None,
+                oidc_provider_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            role,
+        )
+    }
 
     fn metadata_with_header(name: &'static str, value: &'static str) -> RequestMetadata {
         let mut headers = HeaderMap::new();
@@ -1028,5 +1084,13 @@ mod tests {
     fn rejects_missing_browser_origin_evidence() {
         let metadata = metadata_with_header("accept", "application/json");
         assert!(!request_is_same_origin(&metadata));
+    }
+
+    #[test]
+    fn only_instance_admin_can_change_global_sender_domain_grants() {
+        assert!(require_global_sender_domain_authority(&auth_with_role(Role::Admin)).is_ok());
+        let denied = require_global_sender_domain_authority(&auth_with_role(Role::User))
+            .expect_err("project membership must not confer authority over a global domain");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
     }
 }

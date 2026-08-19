@@ -28388,9 +28388,21 @@ export type ListEmailDomainProjectsData = {
 
 export type ListEmailDomainProjectsErrors = {
     /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Domain not found
      */
     404: unknown;
+    /**
+     * Project visibility or database check failed
+     */
+    500: unknown;
 };
 
 export type ListEmailDomainProjectsResponses = {
@@ -28420,9 +28432,21 @@ export type RevokeEmailDomainProjectData = {
 
 export type RevokeEmailDomainProjectErrors = {
     /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Only an instance administrator may change global sender-domain grants
+     */
+    403: unknown;
+    /**
      * Domain not found
      */
     404: unknown;
+    /**
+     * Project access, audit, or database check failed
+     */
+    500: unknown;
 };
 
 export type RevokeEmailDomainProjectResponses = {
@@ -28452,9 +28476,21 @@ export type AuthorizeEmailDomainProjectData = {
 
 export type AuthorizeEmailDomainProjectErrors = {
     /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Only an instance administrator may change global sender-domain grants
+     */
+    403: unknown;
+    /**
      * Domain or project not found
      */
     404: unknown;
+    /**
+     * Project access, audit, or database check failed
+     */
+    500: unknown;
 };
 
 export type AuthorizeEmailDomainProjectResponses = {
@@ -28908,6 +28944,12 @@ export type ListEmailsResponse = ListEmailsResponses[keyof ListEmailsResponses];
 
 export type SendEmailData = {
     body: SendEmailRequestBody;
+    headers?: {
+        /**
+         * Required for deployment-token requests. Reusing a key with the same payload returns the original delivery; reusing it with a different payload returns 409.
+         */
+        'Idempotency-Key'?: string;
+    };
     path?: never;
     query?: never;
     url: '/emails';
@@ -28926,6 +28968,10 @@ export type SendEmailErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * Idempotency key was already used with a different payload
+     */
+    409: unknown;
     /**
      * Internal server error
      */
