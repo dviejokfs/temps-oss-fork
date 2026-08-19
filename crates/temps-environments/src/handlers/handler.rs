@@ -1165,7 +1165,16 @@ pub async fn update_environment_settings(
 
     let updated_environment = state
         .environment_service
-        .update_environment_settings(project_id, env_id, settings.clone())
+        .update_environment_settings(
+            project_id,
+            env_id,
+            settings.clone(),
+            // An operator who can edit the instance-wide ceilings is not
+            // meaningfully constrained by them.
+            temps_core::CeilingEnforcement::from_has_settings_write(
+                auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
+        )
         .await?;
 
     // Create audit event

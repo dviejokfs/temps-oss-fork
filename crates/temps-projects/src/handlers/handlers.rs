@@ -1503,7 +1503,15 @@ pub async fn update_project_deployment_config(
 
     let updated_project = state
         .project_service
-        .update_project_deployment_config(project_id, config.clone())
+        .update_project_deployment_config(
+            project_id,
+            config.clone(),
+            // An operator who can edit the instance-wide ceilings is not
+            // meaningfully constrained by them.
+            temps_core::CeilingEnforcement::from_has_settings_write(
+                auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
+        )
         .await
         .map_err(|e| {
             error!("Error updating deployment config: {:?}", e);

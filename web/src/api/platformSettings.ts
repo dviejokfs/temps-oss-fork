@@ -231,6 +231,11 @@ export async function updatePlatformSettings(
     build_limits: updated.build_limits,
     ai_chat_limits: updated.ai_chat_limits,
     request_timeouts: updated.request_timeouts,
+    // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
+    // omitting these would silently reset the operator's connection cap and
+    // override ceilings to "unlimited" on every unrelated settings save.
+    connection_limits: updated.connection_limits,
+    tenant_resource_ceilings: updated.tenant_resource_ceilings,
     monitoring: updated.monitoring,
     observability_compression: updated.observability_compression,
     observability_retention: updated.observability_retention,

@@ -24,6 +24,9 @@ interface UpdateOptions {
   defaultHttpTimeout?: string
   defaultSseIdleTimeout?: string
   defaultWebsocketIdleTimeout?: string
+  maxMemoryLimitMb?: string
+  maxConcurrentConnectionsCeiling?: string
+  allowUnlimitedTimeouts?: string
   consoleForceHttps?: string
   yes?: boolean
 }
@@ -49,6 +52,11 @@ interface CurrentSettingsSnapshot {
     default_http_timeout_seconds?: number
     default_sse_idle_timeout_seconds?: number
     default_websocket_idle_timeout_seconds?: number
+  } | null
+  tenant_resource_ceilings?: {
+    max_memory_limit_mb?: number
+    max_concurrent_connections?: number
+    allow_unlimited_request_timeouts?: boolean
   } | null
 }
 
@@ -142,6 +150,45 @@ export function buildAutomationSettingsUpdate(
     }
   }
 
+  // The ceilings share one nested object, so a single flag must carry the
+  // other two forward — otherwise setting a memory ceiling would silently
+  // drop an existing connection ceiling back to "no ceiling".
+  if (
+    options.maxMemoryLimitMb !== undefined ||
+    options.maxConcurrentConnectionsCeiling !== undefined ||
+    options.allowUnlimitedTimeouts !== undefined
+  ) {
+    const current = currentSettings?.tenant_resource_ceilings
+    const numeric: Array<[string, string | undefined, number]> = [
+      ['--max-memory-limit-mb', options.maxMemoryLimitMb, current?.max_memory_limit_mb ?? 0],
+      ['--max-concurrent-connections-ceiling', options.maxConcurrentConnectionsCeiling, current?.max_concurrent_connections ?? 0],
+    ]
+    const parsed: number[] = []
+    for (const [flag, raw, fallback] of numeric) {
+      if (raw === undefined) {
+        parsed.push(fallback)
+        continue
+      }
+      const value = parseInt(raw, 10)
+      if (Number.isNaN(value) || value < 0) {
+        return { error: `${flag} must be a non-negative number (0 = no ceiling), got "${raw}"` }
+      }
+      parsed.push(value)
+    }
+    let allowUnlimited = current?.allow_unlimited_request_timeouts ?? true
+    if (options.allowUnlimitedTimeouts !== undefined) {
+      if (options.allowUnlimitedTimeouts !== 'true' && options.allowUnlimitedTimeouts !== 'false') {
+        return { error: `--allow-unlimited-timeouts must be true or false, got "${options.allowUnlimitedTimeouts}"` }
+      }
+      allowUnlimited = options.allowUnlimitedTimeouts === 'true'
+    }
+    updates.tenant_resource_ceilings = {
+      max_memory_limit_mb: parsed[0],
+      max_concurrent_connections: parsed[1],
+      allow_unlimited_request_timeouts: allowUnlimited,
+    }
+  }
+
   if (options.setting && options.value) {
     switch (options.setting) {
       case 'external_url':
@@ -191,6 +238,9 @@ export function registerSettingsCommands(program: Command): void {
     .option('--default-http-timeout <seconds>', 'Default timeout for regular HTTP requests, in seconds')
     .option('--default-sse-idle-timeout <seconds>', 'Default idle timeout for SSE streams, in seconds')
     .option('--default-websocket-idle-timeout <seconds>', 'Default idle timeout for WebSocket connections, in seconds')
+    .option('--max-memory-limit-mb <mb>', 'Ceiling on a project/environment memory limit override, in MB (0 = no ceiling)')
+    .option('--max-concurrent-connections-ceiling <count>', 'Ceiling on a project/environment concurrent-connection override (0 = no ceiling)')
+    .option('--allow-unlimited-timeouts <enabled>', 'Whether projects may set a timeout of 0, i.e. no timeout (true/false)')
     .option('--console-force-https <mode>', 'Redirect the console host to HTTPS: auto (once a cert exists), always, or never')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(updateSettingsAction)
@@ -309,6 +359,31 @@ async function showSettings(options: { json?: boolean }): Promise<void> {
     info('Not configured')
   }
 
+  // Ceilings on what a project/environment may set for itself. All three are
+  // unenforced by default, which is worth showing explicitly — "0" here means
+  // "no ceiling", the opposite of what "0" means in a project's own config.
+  newline()
+  header('Project Override Ceilings')
+  const ceilings = appSettings.tenant_resource_ceilings
+  keyValue(
+    'Max Memory Limit',
+    ceilings?.max_memory_limit_mb
+      ? `${ceilings.max_memory_limit_mb} MB`
+      : colors.muted('No ceiling'),
+  )
+  keyValue(
+    'Max Concurrent Connections',
+    ceilings?.max_concurrent_connections
+      ? ceilings.max_concurrent_connections.toString()
+      : colors.muted('No ceiling'),
+  )
+  keyValue(
+    'Projects May Disable Timeouts',
+    ceilings?.allow_unlimited_request_timeouts === false
+      ? colors.muted('No')
+      : colors.success('Yes'),
+  )
+
   newline()
 }
 
@@ -336,6 +411,9 @@ async function updateSettingsAction(options: UpdateOptions): Promise<void> {
     options.defaultHttpTimeout ||
     options.defaultSseIdleTimeout ||
     options.defaultWebsocketIdleTimeout ||
+    options.maxMemoryLimitMb ||
+    options.maxConcurrentConnectionsCeiling ||
+    options.allowUnlimitedTimeouts ||
     options.consoleForceHttps ||
     (options.setting && options.value)
   )

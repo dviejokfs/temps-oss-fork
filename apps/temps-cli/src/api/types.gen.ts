@@ -1473,6 +1473,12 @@ export type AppSettings = {
      * from appearing on installs that were already configured via the CLI.
      */
     setup_complete?: boolean;
+    /**
+     * Ceilings the operator places on what a *tenant* may configure for
+     * their own project/environment. Entirely unenforced by default, so an
+     * upgrade never changes what an existing config means.
+     */
+    tenant_resource_ceilings?: TenantResourceCeilings;
 };
 
 /**
@@ -1591,6 +1597,12 @@ export type AppSettingsResponse = {
      * wizard checks this field on load and skips itself when true.
      */
     setup_complete: boolean;
+    /**
+     * Upper bounds a project/environment override may not exceed. No
+     * sensitive content — this is operator policy the settings UI edits
+     * directly. Unenforced by default.
+     */
+    tenant_resource_ceilings: TenantResourceCeilings;
 };
 
 /**
@@ -18224,6 +18236,59 @@ export type TemplateResponse = {
      * Tags/categories for filtering
      */
     tags: Array<string>;
+};
+
+/**
+ * Ceilings on the resource overrides a *tenant* may set for their own
+ * project or environment.
+ *
+ * The knobs these bound (`memory_limit`, `max_concurrent_connections`, the
+ * request/idle timeouts) are deliberately uncapped-by-sentinel: `0` means
+ * "unlimited". That is the right default for a single-team self-hosted
+ * install, where the person editing a project *is* the operator. It is the
+ * wrong default on a shared host, where it lets one project opt out of the
+ * operator's protection and take the node — or the shared proxy's connection
+ * budget — down with it.
+ *
+ * Every ceiling here is therefore **off by default**, and turning one on is
+ * what makes the corresponding tenant override enforceable. A caller holding
+ * `Permission::SettingsWrite` (operators: `Admin`/`PlatformAdmin`, never
+ * `Role::User`) may still exceed them — the ceiling constrains tenants, not
+ * the operator who set it.
+ *
+ * Violations are **rejected, not clamped**: silently rewriting a value the
+ * user asked for leaves them debugging a limit they believe they removed,
+ * and self-hosted operators have no support channel to ask.
+ */
+export type TenantResourceCeilings = {
+    /**
+     * Whether a project/environment may set a request, SSE or WebSocket
+     * timeout of `0` ("no timeout"). `true` (the default) preserves current
+     * behaviour.
+     *
+     * Nonzero tenant timeouts need no ceiling here: they are already clamped
+     * to [`RequestTimeoutSettings::ceiling`] at resolution time. `0` escapes
+     * that clamp by construction — it means "no timeout is configured", so
+     * there is nothing to clamp — which is precisely the hole this closes.
+     */
+    allow_unlimited_request_timeouts?: boolean;
+    /**
+     * Largest `max_concurrent_connections` a project/environment may set.
+     * `0` (the default) leaves it unenforced.
+     *
+     * As with memory, a project value of `0` means unlimited and is refused
+     * whenever this ceiling is set.
+     */
+    max_concurrent_connections?: number;
+    /**
+     * Largest `memory_limit` (MB) a project/environment may set for its
+     * containers. `0` (the default) leaves it unenforced.
+     *
+     * A project value of `0` means "no cgroup limit at all", so it is
+     * refused whenever this ceiling is set — that is the case that OOMs the
+     * host, not merely a large number.
+     */
+    max_memory_limit_mb?: number;
 };
 
 /**
