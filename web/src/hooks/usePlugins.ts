@@ -85,8 +85,10 @@ export interface PluginRegistryManifest {
   platforms: Record<string, PluginPlatformAsset>
 }
 
-/** Response from GET /x/plugins/available */
-export interface PluginAvailabilityResponse {
+/** One entry from GET /x/plugins/registry — a plugin this instance knows how to install. */
+export interface PluginRegistryEntry {
+  /** Plugin name (registry key). */
+  name: string
   /** Whether the plugin binary is already installed (present on disk). */
   installed: boolean
   /** The manifest fetched from the registry, if reachable. */
@@ -114,11 +116,7 @@ export interface InstallPluginResponse {
   message: string
 }
 
-export const PLUGIN_AVAILABILITY_QUERY_KEY = (name: string) => [
-  'external-plugins',
-  'available',
-  name,
-]
+export const PLUGIN_REGISTRY_QUERY_KEY = ['external-plugins', 'registry']
 
 export const PLUGIN_STATUS_QUERY_KEY = (name: string) => [
   'external-plugins',
@@ -127,17 +125,20 @@ export const PLUGIN_STATUS_QUERY_KEY = (name: string) => [
 ]
 
 /**
- * React Query hook for GET /x/plugins/available.
+ * React Query hook for GET /x/plugins/registry — every plugin this instance
+ * knows how to install (today that's a single VibeTemps entry, but the
+ * endpoint returns a list, not "the one plugin", so a second installable
+ * plugin needs no frontend change).
  *
  * SystemAdmin-gated on the backend: a non-admin viewer of the Plugins page
  * gets a 403 here, which the caller should render as-is rather than retry.
  */
-export function usePluginAvailability(name: string) {
+export function usePluginRegistry() {
   return useQuery({
-    queryKey: PLUGIN_AVAILABILITY_QUERY_KEY(name),
-    queryFn: async (): Promise<PluginAvailabilityResponse> => {
-      const response = await client.get<PluginAvailabilityResponse, unknown, true>({
-        url: '/x/plugins/available',
+    queryKey: PLUGIN_REGISTRY_QUERY_KEY,
+    queryFn: async (): Promise<PluginRegistryEntry[]> => {
+      const response = await client.get<PluginRegistryEntry[], unknown, true>({
+        url: '/x/plugins/registry',
         throwOnError: true,
       })
       return response.data
@@ -145,6 +146,20 @@ export function usePluginAvailability(name: string) {
     staleTime: 60 * 1000,
     retry: false,
   })
+}
+
+/**
+ * A single named entry from `usePluginRegistry()`. Convenience wrapper for
+ * callers (like the VibeTemps install card) that only care about one plugin
+ * — `data` is `undefined` both while loading and if `name` isn't a known
+ * installable plugin, so callers should check `isLoading` to distinguish.
+ */
+export function usePluginAvailability(name: string) {
+  const registry = usePluginRegistry()
+  return {
+    ...registry,
+    data: registry.data?.find((entry) => entry.name === name),
+  }
 }
 
 /**
@@ -188,7 +203,7 @@ export function useInstallPlugin(name: string) {
       return response.data
     },
     onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: PLUGIN_AVAILABILITY_QUERY_KEY(name) })
+      queryClient.invalidateQueries({ queryKey: PLUGIN_REGISTRY_QUERY_KEY })
       queryClient.invalidateQueries({ queryKey: PLUGIN_STATUS_QUERY_KEY(name) })
       queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
     },

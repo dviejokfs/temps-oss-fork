@@ -226,24 +226,40 @@ impl ExternalPluginsService {
         new_manifests
     }
 
-    /// Start or reload a single plugin by name.
+    /// Start or reload a single plugin.
+    ///
+    /// `plugin_name` is the plugin's own manifest-declared identity (e.g.
+    /// `"vibetemps"`) — `ExternalPluginManager` indexes running processes by
+    /// exactly this string, so it is what `is_running`/`reload_plugin` must
+    /// be called with. `binary_name` is the filename inside the plugins
+    /// directory, used only to locate the binary when starting it fresh.
+    /// Passing the same value for both is a bug: the binary filename and the
+    /// plugin's declared name are not required to match (and for VibeTemps
+    /// they don't — `temps-vibetemps-plugin` vs `vibetemps`), so keying the
+    /// running-process lookup on the binary filename makes an already-running
+    /// plugin permanently report as not running, and makes install/reload
+    /// silently leak the old process instead of shutting it down (a fresh
+    /// `insert` into the manager's process map overwrites the old entry
+    /// without ever calling `.shutdown()` on it).
     ///
     /// If the plugin is already running, it is restarted in-place (shutdown +
     /// re-start from the same binary path). If it is not yet running, the
-    /// plugins directory is scanned for a matching binary and it is started
-    /// fresh. After a successful start the proxy router is rebuilt so the new
-    /// plugin becomes reachable immediately without a full server restart.
+    /// plugins directory's `binary_name` file is started fresh. After a
+    /// successful start the proxy router is rebuilt so the new plugin becomes
+    /// reachable immediately without a full server restart.
     ///
     /// Returns the new manifest on success, or an error string on failure.
     pub async fn start_or_reload_plugin(
         &self,
         plugin_name: &str,
+        binary_name: &str,
     ) -> Result<temps_core::external_plugin::PluginManifest, String> {
         let result = if self.manager.is_running(plugin_name).await {
             self.manager.reload_plugin(plugin_name).await
         } else {
-            // Plugin binary was just installed — find it in the plugins dir and start it.
-            let binary_path = self.manager.config().plugins_dir.join(plugin_name);
+            // Plugin binary was just installed — start it fresh from the
+            // known binary filename inside the plugins directory.
+            let binary_path = self.manager.config().plugins_dir.join(binary_name);
             self.manager.start_plugin_by_path(&binary_path).await
         };
 

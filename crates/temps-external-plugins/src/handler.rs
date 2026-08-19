@@ -100,24 +100,66 @@ async fn reload_plugins(
 // Plugin install endpoints
 // ---------------------------------------------------------------------------
 
-/// Manifest URL for the builder plugin. This is the **only** URL this endpoint
-/// will ever fetch — the URL is never taken from an untrusted caller to prevent
-/// SSRF / RCE. If the release host changes this constant must be updated and
-/// the binary redeployed.
+/// A plugin this instance knows how to fetch and install: its registry
+/// manifest URL and the binary filename it installs as inside the plugins
+/// directory.
 ///
-/// Served by temps.sh rather than a code-hosting release page: the manifest is
-/// the trust root for the whole install flow (asset URLs and their SHA-256
-/// digests both come from it), so it has to live on a host we control and can
-/// serve to every self-hosted instance.
-const VIBETEMPS_MANIFEST_URL: &str = "https://temps.sh/api/plugins/vibetemps/manifest.json";
+/// `name` is the identity key everywhere it matters — it is the plugin's own
+/// manifest-declared name once running, and `ExternalPluginManager` indexes
+/// running processes by exactly this string (see
+/// `ExternalPluginManager::start_plugin`, which inserts under
+/// `result_manifest.name`). Any status/reload/is_running check MUST use
+/// `name`, never a derived binary filename — a prior version of this code
+/// checked `is_running(&binary_name)`, which never matched the manager's key
+/// and made a running plugin permanently report as "not configured", and
+/// made the install flow always take the "start fresh" branch instead of
+/// "reload", leaking the old process (it was silently overwritten in the
+/// process map without ever being shut down).
+struct KnownPlugin {
+    /// User-facing plugin name and the manager's process-table key.
+    name: &'static str,
+    /// Registry manifest URL. This is the **only** URL ever fetched for this
+    /// plugin — never taken from an untrusted caller, to prevent SSRF / RCE.
+    /// If the release host changes this must be updated and the binary
+    /// redeployed.
+    manifest_url: &'static str,
+    /// Binary filename as it appears inside the release tarball and as it is
+    /// written into the plugins directory.
+    binary_name: &'static str,
+}
 
-/// Binary name of the VibeTemps plugin as it appears inside the release
-/// tarball and as it is written into the plugins directory.
-const VIBETEMPS_BINARY_NAME: &str = "temps-vibetemps-plugin";
+/// Fixed set of plugins this instance knows how to install. Intentionally
+/// small and compile-time — this is not a general marketplace where a caller
+/// picks an arbitrary URL, both because the manifest is the trust root for
+/// the whole install flow (its asset URLs and SHA-256 digests are what get
+/// downloaded and executed) and because every self-hosted instance needs the
+/// same known-good set. Add an entry here to make a new plugin installable.
+const KNOWN_PLUGINS: &[KnownPlugin] = &[KnownPlugin {
+    name: "vibetemps",
+    // Served by temps.sh rather than a code-hosting release page: the
+    // manifest is the trust root for the whole install flow, so it has to
+    // live on a host we control and can serve to every self-hosted instance.
+    manifest_url: "https://temps.sh/api/plugins/vibetemps/manifest.json",
+    binary_name: "temps-vibetemps-plugin",
+}];
 
-/// Response for the plugin availability check endpoint.
+fn known_plugin(name: &str) -> Option<&'static KnownPlugin> {
+    KNOWN_PLUGINS.iter().find(|p| p.name == name)
+}
+
+fn known_plugin_names() -> String {
+    KNOWN_PLUGINS
+        .iter()
+        .map(|p| p.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One entry in the installable-plugin registry listing.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct PluginAvailabilityResponse {
+pub struct PluginRegistryEntry {
+    /// Plugin name (registry key).
+    pub name: String,
     /// Whether the plugin binary is already installed (present on disk).
     pub installed: bool,
     /// The manifest fetched from the registry, if reachable.
@@ -131,7 +173,7 @@ pub struct PluginAvailabilityResponse {
 /// Request body for the plugin install endpoint.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct InstallPluginRequest {
-    /// Name of the plugin to install. Currently only `"vibetemps"` is valid.
+    /// Name of the plugin to install — must match a `KNOWN_PLUGINS` entry.
     pub name: String,
     /// Specific version hint (currently unused; install always fetches latest).
     pub version: Option<String>,
@@ -166,59 +208,62 @@ pub struct PluginStatusResponse {
     pub setup_path: Option<String>,
 }
 
-/// Check whether a plugin is available for install and whether it's already installed.
+/// List every plugin this instance knows how to install, whether it's
+/// already installed, and its registry manifest.
 ///
-/// Fetches the registry manifest for the named plugin and returns it alongside
-/// an `installed` flag. Requires `SystemAdmin` permission.
+/// Iterates `KNOWN_PLUGINS` — today that's a single entry (VibeTemps), but
+/// the endpoint returns a list rather than a singular "the one plugin"
+/// response so adding a second installable plugin never needs an API
+/// change, only a new `KNOWN_PLUGINS` entry. Requires `SystemAdmin`
+/// permission.
 #[utoipa::path(
     tag = "External Plugins",
     get,
-    path = "/x/plugins/available",
+    path = "/x/plugins/registry",
     responses(
-        (status = 200, description = "Plugin availability info", body = PluginAvailabilityResponse),
+        (status = 200, description = "Installable-plugin registry", body = Vec<PluginRegistryEntry>),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
     ),
     security(("bearer_auth" = []))
 )]
-async fn get_available_plugins(
+async fn list_plugin_registry(
     RequireAuth(auth): RequireAuth,
     State(state): State<ExternalPluginsAppState>,
-) -> Result<(StatusCode, Json<PluginAvailabilityResponse>), Problem> {
+) -> Result<(StatusCode, Json<Vec<PluginRegistryEntry>>), Problem> {
     permission_guard!(auth, SystemAdmin);
 
     let plugins_dir = state.service.manager().config().plugins_dir.clone();
-    let binary_path = plugins_dir.join(VIBETEMPS_BINARY_NAME);
-    let installed = binary_path.exists();
+    let mut entries = Vec::with_capacity(KNOWN_PLUGINS.len());
 
-    match PluginInstaller::fetch_manifest(VIBETEMPS_MANIFEST_URL).await {
-        Ok(manifest) => Ok((
-            StatusCode::OK,
-            Json(PluginAvailabilityResponse {
-                installed,
-                manifest: Some(manifest),
-                reason: None,
-            }),
-        )),
-        Err(e) => Ok((
-            StatusCode::OK,
-            Json(PluginAvailabilityResponse {
-                installed,
-                manifest: None,
-                reason: Some(format!(
-                    "Could not fetch VibeTemps manifest from {}: {}",
-                    VIBETEMPS_MANIFEST_URL, e
+    for known in KNOWN_PLUGINS {
+        let installed = plugins_dir.join(known.binary_name).exists();
+        let (manifest, reason) = match PluginInstaller::fetch_manifest(known.manifest_url).await {
+            Ok(manifest) => (Some(manifest), None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "Could not fetch {} manifest from {}: {}",
+                    known.name, known.manifest_url, e
                 )),
-            }),
-        )),
+            ),
+        };
+        entries.push(PluginRegistryEntry {
+            name: known.name.to_string(),
+            installed,
+            manifest,
+            reason,
+        });
     }
+
+    Ok((StatusCode::OK, Json(entries)))
 }
 
 /// Download, verify, and install an external plugin binary.
 ///
-/// Currently only `"vibetemps"` is a valid plugin name. After a successful
-/// install the plugin process is (re)started automatically. Requires
-/// `SystemAdmin` permission.
+/// `name` must match a `KNOWN_PLUGINS` entry. After a successful install the
+/// plugin process is (re)started automatically. Requires `SystemAdmin`
+/// permission.
 #[utoipa::path(
     tag = "External Plugins",
     post,
@@ -240,26 +285,25 @@ async fn install_plugin(
 ) -> Result<(StatusCode, Json<InstallPluginResponse>), Problem> {
     permission_guard!(auth, SystemAdmin);
 
-    // v1: only "vibetemps" is a valid plugin name. This is an intentionally
-    // fixed single-entry registry, not a general marketplace.
-    if request.name != "vibetemps" {
-        return Err(error_builder::bad_request()
+    let known = known_plugin(&request.name).ok_or_else(|| {
+        error_builder::bad_request()
             .title("Unsupported Plugin")
             .detail(format!(
-                "'{}' is not a known installable plugin. Currently only 'vibetemps' is supported.",
-                request.name
+                "'{}' is not a known installable plugin. Known plugins: {}.",
+                request.name,
+                known_plugin_names()
             ))
-            .build());
-    }
+            .build()
+    })?;
 
-    let manifest = PluginInstaller::fetch_manifest(VIBETEMPS_MANIFEST_URL)
+    let manifest = PluginInstaller::fetch_manifest(known.manifest_url)
         .await
         .map_err(|e| {
             error_builder::internal_server_error()
                 .title("Manifest Fetch Failed")
                 .detail(format!(
-                    "Could not fetch VibeTemps manifest: {}. Check network connectivity and try again.",
-                    e
+                    "Could not fetch {} manifest: {}. Check network connectivity and try again.",
+                    known.name, e
                 ))
                 .build()
         })?;
@@ -268,7 +312,7 @@ async fn install_plugin(
     let installer = PluginInstaller::new();
 
     let installed_path = installer
-        .install(VIBETEMPS_BINARY_NAME, &manifest, &plugins_dir)
+        .install(known.binary_name, &manifest, &plugins_dir)
         .await
         .map_err(|e| {
             // Surface distinct error types with actionable messages.
@@ -293,16 +337,21 @@ async fn install_plugin(
         })?;
 
     // Start or reload the plugin process — non-fatal on failure (binary is
-    // installed; operator can trigger a manual reload).
+    // installed; operator can trigger a manual reload). `manifest.name` (the
+    // plugin's own declared identity, e.g. "vibetemps") is what
+    // ExternalPluginManager indexes running processes by — NOT
+    // `known.binary_name` — so it must be the identity passed here for
+    // is_running/reload to find the right entry. `known.binary_name` is only
+    // needed for the fresh-start filesystem path.
     let reloaded = match state
         .service
-        .start_or_reload_plugin(VIBETEMPS_BINARY_NAME)
+        .start_or_reload_plugin(&manifest.name, known.binary_name)
         .await
     {
         Ok(_) => true,
         Err(e) => {
             tracing::warn!(
-                plugin = VIBETEMPS_BINARY_NAME,
+                plugin = %manifest.name,
                 "Plugin binary installed but process start failed: {}. \
                  Trigger a manual reload via POST /x/plugins/reload.",
                 e
@@ -320,13 +369,13 @@ async fn install_plugin(
             reloaded,
             message: if reloaded {
                 format!(
-                    "VibeTemps plugin v{} installed and started successfully.",
-                    manifest.version
+                    "{} plugin v{} installed and started successfully.",
+                    manifest.name, manifest.version
                 )
             } else {
                 format!(
-                    "VibeTemps plugin v{} installed. Process start failed — use POST /x/plugins/reload to activate it.",
-                    manifest.version
+                    "{} plugin v{} installed. Process start failed — use POST /x/plugins/reload to activate it.",
+                    manifest.name, manifest.version
                 )
             },
         }),
@@ -356,54 +405,53 @@ async fn get_plugin_status(
     Path(name): Path<String>,
     State(state): State<ExternalPluginsAppState>,
 ) -> Result<(StatusCode, Json<PluginStatusResponse>), Problem> {
-    let plugins_dir = state.service.manager().config().plugins_dir.clone();
-    // Derive the binary name: for "vibetemps" -> "temps-vibetemps-plugin"
-    let binary_name = plugin_name_to_binary_name(&name);
-    let binary_path = plugins_dir.join(&binary_name);
-    let binary_present = binary_path.exists();
-    let process_running = state.service.manager().is_running(&binary_name).await;
-    let configured = binary_present && process_running;
+    // The manager indexes running processes by the plugin's own
+    // manifest-declared name (see ExternalPluginManager::start_plugin, which
+    // inserts under `result_manifest.name`) — so `name` itself, not a
+    // derived binary filename, is the correct key here.
+    if state.service.manager().is_running(&name).await {
+        return Ok((
+            StatusCode::OK,
+            Json(PluginStatusResponse {
+                configured: true,
+                reason: None,
+                setup_path: None,
+            }),
+        ));
+    }
 
-    let response = if configured {
-        PluginStatusResponse {
-            configured: true,
-            reason: None,
-            setup_path: None,
+    // Not running. For a plugin we know how to install, distinguish "never
+    // installed" from "binary present but process not running" using the
+    // registry's known binary filename. For anything else (a plugin dropped
+    // in manually, outside the install flow) we have no reliable filename to
+    // check, so just report that it isn't running.
+    let reason = match known_plugin(&name) {
+        Some(known) => {
+            let plugins_dir = state.service.manager().config().plugins_dir.clone();
+            if plugins_dir.join(known.binary_name).exists() {
+                format!(
+                    "The {} plugin binary is installed but the process is not running. \
+                     Trigger a reload via the plugin settings page.",
+                    name
+                )
+            } else {
+                format!(
+                    "The {} plugin is not installed. Install it from the plugin settings page.",
+                    name
+                )
+            }
         }
-    } else if !binary_present {
-        PluginStatusResponse {
-            configured: false,
-            reason: Some(format!(
-                "The {} plugin is not installed. Install it from the plugin settings page.",
-                name
-            )),
-            setup_path: Some("/settings/plugins".to_string()),
-        }
-    } else {
-        // Binary present but process not running
-        PluginStatusResponse {
-            configured: false,
-            reason: Some(format!(
-                "The {} plugin binary is installed but the process is not running. \
-                 Trigger a reload via the plugin settings page.",
-                name
-            )),
-            setup_path: Some("/settings/plugins".to_string()),
-        }
+        None => format!("The {} plugin is not currently running.", name),
     };
 
-    Ok((StatusCode::OK, Json(response)))
-}
-
-/// Map a user-facing plugin name to the binary filename on disk.
-///
-/// Convention: `"vibetemps"` -> `"temps-vibetemps-plugin"`.
-/// Unknown names fall back to using the name as-is.
-fn plugin_name_to_binary_name(name: &str) -> String {
-    match name {
-        "vibetemps" => VIBETEMPS_BINARY_NAME.to_string(),
-        other => other.to_string(),
-    }
+    Ok((
+        StatusCode::OK,
+        Json(PluginStatusResponse {
+            configured: false,
+            reason: Some(reason),
+            setup_path: Some("/settings/plugins".to_string()),
+        }),
+    ))
 }
 
 /// Build the router for external plugin management endpoints.
@@ -411,7 +459,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
     Router::new()
         .route("/x/plugins", get(list_external_plugins))
         .route("/x/plugins/reload", post(reload_plugins))
-        .route("/x/plugins/available", get(get_available_plugins))
+        .route("/x/plugins/registry", get(list_plugin_registry))
         .route("/x/plugins/install", post(install_plugin))
         .route("/x/plugins/{name}/status", get(get_plugin_status))
 }
@@ -421,7 +469,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
     paths(
         list_external_plugins,
         reload_plugins,
-        get_available_plugins,
+        list_plugin_registry,
         install_plugin,
         get_plugin_status,
     ),
@@ -433,7 +481,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             UiManifest,
             UiRoute,
             ReloadResponse,
-            PluginAvailabilityResponse,
+            PluginRegistryEntry,
             PluginRegistryManifest,
             PlatformAsset,
             InstallPluginRequest,

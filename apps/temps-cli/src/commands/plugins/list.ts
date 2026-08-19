@@ -9,7 +9,7 @@ import { newline, header, icons, json, colors, info, warning } from '../../ui/ou
 // Hand-written request/response shapes
 // ============================================================================
 //
-// `GET /x/plugins/available` and `GET /x/plugins/{name}/status` are core
+// `GET /x/plugins/registry` and `GET /x/plugins/{name}/status` are core
 // routes owned by crates/temps-external-plugins/src/handler.rs, but the
 // committed openapi.json has not yet been regenerated to include them (only
 // the pre-existing `GET /x/plugins` and `POST /x/plugins/reload` routes are
@@ -32,7 +32,9 @@ export interface PluginRegistryManifest {
   platforms: Record<string, PlatformAsset>
 }
 
-export interface PluginAvailabilityResponse {
+/** One entry from GET /x/plugins/registry — a plugin this instance knows how to install. */
+export interface PluginRegistryEntry {
+  name: string
   installed: boolean
   manifest?: PluginRegistryManifest | null
   reason?: string | null
@@ -58,9 +60,9 @@ export async function listPluginsAction(options: { json?: boolean }): Promise<vo
   await requireAuth()
   await setupClient()
 
-  const availability = await withSpinner('Checking available plugins...', async () => {
-    const { data, error, response } = await client.get<PluginAvailabilityResponse, ProblemDetails>({
-      url: '/x/plugins/available',
+  const registry = await withSpinner('Checking available plugins...', async () => {
+    const { data, error, response } = await client.get<PluginRegistryEntry[], ProblemDetails>({
+      url: '/x/plugins/registry',
     })
     if (error || !data) {
       throwPluginsError(response, error)
@@ -69,26 +71,26 @@ export async function listPluginsAction(options: { json?: boolean }): Promise<vo
   })
 
   if (options.json) {
-    json(availability)
+    json(registry)
     return
   }
 
   newline()
   header(`${icons.info} Available Plugins`)
 
-  if (!availability.manifest) {
-    warning(availability.reason ?? 'Plugin registry manifest could not be fetched')
+  if (registry.length === 0) {
+    warning('No installable plugins are known to this instance')
     newline()
     return
   }
 
-  const rows: PluginRow[] = [
-    {
-      name: availability.manifest.name,
-      version: availability.manifest.version,
-      installed: availability.installed,
-    },
-  ]
+  const rows: PluginRow[] = registry
+    .filter((entry) => entry.manifest)
+    .map((entry) => ({
+      name: entry.manifest!.name,
+      version: entry.manifest!.version,
+      installed: entry.installed,
+    }))
 
   const columns: TableColumn<PluginRow>[] = [
     { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
@@ -100,10 +102,16 @@ export async function listPluginsAction(options: { json?: boolean }): Promise<vo
     },
   ]
 
-  printTable(rows, columns, { style: 'minimal' })
+  if (rows.length > 0) {
+    printTable(rows, columns, { style: 'minimal' })
+  }
 
-  if (!availability.installed) {
-    info(`Run: temps plugins install ${availability.manifest.name}`)
+  for (const entry of registry) {
+    if (!entry.manifest) {
+      warning(`${entry.name}: ${entry.reason ?? 'registry manifest could not be fetched'}`)
+    } else if (!entry.installed) {
+      info(`Run: temps plugins install ${entry.name}`)
+    }
   }
   newline()
 }
