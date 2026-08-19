@@ -3156,6 +3156,7 @@ mod storage_cleanup_tests {
             attack_mode: false,
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
+            allow_alternate_sources: None,
             ai_debug_chat_enabled: None,
             ai_write_actions_enabled: false,
             error_source_context_enabled: false,
@@ -3173,6 +3174,7 @@ mod storage_cleanup_tests {
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             cross_project_trace_sharing: false,
+            image_retention_hours: None,
         }
     }
 

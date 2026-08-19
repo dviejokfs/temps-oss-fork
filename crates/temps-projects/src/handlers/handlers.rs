@@ -20,13 +20,14 @@ use temps_auth::{
 };
 use temps_auth::{AuthContext, RequireAuth};
 use temps_core::RequestMetadata;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::types::{
     ChangeProjectSourceRequest, CreateProjectRequest, PaginatedProjectList, PaginationParams,
-    ProjectResponse, ProjectStatisticsResponse, ReinstallWebhookResponse, TriggerPipelinePayload,
-    TriggerPipelineResponse, UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest,
-    UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
+    ProjectResponse, ProjectStatisticsResponse, ReinstallWebhookResponse,
+    SetAlternateSourcesRequest, TriggerPipelinePayload, TriggerPipelineResponse,
+    UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest, UpdateGitSettingsRequest,
+    UpdateProjectSettingsRequest,
 };
 use crate::services::types::CreateProjectEnvVar;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -48,6 +49,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/projects/by-slug/{slug}", get(get_project_by_slug))
         .route("/projects/{id}", put(update_project))
         .route("/projects/{id}/source", patch(change_project_source))
+        .route(
+            "/projects/{id}/alternate-sources",
+            patch(set_alternate_sources),
+        )
         .route("/projects/{id}", delete(delete_project))
         .route("/projects", post(create_project))
         .route("/projects", get(get_projects))
@@ -105,6 +110,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_project,
         update_project,
         change_project_source,
+        set_alternate_sources,
         delete_project,
         get_projects,
         get_project_by_slug,
@@ -129,6 +135,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             DropInspectionResponse,
             DropPresetCandidate,
             ChangeProjectSourceRequest,
+            SetAlternateSourcesRequest,
             ProjectResponse,
             PaginatedProjectList,
             PaginationParams,
@@ -941,6 +948,72 @@ pub async fn change_project_source(
     Ok(Json(ProjectResponse::map_from_project(updated)).into_response())
 }
 
+/// Opt a project in or out of accepting deployments from a source other than
+/// its configured `source_type`.
+///
+/// This leaves `source_type` untouched — a Git project keeps its repository,
+/// branch, webhook-driven auto-deploy and rollback rebuild-from-source — and
+/// only changes whether the project will additionally accept an uploaded
+/// source archive (`drop`). Docker images and static bundles are accepted by
+/// every project regardless of this flag.
+#[utoipa::path(
+    patch,
+    path = "/projects/{id}/alternate-sources",
+    tag = "Projects",
+    params(("id" = i32, Path, description = "Project ID")),
+    request_body = SetAlternateSourcesRequest,
+    responses(
+        (status = 200, description = "Alternate-source policy updated", body = ProjectResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_alternate_sources(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(req): Json<SetAlternateSourcesRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, id);
+    project_access_guard!(auth, id, state.project_access_checker);
+
+    let updated = state
+        .project_service
+        .set_allow_alternate_sources(id, req.allow_alternate_sources)
+        .await?;
+
+    let audit_event = ProjectUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent,
+        },
+        project_id: updated.id,
+        project_name: updated.name.clone(),
+        project_slug: updated.slug.clone(),
+        updated_fields: ProjectUpdatedFields {
+            name: Some(updated.name.clone()),
+            repo_name: None,
+            repo_owner: None,
+            directory: None,
+            main_branch: None,
+            preset: None,
+            automatic_deploy: None,
+            compose_configuration_updated: None,
+        },
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!("Failed to create audit log: {:?}", e);
+    }
+
+    Ok(Json(ProjectResponse::map_from_project(updated)).into_response())
+}
+
 #[utoipa::path(
     delete,
     path = "/projects/{id}",
@@ -1068,6 +1141,32 @@ pub async fn update_project_settings(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    // Capture the pre-update retention window only when it's actually
+    // changing, so an unrelated settings save (slug, attack mode, ...)
+    // doesn't pay for an extra read.
+    let previous_image_retention_hours = if settings.image_retention_hours.is_some() {
+        match state.project_service.get_project(project_id).await {
+            Ok(project) => project.image_retention_hours,
+            Err(e) => {
+                // A failed read and a genuinely-unset prior value both end up
+                // `None` in the audit record below — that's an accepted gap
+                // in what the double-Option type can express, but a *silent*
+                // one would let a transient DB error read back as "there was
+                // no prior retention window" during an incident review. Log
+                // it so the ambiguity is at least visible operationally.
+                warn!(
+                    error = %e,
+                    project_id,
+                    "Could not read prior image_retention_hours before update; \
+                     audit log will record it as unset rather than unknown"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let updated_project = state
         .project_service
         .update_project_settings(
@@ -1092,6 +1191,7 @@ pub async fn update_project_settings(
             settings.error_source_context_enabled,
             settings.error_source_root.clone(),
             settings.ai_api_traffic_summary_enabled,
+            settings.image_retention_hours,
         )
         .await
         .map_err(Problem::from)?;
@@ -1111,6 +1211,8 @@ pub async fn update_project_settings(
         performance_metrics_enabled: None,
         slug: settings.slug,
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
+        image_retention_hours: settings.image_retention_hours,
+        previous_image_retention_hours,
     };
 
     let audit_event = ProjectSettingsUpdatedAudit {
@@ -1401,7 +1503,15 @@ pub async fn update_project_deployment_config(
 
     let updated_project = state
         .project_service
-        .update_project_deployment_config(project_id, config.clone())
+        .update_project_deployment_config(
+            project_id,
+            config.clone(),
+            // An operator who can edit the instance-wide ceilings is not
+            // meaningfully constrained by them.
+            temps_core::CeilingEnforcement::from_has_settings_write(
+                auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
+        )
         .await
         .map_err(|e| {
             error!("Error updating deployment config: {:?}", e);

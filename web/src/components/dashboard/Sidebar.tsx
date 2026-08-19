@@ -230,6 +230,11 @@ const settingsGroups: SettingsGroupDef[] = [
         url: '/settings/metrics-monitoring',
         icon: BarChart3,
       },
+      {
+        title: 'OTel Pipeline',
+        url: '/settings/otel-pipeline',
+        icon: Activity,
+      },
     ],
   },
 ]
@@ -1047,6 +1052,11 @@ const projectPrimaryGroups: ProjectNavGroup[] = [
     label: 'Configure',
     items: [
       { title: 'Environments', url: 'environments', icon: Layers },
+      {
+        title: 'Environment Variables',
+        url: 'environment-variables',
+        icon: KeyRound,
+      },
       { title: 'Domains', url: 'domains', icon: Globe },
       { title: 'Git', url: 'git', icon: GitFork },
       { title: 'Build & Deploy', url: 'build', icon: Settings2 },

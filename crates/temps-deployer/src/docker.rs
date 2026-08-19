@@ -2090,7 +2090,12 @@ impl ContainerDeployer for DockerRuntime {
             pids_limit: Some(512),
             // Security hardening: use init process for proper signal handling and zombie reaping
             init: Some(true),
-            binds: secrets_bind.map(|b| vec![b]),
+            // Collected rather than assigned so adding a second bind here does
+            // not silently drop the secrets mount.
+            binds: {
+                let binds: Vec<String> = secrets_bind.into_iter().collect();
+                (!binds.is_empty()).then_some(binds)
+            },
             ..Default::default()
         };
 
@@ -2490,6 +2495,15 @@ impl ContainerDeployer for DockerRuntime {
 
         let cpu_percent = cpu_percent_from_samples(&second, &first).unwrap_or(0.0);
 
+        // Host core count at sample time. For a container with no CPU limit
+        // this is its real ceiling — `cpu_utilization_percent()` needs it to
+        // avoid treating one saturated core on a multi-core host as 100%.
+        let online_cpus = second
+            .cpu_stats
+            .as_ref()
+            .and_then(|cpu| cpu.online_cpus)
+            .filter(|cpus| *cpus > 0);
+
         // Memory: subtract page cache (matches `docker stats` MEM USAGE).
         // cgroup v2 → `inactive_file`, cgroup v1 → `cache`. Both are
         // reclaimable file pages that the kernel counts as `usage` but
@@ -2525,6 +2539,7 @@ impl ContainerDeployer for DockerRuntime {
             container_name: container_info.container_name,
             cpu_percent,
             cpu_limit_cores: container_info.cpu_limit_cores,
+            online_cpus,
             memory_bytes,
             memory_limit_bytes,
             memory_percent,

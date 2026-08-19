@@ -2749,6 +2749,14 @@
               }
             ]
           },
+          "console_force_https": {
+            "default": null,
+            "description": "Whether plain-HTTP requests to the console host (`external_url`) are\nredirected to HTTPS. Same tri-state contract as an environment's\n`force_https`:\n\n- `None` (default) — inherit the per-host heuristic: redirect only once\n  the console hostname has actually completed TLS provisioning. An\n  HTTP-only install, and an install whose TLS is terminated upstream,\n  are both left alone.\n- `Some(true)` — always redirect. For operators who terminate TLS at\n  Temps but have not provisioned the cert through Temps.\n- `Some(false)` — never redirect, even once a certificate exists.\n\nDeliberately operator-set rather than inferred. Temps cannot tell\n\"HTTPS terminated by an upstream CDN\" apart from \"plain HTTP\" — both\narrive as a plaintext connection, and `X-Forwarded-Proto` is not\ntrustworthy from an arbitrary peer — so inferring `true` from an\n`https://` `external_url` would 301 a CDN-fronted console into an\ninfinite redirect loop with no way out but the global kill switch.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "console_version": {
             "default": null,
             "description": "Binary version tag (e.g. \"v0.1.0\") of the *console* process\n(`temps serve`, role=all or role=console) that last started. Written\non console startup; read by the standalone `temps proxy` to detect\nversion skew during a rolling upgrade (ADR-017 Phase 3). `None` on\ninstalls that never ran a console build carrying this field.\n\nThis is informational state written by the binary itself — NOT an\noperator-tunable setting. It is intentionally absent from\n`AppSettingsResponse` and the PATCH path so an operator cannot\naccidentally overwrite the self-recorded value.",
@@ -2822,6 +2830,18 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "image_retention": {
+            "default": {
+              "default_hours": 336,
+              "enabled": true
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ImageRetentionSettings",
+                "description": "Retention policy for locally-built deployment images. Modeled as a\nsettings row (not an env var) per CLAUDE.md so an operator can change\nthe system-wide default at runtime without restarting the binary.\nIndividual projects override it via `projects.image_retention_hours`."
+              }
             ]
           },
           "insecure_tls": {
@@ -2930,6 +2950,7 @@
           "preview_gateway": {
             "default": {
               "auto_upgrade": true,
+              "container_name": "temps-preview-gateway",
               "host_port": 8090,
               "image": "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9"
             },
@@ -3018,6 +3039,19 @@
             "default": false,
             "description": "Set to `true` by `temps setup` (all modes) once initial configuration\nhas been applied. The web onboarding wizard reads this from the server\nand skips itself when true, preventing the \"Configure Base Domain\" wall\nfrom appearing on installs that were already configured via the CLI.",
             "type": "boolean"
+          },
+          "tenant_resource_ceilings": {
+            "default": {
+              "allow_unlimited_request_timeouts": true,
+              "max_concurrent_connections": 0,
+              "max_memory_limit_mb": 0
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TenantResourceCeilings",
+                "description": "Ceilings the operator places on what a *tenant* may configure for\ntheir own project/environment. Entirely unenforced by default, so an\nupgrade never changes what an existing config means."
+              }
+            ]
           }
         },
         "type": "object"
@@ -3046,6 +3080,13 @@
           "connection_limits": {
             "$ref": "#/components/schemas/ConnectionLimitSettings",
             "description": "Per-upstream concurrent-connection cap applied by the proxy to\ncustomer app traffic. No sensitive content. See issue #646."
+          },
+          "console_force_https": {
+            "description": "Whether plain-HTTP requests to the console host are redirected to HTTPS.\n`None` inherits the per-host certificate heuristic; `Some(b)` is an\nexplicit operator override. No sensitive content.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "container_logs": {
             "$ref": "#/components/schemas/ContainerLogSettings"
@@ -3079,6 +3120,10 @@
               "string",
               "null"
             ]
+          },
+          "image_retention": {
+            "$ref": "#/components/schemas/ImageRetentionSettings",
+            "description": "Deployment-image retention policy. No sensitive content, passed through\nas-is so the settings UI can show and edit the system-wide default."
           },
           "insecure_tls": {
             "type": "boolean"
@@ -3151,6 +3196,10 @@
           "setup_complete": {
             "description": "Whether `temps setup` has been run at least once. The web onboarding\nwizard checks this field on load and skips itself when true.",
             "type": "boolean"
+          },
+          "tenant_resource_ceilings": {
+            "$ref": "#/components/schemas/TenantResourceCeilings",
+            "description": "Upper bounds a project/environment override may not exceed. No\nsensitive content — this is operator policy the settings UI edits\ndirectly. Unenforced by default."
           }
         },
         "required": [
@@ -3181,7 +3230,9 @@
           "ai_chat_limits",
           "request_timeouts",
           "connection_limits",
-          "self_update"
+          "tenant_resource_ceilings",
+          "self_update",
+          "image_retention"
         ],
         "type": "object"
       },
@@ -8834,8 +8885,15 @@
         "type": "object"
       },
       "CreateProjectSecretRequest": {
-        "description": "Request to create a new project secret.\n\nProject secrets are mounted into the container as files under\n`/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.\nValues are always encrypted at rest and never returned in plaintext from\nthe API after create. Distinct from agent secrets (global `/settings/secrets`).",
+        "description": "Request to create a new project secret.\n\nProject secrets are mounted into the container as files under\n`/run/secrets/<KEY>` as a read-only mount, instead of as environment\nvariables, so they do not appear in `docker inspect`.\nValues are always encrypted at rest and never returned in plaintext from\nthe API after create. Distinct from agent secrets (global `/settings/secrets`).",
         "properties": {
+          "compose_services": {
+            "description": "Docker Compose services allowed to read this secret, by compose\nservice name. Empty (the default) delivers it to every service in the\nstack, which is how secrets behaved before scoping existed.\n\nIgnored by non-Compose presets: those deploy a single container, which\nalways receives every secret in scope for its environment.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "environment_ids": {
             "items": {
               "format": "int32",
@@ -17287,7 +17345,7 @@
             ]
           },
           "image": {
-            "description": "Image reference the container was created with (e.g.\n`ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`).",
+            "description": "Image reference the container was created with (e.g. an immutable\n`ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).",
             "type": [
               "string",
               "null"
@@ -19631,6 +19689,26 @@
         ],
         "type": "object"
       },
+      "ImageRetentionSettings": {
+        "description": "System-wide retention policy for locally-built deployment images.\n\nThe nightly cleanup removes a Temps-built image only once *every*\ndeployment that references it is older than the owning project's retention\nwindow. Deleting an image makes rollback/promotion to that deployment\nimpossible, so the default is deliberately generous: it is a rollback\nwindow, not a cache TTL.",
+        "properties": {
+          "default_hours": {
+            "default": 336,
+            "description": "Default hours to keep a built deployment image when the owning project\nhas no `image_retention_hours` override. Valid range 1..=8760.",
+            "example": 336,
+            "format": "int64",
+            "maximum": 8760,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "enabled": {
+            "default": true,
+            "description": "Whether the nightly pass removes expired deployment images at all.\nDisabling it keeps every built image forever (the pre-0.1 behaviour).",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "ImportCredentials": {
         "description": "Platform-specific credentials for accessing the source system.\n\nFor platforms like Vercel and Railway, this contains the API token.\nFor self-hosted platforms like Coolify and Dokploy, this also contains\nthe `base_url` of the instance.\n\nLocal importers (Docker) can use `ImportCredentials::none()`.",
         "properties": {
@@ -20992,6 +21070,48 @@
         "required": [
           "enabled",
           "healthy"
+        ],
+        "type": "object"
+      },
+      "LatestDeploymentMediaResponse": {
+        "properties": {
+          "projects": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/LatestDeploymentMediaResponseItem"
+            },
+            "description": "Latest deployment media keyed by project ID. Projects with no\ndeployments are omitted.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "projects"
+        ],
+        "type": "object"
+      },
+      "LatestDeploymentMediaResponseItem": {
+        "properties": {
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "screenshot_location": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_id"
         ],
         "type": "object"
       },
@@ -27527,6 +27647,18 @@
             "minimum": 0,
             "type": "integer"
           },
+          "quota_exceeded_requests": {
+            "description": "Cumulative count of ingest requests rejected because the per-project\nstorage quota was exceeded (→ HTTP 413). Written to the metrics store\nas `otel.quota_exceeded_requests` (SourceKind::Node, node_id 0) every 60s.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rate_limited_requests": {
+            "description": "Cumulative count of ingest requests rejected because the per-project\nrate limit was exceeded (→ HTTP 429). Written to the metrics store as\n`otel.rate_limited_requests` (SourceKind::Node, node_id 0) every 60s.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "spans_dropped": {
             "format": "int64",
             "minimum": 0,
@@ -27554,7 +27686,9 @@
           "logs_stored_db",
           "logs_stored_s3",
           "logs_dropped",
-          "ingest_errors"
+          "ingest_errors",
+          "rate_limited_requests",
+          "quota_exceeded_requests"
         ],
         "type": "object"
       },
@@ -28038,6 +28172,12 @@
             "example": true,
             "type": "boolean"
           },
+          "container_name": {
+            "default": "temps-preview-gateway",
+            "description": "Docker container name for this instance's gateway.\n\nA single Temps install owns the whole host, so the default is fine and\noperators never need to touch this. It exists for the case where\nseveral Temps instances share one Docker daemon — most obviously a\ndevelopment machine with multiple checkouts running at once.\n\nWithout it those instances silently fight: the `shared_secret` is\nper-database, so each generates a different one, but they all\nreconcile the *same* container name. Each start-up sees the other's\ncontainer as drifted, recreates it with its own secret, and every\nother instance's previews start failing with \"missing or invalid\nX-Temps-Preview-Token\". Giving each instance its own container name\n(and `host_port`) makes them independent.",
+            "example": "temps-preview-gateway",
+            "type": "string"
+          },
           "host_port": {
             "default": 8090,
             "description": "Host port to publish the gateway on (always bound to 127.0.0.1).\nPingora forwards `ws-*` traffic to this port after authenticating.",
@@ -28048,7 +28188,7 @@
           },
           "image": {
             "default": "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9",
-            "description": "Docker image reference for the gateway. Pinned per Temps release.\nOperators can override this to test a custom build.",
+            "description": "Docker image reference for the gateway. Pinned by digest per Temps release.\nOperators can override this to test a custom build.",
             "example": "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9",
             "type": "string"
           },
@@ -28426,7 +28566,7 @@
         "type": "object"
       },
       "ProjectHealthSummary": {
-        "description": "Health summary for a single project (last 1 hour)",
+        "description": "Health summary for a single project over the requested time range.",
         "properties": {
           "avg_response_time_ms": {
             "description": "Average response time in ms",
@@ -28437,6 +28577,13 @@
             "description": "Error rate as a percentage (0-100)",
             "format": "double",
             "type": "number"
+          },
+          "hourly_requests": {
+            "description": "Hourly request counts ordered by bucket start.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectHourlyRequestCount"
+            },
+            "type": "array"
           },
           "project_id": {
             "format": "int32",
@@ -28463,7 +28610,27 @@
           "total_errors",
           "avg_response_time_ms",
           "error_rate",
-          "status"
+          "status",
+          "hourly_requests"
+        ],
+        "type": "object"
+      },
+      "ProjectHourlyRequestCount": {
+        "description": "One hourly request-count point in a project health summary.",
+        "properties": {
+          "bucket": {
+            "description": "Start of the UTC hour in RFC 3339 format.",
+            "example": "2026-08-16T12:00:00Z",
+            "type": "string"
+          },
+          "request_count": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bucket",
+          "request_count"
         ],
         "type": "object"
       },
@@ -28623,6 +28790,14 @@
             "description": "Opt-in to AI propose-then-confirm write capability (false = off).",
             "type": "boolean"
           },
+          "allow_alternate_sources": {
+            "description": "Whether this project also accepts deployments from a source other than\n`source_type` — chiefly, whether a Git-backed project will take an\nuploaded source archive (`drop`). `null` or `false` means only the\nconfigured `source_type` (plus Docker images and static bundles, which\nevery project accepts) may be deployed.",
+            "example": false,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "attack_mode": {
             "description": "Attack mode - when enabled, requires CAPTCHA verification for all project environments",
             "type": "boolean"
@@ -28683,6 +28858,14 @@
           "id": {
             "format": "int32",
             "type": "integer"
+          },
+          "image_retention_hours": {
+            "description": "Hours to retain built Docker images before nightly cleanup. Null = use the\nsystem-wide default from settings.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "is_public_repo": {
             "description": "Authoritative repository visibility. A missing connection alone does\nnot imply that an incompletely configured repository is public.",
@@ -28793,6 +28976,13 @@
       "ProjectSecretResponse": {
         "description": "Project secret metadata. There is deliberately no `value` field — secret\nplaintext is never returned after creation. Callers that need the value\nmust read it from the mounted file inside the container.",
         "properties": {
+          "compose_services": {
+            "description": "Compose services this secret is restricted to. Empty means every\nservice in the stack.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "created_at": {
             "format": "int64",
             "type": "integer"
@@ -28829,7 +29019,8 @@
           "include_in_preview",
           "created_at",
           "updated_at",
-          "environments"
+          "environments",
+          "compose_services"
         ],
         "type": "object"
       },
@@ -29989,6 +30180,19 @@
               "null"
             ]
           },
+          "request_headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Inbound request headers, credential values already replaced with\n`[REDACTED]` at ingest (see [`crate::redaction`]). `None` when the entry\npredates header capture or was written by a path that doesn't record\nthem; an empty map means \"captured, but no headers\", which is different\nand worth being able to tell apart.\n\nA `BTreeMap` rather than a raw `serde_json::Value` so the schema stays\ntyped and the UI gets a stable alphabetical ordering for free.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "request_id": {
             "type": "string"
           },
@@ -30001,6 +30205,19 @@
           },
           "request_source": {
             "type": "string"
+          },
+          "response_headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Upstream response headers, redacted on the same terms as\n[`Self::request_headers`].",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "response_size_bytes": {
             "format": "int64",
@@ -35090,6 +35307,14 @@
           "name": {
             "type": "string"
           },
+          "node_id": {
+            "description": "Node the rule is scoped to. `0` is the synthetic control-plane node\n(see `CONTROL_PLANE_NODE_ID`), which owns the `proxy.*` and `node.*`\nrules. Exactly one of `service_id`/`deployment_id`/`node_id` is set.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "service_id": {
             "format": "int32",
             "type": [
@@ -36615,6 +36840,19 @@
         ],
         "type": "object"
       },
+      "SetAlternateSourcesRequest": {
+        "description": "Opt a project in or out of accepting deployments from a source other than\nits configured `source_type`.\n\nUnlike `ChangeProjectSourceRequest` this leaves `source_type` alone, so a\nGit project keeps its repository, branch, webhook auto-deploy and\nrollback-rebuild behaviour and merely gains the ability to also be deployed\nfrom an uploaded source archive.",
+        "properties": {
+          "allow_alternate_sources": {
+            "description": "`true` to also accept uploaded source archives, `false` to restrict the\nproject to its configured source again.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "allow_alternate_sources"
+        ],
+        "type": "object"
+      },
       "SetFlagEnvironmentRequest": {
         "properties": {
           "enabled": {
@@ -37244,7 +37482,7 @@
             "type": "object"
           },
           {
-            "description": "Match custom event_data by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where event_data->'user'->>'plan' = 'premium'",
+            "description": "Match custom event properties by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where props->'user'->>'plan' = 'premium',\nfalling back to the legacy `event_data` column when `props` is NULL",
             "properties": {
               "type": {
                 "enum": [
@@ -37253,7 +37491,7 @@
                 "type": "string"
               },
               "value": {
-                "description": "Match custom event_data by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where event_data->'user'->>'plan' = 'premium'",
+                "description": "Match custom event properties by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where props->'user'->>'plan' = 'premium',\nfalling back to the legacy `event_data` column when `props` is NULL",
                 "properties": {
                   "path": {
                     "type": "string"
@@ -39735,6 +39973,33 @@
           "env_vars",
           "is_featured"
         ],
+        "type": "object"
+      },
+      "TenantResourceCeilings": {
+        "description": "Ceilings on the resource overrides a *tenant* may set for their own\nproject or environment.\n\nThe knobs these bound (`memory_limit`, `max_concurrent_connections`, the\nrequest/idle timeouts) are deliberately uncapped-by-sentinel: `0` means\n\"unlimited\". That is the right default for a single-team self-hosted\ninstall, where the person editing a project *is* the operator. It is the\nwrong default on a shared host, where it lets one project opt out of the\noperator's protection and take the node — or the shared proxy's connection\nbudget — down with it.\n\nEvery ceiling here is therefore **off by default**, and turning one on is\nwhat makes the corresponding tenant override enforceable. A caller holding\n`Permission::SettingsWrite` (operators: `Admin`/`PlatformAdmin`, never\n`Role::User`) may still exceed them — the ceiling constrains tenants, not\nthe operator who set it.\n\nViolations are **rejected, not clamped**: silently rewriting a value the\nuser asked for leaves them debugging a limit they believe they removed,\nand self-hosted operators have no support channel to ask.",
+        "properties": {
+          "allow_unlimited_request_timeouts": {
+            "default": true,
+            "description": "Whether a project/environment may set a request, SSE or WebSocket\ntimeout of `0` (\"no timeout\"). `true` (the default) preserves current\nbehaviour.\n\nNonzero tenant timeouts need no ceiling here: they are already clamped\nto [`RequestTimeoutSettings::ceiling`] at resolution time. `0` escapes\nthat clamp by construction — it means \"no timeout is configured\", so\nthere is nothing to clamp — which is precisely the hole this closes.",
+            "type": "boolean"
+          },
+          "max_concurrent_connections": {
+            "default": 0,
+            "description": "Largest `max_concurrent_connections` a project/environment may set.\n`0` (the default) leaves it unenforced.\n\nAs with memory, a project value of `0` means unlimited and is refused\nwhenever this ceiling is set.",
+            "example": 200,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_memory_limit_mb": {
+            "default": 0,
+            "description": "Largest `memory_limit` (MB) a project/environment may set for its\ncontainers. `0` (the default) leaves it unenforced.\n\nA project value of `0` means \"no cgroup limit at all\", so it is\nrefused whenever this ceiling is set — that is the case that OOMs the\nhost, not merely a large number.",
+            "example": 4096,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "TestEmailRequest": {
@@ -42828,6 +43093,13 @@
       "UpdateProjectSecretRequest": {
         "description": "Request to update a project secret. The `value` field is optional — omit it\nto rotate only the environment scoping / preview flag without touching the\nciphertext.",
         "properties": {
+          "compose_services": {
+            "description": "Docker Compose services allowed to read this secret, by compose\nservice name. Empty (the default) delivers it to every service in the\nstack, which is how secrets behaved before scoping existed.\n\nIgnored by non-Compose presets: those deploy a single container, which\nalways receives every secret in scope for its environment.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "environment_ids": {
             "items": {
               "format": "int32",
@@ -42920,6 +43192,14 @@
             ]
           },
           "git_provider_connection_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "image_retention_hours": {
+            "description": "How long (hours) to retain built Docker images before nightly cleanup removes them.\nSet to null to use the system default. Valid range: 1–8760.\n\nOmitting the key leaves the current value unchanged; sending an explicit\n`null` clears the per-project override. `skip_serializing_if` keeps the\nround-trip honest — re-serializing a request that omitted the key must\nnot emit `\"image_retention_hours\": null`, which would mean \"reset\".",
             "format": "int32",
             "type": [
               "integer",
@@ -43562,7 +43842,7 @@
       "UpgradeRequest": {
         "properties": {
           "image": {
-            "description": "Image reference to pull and run (e.g.\n`ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`). Empty resets to default.",
+            "description": "Image reference to pull and run (e.g.\nan immutable `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).\nEmpty resets to default.",
             "type": "string"
           }
         },
@@ -55671,6 +55951,83 @@
           }
         ],
         "summary": "Get deployment activity graph showing daily deployment counts\nSimilar to GitHub's contribution graph",
+        "tags": [
+          "Deployments"
+        ]
+      }
+    },
+    "/deployments/latest-media": {
+      "get": {
+        "operationId": "get_latest_deployment_media",
+        "parameters": [
+          {
+            "description": "Comma-separated project IDs. At most 100 IDs are accepted.",
+            "in": "query",
+            "name": "project_ids",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LatestDeploymentMediaResponse"
+                }
+              }
+            },
+            "description": "Latest deployment media keyed by project ID"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid project IDs"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permission or project access"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get the latest deployment URL and screenshot location for multiple projects.",
         "tags": [
           "Deployments"
         ]
@@ -68308,6 +68665,133 @@
         ]
       }
     },
+    "/nodes/{id}/metrics/alert-rules": {
+      "get": {
+        "description": "Node `0` is the synthetic control-plane node, which owns the seeded\n`proxy.*` (error rate, p99 latency) and `node.*` (file-descriptor /\nsocket exhaustion) defaults. Without this endpoint those rules exist only\nin the database and the operator has no way to see that they are watching,\nlet alone retune or silence them.",
+        "operationId": "NodeMetricsGetAlertRules",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ServiceAlertRuleResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of node alert rules"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the monitoring alert rules scoped to a node.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/{id}/metrics/alert-rules/{rule_id}": {
+      "patch": {
+        "description": "Deliberately update-only: there is no delete. The control-plane defaults\nare re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted\nrule would silently reappear on the next restart, whereas `enabled: false`\nsurvives re-seeding — disabling is the operation that actually means\n\"stop alerting on this\".",
+        "operationId": "NodeMetricsUpdateAlertRule",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Alert rule ID",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServiceUpdateAlertRuleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAlertRuleResponse"
+                }
+              }
+            },
+            "description": "Updated alert rule"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Alert rule not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update a node-scoped monitoring alert rule.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/notification-preferences": {
       "delete": {
         "operationId": "delete_preferences",
@@ -74560,6 +75044,67 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Projects"
+        ]
+      }
+    },
+    "/projects/{id}/alternate-sources": {
+      "patch": {
+        "description": "This leaves `source_type` untouched — a Git project keeps its repository,\nbranch, webhook-driven auto-deploy and rollback rebuild-from-source — and\nonly changes whether the project will additionally accept an uploaded\nsource archive (`drop`). Docker images and static bundles are accepted by\nevery project regardless of this flag.",
+        "operationId": "set_alternate_sources",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAlternateSourcesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Alternate-source policy updated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Opt a project in or out of accepting deployments from a source other than\nits configured `source_type`.",
         "tags": [
           "Projects"
         ]
@@ -89614,9 +90159,6 @@
             },
             "description": "Domain assignment updated atomically"
           },
-          "400": {
-            "description": "Target environment does not belong to the target project"
-          },
           "401": {
             "description": "Unauthorized"
           },
@@ -89624,7 +90166,7 @@
             "description": "Write access required for both projects"
           },
           "404": {
-            "description": "Custom domain not found"
+            "description": "Custom domain or target environment not found in the authorized project scopes"
           },
           "409": {
             "description": "Domain assignment changed; refresh and retry"
@@ -91199,7 +91741,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Get health summaries for multiple projects (last 1 hour)",
+        "summary": "Get user-traffic health summaries for multiple projects (last 1 hour).\nTemps' own status-monitor requests are excluded.",
         "tags": [
           "Proxy Logs"
         ]

@@ -113,6 +113,9 @@ impl From<crate::services::secret_service::SecretError> for Problem {
             SecretError::InvalidKey { .. } => temps_core::error_builder::bad_request()
                 .detail(err.to_string())
                 .build(),
+            SecretError::InvalidComposeService { .. } => temps_core::error_builder::bad_request()
+                .detail(err.to_string())
+                .build(),
             SecretError::EnvironmentNotFound { .. } => temps_core::error_builder::not_found()
                 .detail(err.to_string())
                 .build(),
@@ -1162,7 +1165,16 @@ pub async fn update_environment_settings(
 
     let updated_environment = state
         .environment_service
-        .update_environment_settings(project_id, env_id, settings.clone())
+        .update_environment_settings(
+            project_id,
+            env_id,
+            settings.clone(),
+            // An operator who can edit the instance-wide ceilings is not
+            // meaningfully constrained by them.
+            temps_core::CeilingEnforcement::from_has_settings_write(
+                auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
+        )
         .await?;
 
     // Create audit event
@@ -1919,7 +1931,7 @@ pub async fn create_environment(
 // Secrets: file-mounted secret values.
 //
 // Secrets are delivered to containers as files under /run/secrets/<KEY>
-// (tmpfs, mode 0400) rather than as environment variables. Plaintext is
+// via a read-only mount rather than as environment variables. Plaintext is
 // NEVER returned from the API after creation — GET responses always
 // carry only metadata. The mounted file inside the running container is
 // the source of truth for reads.
@@ -1974,6 +1986,7 @@ pub async fn list_project_secrets(
                     main_url: env.main_url,
                 })
                 .collect(),
+            compose_services: s.compose_services,
         })
         .collect();
 
@@ -2017,6 +2030,7 @@ pub async fn create_project_secret(
             request.key,
             request.value,
             request.include_in_preview,
+            request.compose_services,
         )
         .await?;
 
@@ -2036,6 +2050,7 @@ pub async fn create_project_secret(
                 main_url: env.main_url,
             })
             .collect(),
+        compose_services: secret.compose_services,
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -2079,6 +2094,7 @@ pub async fn update_project_secret(
             request.value,
             request.environment_ids,
             request.include_in_preview,
+            request.compose_services,
         )
         .await?;
 
@@ -2098,6 +2114,7 @@ pub async fn update_project_secret(
                 main_url: env.main_url,
             })
             .collect(),
+        compose_services: secret.compose_services,
     };
 
     Ok(Json(response))

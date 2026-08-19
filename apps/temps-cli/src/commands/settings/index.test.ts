@@ -93,4 +93,74 @@ describe('buildAutomationSettingsUpdate', () => {
       },
     })
   })
+  test('a single ceiling flag carries the other ceilings forward', () => {
+    const result = buildAutomationSettingsUpdate(
+      { maxMemoryLimitMb: '4096' },
+      {
+        tenant_resource_ceilings: {
+          max_memory_limit_mb: 0,
+          max_concurrent_connections: 200,
+          allow_unlimited_request_timeouts: false,
+        },
+      },
+    )
+    expect(result).toEqual({
+      updates: {
+        tenant_resource_ceilings: {
+          max_memory_limit_mb: 4096,
+          // Would silently become 0 ("no ceiling") if not carried forward.
+          max_concurrent_connections: 200,
+          allow_unlimited_request_timeouts: false,
+        },
+      },
+    })
+  })
+
+  test('ceilings default to unenforced when the server has none set', () => {
+    const result = buildAutomationSettingsUpdate({ maxMemoryLimitMb: '512' }, undefined)
+    expect(result).toEqual({
+      updates: {
+        tenant_resource_ceilings: {
+          max_memory_limit_mb: 512,
+          max_concurrent_connections: 0,
+          allow_unlimited_request_timeouts: true,
+        },
+      },
+    })
+  })
+
+  test('rejects a negative ceiling instead of writing it', () => {
+    const result = buildAutomationSettingsUpdate({ maxMemoryLimitMb: '-1' }, undefined)
+    expect(result).toEqual({
+      error: '--max-memory-limit-mb must be a non-negative number (0 = no ceiling), got "-1"',
+    })
+  })
+
+  test('rejects a non-boolean --allow-unlimited-timeouts', () => {
+    const result = buildAutomationSettingsUpdate({ allowUnlimitedTimeouts: 'yes' }, undefined)
+    expect(result).toEqual({
+      error: '--allow-unlimited-timeouts must be true or false, got "yes"',
+    })
+  })
+
+  test('--console-force-https maps its three modes onto the tri-state', () => {
+    // `auto` must clear the override (null), not omit it — omitting would let
+    // `#[serde(default)]` decide, which is the same value but by accident.
+    expect(buildAutomationSettingsUpdate({ consoleForceHttps: 'auto' }, undefined)).toEqual({
+      updates: { console_force_https: null },
+    })
+    expect(buildAutomationSettingsUpdate({ consoleForceHttps: 'always' }, undefined)).toEqual({
+      updates: { console_force_https: true },
+    })
+    expect(buildAutomationSettingsUpdate({ consoleForceHttps: 'never' }, undefined)).toEqual({
+      updates: { console_force_https: false },
+    })
+  })
+
+  test('rejects an unknown --console-force-https mode', () => {
+    const result = buildAutomationSettingsUpdate({ consoleForceHttps: 'true' }, undefined)
+    expect(result).toEqual({
+      error: '--console-force-https must be auto, always or never, got "true"',
+    })
+  })
 })

@@ -1352,6 +1352,27 @@ export type AppSettings = {
      */
     connection_limits?: ConnectionLimitSettings;
     /**
+     * Whether plain-HTTP requests to the console host (`external_url`) are
+     * redirected to HTTPS. Same tri-state contract as an environment's
+     * `force_https`:
+     *
+     * - `None` (default) — inherit the per-host heuristic: redirect only once
+     * the console hostname has actually completed TLS provisioning. An
+     * HTTP-only install, and an install whose TLS is terminated upstream,
+     * are both left alone.
+     * - `Some(true)` — always redirect. For operators who terminate TLS at
+     * Temps but have not provisioned the cert through Temps.
+     * - `Some(false)` — never redirect, even once a certificate exists.
+     *
+     * Deliberately operator-set rather than inferred. Temps cannot tell
+     * "HTTPS terminated by an upstream CDN" apart from "plain HTTP" — both
+     * arrive as a plaintext connection, and `X-Forwarded-Proto` is not
+     * trustworthy from an arbitrary peer — so inferring `true` from an
+     * `https://` `external_url` would 301 a CDN-fronted console into an
+     * infinite redirect loop with no way out but the global kill switch.
+     */
+    console_force_https?: boolean | null;
+    /**
      * Binary version tag (e.g. "v0.1.0") of the *console* process
      * (`temps serve`, role=all or role=console) that last started. Written
      * on console startup; read by the standalone `temps proxy` to detect
@@ -1376,6 +1397,13 @@ export type AppSettings = {
      */
     edge_target?: string | null;
     external_url?: string | null;
+    /**
+     * Retention policy for locally-built deployment images. Modeled as a
+     * settings row (not an env var) per CLAUDE.md so an operator can change
+     * the system-wide default at runtime without restarting the binary.
+     * Individual projects override it via `projects.image_retention_hours`.
+     */
+    image_retention?: ImageRetentionSettings;
     /**
      * Skip TLS certificate verification on outbound HTTP clients built by the
      * server (deployer, agent, remote service client). Strictly opt-in for
@@ -1445,6 +1473,12 @@ export type AppSettings = {
      * from appearing on installs that were already configured via the CLI.
      */
     setup_complete?: boolean;
+    /**
+     * Ceilings the operator places on what a *tenant* may configure for
+     * their own project/environment. Entirely unenforced by default, so an
+     * upgrade never changes what an existing config means.
+     */
+    tenant_resource_ceilings?: TenantResourceCeilings;
 };
 
 /**
@@ -1473,6 +1507,12 @@ export type AppSettingsResponse = {
      * customer app traffic. No sensitive content. See issue #646.
      */
     connection_limits: ConnectionLimitSettings;
+    /**
+     * Whether plain-HTTP requests to the console host are redirected to HTTPS.
+     * `None` inherits the per-host certificate heuristic; `Some(b)` is an
+     * explicit operator override. No sensitive content.
+     */
+    console_force_https?: boolean | null;
     container_logs: ContainerLogSettings;
     disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;
@@ -1499,6 +1539,11 @@ export type AppSettingsResponse = {
      */
     effective_observability_store: MetricsStoreKind;
     external_url?: string | null;
+    /**
+     * Deployment-image retention policy. No sensitive content, passed through
+     * as-is so the settings UI can show and edit the system-wide default.
+     */
+    image_retention: ImageRetentionSettings;
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
@@ -1552,6 +1597,12 @@ export type AppSettingsResponse = {
      * wizard checks this field on load and skips itself when true.
      */
     setup_complete: boolean;
+    /**
+     * Upper bounds a project/environment override may not exceed. No
+     * sensitive content — this is operator policy the settings UI edits
+     * directly. Unenforced by default.
+     */
+    tenant_resource_ceilings: TenantResourceCeilings;
 };
 
 /**
@@ -4302,11 +4353,21 @@ export type CreateProjectRequest = {
  * Request to create a new project secret.
  *
  * Project secrets are mounted into the container as files under
- * `/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.
+ * `/run/secrets/<KEY>` as a read-only mount, instead of as environment
+ * variables, so they do not appear in `docker inspect`.
  * Values are always encrypted at rest and never returned in plaintext from
  * the API after create. Distinct from agent secrets (global `/settings/secrets`).
  */
 export type CreateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     /**
      * Include this secret in preview environments (default: false).
@@ -8085,8 +8146,8 @@ export type GatewayStatus = {
      */
     host_port?: number | null;
     /**
-     * Image reference the container was created with (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`).
+     * Image reference the container was created with (e.g. an immutable
+     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
      */
     image?: string | null;
     /**
@@ -9100,6 +9161,28 @@ export type HttpChallengeDebugResponse = {
 };
 
 /**
+ * System-wide retention policy for locally-built deployment images.
+ *
+ * The nightly cleanup removes a Temps-built image only once *every*
+ * deployment that references it is older than the owning project's retention
+ * window. Deleting an image makes rollback/promotion to that deployment
+ * impossible, so the default is deliberately generous: it is a rollback
+ * window, not a cache TTL.
+ */
+export type ImageRetentionSettings = {
+    /**
+     * Default hours to keep a built deployment image when the owning project
+     * has no `image_retention_hours` override. Valid range 1..=8760.
+     */
+    default_hours?: number;
+    /**
+     * Whether the nightly pass removes expired deployment images at all.
+     * Disabling it keeps every built image forever (the pre-0.1 behaviour).
+     */
+    enabled?: boolean;
+};
+
+/**
  * Platform-specific credentials for accessing the source system.
  *
  * For platforms like Vercel and Railway, this contains the API token.
@@ -9764,6 +9847,22 @@ export type KvStatusResponse = {
      * Service version
      */
     version?: string | null;
+};
+
+export type LatestDeploymentMediaResponse = {
+    /**
+     * Latest deployment media keyed by project ID. Projects with no
+     * deployments are omitted.
+     */
+    projects: {
+        [key: string]: LatestDeploymentMediaResponseItem;
+    };
+};
+
+export type LatestDeploymentMediaResponseItem = {
+    project_id: number;
+    screenshot_location?: string | null;
+    url?: string | null;
 };
 
 export type LemonSqueezyConfig = {
@@ -12471,6 +12570,18 @@ export type PipelineStats = {
     metrics_dropped: number;
     metrics_received: number;
     metrics_stored: number;
+    /**
+     * Cumulative count of ingest requests rejected because the per-project
+     * storage quota was exceeded (→ HTTP 413). Written to the metrics store
+     * as `otel.quota_exceeded_requests` (SourceKind::Node, node_id 0) every 60s.
+     */
+    quota_exceeded_requests: number;
+    /**
+     * Cumulative count of ingest requests rejected because the per-project
+     * rate limit was exceeded (→ HTTP 429). Written to the metrics store as
+     * `otel.rate_limited_requests` (SourceKind::Node, node_id 0) every 60s.
+     */
+    rate_limited_requests: number;
     spans_dropped: number;
     spans_received: number;
     spans_stored: number;
@@ -12814,12 +12925,29 @@ export type PreviewGatewaySettings = {
      */
     auto_upgrade?: boolean;
     /**
+     * Docker container name for this instance's gateway.
+     *
+     * A single Temps install owns the whole host, so the default is fine and
+     * operators never need to touch this. It exists for the case where
+     * several Temps instances share one Docker daemon — most obviously a
+     * development machine with multiple checkouts running at once.
+     *
+     * Without it those instances silently fight: the `shared_secret` is
+     * per-database, so each generates a different one, but they all
+     * reconcile the *same* container name. Each start-up sees the other's
+     * container as drifted, recreates it with its own secret, and every
+     * other instance's previews start failing with "missing or invalid
+     * X-Temps-Preview-Token". Giving each instance its own container name
+     * (and `host_port`) makes them independent.
+     */
+    container_name?: string;
+    /**
      * Host port to publish the gateway on (always bound to 127.0.0.1).
      * Pingora forwards `ws-*` traffic to this port after authenticating.
      */
     host_port?: number;
     /**
-     * Docker image reference for the gateway. Pinned per Temps release.
+     * Docker image reference for the gateway. Pinned by digest per Temps release.
      * Operators can override this to test a custom build.
      */
     image?: string;
@@ -13021,7 +13149,7 @@ export type ProjectEnvVarInput = {
 };
 
 /**
- * Health summary for a single project (last 1 hour)
+ * Health summary for a single project over the requested time range.
  */
 export type ProjectHealthSummary = {
     /**
@@ -13032,6 +13160,10 @@ export type ProjectHealthSummary = {
      * Error rate as a percentage (0-100)
      */
     error_rate: number;
+    /**
+     * Hourly request counts ordered by bucket start.
+     */
+    hourly_requests: Array<ProjectHourlyRequestCount>;
     project_id: number;
     /**
      * Health status: "healthy", "degraded", "down", "unknown"
@@ -13045,6 +13177,17 @@ export type ProjectHealthSummary = {
      * Total requests in the period
      */
     total_requests: number;
+};
+
+/**
+ * One hourly request-count point in a project health summary.
+ */
+export type ProjectHourlyRequestCount = {
+    /**
+     * Start of the UTC hour in RFC 3339 format.
+     */
+    bucket: string;
+    request_count: number;
 };
 
 export type ProjectInfo = {
@@ -13121,6 +13264,14 @@ export type ProjectResponse = {
      */
     ai_write_actions_enabled: boolean;
     /**
+     * Whether this project also accepts deployments from a source other than
+     * `source_type` — chiefly, whether a Git-backed project will take an
+     * uploaded source archive (`drop`). `null` or `false` means only the
+     * configured `source_type` (plus Docker images and static bundles, which
+     * every project accepts) may be deployed.
+     */
+    allow_alternate_sources?: boolean | null;
+    /**
      * Attack mode - when enabled, requires CAPTCHA verification for all project environments
      */
     attack_mode: boolean;
@@ -13163,6 +13314,11 @@ export type ProjectResponse = {
      */
     gitlab_webhook_id?: number | null;
     id: number;
+    /**
+     * Hours to retain built Docker images before nightly cleanup. Null = use the
+     * system-wide default from settings.
+     */
+    image_retention_hours?: number | null;
     /**
      * Authoritative repository visibility. A missing connection alone does
      * not imply that an incompletely configured repository is public.
@@ -13211,6 +13367,11 @@ export type ProjectSecretEnvironmentInfo = {
  * must read it from the mounted file inside the container.
  */
 export type ProjectSecretResponse = {
+    /**
+     * Compose services this secret is restricted to. Empty means every
+     * service in the stack.
+     */
+    compose_services: Array<string>;
     created_at: number;
     environments: Array<ProjectSecretEnvironmentInfo>;
     id: number;
@@ -13665,9 +13826,29 @@ export type ProxyLogResponse = {
     project_id?: number | null;
     query_string?: string | null;
     referrer?: string | null;
+    /**
+     * Inbound request headers, credential values already replaced with
+     * `[REDACTED]` at ingest (see [`crate::redaction`]). `None` when the entry
+     * predates header capture or was written by a path that doesn't record
+     * them; an empty map means "captured, but no headers", which is different
+     * and worth being able to tell apart.
+     *
+     * A `BTreeMap` rather than a raw `serde_json::Value` so the schema stays
+     * typed and the UI gets a stable alphabetical ordering for free.
+     */
+    request_headers?: {
+        [key: string]: string;
+    } | null;
     request_id: string;
     request_size_bytes?: number | null;
     request_source: string;
+    /**
+     * Upstream response headers, redacted on the same terms as
+     * [`Self::request_headers`].
+     */
+    response_headers?: {
+        [key: string]: string;
+    } | null;
     response_size_bytes?: number | null;
     response_time_ms?: number | null;
     routing_status: string;
@@ -16070,6 +16251,12 @@ export type ServiceAlertRuleResponse = {
     id: number;
     metric_name: string;
     name: string;
+    /**
+     * Node the rule is scoped to. `0` is the synthetic control-plane node
+     * (see `CONTROL_PLANE_NODE_ID`), which owns the `proxy.*` and `node.*`
+     * rules. Exactly one of `service_id`/`deployment_id`/`node_id` is set.
+     */
+    node_id?: number | null;
     service_id?: number | null;
     severity: string;
     silenced_until?: string | null;
@@ -16600,6 +16787,23 @@ export type SessionSummary = {
     started_at: string;
 };
 
+/**
+ * Opt a project in or out of accepting deployments from a source other than
+ * its configured `source_type`.
+ *
+ * Unlike `ChangeProjectSourceRequest` this leaves `source_type` alone, so a
+ * Git project keeps its repository, branch, webhook auto-deploy and
+ * rollback-rebuild behaviour and merely gains the ability to also be deployed
+ * from an uploaded source archive.
+ */
+export type SetAlternateSourcesRequest = {
+    /**
+     * `true` to also accept uploaded source archives, `false` to restrict the
+     * project to its configured source again.
+     */
+    allow_alternate_sources: boolean;
+};
+
 export type SetFlagEnvironmentRequest = {
     /**
      * The kill switch. `false` makes the flag serve its default regardless of
@@ -16919,9 +17123,10 @@ export type SmartFilter = {
 } | {
     type: 'custom_data';
     /**
-     * Match custom event_data by JSON path
+     * Match custom event properties by JSON path
      * Format: {"path": "user.plan", "value": "premium"}
-     * This will match events where event_data->'user'->>'plan' = 'premium'
+     * This will match events where props->'user'->>'plan' = 'premium',
+     * falling back to the legacy `event_data` column when `props` is NULL
      */
     value: {
         path: string;
@@ -18070,6 +18275,59 @@ export type TemplateResponse = {
      * Tags/categories for filtering
      */
     tags: Array<string>;
+};
+
+/**
+ * Ceilings on the resource overrides a *tenant* may set for their own
+ * project or environment.
+ *
+ * The knobs these bound (`memory_limit`, `max_concurrent_connections`, the
+ * request/idle timeouts) are deliberately uncapped-by-sentinel: `0` means
+ * "unlimited". That is the right default for a single-team self-hosted
+ * install, where the person editing a project *is* the operator. It is the
+ * wrong default on a shared host, where it lets one project opt out of the
+ * operator's protection and take the node — or the shared proxy's connection
+ * budget — down with it.
+ *
+ * Every ceiling here is therefore **off by default**, and turning one on is
+ * what makes the corresponding tenant override enforceable. A caller holding
+ * `Permission::SettingsWrite` (operators: `Admin`/`PlatformAdmin`, never
+ * `Role::User`) may still exceed them — the ceiling constrains tenants, not
+ * the operator who set it.
+ *
+ * Violations are **rejected, not clamped**: silently rewriting a value the
+ * user asked for leaves them debugging a limit they believe they removed,
+ * and self-hosted operators have no support channel to ask.
+ */
+export type TenantResourceCeilings = {
+    /**
+     * Whether a project/environment may set a request, SSE or WebSocket
+     * timeout of `0` ("no timeout"). `true` (the default) preserves current
+     * behaviour.
+     *
+     * Nonzero tenant timeouts need no ceiling here: they are already clamped
+     * to [`RequestTimeoutSettings::ceiling`] at resolution time. `0` escapes
+     * that clamp by construction — it means "no timeout is configured", so
+     * there is nothing to clamp — which is precisely the hole this closes.
+     */
+    allow_unlimited_request_timeouts?: boolean;
+    /**
+     * Largest `max_concurrent_connections` a project/environment may set.
+     * `0` (the default) leaves it unenforced.
+     *
+     * As with memory, a project value of `0` means unlimited and is refused
+     * whenever this ceiling is set.
+     */
+    max_concurrent_connections?: number;
+    /**
+     * Largest `memory_limit` (MB) a project/environment may set for its
+     * containers. `0` (the default) leaves it unenforced.
+     *
+     * A project value of `0` means "no cgroup limit at all", so it is
+     * refused whenever this ceiling is set — that is the case that OOMs the
+     * host, not merely a large number.
+     */
+    max_memory_limit_mb?: number;
 };
 
 /**
@@ -19489,6 +19747,15 @@ export type UpdatePreferencesRequest = {
  * ciphertext.
  */
 export type UpdateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     include_in_preview?: boolean;
     /**
@@ -19541,6 +19808,16 @@ export type UpdateProjectSettingsRequest = {
      */
     error_source_root?: string | null;
     git_provider_connection_id?: number | null;
+    /**
+     * How long (hours) to retain built Docker images before nightly cleanup removes them.
+     * Set to null to use the system default. Valid range: 1–8760.
+     *
+     * Omitting the key leaves the current value unchanged; sending an explicit
+     * `null` clears the per-project override. `skip_serializing_if` keeps the
+     * round-trip honest — re-serializing a request that omitted the key must
+     * not emit `"image_retention_hours": null`, which would mean "reset".
+     */
+    image_retention_hours?: number | null;
     main_branch?: string | null;
     preset?: string | null;
     preset_config?: null | PresetConfigSchema;
@@ -19835,7 +20112,8 @@ export type UpgradeExternalServiceRequest = {
 export type UpgradeRequest = {
     /**
      * Image reference to pull and run (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`). Empty resets to default.
+     * an immutable `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
+     * Empty resets to default.
      */
     image: string;
 };
@@ -26444,6 +26722,48 @@ export type GetActivityGraphResponses = {
 };
 
 export type GetActivityGraphResponse = GetActivityGraphResponses[keyof GetActivityGraphResponses];
+
+export type GetLatestDeploymentMediaData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Comma-separated project IDs. At most 100 IDs are accepted.
+         */
+        project_ids: string;
+    };
+    url: '/deployments/latest-media';
+};
+
+export type GetLatestDeploymentMediaErrors = {
+    /**
+     * Invalid project IDs
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permission or project access
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetLatestDeploymentMediaError = GetLatestDeploymentMediaErrors[keyof GetLatestDeploymentMediaErrors];
+
+export type GetLatestDeploymentMediaResponses = {
+    /**
+     * Latest deployment media keyed by project ID
+     */
+    200: LatestDeploymentMediaResponse;
+};
+
+export type GetLatestDeploymentMediaResponse = GetLatestDeploymentMediaResponses[keyof GetLatestDeploymentMediaResponses];
 
 export type GetScanByDeploymentData = {
     body?: never;
@@ -35215,6 +35535,90 @@ export type NodeMetricsGetRangeResponses = {
 
 export type NodeMetricsGetRangeResponse = NodeMetricsGetRangeResponses[keyof NodeMetricsGetRangeResponses];
 
+export type NodeMetricsGetAlertRulesData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules';
+};
+
+export type NodeMetricsGetAlertRulesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsGetAlertRulesResponses = {
+    /**
+     * List of node alert rules
+     */
+    200: Array<ServiceAlertRuleResponse>;
+};
+
+export type NodeMetricsGetAlertRulesResponse = NodeMetricsGetAlertRulesResponses[keyof NodeMetricsGetAlertRulesResponses];
+
+export type NodeMetricsUpdateAlertRuleData = {
+    body: ServiceUpdateAlertRuleRequest;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+        /**
+         * Alert rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules/{rule_id}';
+};
+
+export type NodeMetricsUpdateAlertRuleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alert rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsUpdateAlertRuleResponses = {
+    /**
+     * Updated alert rule
+     */
+    200: ServiceAlertRuleResponse;
+};
+
+export type NodeMetricsUpdateAlertRuleResponse = NodeMetricsUpdateAlertRuleResponses[keyof NodeMetricsUpdateAlertRuleResponses];
+
 export type DeletePreferencesData = {
     body?: never;
     path?: never;
@@ -38632,6 +39036,46 @@ export type UpdateProjectResponses = {
 };
 
 export type UpdateProjectResponse = UpdateProjectResponses[keyof UpdateProjectResponses];
+
+export type SetAlternateSourcesData = {
+    body: SetAlternateSourcesRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/alternate-sources';
+};
+
+export type SetAlternateSourcesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetAlternateSourcesResponses = {
+    /**
+     * Alternate-source policy updated
+     */
+    200: ProjectResponse;
+};
+
+export type SetAlternateSourcesResponse = SetAlternateSourcesResponses[keyof SetAlternateSourcesResponses];
 
 export type GetProjectDeploymentsData = {
     body?: never;
@@ -48237,10 +48681,6 @@ export type ReassignProjectCustomDomainData = {
 
 export type ReassignProjectCustomDomainErrors = {
     /**
-     * Target environment does not belong to the target project
-     */
-    400: unknown;
-    /**
      * Unauthorized
      */
     401: unknown;
@@ -48249,7 +48689,7 @@ export type ReassignProjectCustomDomainErrors = {
      */
     403: unknown;
     /**
-     * Custom domain not found
+     * Custom domain or target environment not found in the authorized project scopes
      */
     404: unknown;
     /**

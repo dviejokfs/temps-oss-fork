@@ -1229,6 +1229,7 @@ mod tests {
     fn make_project(id: i32, has_git: bool) -> projects::Model {
         projects::Model {
             id,
+            image_retention_hours: None,
             name: "test".into(),
             repo_name: "repo".into(),
             repo_owner: "owner".into(),
@@ -1257,6 +1258,7 @@ mod tests {
             ai_alert_summaries_enabled: None,
             ai_debug_chat_enabled: None,
             ai_api_traffic_summary_enabled: None,
+            allow_alternate_sources: None,
             ai_write_actions_enabled: false,
             error_source_context_enabled: false,
             error_source_root: None,

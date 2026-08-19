@@ -23,6 +23,27 @@ pub struct AppSettings {
     /// disables DNS record sync regardless of per-domain opt-in.
     pub edge_target: Option<String>,
 
+    /// Whether plain-HTTP requests to the console host (`external_url`) are
+    /// redirected to HTTPS. Same tri-state contract as an environment's
+    /// `force_https`:
+    ///
+    /// - `None` (default) — inherit the per-host heuristic: redirect only once
+    ///   the console hostname has actually completed TLS provisioning. An
+    ///   HTTP-only install, and an install whose TLS is terminated upstream,
+    ///   are both left alone.
+    /// - `Some(true)` — always redirect. For operators who terminate TLS at
+    ///   Temps but have not provisioned the cert through Temps.
+    /// - `Some(false)` — never redirect, even once a certificate exists.
+    ///
+    /// Deliberately operator-set rather than inferred. Temps cannot tell
+    /// "HTTPS terminated by an upstream CDN" apart from "plain HTTP" — both
+    /// arrive as a plaintext connection, and `X-Forwarded-Proto` is not
+    /// trustworthy from an arbitrary peer — so inferring `true` from an
+    /// `https://` `external_url` would 301 a CDN-fronted console into an
+    /// infinite redirect loop with no way out but the global kill switch.
+    #[serde(default)]
+    pub console_force_https: Option<bool>,
+
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
 
@@ -80,6 +101,12 @@ pub struct AppSettings {
     #[serde(default)]
     pub connection_limits: ConnectionLimitSettings,
 
+    /// Ceilings the operator places on what a *tenant* may configure for
+    /// their own project/environment. Entirely unenforced by default, so an
+    /// upgrade never changes what an existing config means.
+    #[serde(default)]
+    pub tenant_resource_ceilings: TenantResourceCeilings,
+
     /// Skip TLS certificate verification on outbound HTTP clients built by the
     /// server (deployer, agent, remote service client). Strictly opt-in for
     /// operators running self-signed control plane / worker certs on a trusted
@@ -93,6 +120,12 @@ pub struct AppSettings {
     /// intentionally NOT subject to these limits (each worker is dedicated
     /// hardware that already has its own per-host headroom).
     pub build_limits: BuildLimitsSettings,
+
+    /// Retention policy for locally-built deployment images. Modeled as a
+    /// settings row (not an env var) per CLAUDE.md so an operator can change
+    /// the system-wide default at runtime without restarting the binary.
+    /// Individual projects override it via `projects.image_retention_hours`.
+    pub image_retention: ImageRetentionSettings,
 
     /// Cluster-DNS resolver settings (ADR-024, experimental beta). Off by
     /// default — see `ClusterDnsSettings` for the incident background and
@@ -361,6 +394,109 @@ pub struct ConnectionLimitSettings {
     pub default_max_concurrent_connections: u32,
 }
 
+/// Ceilings on the resource overrides a *tenant* may set for their own
+/// project or environment.
+///
+/// The knobs these bound (`memory_limit`, `max_concurrent_connections`, the
+/// request/idle timeouts) are deliberately uncapped-by-sentinel: `0` means
+/// "unlimited". That is the right default for a single-team self-hosted
+/// install, where the person editing a project *is* the operator. It is the
+/// wrong default on a shared host, where it lets one project opt out of the
+/// operator's protection and take the node — or the shared proxy's connection
+/// budget — down with it.
+///
+/// Every ceiling here is therefore **off by default**, and turning one on is
+/// what makes the corresponding tenant override enforceable. A caller holding
+/// `Permission::SettingsWrite` (operators: `Admin`/`PlatformAdmin`, never
+/// `Role::User`) may still exceed them — the ceiling constrains tenants, not
+/// the operator who set it.
+///
+/// Violations are **rejected, not clamped**: silently rewriting a value the
+/// user asked for leaves them debugging a limit they believe they removed,
+/// and self-hosted operators have no support channel to ask.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct TenantResourceCeilings {
+    /// Largest `memory_limit` (MB) a project/environment may set for its
+    /// containers. `0` (the default) leaves it unenforced.
+    ///
+    /// A project value of `0` means "no cgroup limit at all", so it is
+    /// refused whenever this ceiling is set — that is the case that OOMs the
+    /// host, not merely a large number.
+    #[schema(minimum = 0, example = 4096)]
+    pub max_memory_limit_mb: u32,
+
+    /// Largest `max_concurrent_connections` a project/environment may set.
+    /// `0` (the default) leaves it unenforced.
+    ///
+    /// As with memory, a project value of `0` means unlimited and is refused
+    /// whenever this ceiling is set.
+    #[schema(minimum = 0, example = 200)]
+    pub max_concurrent_connections: u32,
+
+    /// Whether a project/environment may set a request, SSE or WebSocket
+    /// timeout of `0` ("no timeout"). `true` (the default) preserves current
+    /// behaviour.
+    ///
+    /// Nonzero tenant timeouts need no ceiling here: they are already clamped
+    /// to [`RequestTimeoutSettings::ceiling`] at resolution time. `0` escapes
+    /// that clamp by construction — it means "no timeout is configured", so
+    /// there is nothing to clamp — which is precisely the hole this closes.
+    pub allow_unlimited_request_timeouts: bool,
+}
+
+/// Hand-written rather than derived: `#[derive(Default)]` would make
+/// `allow_unlimited_request_timeouts` **false**, which is the opposite of the
+/// "an upgrade changes nothing" contract — it would start rejecting the `0`
+/// timeouts that are currently the documented default for every traffic class.
+impl Default for TenantResourceCeilings {
+    fn default() -> Self {
+        Self {
+            max_memory_limit_mb: 0,
+            max_concurrent_connections: 0,
+            allow_unlimited_request_timeouts: true,
+        }
+    }
+}
+
+impl TenantResourceCeilings {
+    /// True when no ceiling is configured, i.e. tenants are unconstrained and
+    /// validation can be skipped entirely.
+    pub fn is_unenforced(&self) -> bool {
+        self.max_memory_limit_mb == 0
+            && self.max_concurrent_connections == 0
+            && self.allow_unlimited_request_timeouts
+    }
+}
+
+/// Whether a deployment-config write should be checked against
+/// [`TenantResourceCeilings`].
+///
+/// Handlers compute this from the caller's `SettingsWrite` permission —
+/// whoever can raise the ceilings is by definition allowed to exceed them,
+/// so the check would be theatre for them — and pass it down to the service
+/// layer, which has no access to `auth` itself. A bare `bool` parameter
+/// here previously left call sites (and test fixtures) needing a comment to
+/// say what `true`/`false` meant; the variant names make that self-evident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingEnforcement {
+    /// Check the write against `AppSettings.tenant_resource_ceilings`.
+    Enforce,
+    /// Skip the check — the caller holds `Permission::SettingsWrite`.
+    Bypass,
+}
+
+impl CeilingEnforcement {
+    /// The permission that grants the bypass, wrapped as a variant.
+    pub fn from_has_settings_write(has_settings_write: bool) -> Self {
+        if has_settings_write {
+            Self::Bypass
+        } else {
+            Self::Enforce
+        }
+    }
+}
+
 /// Control-plane build resource limits.
 ///
 /// Caps how many builds run concurrently AND how much CPU/memory each build
@@ -391,6 +527,48 @@ pub struct BuildLimitsSettings {
     /// that exceed it OOM-kill.
     #[schema(minimum = 0, example = 2048)]
     pub memory_limit_mb: u32,
+}
+
+/// System-wide retention policy for locally-built deployment images.
+///
+/// The nightly cleanup removes a Temps-built image only once *every*
+/// deployment that references it is older than the owning project's retention
+/// window. Deleting an image makes rollback/promotion to that deployment
+/// impossible, so the default is deliberately generous: it is a rollback
+/// window, not a cache TTL.
+#[derive(Debug, Clone, Serialize, ToSchema, Deserialize)]
+#[serde(default)]
+pub struct ImageRetentionSettings {
+    /// Whether the nightly pass removes expired deployment images at all.
+    /// Disabling it keeps every built image forever (the pre-0.1 behaviour).
+    pub enabled: bool,
+
+    /// Default hours to keep a built deployment image when the owning project
+    /// has no `image_retention_hours` override. Valid range 1..=8760.
+    #[schema(minimum = 1, maximum = 8760, example = 336)]
+    pub default_hours: i64,
+}
+
+impl Default for ImageRetentionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // 14 days. Long enough that a rollback is still possible after a
+            // quiet week; short enough to bound disk growth. A 48h default
+            // would silently destroy the rollback history of any project that
+            // did not deploy over a long weekend.
+            default_hours: 336,
+        }
+    }
+}
+
+impl ImageRetentionSettings {
+    /// Clamp `default_hours` into the range the projects API accepts, so a
+    /// hand-edited settings row can never produce a cutoff that deletes images
+    /// the moment they are built (or one that never expires by accident).
+    pub fn effective_default_hours(&self) -> i64 {
+        self.default_hours.clamp(1, 8760)
+    }
 }
 
 impl Default for BuildLimitsSettings {
@@ -797,6 +975,23 @@ pub struct PreviewGatewaySettings {
     /// Pingora forwards `ws-*` traffic to this port after authenticating.
     #[schema(example = 8090)]
     pub host_port: u16,
+    /// Docker container name for this instance's gateway.
+    ///
+    /// A single Temps install owns the whole host, so the default is fine and
+    /// operators never need to touch this. It exists for the case where
+    /// several Temps instances share one Docker daemon — most obviously a
+    /// development machine with multiple checkouts running at once.
+    ///
+    /// Without it those instances silently fight: the `shared_secret` is
+    /// per-database, so each generates a different one, but they all
+    /// reconcile the *same* container name. Each start-up sees the other's
+    /// container as drifted, recreates it with its own secret, and every
+    /// other instance's previews start failing with "missing or invalid
+    /// X-Temps-Preview-Token". Giving each instance its own container name
+    /// (and `host_port`) makes them independent.
+    #[serde(default = "default_preview_gateway_container")]
+    #[schema(example = "temps-preview-gateway")]
+    pub container_name: String,
     /// When true (default), the supervisor will pull and apply the image
     /// pinned in the Temps binary on every startup. When false, the
     /// currently-running image is left alone — operators upgrade manually
@@ -814,11 +1009,19 @@ pub struct PreviewGatewaySettings {
     pub shared_secret: String,
 }
 
+/// Serde default for [`PreviewGatewaySettings::container_name`], so a settings
+/// row written before this field existed deserialises to today's name rather
+/// than to an empty string (which would mean "container named ''").
+fn default_preview_gateway_container() -> String {
+    "temps-preview-gateway".to_string()
+}
+
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
             image: "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9".to_string(),
             host_port: 8090,
+            container_name: default_preview_gateway_container(),
             auto_upgrade: true,
             shared_secret: String::new(),
         }
@@ -1020,12 +1223,14 @@ impl Default for AppSettings {
             internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             edge_target: None,
+            console_force_https: None,
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
             dns_provider: DnsProviderSettings::default(),
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
             docker_registry: DockerRegistrySettings::default(),
+            image_retention: ImageRetentionSettings::default(),
             disk_space_alert: DiskSpaceAlertSettings::default(),
             container_logs: ContainerLogSettings::default(),
             multi_node: MultiNodeSettings::default(),
@@ -1037,6 +1242,7 @@ impl Default for AppSettings {
             ai_chat_limits: AiChatLimitsSettings::default(),
             request_timeouts: RequestTimeoutSettings::default(),
             connection_limits: ConnectionLimitSettings::default(),
+            tenant_resource_ceilings: TenantResourceCeilings::default(),
             build_limits: BuildLimitsSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),

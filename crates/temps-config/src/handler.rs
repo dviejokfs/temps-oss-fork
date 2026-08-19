@@ -16,10 +16,10 @@ use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AppSettings, AuditContext,
     AuditLogger, AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
-    ObservabilityCompressionSettings, ObservabilityRetentionSettings, PublicHostnameStrategy,
-    RateLimitSettings, RequestMetadata, RequestTimeoutSettings, ScreenshotSettings,
-    SecurityHeadersSettings,
+    DiskSpaceAlertSettings, ImageRetentionSettings, LetsEncryptSettings, MetricsStoreKind,
+    MonitoringSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
+    PublicHostnameStrategy, RateLimitSettings, RequestMetadata, RequestTimeoutSettings,
+    ScreenshotSettings, SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -126,6 +126,10 @@ pub struct AppSettingsResponse {
     pub preview_domain: String,
     /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
     pub edge_target: Option<String>,
+    /// Whether plain-HTTP requests to the console host are redirected to HTTPS.
+    /// `None` inherits the per-host certificate heuristic; `Some(b)` is an
+    /// explicit operator override. No sensitive content.
+    pub console_force_https: Option<bool>,
     /// Port the main Pingora proxy listens on (parsed from `--address`), the
     /// same value `ConfigService::proxy_port()` feeds into
     /// `compute_deployment_url`/`compute_environment_url` when `external_url`
@@ -223,11 +227,18 @@ pub struct AppSettingsResponse {
     /// Per-upstream concurrent-connection cap applied by the proxy to
     /// customer app traffic. No sensitive content. See issue #646.
     pub connection_limits: temps_core::ConnectionLimitSettings,
+    /// Upper bounds a project/environment override may not exceed. No
+    /// sensitive content — this is operator policy the settings UI edits
+    /// directly. Unenforced by default.
+    pub tenant_resource_ceilings: temps_core::TenantResourceCeilings,
     /// Whether admins may apply a release from the console. This is the
     /// database-backed toggle only — a server started with
     /// `--disable-self-update` refuses regardless of what this says, which
     /// `GET /settings/update` reports as the authoritative answer.
     pub self_update: temps_core::SelfUpdateSettings,
+    /// Deployment-image retention policy. No sensitive content, passed through
+    /// as-is so the settings UI can show and edit the system-wide default.
+    pub image_retention: ImageRetentionSettings,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -350,6 +361,7 @@ impl From<AppSettings> for AppSettingsResponse {
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
             edge_target: settings.edge_target,
+            console_force_https: settings.console_force_https,
             // Overridden by the handler via `with_proxy_port` — this struct
             // has no access to `ConfigService` here, only the DB-backed
             // `AppSettings` row. 8080 mirrors `ConfigService::proxy_port()`'s
@@ -451,7 +463,9 @@ impl From<AppSettings> for AppSettingsResponse {
             ai_chat_limits: settings.ai_chat_limits,
             request_timeouts: settings.request_timeouts,
             connection_limits: settings.connection_limits,
+            tenant_resource_ceilings: settings.tenant_resource_ceilings,
             self_update,
+            image_retention: settings.image_retention,
         }
     }
 }

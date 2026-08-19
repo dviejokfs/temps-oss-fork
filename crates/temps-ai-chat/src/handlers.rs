@@ -2219,6 +2219,7 @@ mod tests {
         let now = chrono::Utc::now();
         temps_entities::projects::Model {
             id,
+            image_retention_hours: None,
             name: "P".to_string(),
             repo_name: "r".to_string(),
             repo_owner: "o".to_string(),
@@ -2240,6 +2241,7 @@ mod tests {
             attack_mode: false,
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
+            allow_alternate_sources: None,
             ai_debug_chat_enabled: toggle,
             ai_write_actions_enabled: false,
             error_source_context_enabled: false,

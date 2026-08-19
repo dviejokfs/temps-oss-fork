@@ -80,6 +80,10 @@ pub struct Project {
     pub preview_envs_wake_timeout_seconds: i32,
     /// Source type for deployments (git, docker_image, or static_files)
     pub source_type: SourceType,
+    /// Opt-in: also accept deployments from a source other than `source_type`,
+    /// so a Git project can additionally be shipped from an uploaded archive
+    /// (`drop`) without losing its repository. NULL/false means off.
+    pub allow_alternate_sources: Option<bool>,
     /// GitLab webhook ID installed on the connected repository, if any.
     pub gitlab_webhook_id: Option<i32>,
     /// ADR-027 Phase 3: whether this project's traces appear in cross-project
@@ -87,6 +91,10 @@ pub struct Project {
     /// model). Operators can set false to suppress cross-project links to this
     /// project.
     pub cross_project_trace_sharing: bool,
+    /// How long (hours) to retain built Docker images before nightly cleanup.
+    /// None = use the system default (336 h / 14 days out of the box, from
+    /// `AppSettings.image_retention.default_hours`).
+    pub image_retention_hours: Option<i32>,
 }
 
 /// One environment variable supplied while creating a project.

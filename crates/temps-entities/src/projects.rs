@@ -83,6 +83,14 @@ pub struct Model {
     /// Defaults to 'git' for backward compatibility
     #[sea_orm(default_value = "git")]
     pub source_type: SourceType,
+    /// Opt-in: accept deployments whose source differs from `source_type`.
+    ///
+    /// `source_type` stays the project's primary/default source — a Git project
+    /// keeps its repository, webhooks and rollback-rebuild behaviour. When this
+    /// is true the project will additionally accept an uploaded source archive
+    /// (`drop`), so the same project can be shipped from git, a Docker image, or
+    /// a local folder. NULL means off.
+    pub allow_alternate_sources: Option<bool>,
     /// Bounded template provenance: a reviewed bundled slug or `custom`.
     /// NULL means the project was not created through the template catalog;
     /// operator-defined slugs are never stored in this field.
@@ -129,6 +137,11 @@ pub struct Model {
     /// and the project calls `GET /projects/{id}/api-analytics/summary`.
     /// Falls back to `null` summary gracefully when no AI provider is configured.
     pub ai_api_traffic_summary_enabled: Option<bool>,
+    /// How long (in hours) to retain built Docker images before the nightly
+    /// cleanup removes them. NULL means use the system default, sourced from
+    /// `AppSettings.image_retention.default_hours` (336 hours / 14 days
+    /// out of the box).
+    pub image_retention_hours: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

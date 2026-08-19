@@ -1180,6 +1180,31 @@ impl ProjectService {
         Ok(updated)
     }
 
+    /// Toggle whether the project accepts deployments from a source other than
+    /// its configured `source_type`.
+    ///
+    /// This deliberately does NOT touch `source_type`: the project keeps its
+    /// primary source (and, for a Git project, its repository, webhook-driven
+    /// auto-deploy and rollback rebuild-from-source), and simply gains the
+    /// ability to also take an uploaded source archive via `drop`.
+    pub async fn set_allow_alternate_sources(
+        &self,
+        project_id: i32,
+        allow: bool,
+    ) -> Result<Project, ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
+
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.allow_alternate_sources = Set(Some(allow));
+        active_project.updated_at = Set(chrono::Utc::now());
+        let updated = active_project.update(self.db.as_ref()).await?;
+        Ok(Self::map_db_project_to_project(updated))
+    }
+
     /// Persist deletion intent before cancelling workflows or touching Docker.
     /// Deployment workers reject projects with this fence, closing the window
     /// where a new container could appear after the cleanup snapshot.
@@ -1287,6 +1312,7 @@ impl ProjectService {
         error_source_context_enabled: Option<bool>,
         error_source_root: Option<String>,
         ai_api_traffic_summary_enabled: Option<bool>,
+        image_retention_hours: Option<Option<i32>>,
     ) -> Result<Project, ProjectError> {
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
@@ -1304,6 +1330,14 @@ impl ProjectService {
                 return Err(ProjectError::InvalidInput(format!(
                     "preview_envs_wake_timeout_seconds {} is not in valid range (5-120)",
                     wake
+                )));
+            }
+        }
+        if let Some(Some(hours)) = image_retention_hours {
+            if !(1..=8760).contains(&hours) {
+                return Err(ProjectError::InvalidInput(format!(
+                    "image_retention_hours {} is not in valid range (1-8760)",
+                    hours
                 )));
             }
         }
@@ -1550,13 +1584,14 @@ impl ProjectService {
             active_project.update(self.db.as_ref()).await?;
         }
 
-        // Update preview environment settings if any are provided
-        let needs_preview_update = enable_preview_environments.is_some()
+        // Update preview environment settings and image retention if any are provided
+        let needs_project_row_update = enable_preview_environments.is_some()
             || preview_envs_on_demand.is_some()
             || preview_envs_idle_timeout_seconds.is_some()
-            || preview_envs_wake_timeout_seconds.is_some();
+            || preview_envs_wake_timeout_seconds.is_some()
+            || image_retention_hours.is_some();
 
-        if needs_preview_update {
+        if needs_project_row_update {
             // Reload project to ensure we have the latest state
             let project = projects::Entity::find_by_id(project_id)
                 .one(self.db.as_ref())
@@ -1579,6 +1614,9 @@ impl ProjectService {
             }
             if let Some(wake) = preview_envs_wake_timeout_seconds {
                 active_project.preview_envs_wake_timeout_seconds = Set(wake);
+            }
+            if let Some(hours) = image_retention_hours {
+                active_project.image_retention_hours = Set(hours);
             }
 
             active_project.update(self.db.as_ref()).await?;
@@ -2869,10 +2907,37 @@ impl ProjectService {
         Ok(ProjectStatistics { total_count })
     }
 
+    /// Reject `deployment_config` if it violates `app_settings`'s tenant
+    /// resource ceilings; a no-op when no ceiling is configured.
+    ///
+    /// Pulled out of the two call sites below so the error-mapping (join the
+    /// violations into one `InvalidInput`) has a single place to test without
+    /// standing up a full `ProjectService` — the ceiling logic itself is
+    /// covered independently on [`temps_entities::deployment_config::DeploymentConfig::check_against_tenant_ceilings`].
+    fn enforce_tenant_ceilings(
+        deployment_config: &temps_entities::deployment_config::DeploymentConfig,
+        app_settings: &temps_core::AppSettings,
+    ) -> Result<(), ProjectError> {
+        deployment_config
+            .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
+            .map_err(|violations| ProjectError::InvalidInput(violations.join("; ")))
+    }
+
+    /// See [`Self::update_project_deployment_config`] for what
+    /// `ceiling_enforcement` means.
+    ///
+    /// No handler in this crate calls this method today — `ProjectsWrite`
+    /// callers reach deployment-config updates through
+    /// [`Self::update_project_deployment_config`] instead. It is kept public
+    /// and ceiling-enforced because [`ProjectService`] is registered with the
+    /// plugin DI system (see `crates/temps-projects/src/plugin.rs`), so an
+    /// out-of-tree plugin may call it directly; if you're removing the last
+    /// in-tree reference to this method, check for that before deleting it.
     pub async fn update_deployment_settings(
         &self,
         project_id_or_slug: &str,
         settings: UpdateDeploymentSettingsRequest,
+        ceiling_enforcement: temps_core::CeilingEnforcement,
     ) -> Result<Project, ProjectError> {
         // Find project by ID or slug
         let project = if let Ok(project_id_int) = project_id_or_slug.parse::<i32>() {
@@ -2904,6 +2969,16 @@ impl ProjectService {
         deployment_config.cpu_limit = settings.cpu_limit;
         deployment_config.memory_request = settings.memory_request;
         deployment_config.memory_limit = settings.memory_limit;
+
+        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id_or_slug}: {e}"
+                ))
+            })?;
+            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
+        }
+
         active_project.deployment_config = Set(Some(deployment_config));
 
         let updated_project = active_project.update(self.db.as_ref()).await?;
@@ -2929,11 +3004,18 @@ impl ProjectService {
         Ok(Self::map_db_project_to_project(updated_project))
     }
 
-    /// Update deployment configuration for a project
+    /// Update a project's deployment config.
+    ///
+    /// `ceiling_enforcement` reflects the caller's `SettingsWrite` permission:
+    /// whoever can raise the instance-wide ceilings is by definition allowed to
+    /// exceed them, so the check would be theatre for them. Everyone else is
+    /// held to `AppSettings.tenant_resource_ceilings`, which is unenforced
+    /// until an operator configures it.
     pub async fn update_project_deployment_config(
         &self,
         project_id: i32,
         config: UpdateDeploymentConfigRequest,
+        ceiling_enforcement: temps_core::CeilingEnforcement,
     ) -> Result<Project, ProjectError> {
         // Find project by ID or slug
         let project = projects::Entity::find_by_id(project_id)
@@ -3000,6 +3082,18 @@ impl ProjectService {
         deployment_config
             .validate()
             .map_err(|e| ProjectError::InvalidInput(format!("Invalid deployment config: {}", e)))?;
+
+        // Checked on the merged config, not on the request, so clearing an
+        // override back to "inherit" is judged by what the project will
+        // actually run with.
+        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id}: {e}"
+                ))
+            })?;
+            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
+        }
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.clone().into();
@@ -3158,8 +3252,10 @@ impl ProjectService {
             preview_envs_idle_timeout_seconds: db_project.preview_envs_idle_timeout_seconds,
             preview_envs_wake_timeout_seconds: db_project.preview_envs_wake_timeout_seconds,
             source_type: db_project.source_type,
+            allow_alternate_sources: db_project.allow_alternate_sources,
             gitlab_webhook_id: db_project.gitlab_webhook_id,
             cross_project_trace_sharing: db_project.cross_project_trace_sharing,
+            image_retention_hours: db_project.image_retention_hours,
         }
     }
 
@@ -3496,6 +3592,75 @@ impl ProjectService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
+
+    // ── tenant resource ceilings ─────────────────────────────────────────
+
+    /// The default ceilings are unenforced, so a project config that uses
+    /// every `0 = unlimited` sentinel must pass unchanged — this is what
+    /// "an upgrade changes nothing" means at the service layer.
+    #[test]
+    fn enforce_tenant_ceilings_is_a_noop_with_default_settings() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(0),
+            max_concurrent_connections: Some(0),
+            request_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings::default();
+
+        assert!(ProjectService::enforce_tenant_ceilings(&config, &app_settings).is_ok());
+    }
+
+    /// A configured ceiling rejects a violating config with an
+    /// `InvalidInput` whose message names every violation, not just the
+    /// first — the caller joins them with "; " for a single round trip.
+    #[test]
+    fn enforce_tenant_ceilings_rejects_violations_with_a_joined_message() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(8192),
+            max_concurrent_connections: Some(500),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings {
+            tenant_resource_ceilings: temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 4096,
+                max_concurrent_connections: 200,
+                allow_unlimited_request_timeouts: true,
+            },
+            ..Default::default()
+        };
+
+        let error = ProjectService::enforce_tenant_ceilings(&config, &app_settings)
+            .expect_err("values above the ceiling must be rejected");
+        match error {
+            ProjectError::InvalidInput(msg) => {
+                assert!(msg.contains("4096"), "got: {msg}");
+                assert!(msg.contains("200"), "got: {msg}");
+                assert!(msg.contains(';'), "expected violations joined, got: {msg}");
+            }
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    /// A config within every configured ceiling is accepted.
+    #[test]
+    fn enforce_tenant_ceilings_accepts_values_within_the_ceiling() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(2048),
+            max_concurrent_connections: Some(100),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings {
+            tenant_resource_ceilings: temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 4096,
+                max_concurrent_connections: 200,
+                allow_unlimited_request_timeouts: true,
+            },
+            ..Default::default()
+        };
+
+        assert!(ProjectService::enforce_tenant_ceilings(&config, &app_settings).is_ok());
+    }
 
     // ── git_url / repo identity consistency ─────────────────────────────
 
@@ -3979,6 +4144,62 @@ mod tests {
         assert!(fenced.deleted_at.is_some());
     }
 
+    /// Opting a Git project into alternate sources must leave everything that
+    /// makes it a Git project intact. If `source_type` flipped here, the
+    /// project would lose rollback rebuild-from-source (which keys off
+    /// `source_type == Git` in temps-deployments) while still looking fine.
+    #[tokio::test]
+    async fn allowing_alternate_sources_preserves_git_configuration() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            eprintln!("Test database unavailable, skipping");
+            return;
+        };
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Flexible Project".to_string()),
+            slug: Set("flexible-project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            source_type: Set(temps_entities::source_type::SourceType::Git),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(project.allow_alternate_sources, None, "defaults to off");
+
+        let opted_in = service
+            .set_allow_alternate_sources(project.id, true)
+            .await
+            .unwrap();
+
+        assert_eq!(opted_in.allow_alternate_sources, Some(true));
+        assert_eq!(
+            opted_in.source_type,
+            temps_entities::source_type::SourceType::Git,
+            "the project must remain git-sourced"
+        );
+        assert_eq!(opted_in.repo_owner.as_deref(), Some("owner"));
+        assert_eq!(opted_in.repo_name.as_deref(), Some("repo"));
+        assert_eq!(opted_in.main_branch, "main");
+
+        // And it must be reversible, without disturbing git config either.
+        let opted_out = service
+            .set_allow_alternate_sources(project.id, false)
+            .await
+            .unwrap();
+        assert_eq!(opted_out.allow_alternate_sources, Some(false));
+        assert_eq!(
+            opted_out.source_type,
+            temps_entities::source_type::SourceType::Git
+        );
+        assert_eq!(opted_out.repo_owner.as_deref(), Some("owner"));
+    }
+
     #[tokio::test]
     async fn test_update_project_emits_event() {
         // Setup test database
@@ -4096,6 +4317,7 @@ mod tests {
                 None, // error_source_context_enabled
                 None, // error_source_root
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 
@@ -4465,6 +4687,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("partial preset_config patch");
@@ -4537,6 +4760,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("partial excludedServices patch");
@@ -4585,6 +4809,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("partial relaxedCapabilityServices patch");
@@ -4641,6 +4866,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("explicit composeServices patch, even though it strands relaxedCapabilityServices");
@@ -4693,6 +4919,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("unrelated excludedServices patch");
@@ -4766,6 +4993,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("relaxedCapabilityServices patch for a real non-database service");
@@ -4834,6 +5062,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 
@@ -4893,6 +5122,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("explicit empty providers");
@@ -4993,6 +5223,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 
@@ -5092,6 +5323,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 
@@ -5213,6 +5445,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("update custom Dockerfile config");
@@ -5448,6 +5681,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("update preset and config together");
@@ -5779,6 +6013,7 @@ mod tests {
                 None, // error_source_context_enabled
                 None, // error_source_root
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("update_project_settings should succeed");
@@ -5791,6 +6026,89 @@ mod tests {
         assert_eq!(
             stored.directory, ".",
             "a blank directory must be stored as the repo-root marker, not \"\""
+        );
+    }
+
+    /// `ImageRetentionSettings::effective_default_hours` clamps an
+    /// out-of-range *global* default instead of failing (see
+    /// `test_out_of_range_operator_setting_is_clamped` in
+    /// `docker_cleanup_service`). The *per-project* override validated here
+    /// is a different, intentional behavior: it rejects rather than clamps,
+    /// because it comes straight from an operator-typed API/CLI/form value
+    /// rather than a settings row an admin edited once.
+    #[tokio::test]
+    async fn test_update_project_settings_rejects_out_of_range_image_retention_hours() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Retention Validation Project".to_string()),
+            slug: Set("retention-validation-project".to_string()),
+            repo_name: Set("retention-validation-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let update_with_hours = |hours: i32| {
+            project_service.update_project_settings(
+                inserted_project.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,              // cross_project_trace_sharing
+                None,              // error_source_context_enabled
+                None,              // error_source_root
+                None,              // ai_api_traffic_summary_enabled
+                Some(Some(hours)), // image_retention_hours
+            )
+        };
+
+        let below_range = update_with_hours(0).await;
+        assert!(
+            matches!(below_range, Err(ProjectError::InvalidInput(_))),
+            "0 hours must be rejected, not clamped"
+        );
+
+        let above_range = update_with_hours(8761).await;
+        assert!(
+            matches!(above_range, Err(ProjectError::InvalidInput(_))),
+            "8761 hours must be rejected, not clamped"
+        );
+
+        let stored = temps_entities::projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.image_retention_hours, None,
+            "a rejected update must never reach the database"
         );
     }
 
