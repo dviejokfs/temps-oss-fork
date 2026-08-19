@@ -167,9 +167,7 @@ impl TempsPlugin for ProxyPlugin {
             if let Some(slot) = self.project_ip_gate_slot.get() {
                 if let Some(gate) = context.get_service::<dyn temps_core::ProjectIpGate>() {
                     if slot.set(gate) {
-                        tracing::debug!(
-                            "proxy: ProjectIpGate wired in from a registered plugin"
-                        );
+                        tracing::debug!("proxy: ProjectIpGate wired in from a registered plugin");
                     } else {
                         tracing::warn!(
                             "proxy: ProjectIpGate slot was already claimed; \
