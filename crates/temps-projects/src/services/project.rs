@@ -2882,8 +2882,32 @@ impl ProjectService {
         Ok(ProjectStatistics { total_count })
     }
 
+    /// Reject `deployment_config` if it violates `app_settings`'s tenant
+    /// resource ceilings; a no-op when no ceiling is configured.
+    ///
+    /// Pulled out of the two call sites below so the error-mapping (join the
+    /// violations into one `InvalidInput`) has a single place to test without
+    /// standing up a full `ProjectService` — the ceiling logic itself is
+    /// covered independently on [`temps_entities::deployment_config::DeploymentConfig::check_against_tenant_ceilings`].
+    fn enforce_tenant_ceilings(
+        deployment_config: &temps_entities::deployment_config::DeploymentConfig,
+        app_settings: &temps_core::AppSettings,
+    ) -> Result<(), ProjectError> {
+        deployment_config
+            .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
+            .map_err(|violations| ProjectError::InvalidInput(violations.join("; ")))
+    }
+
     /// See [`Self::update_project_deployment_config`] for what
     /// `bypass_resource_ceilings` means.
+    ///
+    /// No handler in this crate calls this method today — `ProjectsWrite`
+    /// callers reach deployment-config updates through
+    /// [`Self::update_project_deployment_config`] instead. It is kept public
+    /// and ceiling-enforced because [`ProjectService`] is registered with the
+    /// plugin DI system (see `crates/temps-projects/src/plugin.rs`), so an
+    /// out-of-tree plugin may call it directly; if you're removing the last
+    /// in-tree reference to this method, check for that before deleting it.
     pub async fn update_deployment_settings(
         &self,
         project_id_or_slug: &str,
@@ -2927,11 +2951,7 @@ impl ProjectService {
                     "Failed to read instance settings to check resource ceilings for project {project_id_or_slug}: {e}"
                 ))
             })?;
-            if let Err(violations) = deployment_config
-                .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
-            {
-                return Err(ProjectError::InvalidInput(violations.join("; ")));
-            }
+            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
         }
 
         active_project.deployment_config = Set(Some(deployment_config));
@@ -2959,7 +2979,6 @@ impl ProjectService {
         Ok(Self::map_db_project_to_project(updated_project))
     }
 
-    /// Update deployment configuration for a project
     /// Update a project's deployment config.
     ///
     /// `bypass_resource_ceilings` is the caller's `SettingsWrite` permission:
@@ -3048,11 +3067,7 @@ impl ProjectService {
                     "Failed to read instance settings to check resource ceilings for project {project_id}: {e}"
                 ))
             })?;
-            if let Err(violations) = deployment_config
-                .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
-            {
-                return Err(ProjectError::InvalidInput(violations.join("; ")));
-            }
+            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
         }
 
         // Update the project
@@ -3551,6 +3566,75 @@ impl ProjectService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
+
+    // ── tenant resource ceilings ─────────────────────────────────────────
+
+    /// The default ceilings are unenforced, so a project config that uses
+    /// every `0 = unlimited` sentinel must pass unchanged — this is what
+    /// "an upgrade changes nothing" means at the service layer.
+    #[test]
+    fn enforce_tenant_ceilings_is_a_noop_with_default_settings() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(0),
+            max_concurrent_connections: Some(0),
+            request_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings::default();
+
+        assert!(ProjectService::enforce_tenant_ceilings(&config, &app_settings).is_ok());
+    }
+
+    /// A configured ceiling rejects a violating config with an
+    /// `InvalidInput` whose message names every violation, not just the
+    /// first — the caller joins them with "; " for a single round trip.
+    #[test]
+    fn enforce_tenant_ceilings_rejects_violations_with_a_joined_message() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(8192),
+            max_concurrent_connections: Some(500),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings {
+            tenant_resource_ceilings: temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 4096,
+                max_concurrent_connections: 200,
+                allow_unlimited_request_timeouts: true,
+            },
+            ..Default::default()
+        };
+
+        let error = ProjectService::enforce_tenant_ceilings(&config, &app_settings)
+            .expect_err("values above the ceiling must be rejected");
+        match error {
+            ProjectError::InvalidInput(msg) => {
+                assert!(msg.contains("4096"), "got: {msg}");
+                assert!(msg.contains("200"), "got: {msg}");
+                assert!(msg.contains(';'), "expected violations joined, got: {msg}");
+            }
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    /// A config within every configured ceiling is accepted.
+    #[test]
+    fn enforce_tenant_ceilings_accepts_values_within_the_ceiling() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(2048),
+            max_concurrent_connections: Some(100),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings {
+            tenant_resource_ceilings: temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 4096,
+                max_concurrent_connections: 200,
+                allow_unlimited_request_timeouts: true,
+            },
+            ..Default::default()
+        };
+
+        assert!(ProjectService::enforce_tenant_ceilings(&config, &app_settings).is_ok());
+    }
 
     // ── git_url / repo identity consistency ─────────────────────────────
 

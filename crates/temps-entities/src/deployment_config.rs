@@ -755,6 +755,10 @@ impl DeploymentConfig {
         &self,
         ceilings: &temps_core::TenantResourceCeilings,
     ) -> Result<(), Vec<String>> {
+        if ceilings.is_unenforced() {
+            return Ok(());
+        }
+
         let mut violations = Vec::new();
 
         // `<= 0`, not `== 0`, on both of these. `validate()` rejects negatives,
