@@ -815,6 +815,16 @@ impl TempsPlugin for OtelPlugin {
             // because the pipeline stats are process-internal counters rather than
             // externally-scraped ones; re-reading the config each cycle would add an
             // unnecessary DB round-trip on an ingest-hot path.
+            //
+            // Every cycle writes both points, even when the delta is zero. The
+            // AlertEvaluator's `query_latest` only looks back 15 minutes
+            // (`LATEST_WINDOW`), so if a burst of rejections is followed by
+            // silence, skipping the zero-delta write would leave that burst's
+            // non-zero point as the "latest" value for up to 15 minutes,
+            // keeping the alarm falsely active. Always writing — including
+            // zeros — lets the metric self-resolve on the next cycle, exactly
+            // like the proxy sampler's fixed-size point set does. The storage
+            // cost is two rows per minute regardless of ingest volume.
             {
                 const OTEL_STATS_SAMPLE_INTERVAL_SECS: u64 = 60;
                 /// Synthetic node ID of the control plane (mirrors proxy metrics sampler).
@@ -850,20 +860,9 @@ impl TempsPlugin for OtelPlugin {
                             .quota_exceeded_requests
                             .saturating_sub(prev_quota_exceeded);
 
-                        prev_rate_limited = snap.rate_limited_requests;
-                        prev_quota_exceeded = snap.quota_exceeded_requests;
-
-                        // Skip the write if both deltas are zero: no rejections happened,
-                        // no point in a noisy all-zero row in the metrics store.
-                        if delta_rate_limited == 0 && delta_quota_exceeded == 0 {
-                            continue;
-                        }
-
                         let now = Utc::now();
-                        let mut points = Vec::with_capacity(2);
-
-                        if delta_rate_limited > 0 {
-                            points.push(MetricPoint {
+                        let points = vec![
+                            MetricPoint {
                                 time: now,
                                 source_kind: SourceKind::Node,
                                 source_id: CONTROL_PLANE_NODE_ID,
@@ -874,11 +873,8 @@ impl TempsPlugin for OtelPlugin {
                                 environment: None,
                                 node_id: Some(CONTROL_PLANE_NODE_ID),
                                 labels: HashMap::new(),
-                            });
-                        }
-
-                        if delta_quota_exceeded > 0 {
-                            points.push(MetricPoint {
+                            },
+                            MetricPoint {
                                 time: now,
                                 source_kind: SourceKind::Node,
                                 source_id: CONTROL_PLANE_NODE_ID,
@@ -889,16 +885,25 @@ impl TempsPlugin for OtelPlugin {
                                 environment: None,
                                 node_id: Some(CONTROL_PLANE_NODE_ID),
                                 labels: HashMap::new(),
-                            });
-                        }
+                            },
+                        ];
 
+                        // Only advance the checkpoints once the write actually lands.
+                        // Advancing them unconditionally would discard this cycle's
+                        // deltas forever on a transient store failure; leaving them
+                        // in place means the next successful write's delta widens to
+                        // cover the missed cycle too, so no rejection is lost from
+                        // the series.
                         if let Err(e) = stats_metrics_store.write_batch(points).await {
                             warn!(
                                 error = %e,
                                 "OTel pipeline stats write failed (non-fatal); \
-                                 counters continue accumulating and will be included in the next sample"
+                                 checkpoints held back so the next successful write \
+                                 includes this cycle's deltas"
                             );
                         } else {
+                            prev_rate_limited = snap.rate_limited_requests;
+                            prev_quota_exceeded = snap.quota_exceeded_requests;
                             debug!(
                                 delta_rate_limited,
                                 delta_quota_exceeded, "OTel pipeline stats sampled and written"

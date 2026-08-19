@@ -107,9 +107,13 @@ export function OtelPipelineStatusPage() {
 
   usePageTitle('OTel Pipeline Status')
 
-  const { data, isLoading, error } = useQuery(
-    getPipelineStatsOptions({ cache: 'no-store' })
-  )
+  const { data, isLoading, error } = useQuery({
+    ...getPipelineStatsOptions({ cache: 'no-store' }),
+    // Matches NodesPage's status-tile cadence: frequent enough that an
+    // operator watching this page after a rejection spike sees it clear
+    // without a manual refresh, cheap enough for a page that's rarely open.
+    refetchInterval: 30_000,
+  })
 
   const stats = data?.stats
 

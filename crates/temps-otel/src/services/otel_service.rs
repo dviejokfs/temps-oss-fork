@@ -854,6 +854,7 @@ mod tests {
 
         assert!(svc.check_rate_limit(1).is_ok());
         assert!(svc.check_rate_limit(1).is_ok());
+        assert_eq!(svc.pipeline_stats().rate_limited_requests, 0);
         let result = svc.check_rate_limit(1);
         // The error must report the limiter's actual configured limit (2),
         // not a hardcoded value.
@@ -861,6 +862,14 @@ mod tests {
             result,
             Err(OtelError::RateLimitExceeded { limit: 2, .. })
         ));
+        // The rejection counter the pipeline-stats sampler reads must move —
+        // this is what makes the rejection observable at all (dashboard,
+        // metrics store, alarm). A regression here silently blinds both.
+        assert_eq!(svc.pipeline_stats().rate_limited_requests, 1);
+
+        // A second rejection accumulates rather than resetting.
+        assert!(svc.check_rate_limit(1).is_err());
+        assert_eq!(svc.pipeline_stats().rate_limited_requests, 2);
     }
 
     // ── service (`si_`) ingest rate limit (SECURITY metrics-security-2) ────────
@@ -974,6 +983,7 @@ mod tests {
         });
         let (svc, _storage) = make_service(mock);
 
+        assert_eq!(svc.pipeline_stats().quota_exceeded_requests, 0);
         let result = svc.check_quota(42).await;
         assert!(matches!(
             result,
@@ -983,6 +993,11 @@ mod tests {
                 limit_bytes: 100,
             })
         ));
+        // Same counter contract as the rate-limit rejection path above: the
+        // pipeline-stats sampler and the settings-page UI both read this
+        // field, so a quota rejection that doesn't increment it is invisible
+        // to an operator even though requests are actually being dropped.
+        assert_eq!(svc.pipeline_stats().quota_exceeded_requests, 1);
     }
 
     #[tokio::test]

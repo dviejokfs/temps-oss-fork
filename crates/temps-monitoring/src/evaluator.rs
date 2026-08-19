@@ -1453,6 +1453,36 @@ mod tests {
     }
 
     #[test]
+    fn alarm_type_otel_rate_limited_rule_is_otel_rate_limited() {
+        // Both rejection metrics the OTel pipeline-stats sampler writes must
+        // route to the same alarm type, regardless of (service/deployment/node)
+        // scope on the rule row — the metric name is authoritative here, not
+        // the scope columns matched by the fallback below it.
+        for metric in ["otel.rate_limited_requests", "otel.quota_exceeded_requests"] {
+            let mut rule = make_rule_with_node(None, None, Some(0));
+            rule.metric_name = metric.to_string();
+            assert_eq!(
+                alarm_type_for_rule(&rule).as_str(),
+                "otel_rate_limited",
+                "metric {metric} did not map to OtelRateLimited"
+            );
+        }
+    }
+
+    #[test]
+    fn otel_rate_limit_default_seeds_target_the_sampler_written_metric() {
+        let seeds = otel_rate_limit_default_seeds();
+        assert_eq!(seeds.len(), 1);
+        let seed = &seeds[0];
+        // Must match the metric name the plugin.rs pipeline-stats sampler
+        // actually writes, and the one `alarm_type_for_rule` recognizes above
+        // — a drift between these three would seed a rule that never fires.
+        assert_eq!(seed.metric_name, "otel.rate_limited_requests");
+        assert_eq!(seed.comparator, ">");
+        assert!(seed.threshold > 0.0);
+    }
+
+    #[test]
     fn proxy_default_seeds_are_rate_based_and_unique_per_metric() {
         let seeds = proxy_default_seeds();
         assert_eq!(seeds.len(), 2);
