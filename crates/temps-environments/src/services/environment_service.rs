@@ -659,7 +659,7 @@ impl EnvironmentService {
 
     /// Update an environment's settings.
     ///
-    /// `bypass_resource_ceilings` is the caller's `SettingsWrite` permission:
+    /// `ceiling_enforcement` reflects the caller's `SettingsWrite` permission:
     /// whoever can raise the instance-wide ceilings is by definition allowed to
     /// exceed them, so the check would be theatre for them. Everyone else is
     /// held to `AppSettings.tenant_resource_ceilings`, which is unenforced
@@ -669,7 +669,7 @@ impl EnvironmentService {
         project_id_param: i32,
         env_id: i32,
         settings: crate::handlers::UpdateEnvironmentSettingsRequest,
-        bypass_resource_ceilings: bool,
+        ceiling_enforcement: temps_core::CeilingEnforcement,
     ) -> Result<environments::Model, EnvironmentError> {
         // First get the environment to verify it exists and belongs to the project
         let environment = self.get_environment(project_id_param, env_id).await?;
@@ -804,7 +804,7 @@ impl EnvironmentService {
         // already bounded — except for configs written before the operator set
         // the ceiling, which no write path revisits (see the PR discussion on
         // retroactive enforcement).
-        if !bypass_resource_ceilings {
+        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
             let app_settings = self.config_service.get_settings().await.map_err(|e| {
                 EnvironmentError::Other(format!(
                     "Failed to read instance settings to check resource ceilings for environment {env_id}: {e}"
@@ -1470,7 +1470,7 @@ mod tests {
                 },
                 // These fixtures assert merge/persistence behaviour, not policy;
                 // bypassing the ceiling check keeps their mock query sequence intact.
-                true,
+                temps_core::CeilingEnforcement::Bypass,
             )
             .await;
 
@@ -1579,7 +1579,7 @@ mod tests {
                 },
                 // These fixtures assert merge/persistence behaviour, not policy;
                 // bypassing the ceiling check keeps their mock query sequence intact.
-                true,
+                temps_core::CeilingEnforcement::Bypass,
             )
             .await;
         assert!(
@@ -1715,7 +1715,7 @@ mod tests {
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
-                false,
+                temps_core::CeilingEnforcement::Enforce,
             )
             .await
             .expect_err("unlimited memory must be refused under a ceiling");
@@ -1764,7 +1764,7 @@ mod tests {
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
-                true,
+                temps_core::CeilingEnforcement::Bypass,
             )
             .await;
 

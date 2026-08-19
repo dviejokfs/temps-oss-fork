@@ -1435,7 +1435,9 @@ pub async fn update_project_deployment_config(
             config.clone(),
             // An operator who can edit the instance-wide ceilings is not
             // meaningfully constrained by them.
-            auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            temps_core::CeilingEnforcement::from_has_settings_write(
+                auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
         )
         .await
         .map_err(|e| {

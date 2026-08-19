@@ -448,6 +448,34 @@ impl TenantResourceCeilings {
     }
 }
 
+/// Whether a deployment-config write should be checked against
+/// [`TenantResourceCeilings`].
+///
+/// Handlers compute this from the caller's `SettingsWrite` permission —
+/// whoever can raise the ceilings is by definition allowed to exceed them,
+/// so the check would be theatre for them — and pass it down to the service
+/// layer, which has no access to `auth` itself. A bare `bool` parameter
+/// here previously left call sites (and test fixtures) needing a comment to
+/// say what `true`/`false` meant; the variant names make that self-evident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingEnforcement {
+    /// Check the write against `AppSettings.tenant_resource_ceilings`.
+    Enforce,
+    /// Skip the check — the caller holds `Permission::SettingsWrite`.
+    Bypass,
+}
+
+impl CeilingEnforcement {
+    /// The permission that grants the bypass, wrapped as a variant.
+    pub fn from_has_settings_write(has_settings_write: bool) -> Self {
+        if has_settings_write {
+            Self::Bypass
+        } else {
+            Self::Enforce
+        }
+    }
+}
+
 /// Control-plane build resource limits.
 ///
 /// Caps how many builds run concurrently AND how much CPU/memory each build

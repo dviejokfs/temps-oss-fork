@@ -100,12 +100,12 @@ pub use utils::*;
 pub use anyhow;
 pub use app_settings::{
     AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AppSettings, BuildLimitsSettings,
-    ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings, DiskSpaceAlertSettings,
-    DnsProviderSettings, DockerRegistrySettings, ImageRetentionSettings, LetsEncryptSettings,
-    MetricsStoreKind, MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
-    ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
-    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
-    TenantResourceCeilings,
+    CeilingEnforcement, ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings,
+    DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, ImageRetentionSettings,
+    LetsEncryptSettings, MetricsStoreKind, MonitoringSettings, MultiNodeSettings,
+    ObservabilityCompressionSettings, ObservabilityRetentionSettings, PreviewGatewaySettings,
+    ProviderConfig, RateLimitSettings, RequestTimeoutSettings, ScreenshotSettings,
+    SecurityHeadersSettings, SelfUpdateSettings, TenantResourceCeilings,
 };
 pub use async_trait;
 pub use chrono;

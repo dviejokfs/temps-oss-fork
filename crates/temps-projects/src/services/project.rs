@@ -2899,7 +2899,7 @@ impl ProjectService {
     }
 
     /// See [`Self::update_project_deployment_config`] for what
-    /// `bypass_resource_ceilings` means.
+    /// `ceiling_enforcement` means.
     ///
     /// No handler in this crate calls this method today — `ProjectsWrite`
     /// callers reach deployment-config updates through
@@ -2912,7 +2912,7 @@ impl ProjectService {
         &self,
         project_id_or_slug: &str,
         settings: UpdateDeploymentSettingsRequest,
-        bypass_resource_ceilings: bool,
+        ceiling_enforcement: temps_core::CeilingEnforcement,
     ) -> Result<Project, ProjectError> {
         // Find project by ID or slug
         let project = if let Ok(project_id_int) = project_id_or_slug.parse::<i32>() {
@@ -2945,7 +2945,7 @@ impl ProjectService {
         deployment_config.memory_request = settings.memory_request;
         deployment_config.memory_limit = settings.memory_limit;
 
-        if !bypass_resource_ceilings {
+        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
             let app_settings = self.config_service.get_settings().await.map_err(|e| {
                 ProjectError::Other(format!(
                     "Failed to read instance settings to check resource ceilings for project {project_id_or_slug}: {e}"
@@ -2981,7 +2981,7 @@ impl ProjectService {
 
     /// Update a project's deployment config.
     ///
-    /// `bypass_resource_ceilings` is the caller's `SettingsWrite` permission:
+    /// `ceiling_enforcement` reflects the caller's `SettingsWrite` permission:
     /// whoever can raise the instance-wide ceilings is by definition allowed to
     /// exceed them, so the check would be theatre for them. Everyone else is
     /// held to `AppSettings.tenant_resource_ceilings`, which is unenforced
@@ -2990,7 +2990,7 @@ impl ProjectService {
         &self,
         project_id: i32,
         config: UpdateDeploymentConfigRequest,
-        bypass_resource_ceilings: bool,
+        ceiling_enforcement: temps_core::CeilingEnforcement,
     ) -> Result<Project, ProjectError> {
         // Find project by ID or slug
         let project = projects::Entity::find_by_id(project_id)
@@ -3061,7 +3061,7 @@ impl ProjectService {
         // Checked on the merged config, not on the request, so clearing an
         // override back to "inherit" is judged by what the project will
         // actually run with.
-        if !bypass_resource_ceilings {
+        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
             let app_settings = self.config_service.get_settings().await.map_err(|e| {
                 ProjectError::Other(format!(
                     "Failed to read instance settings to check resource ceilings for project {project_id}: {e}"
