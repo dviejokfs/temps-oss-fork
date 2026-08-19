@@ -43,6 +43,11 @@ pub enum AlarmType {
     DeploymentMetricThreshold,
     /// A node cpu/disk/memory metric crossed the configured threshold.
     NodeMetricThreshold,
+    /// OTLP ingest requests were rejected by the per-project rate limiter or
+    /// storage quota, and the count crossed the configured threshold. The
+    /// metric points are written as `otel.rate_limited_requests` /
+    /// `otel.quota_exceeded_requests` on `SourceKind::Node` (node_id 0).
+    OtelRateLimited,
 }
 
 impl AlarmType {
@@ -61,6 +66,7 @@ impl AlarmType {
             Self::ContainerMetricThreshold => "container_metric_threshold",
             Self::DeploymentMetricThreshold => "deployment_metric_threshold",
             Self::NodeMetricThreshold => "node_metric_threshold",
+            Self::OtelRateLimited => "otel_rate_limited",
         }
     }
 
@@ -79,6 +85,7 @@ impl AlarmType {
             "container_metric_threshold" => Some(Self::ContainerMetricThreshold),
             "deployment_metric_threshold" => Some(Self::DeploymentMetricThreshold),
             "node_metric_threshold" => Some(Self::NodeMetricThreshold),
+            "otel_rate_limited" => Some(Self::OtelRateLimited),
             _ => None,
         }
     }
@@ -1069,6 +1076,7 @@ mod tests {
             AlarmType::HighMemory,
             AlarmType::DeploymentFailed,
             AlarmType::HealthCheckFailed,
+            AlarmType::OtelRateLimited,
         ];
 
         for t in &types {

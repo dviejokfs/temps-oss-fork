@@ -414,6 +414,11 @@ const GlobalSkillDetailPage = lazy(() =>
     default: m.GlobalSkillDetail,
   }))
 )
+const OtelPipelineStatusPage = lazy(() =>
+  import('./pages/settings/OtelPipelineStatusPage').then((m) => ({
+    default: m.OtelPipelineStatusPage,
+  }))
+)
 const GlobalMcpServerDetailPage = lazy(() =>
   import('./pages/settings/GlobalMcpServerDetail').then((m) => ({
     default: m.GlobalMcpServerDetail,
@@ -675,6 +680,10 @@ const FullAppRoutes = () => {
                         element={<NodeDetailPage />}
                       />
                       <Route path="plugins" element={<PluginsPage />} />
+                      <Route
+                        path="otel-pipeline"
+                        element={<OtelPipelineStatusPage />}
+                      />
                     </Route>
                     {/* Top-level resources surfaced in the main sidebar */}
                     <Route path="/domains" element={<Domains />} />

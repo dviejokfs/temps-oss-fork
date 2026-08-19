@@ -75,6 +75,11 @@ struct PipelineStatsAtomic {
     logs_stored_s3: AtomicU64,
     logs_dropped: AtomicU64,
     ingest_errors: AtomicU64,
+    /// Ingest requests rejected by the per-project rate limiter (→ HTTP 429).
+    rate_limited_requests: AtomicU64,
+    /// Ingest requests rejected because the per-project storage quota was
+    /// exhausted (→ HTTP 413).
+    quota_exceeded_requests: AtomicU64,
 }
 
 impl Default for PipelineStatsAtomic {
@@ -91,6 +96,8 @@ impl Default for PipelineStatsAtomic {
             logs_stored_s3: AtomicU64::new(0),
             logs_dropped: AtomicU64::new(0),
             ingest_errors: AtomicU64::new(0),
+            rate_limited_requests: AtomicU64::new(0),
+            quota_exceeded_requests: AtomicU64::new(0),
         }
     }
 }
@@ -157,6 +164,9 @@ impl OtelService {
         if !self.rate_limiter.check_and_increment(project_id) {
             // Report the limiter's actual configured limit (set via
             // `TEMPS_OTEL_RATE_LIMIT`) so the error matches reality.
+            self.stats
+                .rate_limited_requests
+                .fetch_add(1, Ordering::Relaxed);
             return Err(OtelError::RateLimitExceeded {
                 project_id,
                 limit: self.rate_limiter.max_requests(),
@@ -196,6 +206,9 @@ impl OtelService {
         };
 
         if quota.usage_pct >= 100.0 {
+            self.stats
+                .quota_exceeded_requests
+                .fetch_add(1, Ordering::Relaxed);
             return Err(OtelError::QuotaExceeded {
                 project_id,
                 used_bytes: quota.total_bytes,
@@ -538,6 +551,8 @@ impl OtelService {
             logs_stored_s3: self.stats.logs_stored_s3.load(Ordering::Relaxed),
             logs_dropped: self.stats.logs_dropped.load(Ordering::Relaxed),
             ingest_errors: self.stats.ingest_errors.load(Ordering::Relaxed),
+            rate_limited_requests: self.stats.rate_limited_requests.load(Ordering::Relaxed),
+            quota_exceeded_requests: self.stats.quota_exceeded_requests.load(Ordering::Relaxed),
         }
     }
 

@@ -12549,6 +12549,16 @@ export type PipelineStats = {
     metrics_dropped: number;
     metrics_received: number;
     metrics_stored: number;
+    /**
+     * Cumulative count of ingest requests rejected because the per-project
+     * rate limit was exceeded (HTTP 429). Sampled to otel.rate_limited_requests every 60s.
+     */
+    quota_exceeded_requests: number;
+    /**
+     * Cumulative count of ingest requests rejected because the per-project
+     * storage quota was exceeded (HTTP 413). Sampled to otel.quota_exceeded_requests every 60s.
+     */
+    rate_limited_requests: number;
     spans_dropped: number;
     spans_received: number;
     spans_stored: number;
