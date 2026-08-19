@@ -158,6 +158,17 @@ impl ServeCommand {
             std::env::set_var("TEMPS_CONSOLE_ADMIN_ADDRESS", admin);
         }
 
+        // Same bridge for the data directory. `ServerConfig::new` resolves it
+        // from TEMPS_DATA_DIR or falls back to ~/.temps, and never saw this
+        // flag — so `--data-dir /srv/temps` was silently ignored and the
+        // server wrote its encryption key, auth secret, logs and plugin data
+        // to the home directory instead. Two instances started with different
+        // `--data-dir` values would quietly share one directory.
+        if let Some(ref dir) = self.data_dir {
+            std::env::set_var("TEMPS_DATA_DIR", dir);
+            debug!("Data directory set to '{}' from CLI flag", dir.display());
+        }
+
         // In split (`--role=console`) mode the console must bind a STABLE,
         // known address: the sibling `temps proxy` forwards console/UI traffic
         // to it (proxy `ProxyConfig.console_address`). The default is a random
