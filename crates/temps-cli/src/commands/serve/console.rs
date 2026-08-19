@@ -1675,24 +1675,25 @@ fn ai_read_allowlist() -> Vec<String> {
         // project_access_guard — same three-layer check the list endpoint uses.
         "get_project",
         "get_project_by_slug",
-        // ── External services: detail + masked env vars ──
+        // ── External services: masked env vars only ──
+        // `get_service` / `get_service_by_slug` are intentionally NOT included.
         // `get_service` calls `get_service_details`, which runs
-        // `mask_sensitive_parameter_values` before returning. That masking is a
-        // name-heuristic (matches suffixes like `_key`/`_password`/`_token`/`_secret`,
-        // prefixes like `private_`), not an unconditional guarantee — a parameter
-        // stored under a non-standard name (e.g. a custom service plugin's `psk` or
-        // a PEM blob under `cert`) could pass through unmasked. `get_service_by_slug`
-        // is intentionally NOT included here: unlike `get_service`, its handler
-        // (handlers.rs:2343) has no `assert_service_owned_by_caller` check, so it
-        // would let the AI resolve and read any service on the instance by slug,
-        // not just ones linked to the caller's own project — see security review on
-        // PR #732.
+        // `mask_sensitive_parameter_values` — a name-heuristic (suffixes like
+        // `_key`/`_password`/`_token`/`_secret`, prefixes like `private_`), not
+        // an unconditional guarantee. A parameter stored under a non-standard
+        // name (e.g. a custom service plugin's `psk`, or a PEM blob under
+        // `cert`) passes through unmasked, and the schema's per-parameter
+        // `encrypted` flag (externalsvc/mod.rs's `ServiceParameter`) isn't
+        // wired into that masking function to catch what the heuristic misses
+        // — flagged in security review on PR #732 (Greptile + internal audit).
+        // `get_service_by_slug` additionally has no `assert_service_owned_by_caller`
+        // check (handlers.rs:2343), so it would let the AI resolve any service
+        // on the instance by slug, not just ones linked to the caller's project.
         // The `get_service_environment_variables` bulk endpoint explicitly sets
         // `mask_sensitive: true`; `get_project_service_environment_variables` calls
         // `mask_environment_variable_values` before responding — both unconditional
         // (every value becomes "***", not name-heuristic). Preview env var
         // endpoints return names only or masked values by design.
-        "get_service",
         "get_service_environment_variables",
         "get_project_service_environment_variables",
         "get_service_preview_environment_variable_names",
@@ -1734,9 +1735,15 @@ fn ai_read_allowlist() -> Vec<String> {
         "listProjectAlarms",
         "getProjectAlarmsSummary",
         // ── Observability event store ──
-        // Raw OTel event records gated by OtelRead; no credentials.
+        // List rows are truncated previews (events.rs: "*_truncated flag") —
+        // safe. `observability_full_event` is intentionally NOT included: it
+        // returns the un-truncated row, and for error events that's
+        // `FullError.data`, "the full JSONB blob... stack trace, breadcrumbs,
+        // request context, everything" (service.rs), plus raw
+        // request/response headers for request events — same risk class as
+        // the already-excluded `get_session_logs`. Flagged in security review
+        // on PR #732 (Greptile).
         "observability_list_events",
-        "observability_full_event",
         // ── IP access control ──
         // Access-rule list and single-IP block check; no secrets.
         "check_ip_blocked",
