@@ -385,7 +385,7 @@ async fn download_asset(url: &str, limit: u64) -> Result<Vec<u8>, InstallError> 
 /// oversized body costs one round trip instead of a full transfer — but the
 /// running total is still enforced, because that header is attacker-controlled
 /// and may be absent (chunked encoding) or a lie.
-async fn read_body_capped(
+pub(crate) async fn read_body_capped(
     response: reqwest::Response,
     url: &str,
     what: &'static str,

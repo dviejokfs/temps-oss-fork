@@ -13,6 +13,7 @@ use temps_core::external_plugin::{NavEntry, NavSection, PluginManifest, UiManife
 use temps_core::problemdetails::Problem;
 use utoipa::{OpenApi as OpenApiTrait, ToSchema};
 
+use crate::catalog::CatalogRejection;
 use crate::install::{InstallError, PlatformAsset, PluginInstaller, PluginRegistryManifest};
 
 use crate::service::ExternalPluginsService;
@@ -627,6 +628,157 @@ async fn get_plugin_status(
     ))
 }
 
+/// One entry in the browsable plugin catalogue, after local verification.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginCatalogEntry {
+    /// Registry key.
+    pub name: String,
+    /// Display name.
+    pub title: String,
+    /// One-line description.
+    pub summary: String,
+    /// Longer description.
+    pub description: String,
+    /// Maintainer.
+    pub author: String,
+    /// Grouping label.
+    pub category: String,
+    /// Source repository, when public.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// Documentation URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docs_url: Option<String>,
+    /// Latest published version, or `None` when nothing is released yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    /// Platform keys the published release covers.
+    pub platforms: Vec<String>,
+    /// Whether the plugin binary is already present on this host.
+    pub installed: bool,
+    /// Whether **this build** would accept an install request for it.
+    pub installable: bool,
+    /// Machine-readable reason it is not installable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<CatalogRejection>,
+    /// Operator-facing reason it is not installable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The catalogue response, including the unreachable-registry state.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginCatalogResponse {
+    /// Whether the registry was reachable and returned a parseable catalogue.
+    pub available: bool,
+    /// Why the catalogue is unavailable, when `available` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Registry endpoint consulted. Shown so an operator behind a proxy or an
+    /// air gap can see exactly which host failed rather than guessing.
+    pub source: String,
+    /// Locally verified catalogue entries. Empty when unavailable.
+    pub plugins: Vec<PluginCatalogEntry>,
+}
+
+/// Browse the plugins published in the registry.
+///
+/// Distinct from `/x/plugins/registry`, which reports on the plugins this
+/// build already knows how to install. This endpoint answers the broader
+/// question — what exists at all — and is therefore the only place a plugin
+/// released after this binary was built can appear.
+///
+/// Every entry is verified locally before it is returned (see
+/// [`crate::catalog`]): a name outside `KNOWN_PLUGINS` comes back
+/// `installable: false` with "upgrade temps" rather than being dropped, and a
+/// manifest URL that disagrees with this build's compile-time value comes
+/// back refused. Nothing the registry says is ever passed to the installer.
+///
+/// A registry outage returns `200` with `available: false` and a reason, not
+/// an error status: "the catalogue is unreachable" is a state the plugins
+/// screen must render, and a 5xx would leave the client unable to tell it
+/// apart from "this endpoint does not exist on this version".
+///
+/// Requires `SystemAdmin` permission — the same gate as the rest of this
+/// module, since the catalogue exists to drive host-level installs.
+#[utoipa::path(
+    tag = "External Plugins",
+    get,
+    path = "/x/plugins/catalog",
+    responses(
+        (status = 200, description = "Published plugin catalogue", body = PluginCatalogResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_plugin_catalog(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+) -> Result<(StatusCode, Json<PluginCatalogResponse>), Problem> {
+    permission_guard!(auth, SystemAdmin);
+
+    let remote = match crate::catalog::fetch_catalog(crate::catalog::CATALOG_URL).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            // WARN, not ERROR: an unreachable registry is expected on an
+            // air-gapped host and must not read as a fault in this binary.
+            tracing::warn!(error = %e, "Plugin catalog unavailable");
+            return Ok((
+                StatusCode::OK,
+                Json(PluginCatalogResponse {
+                    available: false,
+                    reason: Some(e.to_string()),
+                    source: crate::catalog::CATALOG_URL.to_string(),
+                    plugins: Vec::new(),
+                }),
+            ));
+        }
+    };
+
+    let plugins_dir = state.service.manager().config().plugins_dir.clone();
+    let plugins = remote
+        .into_iter()
+        .map(|entry| {
+            let known = known_plugin(&entry.name);
+            let verification = crate::catalog::verify(&entry, known.map(|k| k.manifest_url));
+
+            if let Some(reason) = verification.reason.as_deref() {
+                // A mismatched manifest URL is a security-relevant event, not
+                // a cosmetic one — log it loudly enough to be greppable.
+                tracing::warn!(plugin = %entry.name, "{}", reason);
+            }
+
+            PluginCatalogEntry {
+                installed: known.is_some_and(|k| plugins_dir.join(k.binary_name).exists()),
+                installable: verification.installable,
+                rejection: verification.rejection,
+                reason: verification.reason,
+                name: entry.name,
+                title: entry.title,
+                summary: entry.summary,
+                description: entry.description,
+                author: entry.author,
+                category: entry.category,
+                repository: entry.repository,
+                docs_url: entry.docs_url,
+                latest_version: entry.latest_version,
+                platforms: entry.platforms,
+            }
+        })
+        .collect();
+
+    Ok((
+        StatusCode::OK,
+        Json(PluginCatalogResponse {
+            available: true,
+            reason: None,
+            source: crate::catalog::CATALOG_URL.to_string(),
+            plugins,
+        }),
+    ))
+}
+
 /// Build the router for external plugin management endpoints.
 pub fn configure_routes() -> Router<ExternalPluginsAppState> {
     Router::new()
@@ -635,6 +787,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         .route("/x/plugins/registry", get(list_plugin_registry))
         .route("/x/plugins/install", post(install_plugin))
         .route("/x/plugins/{name}/status", get(get_plugin_status))
+        .route("/x/plugins/catalog", get(list_plugin_catalog))
 }
 
 #[derive(OpenApiTrait)]
@@ -645,6 +798,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         list_plugin_registry,
         install_plugin,
         get_plugin_status,
+        list_plugin_catalog,
     ),
     components(
         schemas(
@@ -660,6 +814,9 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             InstallPluginRequest,
             InstallPluginResponse,
             PluginStatusResponse,
+            PluginCatalogEntry,
+            PluginCatalogResponse,
+            CatalogRejection,
         )
     ),
     tags(

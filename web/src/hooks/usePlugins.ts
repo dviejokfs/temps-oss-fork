@@ -232,3 +232,77 @@ export function useInstallPlugin(name: string) {
     },
   })
 }
+
+// ---------------------------------------------------------------------------
+// Published catalogue (browse what exists) — GET /x/plugins/catalog.
+//
+// Distinct from `usePluginRegistry` above: the registry reports on plugins
+// *this build* knows how to install, so a plugin published after this binary
+// was cut can never appear there. The catalogue is fetched from the release
+// registry, which is the only way an operator can learn a newer plugin
+// exists — and the only way they can be told that upgrading is what unlocks
+// it. Every entry is verified server-side against the compile-time
+// allowlist before it reaches here; see crates/temps-external-plugins/src/catalog.rs.
+
+/** Why a catalogued plugin cannot be installed by this build. */
+export type CatalogRejection = 'unknown_to_this_release' | 'manifest_url_mismatch'
+
+/** One locally verified entry from GET /x/plugins/catalog. */
+export interface PluginCatalogEntry {
+  name: string
+  title: string
+  summary: string
+  description: string
+  author: string
+  category: string
+  repository?: string | null
+  docs_url?: string | null
+  latest_version?: string | null
+  platforms: string[]
+  /** Binary already present on this host. */
+  installed: boolean
+  /** Whether this build would accept an install request for it. */
+  installable: boolean
+  rejection?: CatalogRejection | null
+  reason?: string | null
+}
+
+/** Response from GET /x/plugins/catalog. */
+export interface PluginCatalogResponse {
+  /** False when the registry was unreachable or unparsable. */
+  available: boolean
+  reason?: string | null
+  /** Registry endpoint consulted, so a failure names the host that failed. */
+  source: string
+  plugins: PluginCatalogEntry[]
+}
+
+export const PLUGIN_CATALOG_QUERY_KEY = ['external-plugins', 'catalog']
+
+/**
+ * React Query hook for GET /x/plugins/catalog.
+ *
+ * SystemAdmin-gated on the backend, so pass `enabled: false` for non-admin
+ * viewers rather than firing a request that is known to 403 — see
+ * [[useCanManagePlugins]].
+ *
+ * A registry outage is a successful response with `available: false`, not an
+ * error: "the catalogue is unreachable" is a state the page must render, and
+ * conflating it with a request failure would leave an air-gapped operator
+ * looking at a generic error with no explanation.
+ */
+export function usePluginCatalog(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: PLUGIN_CATALOG_QUERY_KEY,
+    queryFn: async (): Promise<PluginCatalogResponse> => {
+      const response = await client.get<PluginCatalogResponse, unknown, true>({
+        url: '/x/plugins/catalog',
+        throwOnError: true,
+      })
+      return response.data
+    },
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+    enabled: options?.enabled ?? true,
+  })
+}

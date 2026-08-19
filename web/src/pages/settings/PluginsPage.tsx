@@ -16,7 +16,9 @@ import {
   useInstallPlugin,
   useReloadPlugins,
   useCanManagePlugins,
+  usePluginCatalog,
 } from '@/hooks/usePlugins'
+import type { PluginCatalogEntry } from '@/hooks/usePlugins'
 import { problemMessage } from '@/components/settings/oidc-provider-constants'
 import {
   AlertCircle,
@@ -32,6 +34,7 @@ import { useEffect } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Skeleton } from '@/components/ui/skeleton'
 
 export function PluginsPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -77,6 +80,7 @@ export function PluginsPage() {
   return (
     <div className="space-y-6">
       <VibeTempsInstallCard />
+      <PluginCatalogCard />
 
       <Card>
         <CardHeader>
@@ -182,6 +186,195 @@ export function PluginsPage() {
       </Card>
 
       <PluginExamples />
+    </div>
+  )
+}
+
+/**
+ * Everything published in the plugin registry, whether or not this build can
+ * install it.
+ *
+ * Rendered unconditionally, including when the registry is unreachable: an
+ * operator on an air-gapped box needs to be told *that the catalogue exists
+ * and which host it could not reach*, not shown an empty page they will read
+ * as "there are no plugins". Same reason entries this release cannot install
+ * are listed rather than filtered — "upgrade temps to get this" is
+ * actionable; silence is not.
+ */
+function PluginCatalogCard() {
+  const canManagePlugins = useCanManagePlugins()
+  const catalogQuery = usePluginCatalog({ enabled: canManagePlugins })
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Available plugins</CardTitle>
+        <CardDescription>
+          Plugins published in the Temps registry. Each installs as a single
+          binary on this server — nothing is hosted for you.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {!canManagePlugins ? (
+          <p className="text-sm text-muted-foreground">
+            Browsing and installing plugins requires an administrator account.
+          </p>
+        ) : catalogQuery.isLoading ? (
+          <div className="space-y-3">
+            <Skeleton className="h-24 w-full" />
+          </div>
+        ) : catalogQuery.isError ? (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Could not load the plugin catalogue</AlertTitle>
+            <AlertDescription className="space-y-2">
+              <p>{problemMessage(catalogQuery.error, 'Unknown error')}</p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => catalogQuery.refetch()}
+              >
+                Retry
+              </Button>
+            </AlertDescription>
+          </Alert>
+        ) : !catalogQuery.data?.available ? (
+          <Alert>
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Registry unreachable</AlertTitle>
+            <AlertDescription className="space-y-2">
+              <p>
+                {catalogQuery.data?.reason ??
+                  'The plugin registry could not be reached.'}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                This instance browses plugins from {catalogQuery.data?.source}.
+                Plugins already installed here keep running — only the list of
+                what is available is unavailable.
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => catalogQuery.refetch()}
+              >
+                Retry
+              </Button>
+            </AlertDescription>
+          </Alert>
+        ) : catalogQuery.data.plugins.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            The registry has no published plugins yet.
+          </p>
+        ) : (
+          catalogQuery.data.plugins.map((entry) => (
+            <PluginCatalogRow key={entry.name} entry={entry} />
+          ))
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+/** One catalogue entry, with its install control or its refusal reason. */
+function PluginCatalogRow({ entry }: { entry: PluginCatalogEntry }) {
+  const installMutation = useInstallPlugin(entry.name)
+
+  const handleInstall = () => {
+    installMutation.mutate(undefined, {
+      onSuccess: (result) => toast.success(result.message),
+      onError: (error) =>
+        toast.error(problemMessage(error, `Failed to install ${entry.title}`)),
+    })
+  }
+
+  return (
+    <div className="rounded-lg border p-4 space-y-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-sm font-medium">{entry.title}</p>
+            {entry.latest_version ? (
+              <Badge variant="secondary" className="text-xs">
+                v{entry.latest_version}
+              </Badge>
+            ) : (
+              <Badge variant="outline" className="text-xs">
+                No release yet
+              </Badge>
+            )}
+            <Badge variant="outline" className="text-xs">
+              {entry.category}
+            </Badge>
+            {entry.installed && (
+              <Badge
+                variant="default"
+                className="bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20 text-xs"
+              >
+                Installed
+              </Badge>
+            )}
+          </div>
+          <p className="text-xs text-muted-foreground mt-1">{entry.summary}</p>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            by {entry.author}
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {entry.docs_url && (
+            <Button asChild variant="ghost" size="sm">
+              <a href={entry.docs_url} target="_blank" rel="noopener noreferrer">
+                Docs
+                <ExternalLink className="ml-1 h-3 w-3" />
+              </a>
+            </Button>
+          )}
+          {entry.installable && !entry.installed && (
+            <Button
+              size="sm"
+              onClick={handleInstall}
+              disabled={installMutation.isPending || !entry.latest_version}
+            >
+              {installMutation.isPending ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Installing…
+                </>
+              ) : (
+                'Install'
+              )}
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {/* Local verification refused this entry. The distinction matters to the
+          operator: one is "you are behind", the other is "do not trust what
+          the registry just told this instance". */}
+      {!entry.installable && entry.reason && (
+        <Alert
+          variant={
+            entry.rejection === 'manifest_url_mismatch' ? 'destructive' : 'default'
+          }
+        >
+          <AlertCircle className="h-4 w-4" />
+          <AlertTitle>
+            {entry.rejection === 'manifest_url_mismatch'
+              ? 'Registry mismatch — not installable'
+              : 'Not installable on this version'}
+          </AlertTitle>
+          <AlertDescription>{entry.reason}</AlertDescription>
+        </Alert>
+      )}
+
+      {installMutation.isError && (
+        <Alert variant="destructive">
+          <AlertCircle className="h-4 w-4" />
+          <AlertTitle>Install failed</AlertTitle>
+          <AlertDescription>
+            {problemMessage(installMutation.error, 'Unknown error')}
+          </AlertDescription>
+        </Alert>
+      )}
     </div>
   )
 }
