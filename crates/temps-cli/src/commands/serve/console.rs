@@ -1665,6 +1665,289 @@ fn ai_read_allowlist() -> Vec<String> {
         // ── Import ──
         "list_sources",
         "get_import_status",
+        // ── Container metrics history ──
+        // Same class as `get_container_metrics` (already allowlisted); returns
+        // time-series data points with no secrets.
+        "ContainerMetricsGetHistory",
+        // ── Projects: single-project read (metadata, no secrets) ──
+        // `get_project` / `get_project_by_slug` mirror `get_projects` but for a
+        // specific ID/slug. Both enforce permission_guard + project_scope_guard +
+        // project_access_guard — same three-layer check the list endpoint uses.
+        "get_project",
+        "get_project_by_slug",
+        // ── External services: masked env vars only ──
+        // `get_service` / `get_service_by_slug` are intentionally NOT included.
+        // `get_service` calls `get_service_details`, which runs
+        // `mask_sensitive_parameter_values` — a name-heuristic (suffixes like
+        // `_key`/`_password`/`_token`/`_secret`, prefixes like `private_`), not
+        // an unconditional guarantee. A parameter stored under a non-standard
+        // name (e.g. a custom service plugin's `psk`, or a PEM blob under
+        // `cert`) passes through unmasked, and the schema's per-parameter
+        // `encrypted` flag (externalsvc/mod.rs's `ServiceParameter`) isn't
+        // wired into that masking function to catch what the heuristic misses
+        // — flagged in security review on PR #732 (Greptile + internal audit).
+        // `get_service_by_slug` additionally has no `assert_service_owned_by_caller`
+        // check (handlers.rs:2343), so it would let the AI resolve any service
+        // on the instance by slug, not just ones linked to the caller's project.
+        // The `get_service_environment_variables` bulk endpoint explicitly sets
+        // `mask_sensitive: true`; `get_project_service_environment_variables` calls
+        // `mask_environment_variable_values` before responding — both unconditional
+        // (every value becomes "***", not name-heuristic). Preview env var
+        // endpoints return names only or masked values by design.
+        "get_service_environment_variables",
+        "get_project_service_environment_variables",
+        "get_service_preview_environment_variable_names",
+        "get_service_preview_environment_variables_masked",
+        // Provider type catalog and schema metadata — no stored values.
+        "get_provider_metadata",
+        "get_providers_metadata",
+        // Available Docker images for external services (name, version tags).
+        "list_available_containers",
+        // AI data-access toggle — boolean (enabled/disabled) per service.
+        "get_ai_data_access",
+        // Slow-query statistics from pg_stat_statements — parameterised query
+        // text ($1/$2 placeholders), execution counts, timing. No data values.
+        "get_slow_queries",
+        // ── AI traffic analytics (proxy-log aggregates, no raw rows) ──
+        // These endpoints return aggregated breakdowns and time-series counts
+        // derived from proxy logs — agent names, page paths, HTTP status buckets,
+        // request counts, latencies. No full request/response bodies are included.
+        "get_ai_agent_breakdown",
+        "get_ai_agent_pages",
+        "get_ai_agent_timeline",
+        "get_ai_page_breakdown",
+        "get_ai_status_breakdown",
+        // Time-bucketed request aggregates (counts, error rates, p50/p95 latency).
+        // Same privacy class as `get_api_timeseries` (already allowlisted).
+        "get_time_bucket_stats",
+        // Proxy route table — hostname→environment mapping, no credentials.
+        "list_routes",
+        "get_route",
+        // ── OpenTelemetry: cross-project traces, span stats ──
+        // `getCrossProjectTraceSiblings` requires OtelRead + denies deployment
+        // tokens; its response (`CrossProjectTraceResponse`) is genuinely
+        // metadata-only — project id/name/slug/first_seen timestamp, no span
+        // content. `getUnifiedTrace` is intentionally NOT included: it embeds
+        // the full `SpanRecord` per span, whose `attributes` field is
+        // documented as "raw key/value pairs exactly as reported by the
+        // instrumenting library" plus raw `events` — same risk class as the
+        // already-excluded observability span attributes, but fanned out
+        // across up to 20 projects instead of one. Flagged in security review
+        // on PR #732 (Greptile, 5th pass).
+        "getCrossProjectTraceSiblings",
+        // Span statistics ranked by latency/volume (aggregates, no span payloads).
+        "query_span_stats",
+        // ── Alarms ──
+        // Project-scoped alarm list and summary counts; permission_guard DeploymentsRead.
+        "listProjectAlarms",
+        "getProjectAlarmsSummary",
+        // ── Observability event store: excluded entirely ──
+        // Neither `observability_list_events` nor `observability_full_event`
+        // is included. `_full_event` returns the un-truncated row outright
+        // (for errors, `FullError.data` — "the full JSONB blob... stack
+        // trace, breadcrumbs, request context, everything", service.rs).
+        // `_list_events`'s "truncated" preview rows are NOT safe either:
+        // `truncate_stacktrace`/the attributes preview (types.rs) only cap
+        // *count* (first 5 stack frames, first 20 span attribute keys) —
+        // they don't redact *content*. So the list endpoint still returns,
+        // verbatim: `RequestRow.query_string` (untruncated — can carry
+        // `?token=`/`?api_key=`/PII), `SpanRow.attributes` (raw
+        // developer-set tags — same risk class as the already-excluded
+        // `get_property_breakdown`), `ErrorRow.stacktrace_preview` (raw
+        // frames), and `ErrorRow.message`. Only `request_headers`/
+        // `response_headers` are genuinely safe (allowlist-filtered by
+        // `HEADER_WHITELIST`). Flagged in security review on PR #732
+        // (Greptile, 3rd pass).
+        // ── IP access control ──
+        // Access-rule list and single-IP block check; no secrets.
+        "check_ip_blocked",
+        "get_ip_access_control",
+        "list_ip_access_control",
+        // Geolocation lookup for an IP — country/city, no PII beyond what the
+        // caller already knows (the IP itself). Gated by AnalyticsRead.
+        "get_ip_geolocation",
+        // ── AI chat: conversations + pending actions ──
+        // Conversations are the operator's own chat history. Pending actions are
+        // proposed (not yet executed) write operations waiting for confirmation.
+        // Both are scoped to the current user's projects via ProjectsRead.
+        "get_conversation",
+        "find_conversation",
+        "list_conversations",
+        "list_all_conversations",
+        "get_pending_action",
+        "list_pending_actions",
+        // Readiness booleans: ai_configured, chat_enabled, write_actions_enabled.
+        "get_chat_readiness",
+        // ── OTel dashboards ──
+        // Dashboard config (queries, panel layout) — no secrets. Gated OtelRead.
+        "get_dashboard",
+        "list_dashboards",
+        // ── Platform info + update status ──
+        // OS type, architecture, and supported platform strings — no secrets.
+        "get_platform_info",
+        // Server's externally-reachable public IP as detected at startup.
+        "get_public_ip",
+        // Whether an in-place binary update is possible and what version is available.
+        "get_update_capability",
+        "get_update_status",
+        // ── Email provider (masked credentials) + tracking ──
+        // `get_email_provider` / `list_email_providers` call `get_masked_credentials`
+        // before responding — the actual SMTP/SES credentials are replaced with "***".
+        "get_email_provider",
+        "list_email_providers",
+        // Whether email sending is configured (boolean). Unauthenticated endpoint.
+        "email_status",
+        // Tracking pixel / click-through status booleans — not the raw events.
+        "get_email_tracking_status",
+        // ── DNS providers (masked credentials) + domain orders ──
+        // `get_dns_provider` / `list_dns_providers` call `get_masked_credentials`
+        // before responding — the actual provider API key is replaced with "***".
+        "get_dns_provider",
+        "list_dns_providers",
+        // Domain lookups — metadata only, no signing secrets.
+        "get_domain_by_host",
+        "get_domain_by_id",
+        "get_domain_order",
+        "list_orders",
+        "list_on_demand_certs",
+        // DNS provider zone list (zone IDs and names for domain selection).
+        "list_provider_zones",
+        // Live DNS A-record lookup for a hostname — diagnostic read.
+        "lookup_dns_a_records",
+        // Flat vs. wildcard subdomain preview mode for DNS providers.
+        "preview_hostname_mode",
+        // ── User preferences + cluster metadata ──
+        // Notification preferences for the current user — no credentials.
+        "get_preferences",
+        // Boolean: whether a cluster join token is set (not the token itself).
+        "get_join_token_status",
+        // Enrollment token metadata (expiry, use count, bound node). Token values
+        // are never returned; the response only contains `EnrollmentTokenInfo`.
+        "list_enrollment_tokens",
+        // Static list of all available permission names — not sensitive.
+        "get_api_key_permissions",
+        // ── Teams + project access ──
+        // Team and membership metadata scoped by UsersRead permission.
+        "list_teams",
+        "get_team",
+        "list_team_members",
+        "list_team_projects",
+        "list_project_access",
+        // ── Agent secrets + AI provider status ──
+        // Agent secrets always return value masked as "***" in responses.
+        "list_secrets",
+        // Project secrets — metadata only (key names + environment scoping).
+        // Values are never returned by this endpoint; see its doc comment.
+        "listProjectSecrets",
+        // AI provider list — reports installed/authenticated booleans and
+        // available models; actual credentials are never included.
+        "list_ai_providers",
+        // Known AI agent identifiers (name catalogue, no credentials).
+        "list_known_ai_agents",
+        // ── Feature flags ──
+        "get_flag",
+        "get_flag_snapshot",
+        "list_flags",
+        // ── Project presets + templates ──
+        // Built-in and community preset catalogue — no secrets.
+        "list_presets",
+        "get_project_template",
+        "list_project_templates",
+        "list_project_template_tags",
+        // Detect applicable presets from a public repository URL.
+        // Makes read-only calls to public git provider APIs (same as
+        // `get_public_branches` / `get_public_repository` already allowlisted).
+        "detect_public_presets",
+        // ── Static files + source maps + releases (error tracking) ──
+        // Error-tracking release metadata (version strings, file lists).
+        // No stored values; same permission class as list_error_groups.
+        "list_releases",
+        "list_release_files",
+        "list_static_bundles",
+        "get_static_bundle",
+        "list_source_maps",
+        "list_source_files",
+        // Remote external image metadata (registry ref + description). No credentials.
+        "get_remote_external_image",
+        "list_remote_external_images",
+        // ── Deployment tokens (masked prefix only) ──
+        // `DeploymentTokenResponse` exposes only `token_prefix` (first few chars),
+        // not the full token — same masking class as `get_api_key` (already listed).
+        "get_deployment_token",
+        "list_deployment_tokens",
+        // ── Backup metadata ──
+        // Alert thresholds and child backup records — no S3 credentials (those
+        // are in `get_s3_source` / `list_s3_sources`, which are excluded).
+        "list_backup_alerts",
+        "list_backup_children",
+        "list_schedule_run_jobs",
+        "list_service_schedules",
+        "list_schedule_services",
+        // ── PostgreSQL major-version upgrade status ──
+        "get_pg_upgrade",
+        "get_pg_upgrade_logs",
+        "list_pg_upgrades",
+        // ── Git: repository / branch / tag reads ──
+        // Boolean safety check (can_delete + projects_in_use list).
+        "check_provider_deletion_safety",
+        // Boolean: whether a specific commit SHA exists in a repository.
+        "check_commit_exists",
+        // Repository and ref metadata; no OAuth tokens. Same class as
+        // `list_repositories_by_connection` already allowlisted.
+        "get_all_repositories_by_name",
+        "get_repository_by_id",
+        "get_branches_by_repository_id",
+        "get_tags_by_repository_id",
+        "list_commits_by_repository_id",
+        "get_repository_branches",
+        "get_repository_tags",
+        "get_repository_preset_live",
+        // Git connection metadata (connection IDs, names, provider type).
+        "get_provider_connections",
+        // ── Log aggregator: context window — excluded ──
+        // `get_log_context` is intentionally NOT included. It returns raw
+        // `message`/`fields` from application stdout/stderr (arbitrary
+        // developer-controlled content), and its resolver
+        // (temps-log-aggregator/src/services/search.rs `get_context`) has NO
+        // project-ownership check on `chunk_id` at all — only a global
+        // `LogsRead` permission gate, unlike `get_container_logs`'s
+        // container-scoped equivalent. Flagged in security review on PR #732
+        // (Greptile, 4th pass).
+        // ── Preview gateway: settings + status (NOT logs) ──
+        // Settings expose image tag, host port, auto-upgrade flag — no shared_secret
+        // (that is masked as a boolean in the response struct).
+        // `get_preview_gateway_logs` is intentionally NOT included: it
+        // returns `LogsResponse { lines }` straight from `tail_logs` —
+        // raw Docker container stdout/stderr, zero redaction. Flagged in
+        // security review on PR #732 (Greptile, 5th pass).
+        "get_preview_gateway_settings",
+        "get_preview_gateway_status",
+        // ── External plugins ──
+        "list_external_plugins",
+        // ── Analytics: event entry list — excluded ──
+        // `get_event_entries` is intentionally NOT included. Per its own doc
+        // comment: "raw occurrences of a specific event, including custom
+        // JSON properties" — same risk class as the already-excluded
+        // `get_property_breakdown`/`get_property_timeline`. Flagged in
+        // security review on PR #732 (Greptile, 4th pass).
+        // ── Agents + sandbox: run status, job metadata ──
+        // `list_agent_runs`, `list_all_runs`, `get_run_with_logs`, and
+        // `latest_run_for_source` are intentionally NOT included: they all
+        // serialize `AgentRunResponse`, which carries `ai_output`,
+        // `ai_reasoning`, `prompt_text`, `ephemeral_yaml`, `analysis`, and
+        // `user_context` verbatim — raw agent execution content, not
+        // metadata. `job_status` is also excluded: `JobStatusResponse`
+        // returns raw `stdout`/`stderr` from a detached sandbox command.
+        // `list_jobs`/`get_cmd` are ALSO now excluded (previously kept —
+        // wrong call): their DTOs (`JobSummaryResponse.cmd`,
+        // `CmdInner.args`) carry the full invoked command line, which can
+        // itself embed a secret passed as a CLI argument (e.g. `mysql
+        // -p'...'`, `curl -H "Authorization: Bearer ..."`). Flagged in
+        // security review on PR #732 (Greptile, 4th + 5th pass).
+        "get_sandbox",
+        "list_sandboxes",
+        // Sandbox event list — lifecycle events (created, started, stopped).
+        "list_events",
     ]
     .iter()
     .map(|s| s.to_string())
