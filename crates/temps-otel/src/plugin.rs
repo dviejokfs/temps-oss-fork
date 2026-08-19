@@ -797,6 +797,122 @@ impl TempsPlugin for OtelPlugin {
                 });
             }
 
+            // 1c-stats. Background sampler: OTel pipeline rejection stats → MetricsStore.
+            //
+            // Reads `otel_service.pipeline_stats()` every 60 seconds, computes
+            // the delta since the previous sample, and writes two counter points
+            // to the unified MetricsStore (SourceKind::Node, node_id 0):
+            //
+            //   otel.rate_limited_requests  — ingest rejections from the rate limiter
+            //   otel.quota_exceeded_requests — ingest rejections from quota enforcement
+            //
+            // Using delta values (not cumulative) matches the proxy metrics sampler
+            // pattern: each store point represents "rejections in the last N seconds"
+            // so the AlertEvaluator threshold (e.g. "> 10") is intuitive to an
+            // operator ("more than 10 rejections this sample window").
+            //
+            // The 60-second interval is independent of `monitoring.scrape_interval_secs`
+            // because the pipeline stats are process-internal counters rather than
+            // externally-scraped ones; re-reading the config each cycle would add an
+            // unnecessary DB round-trip on an ingest-hot path.
+            //
+            // Every cycle writes both points, even when the delta is zero. The
+            // AlertEvaluator's `query_latest` only looks back 15 minutes
+            // (`LATEST_WINDOW`), so if a burst of rejections is followed by
+            // silence, skipping the zero-delta write would leave that burst's
+            // non-zero point as the "latest" value for up to 15 minutes,
+            // keeping the alarm falsely active. Always writing — including
+            // zeros — lets the metric self-resolve on the next cycle, exactly
+            // like the proxy sampler's fixed-size point set does. The storage
+            // cost is two rows per minute regardless of ingest volume.
+            {
+                const OTEL_STATS_SAMPLE_INTERVAL_SECS: u64 = 60;
+                /// Synthetic node ID of the control plane (mirrors proxy metrics sampler).
+                const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+                let stats_otel_service = otel_service.clone();
+                let stats_metrics_store = metrics_store.clone();
+                tokio::spawn(async move {
+                    use chrono::Utc;
+                    use std::collections::HashMap;
+                    use temps_metrics::{MetricKind, MetricPoint, SourceKind};
+
+                    info!(
+                        "OTel pipeline stats sampler started (interval={}s)",
+                        OTEL_STATS_SAMPLE_INTERVAL_SECS
+                    );
+                    let mut interval =
+                        tokio::time::interval(Duration::from_secs(OTEL_STATS_SAMPLE_INTERVAL_SECS));
+                    interval.tick().await; // discard the immediate first tick
+
+                    let mut prev_rate_limited: u64 = 0;
+                    let mut prev_quota_exceeded: u64 = 0;
+
+                    loop {
+                        interval.tick().await;
+                        let snap = stats_otel_service.pipeline_stats();
+
+                        // Compute monotonic deltas; saturating_sub guards against a
+                        // counter reset (process restart resets all atomics to 0).
+                        let delta_rate_limited =
+                            snap.rate_limited_requests.saturating_sub(prev_rate_limited);
+                        let delta_quota_exceeded = snap
+                            .quota_exceeded_requests
+                            .saturating_sub(prev_quota_exceeded);
+
+                        let now = Utc::now();
+                        let points = vec![
+                            MetricPoint {
+                                time: now,
+                                source_kind: SourceKind::Node,
+                                source_id: CONTROL_PLANE_NODE_ID,
+                                name: "otel.rate_limited_requests".to_string(),
+                                value: delta_rate_limited as f64,
+                                kind: MetricKind::Counter,
+                                engine: Some("otel".to_string()),
+                                environment: None,
+                                node_id: Some(CONTROL_PLANE_NODE_ID),
+                                labels: HashMap::new(),
+                            },
+                            MetricPoint {
+                                time: now,
+                                source_kind: SourceKind::Node,
+                                source_id: CONTROL_PLANE_NODE_ID,
+                                name: "otel.quota_exceeded_requests".to_string(),
+                                value: delta_quota_exceeded as f64,
+                                kind: MetricKind::Counter,
+                                engine: Some("otel".to_string()),
+                                environment: None,
+                                node_id: Some(CONTROL_PLANE_NODE_ID),
+                                labels: HashMap::new(),
+                            },
+                        ];
+
+                        // Only advance the checkpoints once the write actually lands.
+                        // Advancing them unconditionally would discard this cycle's
+                        // deltas forever on a transient store failure; leaving them
+                        // in place means the next successful write's delta widens to
+                        // cover the missed cycle too, so no rejection is lost from
+                        // the series.
+                        if let Err(e) = stats_metrics_store.write_batch(points).await {
+                            warn!(
+                                error = %e,
+                                "OTel pipeline stats write failed (non-fatal); \
+                                 checkpoints held back so the next successful write \
+                                 includes this cycle's deltas"
+                            );
+                        } else {
+                            prev_rate_limited = snap.rate_limited_requests;
+                            prev_quota_exceeded = snap.quota_exceeded_requests;
+                            debug!(
+                                delta_rate_limited,
+                                delta_quota_exceeded, "OTel pipeline stats sampled and written"
+                            );
+                        }
+                    }
+                });
+            }
+
             // 1d. ADR-027 Phase 0: daily prune of POSTGRES cross_project_trace_refs
             //     rows older than 90 days (matching the OTel span TTL on both
             //     backends). Runs unconditionally: on the TimescaleDB backend it

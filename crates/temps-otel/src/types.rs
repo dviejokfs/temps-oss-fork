@@ -617,6 +617,14 @@ pub struct PipelineStats {
     pub logs_stored_s3: u64,
     pub logs_dropped: u64,
     pub ingest_errors: u64,
+    /// Cumulative count of ingest requests rejected because the per-project
+    /// rate limit was exceeded (→ HTTP 429). Written to the metrics store as
+    /// `otel.rate_limited_requests` (SourceKind::Node, node_id 0) every 60s.
+    pub rate_limited_requests: u64,
+    /// Cumulative count of ingest requests rejected because the per-project
+    /// storage quota was exceeded (→ HTTP 413). Written to the metrics store
+    /// as `otel.quota_exceeded_requests` (SourceKind::Node, node_id 0) every 60s.
+    pub quota_exceeded_requests: u64,
 }
 
 // ── Query types ─────────────────────────────────────────────────────

@@ -140,6 +140,13 @@ impl AlertEvaluator {
             warn!("AlertEvaluator: failed to seed default proxy rules on startup: {e}");
         }
 
+        // Seed the default OTel rate-limit alarm rule for the control-plane
+        // node. Idempotent via the same ON CONFLICT DO NOTHING as the proxy
+        // rules above.
+        if let Err(e) = seed_default_otel_rate_limit_rules(self.db.as_ref()).await {
+            warn!("AlertEvaluator: failed to seed default OTel rate-limit rules on startup: {e}");
+        }
+
         // Seed default file-descriptor/socket exhaustion rules for the
         // control-plane node. `NodeMetricsSampler` (spawned alongside the
         // proxy metrics sampler) writes `node.*` points for node 0 whenever
@@ -668,7 +675,21 @@ fn compare(lhs: f64, rhs: f64, comparator: &str) -> bool {
 }
 
 /// Map a rule to the most appropriate [`AlarmType`].
+///
+/// OTel ingest rejection metrics (`otel.rate_limited_requests` /
+/// `otel.quota_exceeded_requests`) are written on the control-plane node
+/// (`SourceKind::Node`, node_id 0).  Because they share the same source
+/// kind/ID as other node metrics, we discriminate by metric name so the fired
+/// alarm carries the purpose-built `OtelRateLimited` type instead of the
+/// generic `NodeMetricThreshold`.
 fn alarm_type_for_rule(rule: &monitoring_alert_rules::Model) -> AlarmType {
+    // OTel ingest rejection metrics keyed on the control-plane node.
+    if matches!(
+        rule.metric_name.as_str(),
+        "otel.rate_limited_requests" | "otel.quota_exceeded_requests"
+    ) {
+        return AlarmType::OtelRateLimited;
+    }
     match (rule.service_id, rule.deployment_id, rule.node_id) {
         (Some(_), None, None) => AlarmType::DatabaseMetricThreshold,
         (None, Some(_), None) => AlarmType::DeploymentMetricThreshold,
@@ -807,6 +828,30 @@ const CONTROL_PLANE_NODE_ID: i32 = 0;
 /// `(node_id, metric_name)` so concurrent calls are safe.
 pub async fn seed_default_proxy_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
     seed_node_rules(db, "seed_default_proxy_rules", &proxy_default_seeds()).await
+}
+
+/// Insert a default alert rule that fires when OTLP ingest requests are being
+/// rate-limited at a sustained high rate, indicating either a noisy client or
+/// a quota that is too low for legitimate traffic.
+///
+/// The metric `otel.rate_limited_requests` is written to the metrics store by
+/// the OTel plugin's background pipeline-stats sampler (SourceKind::Node,
+/// node_id 0) every 60 seconds as a delta counter. The default threshold of
+/// 10 rejected requests per 60-second sample fires a warning if any project
+/// is being consistently turned away. Operators can tighten or loosen this by
+/// editing the seeded rule.
+///
+/// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
+/// `(node_id, metric_name)` so concurrent calls are safe.
+pub async fn seed_default_otel_rate_limit_rules(
+    db: &DatabaseConnection,
+) -> Result<(), MetricsError> {
+    seed_node_rules(
+        db,
+        "seed_default_otel_rate_limit_rules",
+        &otel_rate_limit_default_seeds(),
+    )
+    .await
 }
 
 /// Insert default file-descriptor/socket exhaustion alert rules for the
@@ -1210,6 +1255,25 @@ fn node_fd_default_seeds() -> Vec<RuleSeed> {
     ]
 }
 
+/// Default alert rule for OTel ingest rate limiting.
+///
+/// Fires when the 60-second pipeline-stats sample reports more than 10 ingest
+/// requests rejected by the rate limiter.  A single noisy batch that briefly
+/// tips over the limit will not fire (it fires only when the threshold is
+/// crossed on a single sample, not sustained over time — `for_duration_secs`
+/// is 0 for immediacy).  Operators who want sustained-breach semantics can
+/// edit the rule and set `for_duration_secs`.
+fn otel_rate_limit_default_seeds() -> Vec<RuleSeed> {
+    vec![RuleSeed {
+        name: "OTel ingest rate-limited",
+        metric_name: "otel.rate_limited_requests",
+        threshold: 10.0,
+        comparator: ">",
+        severity: "warning",
+        for_duration_secs: 0,
+    }]
+}
+
 fn container_default_seeds() -> Vec<RuleSeed> {
     vec![
         RuleSeed {
@@ -1386,6 +1450,36 @@ mod tests {
     fn alarm_type_node_rule_is_node() {
         let rule = make_rule_with_node(None, None, Some(0));
         assert_eq!(alarm_type_for_rule(&rule).as_str(), "node_metric_threshold");
+    }
+
+    #[test]
+    fn alarm_type_otel_rate_limited_rule_is_otel_rate_limited() {
+        // Both rejection metrics the OTel pipeline-stats sampler writes must
+        // route to the same alarm type, regardless of (service/deployment/node)
+        // scope on the rule row — the metric name is authoritative here, not
+        // the scope columns matched by the fallback below it.
+        for metric in ["otel.rate_limited_requests", "otel.quota_exceeded_requests"] {
+            let mut rule = make_rule_with_node(None, None, Some(0));
+            rule.metric_name = metric.to_string();
+            assert_eq!(
+                alarm_type_for_rule(&rule).as_str(),
+                "otel_rate_limited",
+                "metric {metric} did not map to OtelRateLimited"
+            );
+        }
+    }
+
+    #[test]
+    fn otel_rate_limit_default_seeds_target_the_sampler_written_metric() {
+        let seeds = otel_rate_limit_default_seeds();
+        assert_eq!(seeds.len(), 1);
+        let seed = &seeds[0];
+        // Must match the metric name the plugin.rs pipeline-stats sampler
+        // actually writes, and the one `alarm_type_for_rule` recognizes above
+        // — a drift between these three would seed a rule that never fires.
+        assert_eq!(seed.metric_name, "otel.rate_limited_requests");
+        assert_eq!(seed.comparator, ">");
+        assert!(seed.threshold > 0.0);
     }
 
     #[test]
