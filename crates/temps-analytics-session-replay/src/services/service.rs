@@ -3,10 +3,10 @@ use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Utc};
 use flate2::read::ZlibDecoder;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,7 +16,10 @@ use temps_core::UtcDateTime;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
-use temps_entities::{ip_geolocations, session_replay_events, session_replay_sessions, visitor};
+use temps_entities::{
+    ip_geolocations, session_replay_events, session_replay_ingest_batches, session_replay_sessions,
+    visitor,
+};
 
 /// How many `session_replay_events` rows to write per `INSERT`.
 ///
@@ -368,11 +371,19 @@ impl SessionReplayService {
     /// session exists but belongs to a different project, `CrossProjectAccess`
     /// is returned so that the handler can surface a 404 — preventing
     /// cross-tenant event injection and avoiding existence disclosure.
+    ///
+    /// `batch_id`, when supplied, makes the call idempotent: a batch already
+    /// recorded for this session is discarded and `Ok(0)` returned. The browser
+    /// SDK resends a failed batch verbatim under a stable id, so without this a
+    /// single timed-out request appends its events again on every retry. It is
+    /// optional because older SDKs do not send one; those clients keep the old
+    /// at-least-once behaviour.
     pub async fn add_session_events(
         &self,
         project_id: i32,
         session_id: &str,
         events_base64: &str,
+        batch_id: Option<&str>,
     ) -> Result<usize, SessionReplayError> {
         info!("Adding events to session: {}", session_id);
 
@@ -415,6 +426,48 @@ impl SessionReplayService {
         let events_to_store = self.extract_events_from_json(&events)?;
         let event_count = events_to_store.len();
 
+        // The marker and the events go in together. Claiming the batch outside
+        // a transaction would let a failed event insert leave the marker
+        // behind, and the client's retry would then be discarded as a
+        // duplicate — turning a retryable error into permanent data loss.
+        let txn = self.db.begin().await?;
+
+        if let Some(batch_id) = batch_id {
+            let marker = session_replay_ingest_batches::ActiveModel {
+                id: sea_orm::NotSet,
+                session_id: Set(session.id),
+                batch_id: Set(batch_id.to_string()),
+                event_count: Set(event_count as i32),
+                received_at: Set(Utc::now().into()),
+            };
+
+            // Claiming the batch *is* the duplicate check: the unique index on
+            // (session_id, batch_id) decides it, so two concurrent retries of
+            // the same batch cannot both win the way a read-then-write check
+            // would allow.
+            let claimed = session_replay_ingest_batches::Entity::insert(marker)
+                .on_conflict(
+                    OnConflict::columns([
+                        session_replay_ingest_batches::Column::SessionId,
+                        session_replay_ingest_batches::Column::BatchId,
+                    ])
+                    .do_nothing()
+                    .to_owned(),
+                )
+                .exec_without_returning(&txn)
+                .await?;
+
+            if claimed == 0 {
+                txn.rollback().await?;
+                debug!(
+                    session_replay_id = %session_id,
+                    batch_id = %batch_id,
+                    "Discarded duplicate session replay batch"
+                );
+                return Ok(0);
+            }
+        }
+
         // Insert in batches rather than one round-trip per event. rrweb emits
         // hundreds to thousands of events per flush (mousemove/scroll sampling
         // dominates), so a row-at-a-time loop costs one network round-trip per
@@ -441,9 +494,11 @@ impl SessionReplayService {
             // generated ids are not used, and not shipping them back keeps
             // the response for a 1000-row batch small.
             session_replay_events::Entity::insert_many(models)
-                .exec_without_returning(self.db.as_ref())
+                .exec_without_returning(&txn)
                 .await?;
         }
+
+        txn.commit().await?;
 
         // Recompute duration from ALL stored events (not just this batch)
         if event_count > 0 {
@@ -1637,7 +1692,7 @@ mod tests {
 
         // Caller claims to be project 2
         let result = service
-            .add_session_events(2, "session-abc", "dGVzdA==") // "test" in base64
+            .add_session_events(2, "session-abc", "dGVzdA==", None) // "test" in base64
             .await;
 
         assert!(result.is_err());
@@ -1666,7 +1721,7 @@ mod tests {
         let service = SessionReplayService::new(Arc::new(db));
 
         let result = service
-            .add_session_events(1, "does-not-exist", "dGVzdA==")
+            .add_session_events(1, "does-not-exist", "dGVzdA==", None)
             .await;
 
         assert!(result.is_err());
@@ -1743,7 +1798,7 @@ mod tests {
 
         let payload = encode_events(&make_events(event_count));
         let result = service
-            .add_session_events(1, "session-batch", &payload)
+            .add_session_events(1, "session-batch", &payload, None)
             .await;
         assert_eq!(
             result.expect("add_session_events should succeed"),
@@ -1794,6 +1849,120 @@ mod tests {
             inserts, 3,
             "{event_count} events must be split into 3 chunked INSERT statements, got {inserts}"
         );
+    }
+
+    /// Count `INSERT` statements against the batch-marker table.
+    fn count_marker_inserts(log: &[sea_orm::Transaction]) -> usize {
+        log.iter()
+            .flat_map(|t| t.statements())
+            .filter(|stmt| {
+                stmt.sql.starts_with("INSERT INTO")
+                    && stmt.sql.contains("session_replay_ingest_batches")
+            })
+            .count()
+    }
+
+    /// Regression: the browser SDK resends a failed batch verbatim under the
+    /// same `batch_id`. When the marker insert conflicts, the batch has
+    /// already been stored and its events must NOT be appended again — that
+    /// duplication is what made an idle visitor accumulate the same events
+    /// over and over whenever ingest was slow enough to trigger retries.
+    #[tokio::test]
+    async fn add_events_discards_a_batch_that_was_already_ingested() {
+        let session = make_session_model(42, "session-dupe", 1);
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![session]])
+            // Marker insert conflicts: ON CONFLICT DO NOTHING affects 0 rows.
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let service = SessionReplayService::new(db.clone());
+        let payload = encode_events(&make_events(10));
+
+        let stored = service
+            .add_session_events(1, "session-dupe", &payload, Some("batch-1"))
+            .await
+            .expect("a duplicate batch is not an error");
+
+        assert_eq!(stored, 0, "a replayed batch must store no events");
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service should be the only other Arc holder")
+            .into_transaction_log();
+
+        assert_eq!(
+            count_event_inserts(&log),
+            0,
+            "no event rows may be written for a batch that already landed"
+        );
+    }
+
+    /// The first delivery of a batch claims the marker and stores its events.
+    #[tokio::test]
+    async fn add_events_stores_a_batch_seen_for_the_first_time() {
+        let session = make_session_model(42, "session-fresh", 1);
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![session]])
+            .append_exec_results(vec![
+                // Marker claimed.
+                sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                },
+                // Event batch insert.
+                sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 10,
+                },
+            ])
+            .append_query_results(vec![Vec::<
+                std::collections::BTreeMap<String, sea_orm::Value>,
+            >::new()])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let service = SessionReplayService::new(db.clone());
+        let payload = encode_events(&make_events(10));
+
+        let stored = service
+            .add_session_events(1, "session-fresh", &payload, Some("batch-2"))
+            .await
+            .expect("a fresh batch should store");
+
+        assert_eq!(stored, 10);
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service should be the only other Arc holder")
+            .into_transaction_log();
+
+        assert_eq!(
+            count_marker_inserts(&log),
+            1,
+            "the batch must be claimed once"
+        );
+        assert_eq!(count_event_inserts(&log), 1, "events must still be batched");
+    }
+
+    /// Clients that predate batch ids keep working: no marker is written and
+    /// the events are stored exactly as before.
+    #[tokio::test]
+    async fn add_events_without_a_batch_id_skips_the_marker_entirely() {
+        let log = insert_log_for(10).await;
+
+        assert_eq!(
+            count_marker_inserts(&log),
+            0,
+            "omitting batchId must not touch the dedup table"
+        );
+        assert_eq!(count_event_inserts(&log), 1);
     }
 
     /// get_project_id_for_session returns the correct project_id when the

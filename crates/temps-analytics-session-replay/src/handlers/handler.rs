@@ -182,8 +182,13 @@ pub struct ErrorResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct AddEventsRequest {
     pub events: String, // Base64 encoded, compressed events
+    /// Client-generated id, stable across retries of the same batch. When
+    /// present the append is idempotent; omitted, delivery is at-least-once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -229,6 +234,10 @@ pub struct SessionReplayInitResponse {
 pub struct SessionReplayEventsRequest {
     pub session_id: String,
     pub events: String, // Base64 encoded, compressed events
+    /// Client-generated id, stable across retries of the same batch. When
+    /// present the append is idempotent; omitted, delivery is at-least-once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
 }
 
 impl From<SessionReplayInfo> for SessionReplayInfoDto {
@@ -736,7 +745,12 @@ pub async fn add_events(
 
     match state
         .session_replay_service
-        .add_session_events(project_id, &session_id, &request.events)
+        .add_session_events(
+            project_id,
+            &session_id,
+            &request.events,
+            request.batch_id.as_deref(),
+        )
         .await
     {
         Ok(event_count) => Ok(Json(AddEventsResponse {
@@ -910,7 +924,12 @@ pub async fn add_session_replay_events(
 
     match state
         .session_replay_service
-        .add_session_events(project_id, &request.session_id, &request.events)
+        .add_session_events(
+            project_id,
+            &request.session_id,
+            &request.events,
+            request.batch_id.as_deref(),
+        )
         .await
     {
         Ok(event_count) => {
