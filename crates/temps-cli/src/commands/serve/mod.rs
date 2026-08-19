@@ -158,6 +158,17 @@ impl ServeCommand {
             std::env::set_var("TEMPS_CONSOLE_ADMIN_ADDRESS", admin);
         }
 
+        // Same bridge for the data directory. `ServerConfig::new` resolves it
+        // from TEMPS_DATA_DIR or falls back to ~/.temps, and never saw this
+        // flag — so `--data-dir /srv/temps` was silently ignored and the
+        // server wrote its encryption key, auth secret, logs and plugin data
+        // to the home directory instead. Two instances started with different
+        // `--data-dir` values would quietly share one directory.
+        if let Some(ref dir) = self.data_dir {
+            std::env::set_var("TEMPS_DATA_DIR", dir);
+            debug!("Data directory set to '{}' from CLI flag", dir.display());
+        }
+
         // In split (`--role=console`) mode the console must bind a STABLE,
         // known address: the sibling `temps proxy` forwards console/UI traffic
         // to it (proxy `ProxyConfig.console_address`). The default is a random
@@ -189,7 +200,22 @@ impl ServeCommand {
         let cookie_crypto = Arc::new(temps_core::CookieCrypto::new(&serve_config.auth_secret)?);
 
         debug!("Initializing database connection...");
-        // Create tokio runtime for database connection since we need async for this
+        // THE long-lived runtime for this process. It runs the startup
+        // `block_on`s just below, and later the index build, the backfill, the
+        // listeners and the console (`rt.spawn` further down). It stays alive
+        // until `serve` returns: under `--role=all` that is when pingora stops
+        // blocking this thread, and under `--role=console` when the console
+        // future it is blocking on finishes.
+        //
+        // It is deliberately built HERE, *before* the pool, rather than as a
+        // second runtime after startup: the pool has to be created on the
+        // runtime that will keep driving it. sqlx spawns a pool-maintenance
+        // task when the pool is constructed, and every socket the pool opens
+        // (`min_connections`, plus the connection migrations run on) registers
+        // with the creating runtime's IO driver. A startup-only runtime would
+        // leave both stranded -- the maintenance task unpolled and the pooled
+        // sockets bound to a driver nothing runs -- and the first query issued
+        // from the main runtime would hang forever.
         let rt = tokio::runtime::Runtime::new()?;
         let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
 
@@ -306,8 +332,6 @@ impl ServeCommand {
         // worker nodes that don't share this queue.) Keep it alive on the stack.
         let route_reload_subscriber =
             temps_routes::RouteReloadSubscriber::new(route_table.clone(), queue.clone());
-
-        let rt = tokio::runtime::Runtime::new()?;
 
         // Run non-transactional indexes and the TimescaleDB backfill on this
         // long-lived runtime, detached. Index creation retries with capped

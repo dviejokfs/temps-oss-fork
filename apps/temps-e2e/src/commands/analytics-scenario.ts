@@ -61,6 +61,7 @@ import {
   waitForHttpReady,
   assertNotConsoleFallback,
   resolveLoadTarget,
+  BROWSER_DOCUMENT_HEADERS,
   teardown,
   makeRunId,
   pollUntil,
@@ -187,9 +188,11 @@ export async function analyticsScenarioCommand(opts: AnalyticsScenarioOptions): 
     let visitorCookie: string | undefined
     let sessionCookie: string | undefined
     await step(
-      'GET / issues real _temps_visitor_id and _temps_sid cookies (should_track_page requires an HTML response)',
+      'GET / issues real _temps_visitor_id and _temps_sid cookies (should_track_page requires an HTML response AND browser document-navigation headers)',
       async () => {
-        const res = await fetch(target.url, { headers: target.headers })
+        const res = await fetch(target.url, {
+          headers: { ...target.headers, ...BROWSER_DOCUMENT_HEADERS },
+        })
         if (res.status !== 200) throw new Error(`GET / returned HTTP ${res.status}, expected 200`)
         const setCookies = res.headers.getSetCookie()
         visitorCookie = extractSetCookieValue(setCookies, '_temps_visitor_id')
@@ -197,6 +200,37 @@ export async function analyticsScenarioCommand(opts: AnalyticsScenarioOptions): 
         if (!visitorCookie) throw new Error(`no _temps_visitor_id in Set-Cookie: ${JSON.stringify(setCookies)}`)
         if (!sessionCookie) throw new Error(`no _temps_sid in Set-Cookie: ${JSON.stringify(setCookies)}`)
       },
+    )
+
+    // The other half of the contract. #700 narrowed tracking so non-browser
+    // traffic stops minting a visitor/session on every request; the step above
+    // only proves the positive case still works. These pin the negative, so a
+    // future loosening of should_track_page can't silently reintroduce the
+    // churn while the happy path keeps passing.
+    const assertNotTracked = async (what: string, headers: Record<string, string>) => {
+      const res = await fetch(target.url, { headers: { ...target.headers, ...headers } })
+      if (res.status !== 200) throw new Error(`GET / returned HTTP ${res.status}, expected 200`)
+      const setCookies = res.headers.getSetCookie()
+      const leaked = ['_temps_visitor_id', '_temps_sid'].filter((name) =>
+        extractSetCookieValue(setCookies, name),
+      )
+      if (leaked.length > 0) {
+        throw new Error(`${what} was tracked; unexpected ${leaked.join(', ')} in ${JSON.stringify(setCookies)}`)
+      }
+    }
+
+    await step('a generic HTTP client (wildcard Accept) is NOT tracked', () =>
+      assertNotTracked('generic HTTP client', { Accept: '*/*' }),
+    )
+
+    // A browser data fetch DOES send Fetch Metadata, and must be rejected even
+    // though it asks for HTML — the case a plain-Accept heuristic would miss.
+    await step('a browser data fetch (Sec-Fetch-Dest: empty) is NOT tracked', () =>
+      assertNotTracked('browser data fetch', {
+        Accept: 'text/html,application/xhtml+xml',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+      }),
     )
 
     const cookieHeader = () => `_temps_visitor_id=${visitorCookie}; _temps_sid=${sessionCookie}`

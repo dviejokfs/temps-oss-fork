@@ -26,9 +26,8 @@ use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
     build_set_cookie_sandbox, check_preview_auth, combine_cookie_header_values,
     encode_preview_cookie_subject, extract_cookie_values, parse_preview_host,
-    preview_cookie_needs_refresh, preview_peer_group_key, verify_argon2, PreviewAuthLimiter,
-    PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
-    PREVIEW_GATEWAY_PEER,
+    preview_cookie_needs_refresh, preview_gateway_peer, preview_peer_group_key, verify_argon2,
+    PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
 };
 use crate::service::cert_host_cache::CertHostCache;
 use crate::service::challenge_service::ChallengeService;
@@ -385,6 +384,12 @@ pub const LOG_STATIC_ASSETS: bool = false;
 /// Encrypt validation can never be redirected out from under the CA.
 pub const ACME_HTTP01_PREFIX: &str = "/.well-known/acme-challenge/";
 
+/// Path prefix for control-plane↔node cluster management (registration,
+/// heartbeat, DNS sync). A worker joining the cluster speaks plaintext HTTP
+/// before any TLS material exists, so these calls must never be answered with
+/// a redirect to a certificate that has not been issued yet.
+pub const INTERNAL_CLUSTER_PREFIX: &str = "/api/internal/";
+
 /// Decide whether a request on the plain-HTTP listener should be answered with
 /// a 301 to the HTTPS URL.
 ///
@@ -400,7 +405,10 @@ pub const ACME_HTTP01_PREFIX: &str = "/.well-known/acme-challenge/";
 ///   redirect to an HTTPS endpoint whose certificate is precisely the one that
 ///   has expired or does not exist yet. This exemption applies even when the
 ///   host has a valid certificate, because renewal happens while the old
-///   certificate is still installed.
+///   certificate is still installed. [`INTERNAL_CLUSTER_PREFIX`] is exempt for
+///   the same reason: a worker registering with the control plane speaks
+///   plaintext HTTP before it holds any TLS material, and those calls land on
+///   the console host — the one an operator is most likely to force to HTTPS.
 /// - `env_force_https` — the per-environment override. `None` inherits
 ///   `host_has_cert`; `Some(b)` wins outright.
 /// - `host_has_cert` — the default heuristic: redirect only hosts that actually
@@ -423,7 +431,7 @@ fn should_redirect_to_https(
         return false;
     }
 
-    if path.starts_with(ACME_HTTP01_PREFIX) {
+    if path.starts_with(ACME_HTTP01_PREFIX) || path.starts_with(INTERNAL_CLUSTER_PREFIX) {
         return false;
     }
 
@@ -450,17 +458,27 @@ fn inherited_https_policy(production_https: bool, host_has_cert: bool) -> bool {
 /// cluster-management API calls such as node registration/heartbeat — must
 /// never be redirected off this default. Cluster bootstrap traffic runs over
 /// plaintext HTTP by design, before any TLS material exists to redirect to.
+///
+/// The console deliberately does **not** ride on this default. An `https://`
+/// `external_url` says how users reach the platform, not who terminates the
+/// TLS: with an upstream CDN or reverse proxy in front, Temps sees a plaintext
+/// connection and holds no certificate, so redirecting would bounce the
+/// browser back to the CDN and into an infinite loop. Operators who want the
+/// console forced to HTTPS say so explicitly via
+/// `AppSettings::console_force_https`, which flows in through the same
+/// `force_https` parameter an environment uses.
 fn should_apply_production_https_default(
     disable_https_redirect: bool,
     is_tls: bool,
     path: &str,
-    env_force_https: Option<bool>,
+    force_https: Option<bool>,
     has_environment: bool,
 ) -> bool {
     !disable_https_redirect
         && !is_tls
         && !path.starts_with(ACME_HTTP01_PREFIX)
-        && env_force_https.is_none()
+        && !path.starts_with(INTERNAL_CLUSTER_PREFIX)
+        && force_https.is_none()
         && has_environment
 }
 
@@ -468,7 +486,7 @@ fn should_apply_production_https_default(
 mod deployment_asset_scope_tests {
     use super::{
         deployment_asset_path_matches, inherited_https_policy,
-        should_apply_production_https_default,
+        should_apply_production_https_default, should_redirect_to_https,
     };
 
     #[test]
@@ -500,6 +518,110 @@ mod deployment_asset_scope_tests {
         // Resolved project traffic with everything else the same — applies.
         assert!(should_apply_production_https_default(
             false, false, "/", None, true
+        ));
+    }
+
+    /// Cluster bootstrap speaks plaintext HTTP before any TLS material exists,
+    /// so internal node calls are never redirected — not by the production
+    /// default, and not by an explicit `force_https` either. A worker registers
+    /// against the console host, which is exactly the host an operator is
+    /// likeliest to force to HTTPS.
+    #[test]
+    fn internal_cluster_calls_are_never_redirected() {
+        assert!(!should_apply_production_https_default(
+            false,
+            false,
+            "/api/internal/nodes/1/heartbeat",
+            None,
+            true
+        ));
+        // Even with the override switched on and a certificate present.
+        assert!(!should_redirect_to_https(
+            false,
+            false,
+            "/api/internal/nodes/register",
+            Some(true),
+            || true
+        ));
+    }
+
+    /// The console gets no implicit HTTPS default. Temps cannot distinguish
+    /// "TLS terminated by an upstream CDN" from "plain HTTP" — both arrive as
+    /// a plaintext connection with no local certificate — so redirecting on the
+    /// strength of an `https://` external_url would loop the browser between
+    /// the CDN and Temps forever. Only an explicit operator override redirects.
+    #[test]
+    fn console_https_is_opt_in_not_inferred() {
+        // No override: falls through to the per-host certificate heuristic.
+        // No cert (CDN-fronted, or plain HTTP install) → no redirect.
+        assert!(!should_redirect_to_https(
+            false,
+            false,
+            "/login",
+            None,
+            || false
+        ));
+        // Cert provisioned through Temps → redirect, as it always has.
+        assert!(should_redirect_to_https(
+            false,
+            false,
+            "/login",
+            None,
+            || true
+        ));
+        // Explicit opt-in redirects even with no local certificate.
+        assert!(should_redirect_to_https(
+            false,
+            false,
+            "/login",
+            Some(true),
+            || false
+        ));
+        // Explicit opt-out wins over a provisioned certificate.
+        assert!(!should_redirect_to_https(
+            false,
+            false,
+            "/login",
+            Some(false),
+            || true
+        ));
+        // The global kill switch still outranks the override.
+        assert!(!should_redirect_to_https(
+            true,
+            false,
+            "/login",
+            Some(true),
+            || true
+        ));
+    }
+
+    /// Regression: the CDN redirect loop.
+    ///
+    /// Browser →(https)→ CDN →(http)→ Temps. `is_tls` is false because Temps
+    /// only trusts its own TLS digest, and no certificate exists locally
+    /// because the CDN holds it. If any rule inferred "redirect" from the
+    /// `https://` external_url alone, Temps would 301 back to the CDN, which
+    /// would forward plain HTTP again — forever, with the global kill switch
+    /// as the only escape.
+    #[test]
+    fn a_cdn_fronted_console_is_never_redirected_by_inference() {
+        let cdn_fronted_console = || {
+            should_redirect_to_https(
+                /* globally_disabled */ false,
+                /* is_tls */ false,
+                "/login",
+                // No environment resolved, and the operator set no override.
+                None,
+                // TLS terminated upstream, so Temps holds no certificate.
+                || false,
+            )
+        };
+        assert!(!cdn_fronted_console());
+
+        // And the production-HTTPS default cannot reach this request either:
+        // it is gated on a resolved environment, which the console never has.
+        assert!(!should_apply_production_https_default(
+            false, false, "/login", None, false
         ));
     }
 
@@ -2608,20 +2730,62 @@ fn is_event_stream_content_type(value: &str) -> bool {
         .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
+/// Whether a request looks like a browser navigating to a top-level document,
+/// as opposed to a data fetch, an embedded subresource, or a generic HTTP
+/// client that happens to accept HTML.
+///
+/// `Sec-Fetch-Dest` is the strong signal and is used whenever it is present:
+/// a browser labels a navigation `document` and a `fetch()`/XHR `empty`, so
+/// "present and not `document`" is a definitive no. But it is **not** present
+/// on every real page view. Per the Fetch Metadata spec, user agents append
+/// `Sec-Fetch-*` only for potentially trustworthy URLs — HTTPS and localhost —
+/// and Safari only began sending them in 16.4. A self-hosted Temps serving an
+/// app over plain HTTP therefore receives no Fetch Metadata at all, and
+/// treating that absence as "not a browser" would silently zero out every
+/// visitor, session and page view for that operator, with nothing in the UI
+/// to explain why.
+///
+/// So absence falls back to the weaker `Accept` + `text/html` response pair
+/// (the caller checks the response content-type). That is spoofable, but the
+/// thing it admits is an unauthenticated visitor row — analytics noise, not a
+/// trust decision — and a client must still both ask for HTML and be served
+/// HTML at a non-asset, non-API path. A browser-issued `fetch()` defaults to
+/// `Accept: */*` and is excluded by that alone, which is what keeps framework
+/// data fetches out on HTTP origins too.
+///
+/// Known cost of the fallback: on a plain-HTTP origin an `<iframe>` embed is
+/// indistinguishable from a navigation here, because the `Sec-Fetch-Dest:
+/// iframe` that would reject it is exactly what the browser withholds — the
+/// same goes for prefetch/prerender, whose `Sec-Purpose` is also absent. Those
+/// count as page views on HTTP. That is a regression against #700 but not
+/// against the behaviour before it, and it is scoped to origins that already
+/// get no Fetch Metadata at all. `Upgrade-Insecure-Requests` would tighten the
+/// generic-client case (issue #715) but does not separate an iframe from a
+/// document either.
 fn is_browser_document_request(
     method: &str,
     accept: Option<&str>,
     fetch_destination: Option<&str>,
 ) -> bool {
-    method == "GET"
-        && accept.is_some_and(|value| {
-            value.split(',').any(|part| {
-                part.split(';')
-                    .next()
-                    .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
-            })
+    if method != "GET" {
+        return false;
+    }
+
+    let accepts_html = accept.is_some_and(|value| {
+        value.split(',').any(|part| {
+            part.split(';')
+                .next()
+                .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
         })
-        && fetch_destination.is_some_and(|destination| destination.eq_ignore_ascii_case("document"))
+    });
+    if !accepts_html {
+        return false;
+    }
+
+    match fetch_destination {
+        Some(destination) => destination.eq_ignore_ascii_case("document"),
+        None => true,
+    }
 }
 
 /// Console/control-plane traffic always gets a fixed timeout, regardless of
@@ -4487,11 +4651,50 @@ impl ProxyHttp for LoadBalancer {
         // WS3: cert-host check is now a lock-free ArcSwap snapshot read; the
         // background `CertHostCache::run_refresh_loop` keeps it current (±30 s).
         let env_force_https = ctx.environment.as_ref().and_then(|env| env.force_https);
+        // An unresolved Host falls through to the console upstream. The console
+        // has its own operator-set override rather than inheriting a project's,
+        // and it is consulted only when no environment matched — `get_settings`
+        // is TTL-cached, so this costs nothing on the project hot path.
+        //
+        // On a settings read failure this yields `None` (inherit the per-host
+        // certificate heuristic), not `Some(true)`: guessing "redirect" here
+        // would turn a transient database blip into a console that 301s to a
+        // certificate it may not have.
+        let console_force_https = if ctx.environment.is_none() {
+            match self.config_service.get_settings().await {
+                Ok(settings) => {
+                    let request_host = ctx
+                        .host
+                        .split(':')
+                        .next()
+                        .unwrap_or(&ctx.host)
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase();
+                    if settings.console_hostname().as_deref() == Some(request_host.as_str()) {
+                        settings.console_force_https
+                    } else {
+                        None
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Failed to read app settings; falling back to the per-host certificate heuristic for HTTPS policy"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // Exactly one of these can be set: `console_force_https` is only
+        // computed when no environment resolved.
+        let force_https = env_force_https.or(console_force_https);
         let production_https = if should_apply_production_https_default(
             self.disable_https_redirect,
             self.is_tls_connection(session),
             &ctx.path,
-            env_force_https,
+            force_https,
             ctx.environment.is_some(),
         ) {
             match self.config_service.get_url_scheme().await {
@@ -4511,7 +4714,7 @@ impl ProxyHttp for LoadBalancer {
             self.disable_https_redirect,
             self.is_tls_connection(session),
             &ctx.path,
-            env_force_https,
+            force_https,
             // Lock-free ArcSwap snapshot read, and only reached when the
             // environment has no explicit override.
             || {
@@ -5214,13 +5417,14 @@ impl ProxyHttp for LoadBalancer {
             } else {
                 std::time::Duration::from_secs(60)
             };
-            let mut peer = Box::new(HttpPeer::new(PREVIEW_GATEWAY_PEER, false, String::new()));
+            let gateway_peer = preview_gateway_peer();
+            let mut peer = Box::new(HttpPeer::new(gateway_peer.as_str(), false, String::new()));
             peer.group_key = preview_peer_group_key(host);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
             peer.options.read_timeout = Some(preview_io_timeout);
             peer.options.write_timeout = Some(preview_io_timeout);
             peer.options.idle_timeout = Some(preview_io_timeout);
-            ctx.upstream_host = Some(PREVIEW_GATEWAY_PEER.to_string());
+            ctx.upstream_host = Some(gateway_peer);
             return Ok(peer);
         }
 
