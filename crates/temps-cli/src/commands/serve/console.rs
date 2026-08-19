@@ -1676,15 +1676,23 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_project",
         "get_project_by_slug",
         // ── External services: detail + masked env vars ──
-        // `get_service` / `get_service_by_slug` call `get_service_details`, which
-        // runs `mask_sensitive_parameter_values` before returning — sensitive params
-        // are replaced with "***" and listed in `sensitive_parameters`.
+        // `get_service` calls `get_service_details`, which runs
+        // `mask_sensitive_parameter_values` before returning. That masking is a
+        // name-heuristic (matches suffixes like `_key`/`_password`/`_token`/`_secret`,
+        // prefixes like `private_`), not an unconditional guarantee — a parameter
+        // stored under a non-standard name (e.g. a custom service plugin's `psk` or
+        // a PEM blob under `cert`) could pass through unmasked. `get_service_by_slug`
+        // is intentionally NOT included here: unlike `get_service`, its handler
+        // (handlers.rs:2343) has no `assert_service_owned_by_caller` check, so it
+        // would let the AI resolve and read any service on the instance by slug,
+        // not just ones linked to the caller's own project — see security review on
+        // PR #732.
         // The `get_service_environment_variables` bulk endpoint explicitly sets
         // `mask_sensitive: true`; `get_project_service_environment_variables` calls
-        // `mask_environment_variable_values` before responding. Preview env var
+        // `mask_environment_variable_values` before responding — both unconditional
+        // (every value becomes "***", not name-heuristic). Preview env var
         // endpoints return names only or masked values by design.
         "get_service",
-        "get_service_by_slug",
         "get_service_environment_variables",
         "get_project_service_environment_variables",
         "get_service_preview_environment_variable_names",
