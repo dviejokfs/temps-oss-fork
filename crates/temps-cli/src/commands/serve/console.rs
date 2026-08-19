@@ -1734,16 +1734,23 @@ fn ai_read_allowlist() -> Vec<String> {
         // Project-scoped alarm list and summary counts; permission_guard DeploymentsRead.
         "listProjectAlarms",
         "getProjectAlarmsSummary",
-        // ── Observability event store ──
-        // List rows are truncated previews (events.rs: "*_truncated flag") —
-        // safe. `observability_full_event` is intentionally NOT included: it
-        // returns the un-truncated row, and for error events that's
-        // `FullError.data`, "the full JSONB blob... stack trace, breadcrumbs,
-        // request context, everything" (service.rs), plus raw
-        // request/response headers for request events — same risk class as
-        // the already-excluded `get_session_logs`. Flagged in security review
-        // on PR #732 (Greptile).
-        "observability_list_events",
+        // ── Observability event store: excluded entirely ──
+        // Neither `observability_list_events` nor `observability_full_event`
+        // is included. `_full_event` returns the un-truncated row outright
+        // (for errors, `FullError.data` — "the full JSONB blob... stack
+        // trace, breadcrumbs, request context, everything", service.rs).
+        // `_list_events`'s "truncated" preview rows are NOT safe either:
+        // `truncate_stacktrace`/the attributes preview (types.rs) only cap
+        // *count* (first 5 stack frames, first 20 span attribute keys) —
+        // they don't redact *content*. So the list endpoint still returns,
+        // verbatim: `RequestRow.query_string` (untruncated — can carry
+        // `?token=`/`?api_key=`/PII), `SpanRow.attributes` (raw
+        // developer-set tags — same risk class as the already-excluded
+        // `get_property_breakdown`), `ErrorRow.stacktrace_preview` (raw
+        // frames), and `ErrorRow.message`. Only `request_headers`/
+        // `response_headers` are genuinely safe (allowlist-filtered by
+        // `HEADER_WHITELIST`). Flagged in security review on PR #732
+        // (Greptile, 3rd pass).
         // ── IP access control ──
         // Access-rule list and single-IP block check; no secrets.
         "check_ip_blocked",
