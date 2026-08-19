@@ -9,14 +9,23 @@ import {
 } from '@/components/ui/card'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { usePlugins, useReloadPlugins } from '@/hooks/usePlugins'
+import {
+  usePlugins,
+  usePluginAvailability,
+  usePluginStatus,
+  useInstallPlugin,
+  useReloadPlugins,
+} from '@/hooks/usePlugins'
+import { problemMessage } from '@/components/settings/oidc-provider-constants'
 import {
   AlertCircle,
+  CheckCircle2,
   Copy,
   ExternalLink,
   Loader2,
   Puzzle,
   RefreshCw,
+  Sparkles,
 } from 'lucide-react'
 import { useEffect } from 'react'
 import { Link } from 'react-router'
@@ -66,6 +75,8 @@ export function PluginsPage() {
 
   return (
     <div className="space-y-6">
+      <VibeTempsInstallCard />
+
       <Card>
         <CardHeader>
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
@@ -171,6 +182,130 @@ export function PluginsPage() {
 
       <PluginExamples />
     </div>
+  )
+}
+
+const VIBETEMPS_PLUGIN_NAME = 'vibetemps'
+
+/**
+ * Install card for VibeTemps — the one plugin the platform knows how to
+ * fetch and install for you (everything else is the manual binary-drop flow
+ * below). Always rendered, regardless of whether VibeTemps is configured:
+ * an unconfigured feature must onboard the operator, not disappear.
+ */
+function VibeTempsInstallCard() {
+  const statusQuery = usePluginStatus(VIBETEMPS_PLUGIN_NAME)
+  const availabilityQuery = usePluginAvailability(VIBETEMPS_PLUGIN_NAME)
+  const installMutation = useInstallPlugin(VIBETEMPS_PLUGIN_NAME)
+
+  const configured = statusQuery.data?.configured ?? false
+  const reason = statusQuery.data?.reason
+  const setupPath = statusQuery.data?.setup_path
+  const manifest = availabilityQuery.data?.manifest
+
+  const handleInstall = () => {
+    installMutation.mutate(manifest?.version, {
+      onSuccess: (result) => {
+        toast.success(result.message)
+      },
+      onError: (error) => {
+        toast.error(problemMessage(error, 'Failed to install VibeTemps'))
+      },
+    })
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-start gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-muted">
+              <Sparkles className="h-4 w-4" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <CardTitle>VibeTemps</CardTitle>
+                {manifest?.version && (
+                  <Badge variant="secondary" className="text-xs">
+                    v{manifest.version}
+                  </Badge>
+                )}
+              </div>
+              <CardDescription className="mt-1">
+                An AI app builder embedded in the Temps platform — describe
+                what you want and it scaffolds, previews, and deploys the app
+                for you, right inside the console.
+              </CardDescription>
+            </div>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {statusQuery.isLoading ? (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Checking VibeTemps status…
+          </div>
+        ) : statusQuery.isError ? (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Could not check VibeTemps status</AlertTitle>
+            <AlertDescription>
+              {problemMessage(statusQuery.error, 'Unknown error')}
+            </AlertDescription>
+          </Alert>
+        ) : configured ? (
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-2 text-sm">
+              <CheckCircle2 className="h-4 w-4 text-green-600 dark:text-green-400" />
+              <span>VibeTemps is installed and running.</span>
+            </div>
+            {setupPath && (
+              <Button asChild variant="outline" size="sm">
+                <Link to={setupPath}>Open VibeTemps</Link>
+              </Button>
+            )}
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="rounded-lg border border-dashed bg-muted/30 p-3">
+              <p className="text-sm">
+                {reason ?? 'VibeTemps is not installed on this instance.'}
+              </p>
+            </div>
+            {installMutation.isError && (
+              <Alert variant="destructive">
+                <AlertCircle className="h-4 w-4" />
+                <AlertTitle>Install failed</AlertTitle>
+                <AlertDescription>
+                  {problemMessage(installMutation.error, 'Unknown error')}
+                </AlertDescription>
+              </Alert>
+            )}
+            <div className="flex items-center gap-2">
+              <Button
+                onClick={handleInstall}
+                disabled={installMutation.isPending}
+              >
+                {installMutation.isPending ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Installing…
+                  </>
+                ) : (
+                  'Install VibeTemps'
+                )}
+              </Button>
+              {availabilityQuery.data?.reason && (
+                <span className="text-xs text-muted-foreground">
+                  {availabilityQuery.data.reason}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 

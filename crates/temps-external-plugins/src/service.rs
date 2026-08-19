@@ -226,6 +226,45 @@ impl ExternalPluginsService {
         new_manifests
     }
 
+    /// Start or reload a single plugin by name.
+    ///
+    /// If the plugin is already running, it is restarted in-place (shutdown +
+    /// re-start from the same binary path). If it is not yet running, the
+    /// plugins directory is scanned for a matching binary and it is started
+    /// fresh. After a successful start the proxy router is rebuilt so the new
+    /// plugin becomes reachable immediately without a full server restart.
+    ///
+    /// Returns the new manifest on success, or an error string on failure.
+    pub async fn start_or_reload_plugin(
+        &self,
+        plugin_name: &str,
+    ) -> Result<temps_core::external_plugin::PluginManifest, String> {
+        let result = if self.manager.is_running(plugin_name).await {
+            self.manager.reload_plugin(plugin_name).await
+        } else {
+            // Plugin binary was just installed — find it in the plugins dir and start it.
+            let binary_path = self.manager.config().plugins_dir.join(plugin_name);
+            self.manager.start_plugin_by_path(&binary_path).await
+        };
+
+        if let Ok(ref manifest) = result {
+            // Rebuild the proxy router so the (re)started plugin is immediately reachable.
+            let manifests = self.manager.manifests().await;
+            let new_router = Self::build_proxy_router_from(&self.manager, &manifests).await;
+            {
+                let mut router = self.proxy_router.write().await;
+                *router = new_router;
+            }
+            {
+                let mut cached = self.manifests.write().await;
+                *cached = manifests;
+            }
+            info!(plugin = %manifest.name, version = %manifest.version, "Plugin started/reloaded via install flow");
+        }
+
+        result
+    }
+
     /// Shut down all external plugins gracefully.
     pub async fn shutdown_all(&self) {
         let mut listener = self.event_listener.write().await;
