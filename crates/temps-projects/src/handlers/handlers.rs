@@ -1117,6 +1117,28 @@ pub async fn delete_project(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// Decide what the settings audit should record in its `name` field.
+///
+/// Records the *persisted* name rather than the request, because the service
+/// trims the incoming value — auditing the raw request could write a name that
+/// never reached the database. Records nothing when the request re-submitted
+/// the name the project already had (directly, or via a value that trims to
+/// it), because no rename happened and a rename in the audit history would be a
+/// lie.
+///
+/// `previous` is `None` when the pre-update read failed. That case cannot prove
+/// the update was a no-op, so it records the name: over-reporting a rename is
+/// recoverable during an incident review, silently dropping a real one is not.
+fn audited_rename(name_requested: bool, previous: Option<&str>, persisted: &str) -> Option<String> {
+    if !name_requested {
+        return None;
+    }
+    match previous {
+        Some(previous) if previous == persisted => None,
+        _ => Some(persisted.to_string()),
+    }
+}
+
 /// Update project settings
 #[utoipa::path(
     post,
@@ -1148,12 +1170,14 @@ pub async fn update_project_settings(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    // Capture the pre-update retention window only when it's actually
-    // changing, so an unrelated settings save (slug, attack mode, ...)
-    // doesn't pay for an extra read.
-    let previous_image_retention_hours = if settings.image_retention_hours.is_some() {
+    // Capture the pre-update state only when a field that audits its previous
+    // value is actually changing, so an unrelated settings save (attack mode,
+    // preview envs, ...) doesn't pay for an extra read. One read serves both
+    // the retention window and the display name.
+    let audits_previous_value = settings.image_retention_hours.is_some() || settings.name.is_some();
+    let prior_project = if audits_previous_value {
         match state.project_service.get_project(project_id).await {
-            Ok(project) => project.image_retention_hours,
+            Ok(project) => Some(project),
             Err(e) => {
                 // A failed read and a genuinely-unset prior value both end up
                 // `None` in the audit record below — that's an accepted gap
@@ -1164,8 +1188,8 @@ pub async fn update_project_settings(
                 warn!(
                     error = %e,
                     project_id,
-                    "Could not read prior image_retention_hours before update; \
-                     audit log will record it as unset rather than unknown"
+                    "Could not read prior project state before update; audit log \
+                     will record previous values as unset rather than unknown"
                 );
                 None
             }
@@ -1173,6 +1197,20 @@ pub async fn update_project_settings(
     } else {
         None
     };
+
+    let previous_image_retention_hours = if settings.image_retention_hours.is_some() {
+        prior_project
+            .as_ref()
+            .and_then(|project| project.image_retention_hours)
+    } else {
+        None
+    };
+
+    let previous_name = settings
+        .name
+        .as_ref()
+        .and(prior_project.as_ref())
+        .map(|project| project.name.clone());
 
     let updated_project = state
         .project_service
@@ -1217,10 +1255,12 @@ pub async fn update_project_settings(
         memory_request: None,
         memory_limit: None,
         performance_metrics_enabled: None,
-        // Record what was actually persisted rather than what was sent: the
-        // service trims the incoming name, so auditing the raw request could
-        // write a value that never reached the database.
-        name: settings.name.as_ref().map(|_| updated_project.name.clone()),
+        name: audited_rename(
+            settings.name.is_some(),
+            previous_name.as_deref(),
+            &updated_project.name,
+        ),
+        previous_name,
         slug: settings.slug,
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
         image_retention_hours: settings.image_retention_hours,
@@ -2401,7 +2441,7 @@ pub async fn create_project_from_template(
 #[cfg(test)]
 mod tests {
     use super::{
-        compose_path_for_candidate, parse_owner_repo_from_git_url,
+        audited_rename, compose_path_for_candidate, parse_owner_repo_from_git_url,
         project_created_from_template_telemetry_event, require_git_settings_permissions,
     };
     use chrono::Utc;
@@ -2592,5 +2632,38 @@ mod tests {
         let (owner, repo) = parse_owner_repo_from_git_url("not-a-url");
         assert!(!owner.is_empty());
         assert!(!repo.is_empty());
+    }
+
+    #[test]
+    fn audited_rename_records_nothing_when_no_name_was_requested() {
+        assert_eq!(audited_rename(false, Some("Old"), "Old"), None);
+        // Even if the persisted name differs for unrelated reasons, a request
+        // that did not ask to rename must not record one.
+        assert_eq!(audited_rename(false, Some("Old"), "New"), None);
+    }
+
+    #[test]
+    fn audited_rename_records_nothing_for_a_no_op_rename() {
+        // Re-submitting the current name, or a value that trims to it, performs
+        // no rename — the audit must not claim otherwise.
+        assert_eq!(audited_rename(true, Some("Same Name"), "Same Name"), None);
+    }
+
+    #[test]
+    fn audited_rename_records_the_persisted_name_on_a_real_rename() {
+        assert_eq!(
+            audited_rename(true, Some("Old Name"), "New Name"),
+            Some("New Name".to_string())
+        );
+    }
+
+    #[test]
+    fn audited_rename_records_the_name_when_the_previous_value_is_unknown() {
+        // The pre-update read failed. We cannot prove this was a no-op, and
+        // dropping a real rename from the audit trail is the worse error.
+        assert_eq!(
+            audited_rename(true, None, "New Name"),
+            Some("New Name".to_string())
+        );
     }
 }

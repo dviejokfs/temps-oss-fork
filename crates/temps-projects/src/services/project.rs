@@ -468,6 +468,19 @@ fn resolve_preset_selection(
     })
 }
 
+/// How the route-reload signal for a public-port change was published, which
+/// determines whether the caller still owes an in-process queue job after it
+/// commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteReloadSignal {
+    /// NOTIFY rides the caller's transaction and is delivered at commit. The
+    /// caller should enqueue the in-process job once the commit succeeds.
+    NotifyQueuedOnTransaction,
+    /// NOTIFY was unavailable and the job was already sent as a fallback; the
+    /// caller must not send it a second time.
+    FallbackJobAlreadySent,
+}
+
 #[derive(Clone)]
 pub struct ProjectService {
     pub db: Arc<temps_database::DbConnection>,
@@ -1744,11 +1757,24 @@ impl ProjectService {
                 active_project.name = Set(name_value.clone());
             }
 
-            let updated_project = active_project.update(self.db.as_ref()).await?;
-            if initial_public_ports != compose_public_ports(updated_project.preset_config.as_ref())
+            // Commit the write and publish the route reload in one transaction.
+            // Route reload can fail (only when both the queue and NOTIFY are
+            // unavailable), and returning an error while the rename and the
+            // preset/directory changes stayed persisted would leave the caller
+            // unable to tell what actually happened. Dropping the transaction on
+            // the error path rolls all of it back together.
+            let txn = self.db.begin().await?;
+            let updated_project = active_project.update(&txn).await?;
+            let route_signal = if initial_public_ports
+                != compose_public_ports(updated_project.preset_config.as_ref())
             {
-                self.reload_routes_after_compose_port_change(project_id)
-                    .await?;
+                Some(self.publish_route_reload(&txn, project_id).await?)
+            } else {
+                None
+            };
+            txn.commit().await?;
+            if route_signal == Some(RouteReloadSignal::NotifyQueuedOnTransaction) {
+                self.enqueue_route_reload(project_id).await;
             }
             let project_found = Self::map_db_project_to_project(updated_project);
 
@@ -2193,11 +2219,22 @@ impl ProjectService {
             active_project.generic_webhook_token = Set(None);
         }
 
-        let updated_project = active_project.update(self.db.as_ref()).await?;
+        // Same rollback-together reasoning as `update_project_settings`: publish
+        // the reload on the transaction that carries the write, so a failure to
+        // signal leaves nothing persisted.
+        let txn = self.db.begin().await?;
+        let updated_project = active_project.update(&txn).await?;
 
-        if previous_public_ports != compose_public_ports(updated_project.preset_config.as_ref()) {
-            self.reload_routes_after_compose_port_change(project_id)
-                .await?;
+        let route_signal = if previous_public_ports
+            != compose_public_ports(updated_project.preset_config.as_ref())
+        {
+            Some(self.publish_route_reload(&txn, project_id).await?)
+        } else {
+            None
+        };
+        txn.commit().await?;
+        if route_signal == Some(RouteReloadSignal::NotifyQueuedOnTransaction) {
+            self.enqueue_route_reload(project_id).await;
         }
 
         Ok(Self::map_db_project_to_project(updated_project))
@@ -2210,26 +2247,30 @@ impl ProjectService {
     /// the queue gives this process a deterministic reload, while PostgreSQL
     /// NOTIFY wakes other control-plane processes and remains a fallback if
     /// the queue is unavailable.
-    async fn reload_routes_after_compose_port_change(
+    ///
+    /// Publishes on the caller's connection rather than reaching for `self.db`,
+    /// so a caller writing inside a transaction issues the NOTIFY on that same
+    /// transaction. PostgreSQL queues notifications and delivers them at commit,
+    /// so a rolled-back update signals nothing and no listener can observe a
+    /// reload for a write that never landed.
+    ///
+    /// The in-process queue job is deliberately *not* sent here: its subscriber
+    /// reloads the route table straight from the database, so enqueuing it
+    /// before the transaction commits would race the commit and could latch in
+    /// the pre-update ports with nothing left to trigger a re-read. The caller
+    /// sends it after committing — see [`Self::enqueue_route_reload`].
+    async fn publish_route_reload<C: ConnectionTrait>(
         &self,
+        conn: &C,
         project_id: i32,
-    ) -> Result<(), ProjectError> {
-        let queue_result = self
-            .queue_service
-            .send(Job::ForceRouteReload(ForceRouteReloadJob {
-                environment_id: None,
-                deployment_id: None,
-            }))
-            .await;
-
+    ) -> Result<RouteReloadSignal, ProjectError> {
         let payload = serde_json::json!({
             "action": "UPDATE",
             "project_id": project_id,
             "field": "preset_config.public_ports",
         })
         .to_string();
-        let notify_result = self
-            .db
+        let notify_result = conn
             .execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT pg_notify('project_route_change', $1)",
@@ -2237,13 +2278,59 @@ impl ProjectService {
             ))
             .await;
 
-        match (queue_result, notify_result) {
-            (Ok(()), _) | (_, Ok(_)) => Ok(()),
-            (Err(queue_error), Err(database_error)) => Err(ProjectError::RouteReloadFailed {
+        match notify_result {
+            Ok(_) => Ok(RouteReloadSignal::NotifyQueuedOnTransaction),
+            Err(database_error) => {
+                // NOTIFY is unavailable. Fall back to the queue immediately —
+                // this races the commit as described above, but a stale route
+                // table beats no reload signal at all, and this only happens
+                // when the database refused the NOTIFY in the first place.
+                match self
+                    .queue_service
+                    .send(Job::ForceRouteReload(ForceRouteReloadJob {
+                        environment_id: None,
+                        deployment_id: None,
+                    }))
+                    .await
+                {
+                    Ok(()) => {
+                        warn!(
+                            project_id,
+                            error = %database_error,
+                            "NOTIFY for route reload failed; fell back to the in-process queue"
+                        );
+                        Ok(RouteReloadSignal::FallbackJobAlreadySent)
+                    }
+                    Err(queue_error) => Err(ProjectError::RouteReloadFailed {
+                        project_id,
+                        queue_reason: queue_error.to_string(),
+                        database_reason: database_error.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Send the in-process route-reload job. Call only *after* the transaction
+    /// carrying the port change has committed, so the subscriber cannot read
+    /// pre-commit state. Best-effort: the NOTIFY published on the transaction
+    /// has already been delivered by this point, so a queue failure degrades
+    /// this process's reload latency rather than losing the signal.
+    async fn enqueue_route_reload(&self, project_id: i32) {
+        if let Err(e) = self
+            .queue_service
+            .send(Job::ForceRouteReload(ForceRouteReloadJob {
+                environment_id: None,
+                deployment_id: None,
+            }))
+            .await
+        {
+            warn!(
                 project_id,
-                queue_reason: queue_error.to_string(),
-                database_reason: database_error.to_string(),
-            }),
+                error = %e,
+                "Route reload job could not be enqueued after committing a public-port change; \
+                 this process will rely on the delivered NOTIFY"
+            );
         }
     }
 
