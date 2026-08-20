@@ -18,6 +18,13 @@ pub use proxy::start_proxy_server;
 const POST_MIGRATION_INDEX_INITIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 const POST_MIGRATION_INDEX_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Bound on how long single-binary proxy startup waits for console plugin
+/// initialization (specifically, for a licensed plugin to claim
+/// `project_ip_gate_slot`) before starting to serve traffic anyway. See the
+/// comment at the call site for why this exists and why it is bounded
+/// rather than an unconditional wait.
+const PROJECT_IP_GATE_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn next_post_migration_index_retry(current: std::time::Duration) -> std::time::Duration {
     current
         .saturating_mul(2)
@@ -690,29 +697,60 @@ impl ServeCommand {
             }
         });
 
-        // Monitor console readiness in a background thread so we can log it,
-        // but do NOT block proxy startup on it.
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("Failed to create runtime for console monitor: {}", e);
-                    return;
-                }
-            };
-            match rt.block_on(ready_rx) {
-                Ok(()) => {
-                    info!("✅ Console API is ready");
-                }
-                Err(_) => {
-                    tracing::error!(
-                        "❌ Console API failed to become ready — check error logs above"
-                    );
-                }
+        // Wait *briefly* for the console to finish plugin initialization
+        // before the proxy starts serving traffic — this is deliberately
+        // NOT the same thing as waiting for the console to be fully
+        // healthy (that could hang indefinitely on an unrelated console
+        // failure — Docker check, GeoIP validation, etc. — which is
+        // exactly the "proxied traffic goes down because of a console
+        // problem" failure mode the comment above exists to avoid).
+        //
+        // The reason this wait exists at all: `project_ip_gate_slot` (see
+        // the security guardrail comment above) starts as `OpenIpGate`
+        // (allow everything) and is only claimed once plugin
+        // initialization completes — the exact point `ready_signal` fires
+        // ("Plugins are fully initialized at this point", console.rs).
+        // Starting the proxy before that point meant every IP-restricted
+        // project was reachable by any client on every single boot, for
+        // however long console init happened to take (P1 security finding
+        // on PR #725 — a client that a configured gate would deny could
+        // reach a restricted project during this window). A short, bounded
+        // wait closes the gap entirely in the normal case (plugin
+        // registration is fast — no HTTP listener bind, no migration wait,
+        // just service registration) while still guaranteeing the proxy
+        // starts even if console init is slow or fails outright, so the
+        // availability guarantee above still holds — the failure mode
+        // just becomes a loud, bounded, logged exposure window instead of
+        // a silent, unbounded one.
+        match rt.block_on(tokio::time::timeout(PROJECT_IP_GATE_STARTUP_GRACE, ready_rx)) {
+            Ok(Ok(())) => {
+                info!(
+                    "✅ Console API is ready — any project IP gate a licensed plugin \
+                     installed is in place before the proxy starts serving"
+                );
             }
-        });
+            Ok(Err(_)) => {
+                tracing::error!(
+                    "❌ Console API failed to become ready — check error logs above. \
+                     Starting the proxy anyway (proxied traffic to deployed applications \
+                     is not held hostage by a console failure), but note: any \
+                     project-scoped IP restriction will NOT be enforced until the console \
+                     problem is resolved and the process is restarted."
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "⏳ Console API did not become ready within {:?} — starting the proxy \
+                     anyway rather than blocking indefinitely. Any project-scoped IP \
+                     restriction will not be enforced until console plugin initialization \
+                     finishes; this is a bounded, logged exposure window, not the \
+                     unbounded one this wait exists to close.",
+                    PROJECT_IP_GATE_STARTUP_GRACE
+                );
+            }
+        }
 
-        info!("Starting proxy server (console API initializing in background)...");
+        info!("Starting proxy server...");
 
         // Start proxy server (this will block until shutdown)
         start_proxy_server(
