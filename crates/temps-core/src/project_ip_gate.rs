@@ -17,14 +17,20 @@
 //! [`RetentionResolver`](crate::RetentionResolver) for the established
 //! version of this same shape.
 //!
-//! **Deployment note (split topology).** A standalone proxy process that
-//! loads no plugins never claims [`ProjectIpGateSlot`], so every request is
-//! allowed — a project-scoped IP rule only takes effect when the proxy runs
-//! in-process with the console (the default single-binary mode). This is a
-//! deliberate, documented limitation rather than an oversight: keeping the
-//! enforcement mechanism entirely inside the (optional) plugin, rather than
-//! adding it to core, was the explicit trade-off made when this feature was
-//! designed.
+//! **Deployment note (split topology).** A standalone proxy process loads no
+//! plugins, so nothing claims [`ProjectIpGateSlot`] there and the default
+//! gate allows every request. That process does, however, open the same
+//! database as the console, so under-enforcing is not structural — a gate
+//! only needs a way in. The proxy entrypoint therefore takes an optional
+//! builder (`ProxyCommand::execute_with_ip_gate`) that an embedding binary
+//! can use to supply a real gate at startup; the plain `temps proxy`
+//! entrypoint supplies none and gets [`OpenIpGate`].
+//!
+//! The consequence worth stating plainly: a standalone proxy started through
+//! `execute` enforces nothing, and that is invisible from the outside — the
+//! rules are configured, and traffic simply is not checked against them.
+//! Anyone running a split topology needs to confirm which entrypoint their
+//! proxy nodes use.
 
 use std::net::IpAddr;
 

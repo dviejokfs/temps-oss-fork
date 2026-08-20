@@ -178,8 +178,34 @@ pub struct ProxyCommand {
     pub disable_https_redirect: bool,
 }
 
+/// Builds the [`temps_core::ProjectIpGate`] a standalone proxy enforces with.
+///
+/// Called once at startup with the proxy's own database handle and the
+/// runtime handle its background work may use. This exists because the
+/// standalone proxy has no plugin registry — the mechanism every other
+/// process uses to install a gate — but it *does* have the same database,
+/// so there is no structural reason it must under-enforce. A binary that
+/// knows how to build a gate passes one here; `execute` passes none and
+/// gets [`temps_core::OpenIpGate`].
+///
+/// The runtime handle is part of the contract rather than an implementation
+/// detail: pingora owns the process runtime once the proxy starts, so a gate
+/// that refreshes in the background has to be given somewhere to run before
+/// that happens.
+pub type ProjectIpGateBuilder = Box<
+    dyn FnOnce(Arc<DbConnection>, &tokio::runtime::Handle) -> Arc<dyn temps_core::ProjectIpGate>,
+>;
+
 impl ProxyCommand {
     pub fn execute(self) -> anyhow::Result<()> {
+        self.execute_with_ip_gate(None)
+    }
+
+    /// `execute`, but with a caller-supplied project IP gate.
+    pub fn execute_with_ip_gate(
+        self,
+        ip_gate_builder: Option<ProjectIpGateBuilder>,
+    ) -> anyhow::Result<()> {
         let serve_config = Arc::new(temps_config::ServerConfig::new(
             self.address.clone(),
             self.database_url.clone(),
@@ -208,9 +234,21 @@ impl ProxyCommand {
         // Services are now available for use
         debug!("Cookie crypto and encryption services initialized");
 
+        // Built before pingora takes over the process, on the runtime whose
+        // worker threads keep driving whatever the gate spawns.
+        let project_ip_gate = match ip_gate_builder {
+            Some(build) => {
+                let gate = build(db.clone(), rt.handle());
+                debug!("proxy: enforcing project IP rules via a caller-supplied gate");
+                gate
+            }
+            None => Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>,
+        };
+
         // Start proxy server
         self.start_proxy_server(
             db,
+            project_ip_gate,
             self.address.clone(),
             self.tls_address.clone(),
             self.console_address.clone(),
@@ -224,6 +262,7 @@ impl ProxyCommand {
     fn start_proxy_server(
         &self,
         db: Arc<DbConnection>,
+        project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
         address: String,
         tls_address: Option<String>,
         console_address: Option<String>,
@@ -530,12 +569,10 @@ impl ProxyCommand {
             // its plugins — there is nothing here to register an alternative
             // resolver.
             Arc::new(temps_core::FixedRetentionResolver),
-            // Same reasoning, for the same structural cause: a
-            // project's IP restriction is not enforced when the proxy runs
-            // as this standalone process, because there are no plugins here
-            // to claim the gate. Accepted, documented limitation — see
-            // `temps_core::project_ip_gate`'s module doc — not an oversight.
-            Arc::new(temps_core::OpenIpGate),
+            // Supplied by the caller when the embedding binary knows how to
+            // build one; `temps_core::OpenIpGate` (allow everything) otherwise,
+            // which is what the plain `temps proxy` entrypoint passes.
+            project_ip_gate,
         ) {
             Ok(_) => {
                 info!("Proxy server exited");
