@@ -23,6 +23,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TimeBucketStats } from '@/api/client/types.gen'
 import { Link } from 'react-router'
+import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -922,10 +923,6 @@ function FilterBar({
   filter: ProxyFilter
   onChange: (f: ProxyFilter) => void
 }) {
-  const projectsQ = useQuery({
-    ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
-    staleTime: 60_000,
-  })
   const environmentsQ = useQuery({
     ...getEnvironmentsOptions({
       path: { project_id: filter.projectId ?? 0 },
@@ -934,34 +931,16 @@ function FilterBar({
     staleTime: 60_000,
   })
 
-  const projects = projectsQ.data?.projects ?? []
   const environments = environmentsQ.data ?? []
 
   return (
     <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-      <Select
-        value={
-          filter.projectId != null ? String(filter.projectId) : ALL_SENTINEL
+      <ProjectSelect
+        value={filter.projectId}
+        onValueChange={(projectId) =>
+          onChange({ projectId, environmentId: null })
         }
-        onValueChange={(v) =>
-          onChange({
-            projectId: v === ALL_SENTINEL ? null : Number(v),
-            environmentId: null,
-          })
-        }
-      >
-        <SelectTrigger className="w-full sm:w-[200px]">
-          <SelectValue placeholder="All projects" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value={ALL_SENTINEL}>All projects</SelectItem>
-          {projects.map((p) => (
-            <SelectItem key={p.id} value={String(p.id)}>
-              {p.name}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+      />
       {filter.projectId != null && (
         <Select
           value={
