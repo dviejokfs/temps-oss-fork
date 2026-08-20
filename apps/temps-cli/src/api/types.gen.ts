@@ -7048,12 +7048,30 @@ export type ErrorEventResponse = {
     timestamp: string;
 };
 
+export type ErrorGroupDeploymentResponse = {
+    branch?: string | null;
+    commit_hash?: string | null;
+    commit_message?: string | null;
+    id: number;
+};
+
 export type ErrorGroupResponse = {
+    /**
+     * Count of distinct affected visitors/users within the requested time window.
+     * Present only when `start_date` and `end_date` were supplied on the list request.
+     */
+    affected_users?: number | null;
     assigned_to?: string | null;
     created_at: string;
+    deployment?: null | ErrorGroupDeploymentResponse;
     deployment_id?: number | null;
     environment_id?: number | null;
     error_type: string;
+    /**
+     * Count of error events within the requested time window.
+     * Present only when `start_date` and `end_date` were supplied on the list request.
+     */
+    events_in_range?: number | null;
     first_seen: string;
     id: number;
     last_seen: string;
@@ -7103,6 +7121,12 @@ export type ErrorTimeSeriesQuery = {
      */
     bucket?: string;
     end_time: string;
+    /**
+     * Filter chart data to a specific environment.
+     * Always AND-combined with project_id — an environment from a different project
+     * returns zero-filled buckets rather than cross-project data.
+     */
+    environment_id?: number | null;
     start_time: string;
 };
 
@@ -12561,6 +12585,18 @@ export type PipelineStats = {
     metrics_dropped: number;
     metrics_received: number;
     metrics_stored: number;
+    /**
+     * Cumulative count of ingest requests rejected because the per-project
+     * storage quota was exceeded (→ HTTP 413). Written to the metrics store
+     * as `otel.quota_exceeded_requests` (SourceKind::Node, node_id 0) every 60s.
+     */
+    quota_exceeded_requests: number;
+    /**
+     * Cumulative count of ingest requests rejected because the per-project
+     * rate limit was exceeded (→ HTTP 429). Written to the metrics store as
+     * `otel.rate_limited_requests` (SourceKind::Node, node_id 0) every 60s.
+     */
+    rate_limited_requests: number;
     spans_dropped: number;
     spans_received: number;
     spans_stored: number;
@@ -12903,6 +12939,23 @@ export type PreviewGatewaySettings = {
      * from the settings UI.
      */
     auto_upgrade?: boolean;
+    /**
+     * Docker container name for this instance's gateway.
+     *
+     * A single Temps install owns the whole host, so the default is fine and
+     * operators never need to touch this. It exists for the case where
+     * several Temps instances share one Docker daemon — most obviously a
+     * development machine with multiple checkouts running at once.
+     *
+     * Without it those instances silently fight: the `shared_secret` is
+     * per-database, so each generates a different one, but they all
+     * reconcile the *same* container name. Each start-up sees the other's
+     * container as drifted, recreates it with its own secret, and every
+     * other instance's previews start failing with "missing or invalid
+     * X-Temps-Preview-Token". Giving each instance its own container name
+     * (and `host_port`) makes them independent.
+     */
+    container_name?: string;
     /**
      * Host port to publish the gateway on (always bound to 127.0.0.1).
      * Pingora forwards `ws-*` traffic to this port after authenticating.
@@ -17085,9 +17138,10 @@ export type SmartFilter = {
 } | {
     type: 'custom_data';
     /**
-     * Match custom event_data by JSON path
+     * Match custom event properties by JSON path
      * Format: {"path": "user.plan", "value": "premium"}
-     * This will match events where event_data->'user'->>'plan' = 'premium'
+     * This will match events where props->'user'->>'plan' = 'premium',
+     * falling back to the legacy `event_data` column when `props` is NULL
      */
     value: {
         path: string;
@@ -19513,6 +19567,12 @@ export type UpdateEnvironmentVariableRequest = {
 };
 
 export type UpdateErrorGroupRequest = {
+    /**
+     * Assignee (email by convention).
+     * - `Some("user@example.com")` — sets the assignee.
+     * - `Some("")` (empty string) — clears the current assignment (sets to null).
+     * - `null` / field omitted — leaves the existing value unchanged.
+     */
     assigned_to?: string | null;
     status: string;
 };
@@ -44635,6 +44695,12 @@ export type GetErrorTimeSeriesData = {
          * Time bucket size (e.g., "1h", "15m", "1d", "1 hour", "30 minutes")
          */
         bucket?: string;
+        /**
+         * Filter chart data to a specific environment.
+         * Always AND-combined with project_id — an environment from a different project
+         * returns zero-filled buckets rather than cross-project data.
+         */
+        environment_id?: number | null;
     };
     url: '/projects/{project_id}/error-time-series';
 };

@@ -2950,6 +2950,7 @@
           "preview_gateway": {
             "default": {
               "auto_upgrade": true,
+              "container_name": "temps-preview-gateway",
               "host_port": 8090,
               "image": "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9"
             },
@@ -14802,8 +14803,46 @@
         ],
         "type": "object"
       },
+      "ErrorGroupDeploymentResponse": {
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
       "ErrorGroupResponse": {
         "properties": {
+          "affected_users": {
+            "description": "Count of distinct affected visitors/users within the requested time window.\nPresent only when `start_date` and `end_date` were supplied on the list request.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "assigned_to": {
             "type": [
               "string",
@@ -14812,6 +14851,17 @@
           },
           "created_at": {
             "type": "string"
+          },
+          "deployment": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ErrorGroupDeploymentResponse",
+                "description": "The deployment this group's `deployment_id` points to, resolved to its commit info.\n`None` when the group has no linked deployment."
+              }
+            ]
           },
           "deployment_id": {
             "format": "int32",
@@ -14829,6 +14879,14 @@
           },
           "error_type": {
             "type": "string"
+          },
+          "events_in_range": {
+            "description": "Count of error events within the requested time window.\nPresent only when `start_date` and `end_date` were supplied on the list request.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "first_seen": {
             "type": "string"
@@ -15017,6 +15075,14 @@
           "end_time": {
             "format": "date-time",
             "type": "string"
+          },
+          "environment_id": {
+            "description": "Filter chart data to a specific environment.\nAlways AND-combined with project_id — an environment from a different project\nreturns zero-filled buckets rather than cross-project data.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "start_time": {
             "format": "date-time",
@@ -27625,6 +27691,18 @@
             "minimum": 0,
             "type": "integer"
           },
+          "quota_exceeded_requests": {
+            "description": "Cumulative count of ingest requests rejected because the per-project\nstorage quota was exceeded (→ HTTP 413). Written to the metrics store\nas `otel.quota_exceeded_requests` (SourceKind::Node, node_id 0) every 60s.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rate_limited_requests": {
+            "description": "Cumulative count of ingest requests rejected because the per-project\nrate limit was exceeded (→ HTTP 429). Written to the metrics store as\n`otel.rate_limited_requests` (SourceKind::Node, node_id 0) every 60s.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "spans_dropped": {
             "format": "int64",
             "minimum": 0,
@@ -27652,7 +27730,9 @@
           "logs_stored_db",
           "logs_stored_s3",
           "logs_dropped",
-          "ingest_errors"
+          "ingest_errors",
+          "rate_limited_requests",
+          "quota_exceeded_requests"
         ],
         "type": "object"
       },
@@ -28135,6 +28215,12 @@
             "description": "When true (default), the supervisor will pull and apply the image\npinned in the Temps binary on every startup. When false, the\ncurrently-running image is left alone — operators upgrade manually\nfrom the settings UI.",
             "example": true,
             "type": "boolean"
+          },
+          "container_name": {
+            "default": "temps-preview-gateway",
+            "description": "Docker container name for this instance's gateway.\n\nA single Temps install owns the whole host, so the default is fine and\noperators never need to touch this. It exists for the case where\nseveral Temps instances share one Docker daemon — most obviously a\ndevelopment machine with multiple checkouts running at once.\n\nWithout it those instances silently fight: the `shared_secret` is\nper-database, so each generates a different one, but they all\nreconcile the *same* container name. Each start-up sees the other's\ncontainer as drifted, recreates it with its own secret, and every\nother instance's previews start failing with \"missing or invalid\nX-Temps-Preview-Token\". Giving each instance its own container name\n(and `host_port`) makes them independent.",
+            "example": "temps-preview-gateway",
+            "type": "string"
           },
           "host_port": {
             "default": 8090,
@@ -37440,7 +37526,7 @@
             "type": "object"
           },
           {
-            "description": "Match custom event_data by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where event_data->'user'->>'plan' = 'premium'",
+            "description": "Match custom event properties by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where props->'user'->>'plan' = 'premium',\nfalling back to the legacy `event_data` column when `props` is NULL",
             "properties": {
               "type": {
                 "enum": [
@@ -37449,7 +37535,7 @@
                 "type": "string"
               },
               "value": {
-                "description": "Match custom event_data by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where event_data->'user'->>'plan' = 'premium'",
+                "description": "Match custom event properties by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where props->'user'->>'plan' = 'premium',\nfalling back to the legacy `event_data` column when `props` is NULL",
                 "properties": {
                   "path": {
                     "type": "string"
@@ -42565,6 +42651,7 @@
       "UpdateErrorGroupRequest": {
         "properties": {
           "assigned_to": {
+            "description": "Assignee (email by convention).\n- `Some(\"user@example.com\")` — sets the assignee.\n- `Some(\"\")` (empty string) — clears the current assignment (sets to null).\n- `null` / field omitted — leaves the existing value unchanged.",
             "type": [
               "string",
               "null"
@@ -83691,6 +83778,19 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Filter chart data to a specific environment.\nAlways AND-combined with project_id — an environment from a different project\nreturns zero-filled buckets rather than cross-project data.",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           }
         ],
