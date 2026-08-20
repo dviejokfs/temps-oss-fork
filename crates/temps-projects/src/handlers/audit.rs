@@ -176,11 +176,12 @@ pub struct ProjectSettingsUpdatedFields {
     /// reports under a different name in dashboards and alerts can be traced
     /// back to who renamed it.
     pub name: Option<String>,
-    /// The display name immediately before this update, when the request
-    /// supplied a name. Recorded alongside `name` because the new value alone
-    /// doesn't tell an incident reviewer what the project used to be called —
-    /// which is the whole question when older traces and alerts refer to it by
-    /// the old name.
+    /// The display name immediately before this update. Set only alongside
+    /// `name` — the two are recorded as a pair, because a previous name with no
+    /// new name reads like a half-finished rename. Recorded because the new
+    /// value alone doesn't tell an incident reviewer what the project used to be
+    /// called, which is the whole question when older traces and alerts refer to
+    /// it by the old name.
     pub previous_name: Option<String>,
     pub slug: Option<String>,
     pub cpu_request: Option<i32>,

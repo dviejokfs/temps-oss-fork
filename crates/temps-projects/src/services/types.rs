@@ -262,11 +262,12 @@ pub enum ProjectError {
     DeploymentCleanupFailed { project_id: i32, reason: String },
 
     #[error(
-        "Project {project_id} was saved, but its proxy routes could not be reloaded (queue: {queue_reason}; database notification: {database_reason})"
+        "Project {project_id} was not saved: its proxy routes could not be signalled for reload \
+         (database notification: {database_reason}), so the change was rolled back. Retry once the \
+         database is reachable."
     )]
     RouteReloadFailed {
         project_id: i32,
-        queue_reason: String,
         database_reason: String,
     },
 

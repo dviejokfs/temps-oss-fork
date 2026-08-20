@@ -1249,18 +1249,23 @@ pub async fn update_project_settings(
         user_agent: metadata.user_agent,
     };
 
+    let audited_name = audited_rename(
+        settings.name.is_some(),
+        previous_name.as_deref(),
+        &updated_project.name,
+    );
+
     let updated_settings = ProjectSettingsUpdatedFields {
         cpu_request: None,
         cpu_limit: None,
         memory_request: None,
         memory_limit: None,
         performance_metrics_enabled: None,
-        name: audited_rename(
-            settings.name.is_some(),
-            previous_name.as_deref(),
-            &updated_project.name,
-        ),
-        previous_name,
+        // `previous_name` is only meaningful next to a recorded rename. Keeping
+        // it when the rename was a no-op would render as an old name with no
+        // new one, reading like a half-finished rename that never happened.
+        name: audited_name.clone(),
+        previous_name: audited_name.and(previous_name),
         slug: settings.slug,
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
         image_retention_hours: settings.image_retention_hours,
@@ -2655,6 +2660,22 @@ mod tests {
             audited_rename(true, Some("Old Name"), "New Name"),
             Some("New Name".to_string())
         );
+    }
+
+    /// `name` and `previous_name` are recorded as a pair. A no-op rename must
+    /// clear both, or the audit renders an old name with no new one and reads
+    /// like a rename that half-happened.
+    #[test]
+    fn audited_rename_and_previous_name_are_recorded_as_a_pair() {
+        let previous_name = Some("Same Name".to_string());
+
+        let audited = audited_rename(true, previous_name.as_deref(), "Same Name");
+        assert_eq!(audited, None);
+        assert_eq!(audited.and(previous_name.clone()), None);
+
+        let audited = audited_rename(true, previous_name.as_deref(), "New Name");
+        assert_eq!(audited, Some("New Name".to_string()));
+        assert_eq!(audited.and(previous_name), Some("Same Name".to_string()));
     }
 
     #[test]
