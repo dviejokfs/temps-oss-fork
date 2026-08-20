@@ -41,6 +41,29 @@ function envVar(name: string): string | undefined {
   return global.process?.env?.[name];
 }
 
+/**
+ * Parse `TEMPS_FLAGS_REFRESH_INTERVAL_MS`, falling back to `fallback` for an
+ * unset, non-numeric, or negative value.
+ *
+ * A malformed value is surfaced via `console.warn` rather than silently
+ * ignored — an operator who set this and sees no effect needs to know the
+ * value they set was rejected, not that the feature doesn't exist.
+ */
+function refreshIntervalFromEnv(fallback: number): number {
+  const raw = envVar('TEMPS_FLAGS_REFRESH_INTERVAL_MS');
+  if (raw === undefined) return fallback;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    console.warn(
+      `[temps-flags] TEMPS_FLAGS_REFRESH_INTERVAL_MS=${JSON.stringify(raw)} is not a valid non-negative number. Using the default of ${fallback}ms instead.`,
+    );
+    return fallback;
+  }
+
+  return parsed;
+}
+
 export class FlagsClient {
   private readonly apiUrl: string;
   private readonly apiToken: string;
@@ -75,7 +98,8 @@ export class FlagsClient {
     this.apiUrl = (options.apiUrl ?? envVar('TEMPS_API_URL') ?? '').replace(/\/+$/, '');
     this.apiToken = options.apiToken ?? envVar('TEMPS_API_TOKEN') ?? '';
     this.environmentId = options.environmentId;
-    this.refreshIntervalMs = options.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS;
+    this.refreshIntervalMs =
+      options.refreshIntervalMs ?? refreshIntervalFromEnv(DEFAULT_REFRESH_INTERVAL_MS);
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.reportExposure = options.reportExposure ?? true;
     this.onError =
