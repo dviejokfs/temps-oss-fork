@@ -28918,6 +28918,14 @@
               "null"
             ]
           },
+          "git_provider_type": {
+            "description": "Git provider behind `git_provider_connection_id`: `github`,\n`github_app`, `gitlab`, `gitea`, `bitbucket` or `generic`. `null` when\nthe project has no connection (public repository, Docker image or\nuploaded source).\n\nClients must use this rather than guessing the host from `git_url`: a\nself-hosted GitLab/Gitea/Bitbucket instance can live on any domain, and\na connected project may have no clone URL stored at all.",
+            "example": "gitlab",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "git_url": {
             "description": "Git clone URL for the repository (used for public repos without a provider connection)",
             "type": [

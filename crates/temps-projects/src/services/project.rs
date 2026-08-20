@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
 use tracing::{info, warn};
@@ -10,7 +10,7 @@ use sea_orm::{
 use temps_core::{
     ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
 };
-use temps_entities::projects;
+use temps_entities::{git_provider_connections, git_providers, projects};
 use temps_git::services::public_repo::PublicRepoProviderFactory;
 
 use serde::Serialize;
@@ -986,6 +986,54 @@ impl ProjectService {
         Ok(default_environment)
     }
 
+    /// Fill in `git_provider_type` for every project that is linked to a Git
+    /// provider connection.
+    ///
+    /// The provider type is two hops away from the project row
+    /// (`projects` → `git_provider_connections` → `git_providers`), so it is
+    /// resolved here with a single JOIN over the whole batch rather than a
+    /// lookup per project. Projects without a connection are left as `None`.
+    async fn resolve_git_provider_types(
+        &self,
+        projects: &mut [Project],
+    ) -> Result<(), ProjectError> {
+        let connection_ids: HashSet<i32> = projects
+            .iter()
+            .filter_map(|project| project.git_provider_connection_id)
+            .collect();
+
+        if connection_ids.is_empty() {
+            return Ok(());
+        }
+
+        let connection_count = connection_ids.len();
+        let rows: Vec<(i32, String)> = git_provider_connections::Entity::find()
+            .select_only()
+            .column(git_provider_connections::Column::Id)
+            .column(git_providers::Column::ProviderType)
+            .inner_join(git_providers::Entity)
+            .filter(git_provider_connections::Column::Id.is_in(connection_ids))
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to resolve the git provider type for {} connection(s): {}",
+                    connection_count, e
+                ))
+            })?;
+
+        let provider_type_by_connection: HashMap<i32, String> = rows.into_iter().collect();
+
+        for project in projects.iter_mut() {
+            project.git_provider_type = project
+                .git_provider_connection_id
+                .and_then(|id| provider_type_by_connection.get(&id).cloned());
+        }
+
+        Ok(())
+    }
+
     pub async fn get_projects(&self) -> Result<Vec<Project>, ProjectError> {
         let results = projects::Entity::find()
             // Most-recently-deployed first; never-deployed projects (NULL
@@ -1001,10 +1049,13 @@ impl ProjectService {
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))?;
 
-        Ok(results
+        let mut projects_found: Vec<Project> = results
             .into_iter()
             .map(Self::map_db_project_to_project)
-            .collect())
+            .collect();
+        self.resolve_git_provider_types(&mut projects_found).await?;
+
+        Ok(projects_found)
     }
 
     pub async fn get_project(&self, project_id: i32) -> Result<Project, ProjectError> {
@@ -1013,12 +1064,17 @@ impl ProjectService {
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))?;
 
-        project_found_db
+        let mut project_found = project_found_db
             .map(Self::map_db_project_to_project)
             .ok_or(ProjectError::NotFound(format!(
                 "project {} not found",
                 project_id
-            )))
+            )))?;
+
+        self.resolve_git_provider_types(std::slice::from_mut(&mut project_found))
+            .await?;
+
+        Ok(project_found)
     }
 
     pub async fn get_project_by_slug(&self, slug: &str) -> Result<Project, ProjectError> {
@@ -1031,7 +1087,11 @@ impl ProjectService {
                 slug
             )))?;
 
-        Ok(Self::map_db_project_to_project(project_found_db))
+        let mut project_found = Self::map_db_project_to_project(project_found_db);
+        self.resolve_git_provider_types(std::slice::from_mut(&mut project_found))
+            .await?;
+
+        Ok(project_found)
     }
 
     pub async fn get_projects_by_repo_owner_and_name(
@@ -2910,10 +2970,12 @@ impl ProjectService {
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?;
 
-        let projects_found: Vec<Project> = projects
+        let mut projects_found: Vec<Project> = projects
             .into_iter()
             .map(Self::map_db_project_to_project)
             .collect();
+        self.resolve_git_provider_types(&mut projects_found).await?;
+
         Ok((projects_found, total))
     }
 
@@ -3290,6 +3352,10 @@ impl ProjectService {
             is_public_repo: db_project.is_public_repo,
             git_url: db_project.git_url,
             git_provider_connection_id: db_project.git_provider_connection_id,
+            // Lives on the connection's provider row, not on the project, so
+            // it is filled in by `resolve_git_provider_types` on the read
+            // paths that serve it to a client.
+            git_provider_type: None,
             is_on_demand: false, // Deprecated field, default to false
             deployment_config: deployment_config.clone(),
             attack_mode: db_project.attack_mode,
@@ -4250,6 +4316,115 @@ mod tests {
             temps_entities::source_type::SourceType::Git
         );
         assert_eq!(opted_out.repo_owner.as_deref(), Some("owner"));
+    }
+
+    /// The console draws a provider logo for each project. Before this, it had
+    /// nothing authoritative to draw it from and guessed from the clone URL —
+    /// which reports GitHub for every project whose URL is missing, and for
+    /// self-hosted instances whose hostname doesn't happen to spell out the
+    /// vendor. A GitLab-connected project must report GitLab.
+    #[tokio::test]
+    async fn connected_projects_report_the_provider_they_are_linked_to() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            eprintln!("Test database unavailable, skipping");
+            return;
+        };
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        // Self-hosted GitLab on a hostname that says nothing about the vendor,
+        // and a project connected to it that stores no clone URL at all.
+        let provider = temps_entities::git_providers::ActiveModel {
+            name: Set("Internal Git".to_string()),
+            provider_type: Set("gitlab".to_string()),
+            base_url: Set(Some("https://code.example.internal".to_string())),
+            api_url: Set(None),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let connection = temps_entities::git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None),
+            account_name: Set("platform-team".to_string()),
+            account_type: Set("Organization".to_string()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let connected = temps_entities::projects::ActiveModel {
+            name: Set("Connected Project".to_string()),
+            slug: Set("connected-project".to_string()),
+            repo_name: Set("api".to_string()),
+            repo_owner: Set("platform-team".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            git_url: Set(None),
+            git_provider_connection_id: Set(Some(connection.id)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let standalone = temps_entities::projects::ActiveModel {
+            name: Set("Image Project".to_string()),
+            slug: Set("image-project".to_string()),
+            repo_name: Set("image".to_string()),
+            repo_owner: Set("owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            git_provider_connection_id: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let fetched = service.get_project(connected.id).await.unwrap();
+        assert_eq!(fetched.git_provider_type.as_deref(), Some("gitlab"));
+
+        let by_slug = service
+            .get_project_by_slug("connected-project")
+            .await
+            .unwrap();
+        assert_eq!(by_slug.git_provider_type.as_deref(), Some("gitlab"));
+
+        // A project with no connection has no provider to report — it must stay
+        // empty rather than fall back to a guess.
+        let unconnected = service.get_project(standalone.id).await.unwrap();
+        assert_eq!(unconnected.git_provider_type, None);
+
+        // The dashboard list resolves every project in one pass, not per row.
+        let (listed, _total) = service
+            .get_projects_paginated_excluding_search(1, 100, &[], None)
+            .await
+            .unwrap();
+        let listed_connected = listed
+            .iter()
+            .find(|project| project.id == connected.id)
+            .expect("connected project is listed");
+        let listed_standalone = listed
+            .iter()
+            .find(|project| project.id == standalone.id)
+            .expect("standalone project is listed");
+        assert_eq!(
+            listed_connected.git_provider_type.as_deref(),
+            Some("gitlab")
+        );
+        assert_eq!(listed_standalone.git_provider_type, None);
     }
 
     #[tokio::test]
