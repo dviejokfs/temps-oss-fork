@@ -1352,6 +1352,22 @@ impl ProjectService {
                 )));
             }
         }
+        // Normalize the display name up-front with the other validations so an
+        // unusable name is rejected before anything is written, then persist it
+        // only at the end (see below) — a rename must not survive a request that
+        // goes on to fail on a conflicting slug or a git desync.
+        let new_name = match new_name {
+            Some(raw) => {
+                let trimmed = raw.trim().to_string();
+                if trimmed.is_empty() || trimmed.chars().count() > 100 {
+                    return Err(ProjectError::InvalidInput(
+                        "Project name must contain 1-100 characters".to_string(),
+                    ));
+                }
+                Some(trimmed)
+            }
+            None => None,
+        };
 
         // Get the current project
         let mut project = projects::Entity::find_by_id(project_id)
@@ -1362,29 +1378,6 @@ impl ProjectService {
                 project_id
             )))?;
         let initial_public_ports = compose_public_ports(project.preset_config.as_ref());
-
-        // Update the display name if provided. The name is a human-facing label
-        // only — the slug remains the routing identifier — so it is not
-        // uniqueness-checked and changing it never rewrites a subdomain. It is
-        // deliberately applied before the slug block: the slug path rebuilds
-        // `project` from its own transaction, and `Model -> ActiveModel` leaves
-        // unset columns `Unchanged`, so the two writes don't clobber each other.
-        if let Some(name_value) = new_name {
-            let name_value = name_value.trim().to_string();
-            if name_value.is_empty() || name_value.chars().count() > 100 {
-                return Err(ProjectError::InvalidInput(
-                    "Project name must contain 1-100 characters".to_string(),
-                ));
-            }
-
-            if name_value != project.name {
-                let mut active_project: projects::ActiveModel = project.clone().into();
-                active_project.name = Set(name_value.clone());
-                active_project.updated_at = Set(chrono::Utc::now());
-                active_project.update(self.db.as_ref()).await?;
-                project.name = name_value;
-            }
-        }
 
         // Update the slug if provided
         if let Some(slug_value) = new_slug {
@@ -1745,6 +1738,11 @@ impl ProjectService {
             if let Some(dir) = directory {
                 active_project.directory = Set(normalize_project_directory(&dir)?);
             }
+            // Fold the rename into this same write so a name change submitted
+            // alongside git settings commits atomically with them.
+            if let Some(ref name_value) = new_name {
+                active_project.name = Set(name_value.clone());
+            }
 
             let updated_project = active_project.update(self.db.as_ref()).await?;
             if initial_public_ports != compose_public_ports(updated_project.preset_config.as_ref())
@@ -1768,6 +1766,25 @@ impl ProjectService {
             }
 
             return Ok(project_found);
+        }
+
+        // Persist the rename last, once every other fallible step has
+        // succeeded, so a failed request never leaves a renamed project behind.
+        if let Some(name_value) = new_name {
+            let current = projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+
+            if current.name != name_value {
+                let mut active_project: projects::ActiveModel = current.into();
+                active_project.name = Set(name_value);
+                active_project.updated_at = Set(chrono::Utc::now());
+                active_project.update(self.db.as_ref()).await?;
+            }
         }
 
         // Always reload the final project state before returning
@@ -4405,6 +4422,90 @@ mod tests {
             .expect("project should still exist");
         assert_eq!(reloaded.name, "New Display Name");
         assert_eq!(reloaded.slug, "rename-keeps-slug");
+    }
+
+    /// A request that renames *and* fails on something else must not leave the
+    /// rename behind: the endpoint reporting an error while the project silently
+    /// kept a new name is exactly the kind of half-applied write a self-hosted
+    /// operator has no way to diagnose.
+    #[tokio::test]
+    async fn test_update_project_settings_rename_does_not_persist_when_slug_conflicts() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        // The project we will try to rename...
+        let target = temps_entities::projects::ActiveModel {
+            name: Set("Original Name".to_string()),
+            slug: Set("rename-rollback-target".to_string()),
+            repo_name: Set("rollback-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("rollback-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let target = target.insert(db.as_ref()).await.unwrap();
+
+        // ...and a second project already holding the slug we will collide with.
+        let occupier = temps_entities::projects::ActiveModel {
+            name: Set("Occupier".to_string()),
+            slug: Set("rename-rollback-taken".to_string()),
+            repo_name: Set("occupier-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("occupier-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        occupier.insert(db.as_ref()).await.unwrap();
+
+        let result = project_service
+            .update_project_settings(
+                target.id,
+                Some("Renamed Before Failure".to_string()),
+                Some("rename-rollback-taken".to_string()), // conflicts
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ProjectError::SlugAlreadyExists(_))),
+            "conflicting slug should be rejected"
+        );
+
+        let reloaded = projects::Entity::find_by_id(target.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(
+            reloaded.name, "Original Name",
+            "rename must not survive a failed request"
+        );
+        assert_eq!(reloaded.slug, "rename-rollback-target");
     }
 
     #[tokio::test]

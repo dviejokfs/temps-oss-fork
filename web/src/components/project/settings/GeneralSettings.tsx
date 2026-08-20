@@ -38,7 +38,7 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
@@ -77,6 +77,17 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       slug: project?.slug || '',
     },
   })
+
+  // `defaultValues` are only read on mount, but this component stays mounted
+  // when the route switches between two projects' settings pages. Without this
+  // reset the form would still hold the previous project's identity, and Save
+  // would rename the newly-selected project to the old one's name and slug.
+  useEffect(() => {
+    projectForm.reset({
+      name: project?.name || '',
+      slug: project?.slug || '',
+    })
+  }, [project?.id, project?.name, project?.slug, projectForm])
 
   const handleSaveProject = async (values: ProjectFormValues) => {
     if (!project?.id) return

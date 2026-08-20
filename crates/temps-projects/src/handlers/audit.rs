@@ -170,7 +170,9 @@ pub struct ProjectSettingsUpdatedAudit {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectSettingsUpdatedFields {
-    /// New display name, when the request changed it. Audited so a project that
+    /// The project's persisted display name after the update, set whenever the
+    /// request supplied a name (the value is post-trim, so it is what actually
+    /// reached the database — not the raw request). Audited so a project that
     /// suddenly reports under a different name in dashboards and alerts can be
     /// traced back to who renamed it.
     pub name: Option<String>,
