@@ -42,6 +42,33 @@ export interface SessionRecordingConfig {
   batchSize?: number;
   /** Interval in ms to flush events. Defaults to 5000. */
   flushInterval?: number;
+  /**
+   * Milliseconds of no user interaction after which recording pauses. A paused
+   * recorder detaches rrweb entirely, so a passive tab stops producing events
+   * instead of recording page-driven DOM churn forever. Interaction resumes it
+   * with a fresh full snapshot, on the same session. Set to `0` to never pause.
+   * Defaults to 60000 (1 minute).
+   */
+  idleTimeout?: number;
+  /**
+   * Pause recording while the document is hidden (background tab). Defaults to
+   * true. Independent of `idleTimeout` — a hidden tab pauses immediately.
+   */
+  pauseOnHidden?: boolean;
+  /**
+   * Force a full DOM snapshot every N milliseconds. Snapshots make replay
+   * seeking cheap but are by far the largest events, so raising this trades
+   * seek granularity for ingest volume. Defaults to 30000.
+   */
+  checkoutEveryNms?: number;
+  /** Force a full DOM snapshot every N events. Defaults to 200. */
+  checkoutEveryNth?: number;
+  /**
+   * Upper bound on events buffered while the server is unreachable. Past this
+   * the oldest events are dropped, so a persistent ingest outage costs bounded
+   * memory rather than growing until the tab dies. Defaults to 5000.
+   */
+  maxBufferedEvents?: number;
 }
 
 export interface AnalyticsClientOptions {

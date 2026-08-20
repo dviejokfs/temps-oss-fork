@@ -121,6 +121,7 @@ pub use team_role::{TeamRole, TeamRoleParseError};
 
 pub mod events;
 pub mod session_replay_events;
+pub mod session_replay_ingest_batches;
 pub mod session_replay_sessions;
 pub mod settings;
 pub mod visitor;

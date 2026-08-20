@@ -481,6 +481,13 @@
       },
       "AddEventsRequest": {
         "properties": {
+          "batchId": {
+            "description": "Client-generated id, stable across retries of the same batch. When\npresent the append is idempotent; omitted, delivery is at-least-once.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "events": {
             "type": "string"
           }
@@ -36404,6 +36411,13 @@
       },
       "SessionReplayEventsRequest": {
         "properties": {
+          "batchId": {
+            "description": "Client-generated id, stable across retries of the same batch. When\npresent the append is idempotent; omitted, delivery is at-least-once.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "events": {
             "type": "string"
           },
