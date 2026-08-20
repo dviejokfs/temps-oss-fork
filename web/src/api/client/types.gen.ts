@@ -6461,9 +6461,17 @@ export type EmailStatsResponse = {
      * Emails captured without sending (Mailhog mode - no provider configured)
      */
     captured: number;
+    /**
+     * Provider transport completed without a definitive delivery result; never retried automatically
+     */
+    delivery_unknown: number;
     failed: number;
     queued: number;
     sent: number;
+    /**
+     * Emails currently protected by a delivery lease
+     */
+    sending: number;
     total: number;
 };
 
@@ -38794,11 +38802,19 @@ export type GetProjectsData = {
          * Number of items per page
          */
         per_page?: number;
+        /**
+         * Case-insensitive project name or slug filter
+         */
+        search?: string;
     };
     url: '/projects';
 };
 
 export type GetProjectsErrors = {
+    /**
+     * Invalid pagination parameters
+     */
+    400: unknown;
     /**
      * Unauthorized
      */

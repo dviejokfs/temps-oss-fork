@@ -3,7 +3,8 @@
 use chrono::Utc;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -91,7 +92,25 @@ enum DeliveryClaim {
 enum ProviderDeliveryOutcome {
     Accepted(crate::providers::SendEmailResponse),
     Rejected(EmailError),
-    TimedOut,
+    Unknown(String),
+}
+
+#[derive(Debug, FromQueryResult)]
+struct EmailStatusCount {
+    status: String,
+    count: i64,
+}
+
+fn classify_provider_result(
+    result: Result<crate::providers::SendEmailResponse, EmailError>,
+) -> ProviderDeliveryOutcome {
+    match result {
+        Ok(response) => ProviderDeliveryOutcome::Accepted(response),
+        Err(EmailError::ProviderDeliveryUnknown(reason)) => {
+            ProviderDeliveryOutcome::Unknown(reason)
+        }
+        Err(error) => ProviderDeliveryOutcome::Rejected(error),
+    }
 }
 
 // Keep this shorter than the Cloud outbox retry horizon. A process crash after
@@ -565,8 +584,21 @@ impl EmailService {
                 .await;
         }
 
-        match provider_instance.send(&provider_request).await {
-            Ok(response) => {
+        self.finalize_unfenced_delivery(
+            email_model,
+            classify_provider_result(provider_instance.send(&provider_request).await),
+        )
+        .await
+    }
+
+    async fn finalize_unfenced_delivery(
+        &self,
+        email_model: emails::Model,
+        outcome: ProviderDeliveryOutcome,
+    ) -> Result<SendEmailResponse, EmailError> {
+        let email_id = email_model.id;
+        match outcome {
+            ProviderDeliveryOutcome::Accepted(response) => {
                 // Update email with success status
                 let mut active_model: emails::ActiveModel = email_model.clone().into();
                 active_model.status = Set("sent".to_string());
@@ -586,7 +618,7 @@ impl EmailService {
                     provider_message_id: Some(response.message_id),
                 })
             }
-            Err(e) => {
+            ProviderDeliveryOutcome::Rejected(e) => {
                 // Provider send failed - capture email instead of failing
                 info!(
                     "Failed to send email via provider, capturing instead: {}",
@@ -603,6 +635,25 @@ impl EmailService {
                 Ok(SendEmailResponse {
                     id: email_id,
                     status: "captured".to_string(),
+                    provider_message_id: None,
+                })
+            }
+            ProviderDeliveryOutcome::Unknown(reason) => {
+                warn!(
+                    email_id = %email_id,
+                    reason = %reason,
+                    "Provider delivery result is unknown; refusing automatic or implied retry"
+                );
+
+                let mut active_model: emails::ActiveModel = email_model.into();
+                active_model.status = Set("delivery_unknown".to_string());
+                active_model.error_message = Set(Some(reason));
+                active_model.sent_at = Set(Some(Utc::now()));
+                active_model.update(self.db.as_ref()).await?;
+
+                Ok(SendEmailResponse {
+                    id: email_id,
+                    status: "delivery_unknown".to_string(),
                     provider_message_id: None,
                 })
             }
@@ -633,9 +684,10 @@ impl EmailService {
         )
         .await
         {
-            Ok(Ok(response)) => ProviderDeliveryOutcome::Accepted(response),
-            Ok(Err(error)) => ProviderDeliveryOutcome::Rejected(error),
-            Err(_) => ProviderDeliveryOutcome::TimedOut,
+            Ok(result) => classify_provider_result(result),
+            Err(_) => ProviderDeliveryOutcome::Unknown(format!(
+                "Provider did not return within {PROVIDER_SEND_TIMEOUT_SECONDS} seconds"
+            )),
         };
 
         self.finalize_project_email_delivery(email_id, attempt_token, provider_outcome)
@@ -681,7 +733,11 @@ impl EmailService {
         let attempt_token = Utc::now() + chrono::Duration::seconds(DELIVERY_LEASE_SECONDS);
         let mut active_claim: email_idempotency_keys::ActiveModel = claim.into();
         active_claim.lease_expires_at = Set(attempt_token);
-        active_claim.update(&transaction).await?;
+        // PostgreSQL stores TIMESTAMPTZ at microsecond precision. Use the value
+        // returned by PostgreSQL as the fence token so finalization never
+        // compares it with a higher-precision in-memory timestamp.
+        let persisted_claim = active_claim.update(&transaction).await?;
+        let attempt_token = persisted_claim.lease_expires_at;
 
         let mut active: emails::ActiveModel = current.into();
         active.status = Set("sending".to_string());
@@ -756,14 +812,14 @@ impl EmailService {
                     provider_message_id: None,
                 }
             }
-            ProviderDeliveryOutcome::TimedOut => {
+            ProviderDeliveryOutcome::Unknown(reason) => {
                 warn!(
                     email_id = %email_id,
                     timeout_seconds = PROVIDER_SEND_TIMEOUT_SECONDS,
                     "Project-scoped provider delivery timed out with an unknown outcome; automatic retry disabled"
                 );
                 let message = format!(
-                    "Provider outcome unknown after {PROVIDER_SEND_TIMEOUT_SECONDS}-second timeout; automatic retry disabled to avoid duplicate delivery"
+                    "Provider outcome unknown ({reason}); automatic retry disabled to avoid duplicate delivery"
                 );
                 let mut active: emails::ActiveModel = current.into();
                 active.status = Set("delivery_unknown".to_string());
@@ -911,30 +967,35 @@ impl EmailService {
             base_query = base_query.filter(emails::Column::DomainId.eq(domain_id));
         }
 
-        let total = base_query.clone().count(self.db.as_ref()).await?;
-
-        let sent = base_query
-            .clone()
-            .filter(emails::Column::Status.eq("sent"))
-            .count(self.db.as_ref())
+        let grouped = base_query
+            .select_only()
+            .column(emails::Column::Status)
+            .column_as(emails::Column::Id.count(), "count")
+            .group_by(emails::Column::Status)
+            .into_model::<EmailStatusCount>()
+            .all(self.db.as_ref())
             .await?;
 
-        let failed = base_query
-            .clone()
-            .filter(emails::Column::Status.eq("failed"))
-            .count(self.db.as_ref())
-            .await?;
+        let mut counts = BTreeMap::new();
+        let mut total = 0_u64;
+        for row in grouped {
+            let count = u64::try_from(row.count).map_err(|_| {
+                EmailError::Database(sea_orm::DbErr::Custom(format!(
+                    "Email status aggregate for '{}' returned a negative count: {}",
+                    row.status, row.count
+                )))
+            })?;
+            total = total.saturating_add(count);
+            counts.insert(row.status, count);
+        }
 
-        let queued = base_query
-            .clone()
-            .filter(emails::Column::Status.eq("queued"))
-            .count(self.db.as_ref())
-            .await?;
-
-        let captured = base_query
-            .filter(emails::Column::Status.eq("captured"))
-            .count(self.db.as_ref())
-            .await?;
+        let count = |status: &str| counts.get(status).copied().unwrap_or_default();
+        let sent = count("sent");
+        let failed = count("failed");
+        let queued = count("queued");
+        let captured = count("captured");
+        let sending = count("sending");
+        let delivery_unknown = count("delivery_unknown");
 
         Ok(EmailStats {
             total,
@@ -942,6 +1003,8 @@ impl EmailService {
             failed,
             queued,
             captured,
+            sending,
+            delivery_unknown,
         })
     }
 }
@@ -991,6 +1054,8 @@ pub struct EmailStats {
     pub failed: u64,
     pub queued: u64,
     pub captured: u64,
+    pub sending: u64,
+    pub delivery_unknown: u64,
 }
 
 /// Drop suppressed addresses from `to`/`cc`/`bcc`. `suppressed` is the
@@ -1024,6 +1089,19 @@ fn filter_suppressed_recipients(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ambiguous_provider_transport_error_is_never_retryable() {
+        let outcome = classify_provider_result(Err(EmailError::ProviderDeliveryUnknown(
+            "connection closed while reading provider response".to_string(),
+        )));
+
+        assert!(matches!(
+            outcome,
+            ProviderDeliveryOutcome::Unknown(reason)
+                if reason.contains("connection closed while reading provider response")
+        ));
+    }
     use crate::providers::{EmailProviderType, MockEmailProvider, SesCredentials};
     use crate::services::provider_service::{CreateProviderRequest, ProviderCredentials};
     use crate::services::TrackingService;
@@ -1060,8 +1138,12 @@ mod tests {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                eprintln!("Skipping Docker-dependent email test: {error}");
-                return None;
+                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
+                {
+                    eprintln!("Skipping Docker-dependent email test: {error}");
+                    return None;
+                }
+                panic!("Email test database or migrations failed: {error}");
             }
         };
         let encryption_service = create_test_encryption_service();
@@ -1244,6 +1326,8 @@ mod tests {
             failed: 10,
             queued: 5,
             captured: 15,
+            sending: 0,
+            delivery_unknown: 0,
         };
 
         assert_eq!(stats.total, 100);
@@ -1370,6 +1454,8 @@ mod tests {
             failed: 10,
             queued: 5,
             captured: 15,
+            sending: 0,
+            delivery_unknown: 0,
         };
 
         assert_eq!(stats.total, 100);
@@ -1529,6 +1615,137 @@ mod tests {
         assert_eq!(stats.failed, 0);
         assert_eq!(stats.queued, 0);
         assert_eq!(stats.captured, 0);
+        assert_eq!(stats.sending, 0);
+        assert_eq!(stats.delivery_unknown, 0);
+    }
+
+    #[tokio::test]
+    async fn unfenced_delivery_ambiguity_is_persisted_as_terminal() {
+        let Some((db, email_service, _provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
+
+        let email = emails::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            domain_id: Set(None),
+            project_id: Set(None),
+            from_address: Set("sender@example.test".to_string()),
+            to_addresses: Set(serde_json::json!(["recipient@example.test"])),
+            subject: Set("ambiguous unfenced delivery".to_string()),
+            status: Set("queued".to_string()),
+            track_opens: Set(false),
+            track_clicks: Set(false),
+            open_count: Set(0),
+            click_count: Set(0),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let response = email_service
+            .finalize_unfenced_delivery(
+                email.clone(),
+                ProviderDeliveryOutcome::Unknown(
+                    "provider disconnected after request upload".to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, "delivery_unknown");
+        let persisted = emails::Entity::find_by_id(email.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, "delivery_unknown");
+        assert!(persisted
+            .error_message
+            .as_deref()
+            .is_some_and(|reason| reason.contains("disconnected")));
+    }
+
+    #[tokio::test]
+    async fn count_by_status_uses_one_consistent_grouped_snapshot_and_domain_filter() {
+        let Some((db, email_service, provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
+        let provider = create_test_provider(&provider_service).await;
+        let first_domain = create_test_domain(
+            &db.db,
+            provider.id,
+            &format!("stats-a-{}.example.test", Uuid::new_v4()),
+        )
+        .await;
+        let second_domain = create_test_domain(
+            &db.db,
+            provider.id,
+            &format!("stats-b-{}.example.test", Uuid::new_v4()),
+        )
+        .await;
+
+        for status in [
+            "sent",
+            "failed",
+            "queued",
+            "captured",
+            "sending",
+            "delivery_unknown",
+        ] {
+            emails::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                domain_id: Set(Some(first_domain.id)),
+                project_id: Set(None),
+                from_address: Set(format!("sender@{}", first_domain.domain)),
+                to_addresses: Set(serde_json::json!(["recipient@example.test"])),
+                subject: Set(format!("status {status}")),
+                status: Set(status.to_string()),
+                track_opens: Set(false),
+                track_clicks: Set(false),
+                open_count: Set(0),
+                click_count: Set(0),
+                ..Default::default()
+            }
+            .insert(db.db.as_ref())
+            .await
+            .unwrap();
+        }
+        emails::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            domain_id: Set(Some(second_domain.id)),
+            project_id: Set(None),
+            from_address: Set(format!("sender@{}", second_domain.domain)),
+            to_addresses: Set(serde_json::json!(["recipient@example.test"])),
+            subject: Set("other domain".to_string()),
+            status: Set("sent".to_string()),
+            track_opens: Set(false),
+            track_clicks: Set(false),
+            open_count: Set(0),
+            click_count: Set(0),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let scoped = email_service
+            .count_by_status(Some(first_domain.id))
+            .await
+            .unwrap();
+        assert_eq!(scoped.total, 6);
+        assert_eq!(scoped.sent, 1);
+        assert_eq!(scoped.failed, 1);
+        assert_eq!(scoped.queued, 1);
+        assert_eq!(scoped.captured, 1);
+        assert_eq!(scoped.sending, 1);
+        assert_eq!(scoped.delivery_unknown, 1);
+
+        let all = email_service.count_by_status(None).await.unwrap();
+        assert_eq!(all.total, 7);
+        assert_eq!(all.sent, 2);
     }
 
     #[tokio::test]
@@ -1899,7 +2116,7 @@ mod tests {
             .finalize_project_email_delivery(
                 email_id,
                 attempt_token,
-                ProviderDeliveryOutcome::TimedOut,
+                ProviderDeliveryOutcome::Unknown("test timeout".to_string()),
             )
             .await
             .unwrap();

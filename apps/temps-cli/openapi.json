@@ -13548,12 +13548,24 @@
             "minimum": 0,
             "type": "integer"
           },
+          "delivery_unknown": {
+            "description": "Emails whose provider accepted/rejected outcome could not be determined",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "failed": {
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
           "queued": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sending": {
+            "description": "Emails currently owned by an active provider delivery attempt",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -13574,7 +13586,9 @@
           "sent",
           "failed",
           "queued",
-          "captured"
+          "captured",
+          "sending",
+          "delivery_unknown"
         ],
         "type": "object"
       },
@@ -58439,7 +58453,7 @@
             "description": "Unauthorized"
           },
           "403": {
-            "description": "Only an instance administrator may change global sender-domain grants"
+            "description": "Only an instance or platform administrator may change global sender-domain grants"
           },
           "404": {
             "description": "Domain not found"
@@ -58489,7 +58503,7 @@
             "description": "Unauthorized"
           },
           "403": {
-            "description": "Only an instance administrator may change global sender-domain grants"
+            "description": "Only an instance or platform administrator may change global sender-domain grants"
           },
           "404": {
             "description": "Domain or project not found"
@@ -59143,7 +59157,10 @@
             "name": "Idempotency-Key",
             "required": false,
             "schema": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -74703,13 +74720,22 @@
             }
           },
           {
-            "description": "Number of items per page",
+            "description": "Number of items per page (1-100)",
             "in": "query",
             "name": "per_page",
             "required": false,
             "schema": {
               "format": "int64",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Case-insensitive project name or slug filter",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -74723,6 +74749,9 @@
               }
             },
             "description": "List of projects"
+          },
+          "400": {
+            "description": "Invalid pagination parameters"
           },
           "401": {
             "description": "Unauthorized"

@@ -6461,8 +6461,16 @@ export type EmailStatsResponse = {
      * Emails captured without sending (Mailhog mode - no provider configured)
      */
     captured: number;
+    /**
+     * Emails whose provider accepted/rejected outcome could not be determined
+     */
+    delivery_unknown: number;
     failed: number;
     queued: number;
+    /**
+     * Emails currently owned by an active provider delivery attempt
+     */
+    sending: number;
     sent: number;
     total: number;
 };
@@ -28436,7 +28444,7 @@ export type RevokeEmailDomainProjectErrors = {
      */
     401: unknown;
     /**
-     * Only an instance administrator may change global sender-domain grants
+     * Only an instance or platform administrator may change global sender-domain grants
      */
     403: unknown;
     /**
@@ -28480,7 +28488,7 @@ export type AuthorizeEmailDomainProjectErrors = {
      */
     401: unknown;
     /**
-     * Only an instance administrator may change global sender-domain grants
+     * Only an instance or platform administrator may change global sender-domain grants
      */
     403: unknown;
     /**
@@ -28948,7 +28956,7 @@ export type SendEmailData = {
         /**
          * Required for deployment-token requests. Reusing a key with the same payload returns the original delivery; reusing it with a different payload returns 409.
          */
-        'Idempotency-Key'?: string;
+        'Idempotency-Key'?: string | null;
     };
     path?: never;
     query?: never;
@@ -38791,14 +38799,22 @@ export type GetProjectsData = {
          */
         page?: number;
         /**
-         * Number of items per page
+         * Number of items per page (1-100)
          */
         per_page?: number;
+        /**
+         * Case-insensitive project name or slug filter
+         */
+        search?: string;
     };
     url: '/projects';
 };
 
 export type GetProjectsErrors = {
+    /**
+     * Invalid pagination parameters
+     */
+    400: unknown;
     /**
      * Unauthorized
      */

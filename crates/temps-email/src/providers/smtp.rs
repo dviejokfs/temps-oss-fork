@@ -293,7 +293,9 @@ impl EmailProvider for SmtpProvider {
 
         self.transport.send(message).await.map_err(|e| {
             error!("Failed to send email via SMTP: {}", e);
-            EmailError::Smtp(format!("Failed to send email: {}", e))
+            EmailError::ProviderDeliveryUnknown(format!(
+                "SMTP transport failed after delivery began: {e}"
+            ))
         })?;
 
         debug!("Email sent via SMTP, message_id: {}", message_id);

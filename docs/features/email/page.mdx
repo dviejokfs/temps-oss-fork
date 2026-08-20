@@ -64,7 +64,7 @@ Authorize a project under **Email → Domains → *(your domain)* → Authorized
 bunx @temps-sdk/cli email-domains authorize-project --id <domain-id> --project-id <project-id>
 ```
 
-Deployment-token sends also require an `Idempotency-Key` header, so a retried request resumes the original send instead of delivering a duplicate. See [CLI reference](/docs/cli) for the full `email-domains` command set, and the [Transactional Email API guide](/docs/transactional-email#deployment-tokens-authorized-senders) for the request/response details.
+Deployment-token sends also require an `Idempotency-Key` header, so ordinary request retries resume the original send. If the provider accepts a message but the response is lost, Temps marks it **Delivery unknown** and stops automatic retries for manual review; it never claims that an ambiguous delivery is safe to repeat. See [CLI reference](/docs/cli) for the full `email-domains` command set and this page's [deployment-token section](#deployment-tokens) for the authorization contract.
 
 <Note>
   **Upgrading?** No project starts out authorized for any domain — authorization is opt-in. If you have apps already sending mail with `TEMPS_API_TOKEN`, authorize their projects for the relevant domain(s) before or immediately after upgrading, or those sends will start failing with `403 DomainNotAuthorized`.

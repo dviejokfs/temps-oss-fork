@@ -218,6 +218,15 @@ impl DomainService {
         domain_id: i32,
         project_id: i32,
     ) -> Result<bool, EmailError> {
+        let project_exists = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !project_exists {
+            return Ok(false);
+        }
+
         Ok(
             email_domain_projects::Entity::find_by_id((domain_id, project_id))
                 .one(self.db.as_ref())
@@ -622,8 +631,12 @@ mod tests {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                eprintln!("Skipping Docker-dependent email domain test: {error}");
-                return None;
+                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
+                {
+                    eprintln!("Skipping Docker-dependent email domain test: {error}");
+                    return None;
+                }
+                panic!("Email domain test database or migrations failed: {error}");
             }
         };
         let encryption_service = create_test_encryption_service();
@@ -899,6 +912,22 @@ mod tests {
         let projects = service.list_authorized_projects(17).await.unwrap();
 
         assert!(projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_or_missing_project_cannot_use_surviving_domain_grant() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<projects::Model>::new()])
+                .into_connection(),
+        );
+        let provider_service = Arc::new(ProviderService::new(
+            db.clone(),
+            create_test_encryption_service(),
+        ));
+        let service = DomainService::new(db, provider_service);
+
+        assert!(!service.is_authorized_for_project(17, 42).await.unwrap());
     }
 
     #[tokio::test]

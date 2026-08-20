@@ -12527,6 +12527,12 @@
             "minimum": 0,
             "type": "integer"
           },
+          "delivery_unknown": {
+            "description": "Provider transport completed without a definitive delivery result; never retried automatically",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "failed": {
             "format": "int64",
             "minimum": 0,
@@ -12542,6 +12548,12 @@
             "minimum": 0,
             "type": "integer"
           },
+          "sending": {
+            "description": "Emails currently protected by a delivery lease",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "total": {
             "format": "int64",
             "minimum": 0,
@@ -12553,7 +12565,9 @@
           "sent",
           "failed",
           "queued",
-          "captured"
+          "captured",
+          "sending",
+          "delivery_unknown"
         ],
         "type": "object"
       },
@@ -54501,8 +54515,17 @@
             },
             "description": "Projects authorized to use this sender domain"
           },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "Domain not found"
+          },
+          "500": {
+            "description": "Project visibility or database check failed"
           }
         },
         "security": [
@@ -54544,8 +54567,17 @@
           "204": {
             "description": "Project authorization revoked"
           },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Only an instance or platform administrator may change global sender-domain grants"
+          },
           "404": {
             "description": "Domain not found"
+          },
+          "500": {
+            "description": "Project access, audit, or database check failed"
           }
         },
         "security": [
@@ -54585,8 +54617,17 @@
           "204": {
             "description": "Project authorized"
           },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Only an instance or platform administrator may change global sender-domain grants"
+          },
           "404": {
             "description": "Domain or project not found"
+          },
+          "500": {
+            "description": "Project access, audit, or database check failed"
           }
         },
         "security": [
@@ -55225,6 +55266,17 @@
       },
       "post": {
         "operationId": "send_email",
+        "parameters": [
+          {
+            "description": "Required for deployment-token requests. Reusing a key with the same payload returns the original delivery; reusing it with a different payload returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -55254,6 +55306,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "Idempotency key was already used with a different payload"
           },
           "500": {
             "description": "Internal server error"
@@ -69728,13 +69783,22 @@
             }
           },
           {
-            "description": "Number of items per page",
+          "description": "Number of items per page (1-100)",
             "in": "query",
             "name": "per_page",
             "required": false,
             "schema": {
               "format": "int64",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Case-insensitive project name or slug filter",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -69748,6 +69812,9 @@
               }
             },
             "description": "List of projects"
+          },
+          "400": {
+            "description": "Invalid pagination parameters"
           },
           "401": {
             "description": "Unauthorized"

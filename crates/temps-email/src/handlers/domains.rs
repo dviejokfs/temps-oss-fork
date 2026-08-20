@@ -20,7 +20,8 @@ use tracing::{error, info, warn};
 
 use super::audit::{
     EmailDomainCreatedAudit, EmailDomainDeletedAudit, EmailDomainProjectAuthorizedAudit,
-    EmailDomainProjectRevokedAudit, EmailDomainVerifiedAudit,
+    EmailDomainProjectChangeRequestedAudit, EmailDomainProjectRevokedAudit,
+    EmailDomainVerifiedAudit,
 };
 use super::types::{
     AppState, AuthorizedEmailDomainProjectResponse, CreateEmailDomainRequest, DnsRecordResponse,
@@ -66,6 +67,7 @@ impl From<EmailError> for Problem {
 
             EmailError::Database(_)
             | EmailError::ProviderError(_)
+            | EmailError::ProviderDeliveryUnknown(_)
             | EmailError::Encryption(_)
             | EmailError::Decryption(_)
             | EmailError::Configuration(_)
@@ -175,7 +177,7 @@ pub async fn list_email_domain_projects(
     responses(
         (status = 204, description = "Project authorized"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Only an instance administrator may change global sender-domain grants"),
+        (status = 403, description = "Only an instance or platform administrator may change global sender-domain grants"),
         (status = 404, description = "Domain or project not found"),
         (status = 500, description = "Project access, audit, or database check failed")
     ),
@@ -192,6 +194,15 @@ pub async fn authorize_email_domain_project(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     require_same_origin_session(&auth, &metadata)?;
+    let correlation_id = require_domain_project_change_audit(
+        state.as_ref(),
+        &auth,
+        &metadata,
+        id,
+        project_id,
+        "authorize",
+    )
+    .await?;
     let result = state.domain_service.authorize_project(id, project_id).await;
     let audit = EmailDomainProjectAuthorizedAudit {
         context: AuditContext {
@@ -199,6 +210,7 @@ pub async fn authorize_email_domain_project(
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         },
+        correlation_id,
         domain_id: id,
         project_id,
         success: result.is_ok(),
@@ -221,7 +233,7 @@ pub async fn authorize_email_domain_project(
     responses(
         (status = 204, description = "Project authorization revoked"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Only an instance administrator may change global sender-domain grants"),
+        (status = 403, description = "Only an instance or platform administrator may change global sender-domain grants"),
         (status = 404, description = "Domain not found"),
         (status = 500, description = "Project access, audit, or database check failed")
     ),
@@ -238,6 +250,15 @@ pub async fn revoke_email_domain_project(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     require_same_origin_session(&auth, &metadata)?;
+    let correlation_id = require_domain_project_change_audit(
+        state.as_ref(),
+        &auth,
+        &metadata,
+        id,
+        project_id,
+        "revoke",
+    )
+    .await?;
     let result = state.domain_service.revoke_project(id, project_id).await;
     let audit = EmailDomainProjectRevokedAudit {
         context: AuditContext {
@@ -245,6 +266,7 @@ pub async fn revoke_email_domain_project(
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         },
+        correlation_id,
         domain_id: id,
         project_id,
         success: result.is_ok(),
@@ -261,16 +283,54 @@ pub async fn revoke_email_domain_project(
 /// arbitrary verified sender domain. Until domains have an explicit owner,
 /// only an instance administrator may change domain-to-project grants.
 fn require_global_sender_domain_authority(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
-    if auth.is_admin() {
+    if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
         return Ok(());
     }
 
     Err(forbidden()
         .title("Sender Domain Authority Required")
         .detail(
-            "Only an instance administrator may change project access to a global sender domain",
+            "Only an instance or platform administrator may change project access to a global sender domain",
         )
         .build())
+}
+
+async fn require_domain_project_change_audit(
+    state: &AppState,
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+    domain_id: i32,
+    project_id: i32,
+    action: &str,
+) -> Result<uuid::Uuid, Problem> {
+    let correlation_id = uuid::Uuid::new_v4();
+    let audit = EmailDomainProjectChangeRequestedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        correlation_id,
+        domain_id,
+        project_id,
+        action: action.to_string(),
+    };
+
+    state
+        .audit_service
+        .create_audit_log(&audit)
+        .await
+        .map_err(|error| {
+            error!(
+                "Refusing unaudited email-domain project {action} for domain {domain_id}, project {project_id}: {error}"
+            );
+            internal_server_error()
+                .title("Audit Log Unavailable")
+                .detail("The sender-domain change was not applied because its audit record could not be stored")
+                .build()
+        })?;
+
+    Ok(correlation_id)
 }
 
 /// Browser sessions carry ambient cookie credentials, so unsafe requests must
@@ -1087,8 +1147,11 @@ mod tests {
     }
 
     #[test]
-    fn only_instance_admin_can_change_global_sender_domain_grants() {
+    fn only_instance_or_platform_admin_can_change_global_sender_domain_grants() {
         assert!(require_global_sender_domain_authority(&auth_with_role(Role::Admin)).is_ok());
+        assert!(
+            require_global_sender_domain_authority(&auth_with_role(Role::PlatformAdmin)).is_ok()
+        );
         let denied = require_global_sender_domain_authority(&auth_with_role(Role::User))
             .expect_err("project membership must not confer authority over a global domain");
         assert_eq!(denied.status_code, StatusCode::FORBIDDEN);

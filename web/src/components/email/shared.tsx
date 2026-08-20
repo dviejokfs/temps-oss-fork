@@ -50,6 +50,20 @@ export function StatusBadge({ status }: { status: string }) {
           Captured
         </Badge>
       )
+    case 'sending':
+      return (
+        <Badge variant="secondary" className="gap-1">
+          <Clock className="h-3 w-3" />
+          Sending
+        </Badge>
+      )
+    case 'delivery_unknown':
+      return (
+        <Badge variant="outline" className="gap-1 border-amber-500 text-amber-600">
+          <AlertTriangle className="h-3 w-3" />
+          Delivery unknown
+        </Badge>
+      )
     default:
       return <Badge variant="outline">{status}</Badge>
   }

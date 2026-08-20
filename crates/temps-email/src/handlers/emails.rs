@@ -1,6 +1,6 @@
 //! Email sending handlers
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{
     extract::{Path, Query, State},
@@ -9,6 +9,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, conflict, forbidden, internal_server_error, not_found},
@@ -18,12 +20,58 @@ use temps_core::{
 use tracing::error;
 use uuid::Uuid;
 
-use super::audit::{DeploymentEmailPrincipal, EmailSentAudit};
+use super::audit::{DeploymentEmailPrincipal, EmailSendRequestedAudit, EmailSentAudit};
 use super::types::{
     AppState, EmailResponse, EmailStatsResponse, ListEmailsQuery, PaginatedEmailsResponse,
     SendEmailRequestBody, SendEmailResponseBody,
 };
 use crate::services::{ListEmailsOptions, SendEmailRequest};
+
+#[derive(Serialize)]
+struct CanonicalEmailAuditRequest<'a> {
+    from: &'a str,
+    from_name: &'a Option<String>,
+    to: &'a [String],
+    cc: &'a Option<Vec<String>>,
+    bcc: &'a Option<Vec<String>>,
+    reply_to: &'a Option<String>,
+    subject: &'a str,
+    html: &'a Option<String>,
+    text: &'a Option<String>,
+    headers: BTreeMap<&'a str, &'a str>,
+    tags: &'a Option<Vec<String>>,
+    track_opens: Option<bool>,
+    track_clicks: Option<bool>,
+}
+
+fn email_request_fingerprint(request: &SendEmailRequestBody) -> Result<String, serde_json::Error> {
+    let headers = request
+        .headers
+        .as_ref()
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let canonical = CanonicalEmailAuditRequest {
+        from: &request.from,
+        from_name: &request.from_name,
+        to: &request.to,
+        cc: &request.cc,
+        bcc: &request.bcc,
+        reply_to: &request.reply_to,
+        subject: &request.subject,
+        html: &request.html,
+        text: &request.text,
+        headers,
+        tags: &request.tags,
+        track_opens: request.track_opens,
+        track_clicks: request.track_clicks,
+    };
+    serde_json::to_vec(&canonical).map(|bytes| hex::encode(Sha256::digest(bytes)))
+}
 
 /// Configure email routes
 pub fn routes() -> Router<Arc<AppState>> {
@@ -91,8 +139,65 @@ pub async fn send_email(
     };
 
     let deployment = auth.deployment_token_info();
+    let deployment_idempotency_key = deployment
+        .as_ref()
+        .map(|_| deployment_idempotency_key(&headers))
+        .transpose()?;
+    let deployment_principal = deployment
+        .as_ref()
+        .map(|principal| DeploymentEmailPrincipal {
+            token_id: principal.token_id,
+            token_name: principal.token_name.clone(),
+            project_id: principal.project_id,
+            environment_id: principal.environment_id,
+            deployment_id: principal.deployment_id,
+        });
+    let correlation_id = Uuid::new_v4();
+    let sender_domain = request
+        .from
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.to_ascii_lowercase())
+        .unwrap_or_else(|| "invalid".to_string());
+    let recipient_count = request.to.len()
+        + request.cc.as_ref().map_or(0, Vec::len)
+        + request.bcc.as_ref().map_or(0, Vec::len);
+    let request_fingerprint =
+        email_request_fingerprint(&request).map_err(|serialization_error| {
+            error!("Could not fingerprint email request for auditing: {serialization_error}");
+            internal_server_error()
+                .title("Email Audit Preparation Failed")
+                .detail("The email was not sent because its audit fingerprint could not be created")
+                .build()
+        })?;
+    let request_audit = EmailSendRequestedAudit {
+        user_id: auth.user_id_opt(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+        deployment_principal: deployment_principal.clone(),
+        correlation_id,
+        sender_domain: sender_domain.clone(),
+        recipient_count,
+        request_fingerprint: request_fingerprint.clone(),
+    };
+    state
+        .audit_service
+        .create_audit_log(&request_audit)
+        .await
+        .map_err(|audit_error| {
+            error!("Refusing unaudited email send: {audit_error}");
+            internal_server_error()
+                .title("Audit Log Unavailable")
+                .detail("The email was not sent because its audit record could not be stored")
+                .build()
+        })?;
+
     let result = if let Some(deployment) = deployment.as_ref() {
-        let idempotency_key = deployment_idempotency_key(&headers)?;
+        let Some(idempotency_key) = deployment_idempotency_key else {
+            return Err(internal_server_error()
+                .title("Idempotency Validation Failed")
+                .detail("The validated deployment idempotency key was unavailable")
+                .build());
+        };
         state
             .email_service
             .send_for_project(send_request, deployment.project_id, idempotency_key)
@@ -124,17 +229,12 @@ pub async fn send_email(
         user_id: auth.user_id_opt(),
         ip_address: Some(metadata.ip_address.clone()),
         user_agent: metadata.user_agent.clone(),
-        deployment_principal: deployment.map(|principal| DeploymentEmailPrincipal {
-            token_id: principal.token_id,
-            token_name: principal.token_name,
-            project_id: principal.project_id,
-            environment_id: principal.environment_id,
-            deployment_id: principal.deployment_id,
-        }),
+        deployment_principal,
+        correlation_id,
         email_id: result.id,
-        from: request.from,
-        to: request.to,
-        subject: request.subject,
+        sender_domain,
+        recipient_count,
+        request_fingerprint,
     };
 
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
@@ -365,6 +465,8 @@ pub async fn get_email_stats(
         failed: stats.failed,
         queued: stats.queued,
         captured: stats.captured,
+        sending: stats.sending,
+        delivery_unknown: stats.delivery_unknown,
     };
 
     Ok(Json(response))
@@ -452,12 +554,53 @@ mod tests {
     use temps_entities::{deployment_tokens::DeploymentTokenPermission, email_domains, users};
     use tower::ServiceExt;
 
+    #[test]
+    fn audit_fingerprint_is_independent_of_header_insertion_order() {
+        let request_with_headers = |headers| SendEmailRequestBody {
+            from: "sender@example.com".to_string(),
+            from_name: Some("Sender".to_string()),
+            to: vec!["recipient@example.com".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: "Canonical audit".to_string(),
+            html: None,
+            text: Some("body".to_string()),
+            headers: Some(headers),
+            tags: Some(vec!["audit".to_string()]),
+            track_opens: Some(false),
+            track_clicks: Some(false),
+        };
+        let first = request_with_headers(std::collections::HashMap::from([
+            ("X-Zeta".to_string(), "two".to_string()),
+            ("X-Alpha".to_string(), "one".to_string()),
+        ]));
+        let second = request_with_headers(std::collections::HashMap::from([
+            ("X-Alpha".to_string(), "one".to_string()),
+            ("X-Zeta".to_string(), "two".to_string()),
+        ]));
+
+        assert_eq!(
+            email_request_fingerprint(&first).unwrap(),
+            email_request_fingerprint(&second).unwrap()
+        );
+    }
+
     struct MockAuditLogger;
 
     #[async_trait::async_trait]
     impl AuditLogger for MockAuditLogger {
         async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
             Ok(())
+        }
+    }
+
+    struct FailingAuditLogger;
+
+    #[async_trait::async_trait]
+    impl AuditLogger for FailingAuditLogger {
+        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
+            anyhow::bail!("intentional audit storage failure")
         }
     }
 
@@ -503,12 +646,18 @@ mod tests {
         }
     }
 
-    async fn setup_test_env() -> Option<(TestDatabase, Arc<AppState>)> {
+    async fn setup_test_env_with_audit(
+        audit_service: Arc<dyn AuditLogger>,
+    ) -> Option<(TestDatabase, Arc<AppState>)> {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                eprintln!("Skipping Docker-dependent email handler test: {error}");
-                return None;
+                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
+                {
+                    eprintln!("Skipping Docker-dependent email handler test: {error}");
+                    return None;
+                }
+                panic!("Email handler test database or migrations failed: {error}");
             }
         };
         let encryption_service = create_test_encryption_service();
@@ -576,7 +725,7 @@ mod tests {
             email_service,
             validation_service,
             tracking_service,
-            audit_service: Arc::new(MockAuditLogger),
+            audit_service,
             project_access_checker: None,
             dns_provider_service: None,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
@@ -585,6 +734,10 @@ mod tests {
         });
 
         Some((db, app_state))
+    }
+
+    async fn setup_test_env() -> Option<(TestDatabase, Arc<AppState>)> {
+        setup_test_env_with_audit(Arc::new(MockAuditLogger)).await
     }
 
     async fn create_test_provider(
@@ -757,6 +910,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn audit_failure_prevents_provider_delivery_and_email_persistence() {
+        let Some((db, state)) = setup_test_env_with_audit(Arc::new(FailingAuditLogger)).await
+        else {
+            return;
+        };
+        let provider = create_test_provider(&state.provider_service).await;
+        create_test_domain(&db.db, provider.id, "audit-failure.example.com").await;
+
+        let app = build_session_app(state);
+        let response = app
+            .oneshot(send_request("audit-failure.example.com", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let persisted = db
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT count(*) AS count FROM emails".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "count")
+            .unwrap();
+        assert_eq!(persisted, 0, "unaudited sends must not reach persistence");
     }
 
     #[tokio::test]

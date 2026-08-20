@@ -428,7 +428,7 @@ pub struct SetupDnsResponse {
 // Email Types
 // ========================================
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct SendEmailRequestBody {
     /// Sender email address (domain will be auto-extracted for lookup)
     #[schema(example = "hello@updates.example.com")]
@@ -528,6 +528,10 @@ pub struct EmailStatsResponse {
     pub queued: u64,
     /// Emails captured without sending (Mailhog mode - no provider configured)
     pub captured: u64,
+    /// Emails currently owned by an active provider delivery attempt
+    pub sending: u64,
+    /// Emails whose provider accepted/rejected outcome could not be determined
+    pub delivery_unknown: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

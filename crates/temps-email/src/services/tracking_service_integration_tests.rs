@@ -48,8 +48,12 @@ mod tests {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                eprintln!("Skipping Docker-dependent tracking service test: {error}");
-                return None;
+                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
+                {
+                    eprintln!("Skipping Docker-dependent tracking service test: {error}");
+                    return None;
+                }
+                panic!("Tracking service test database or migrations failed: {error}");
             }
         };
         let config_service = create_test_config_service(db.db.clone());

@@ -34,6 +34,11 @@ pub enum EmailError {
     #[error("Provider error: {0}")]
     ProviderError(String),
 
+    /// The provider request may have been accepted, but no definitive response
+    /// reached Temps. Retrying this outcome could deliver a duplicate email.
+    #[error("Provider delivery outcome is unknown: {0}")]
+    ProviderDeliveryUnknown(String),
+
     #[error("Encryption error: {0}")]
     Encryption(String),
 
