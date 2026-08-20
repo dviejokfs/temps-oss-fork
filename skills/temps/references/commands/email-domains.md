@@ -18,6 +18,9 @@ Manage email domains for transactional email
 - `dns-records` - Get DNS records for an email domain
 - `setup-dns` - Setup DNS records using a configured DNS provider
 - `verify` - Verify an email domain DNS configuration
+- `projects` - List projects authorized to send through an email domain
+- `authorize-project` - Authorize a project to send through an email domain
+- `revoke-project` - Revoke a project's permission to send through an email domain
 
 ### `email-domains list` (alias: `ls`)
 
@@ -106,3 +109,38 @@ Verify an email domain DNS configuration
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Email domain ID | - | Yes |
+
+### `email-domains projects`
+
+List projects authorized to send through an email domain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Email domain ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `email-domains authorize-project`
+
+Authorize a project to send through an email domain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Email domain ID | - | Yes |
+| `--project-id <id>` | Project ID | - | Yes |
+
+### `email-domains revoke-project`
+
+Revoke a project's permission to send through an email domain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Email domain ID | - | Yes |
+| `--project-id <id>` | Project ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |

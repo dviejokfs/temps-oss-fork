@@ -44,8 +44,10 @@ pub mod deployments;
 pub mod dns_managed_domains;
 pub mod dns_providers;
 pub mod domains;
+pub mod email_domain_projects;
 pub mod email_domains;
 pub mod email_events;
+pub mod email_idempotency_keys;
 pub mod email_links;
 pub mod email_providers;
 pub mod emails;
@@ -92,6 +94,7 @@ pub mod restore_runs;
 pub mod roles;
 pub mod s3_sources;
 pub mod schedule_runs;
+pub mod secret_compose_services;
 pub mod secret_environments;
 pub mod secrets;
 pub mod service_endpoints;
@@ -148,6 +151,9 @@ pub mod metric_dashboards;
 
 // Metric alert rules (first-class metric-centric alerting)
 pub mod metric_alert_rules;
+
+// OTel span attribute facets (pre-allocated slot columns for fast filtering)
+pub mod otel_span_facets;
 
 // Webhook entities
 pub mod webhook_deliveries;

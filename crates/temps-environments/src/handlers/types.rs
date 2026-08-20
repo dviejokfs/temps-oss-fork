@@ -66,8 +66,9 @@ pub struct CreateEnvironmentVariableRequest {
     pub key: String,
     pub value: String,
     pub environment_ids: Vec<i32>,
-    /// Include this environment variable in preview environments (default: true)
+    /// Include this environment variable in preview environments (default: false)
     #[serde(default = "default_include_in_preview")]
+    #[schema(default = false)]
     pub include_in_preview: bool,
     /// When true the variable is treated as write-only: never returned in
     /// plaintext from the API, masked in the UI, and updates that omit the
@@ -97,7 +98,7 @@ pub struct UpdateEnvironmentVariableRequest {
 }
 
 fn default_include_in_preview() -> bool {
-    true
+    false
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -394,10 +395,12 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// Security configuration for this environment (overrides project-level settings)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<temps_entities::deployment_config::SecurityConfig>,
-    /// Optional list of node IDs to deploy to (overrides project-level setting)
+    /// Optional list of node IDs to deploy to (overrides project-level setting).
+    /// Send an empty list to clear the environment-level override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_nodes: Option<Vec<i32>>,
     /// Label selector for node-based scheduling (overrides project-level setting).
+    /// Send an empty object to clear the environment-level override.
     /// Same key with array value -> OR, different keys -> AND.
     /// Example: `{"region": ["us", "asia"], "gpu": "true"}`
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -506,7 +509,8 @@ pub struct CreateEnvironmentRequest {
 /// Request to create a new project secret.
 ///
 /// Project secrets are mounted into the container as files under
-/// `/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.
+/// `/run/secrets/<KEY>` as a read-only mount, instead of as environment
+/// variables, so they do not appear in `docker inspect`.
 /// Values are always encrypted at rest and never returned in plaintext from
 /// the API after create. Distinct from agent secrets (global `/settings/secrets`).
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -518,9 +522,18 @@ pub struct CreateProjectSecretRequest {
     pub value: String,
     #[serde(default)]
     pub environment_ids: Vec<i32>,
-    /// Include this secret in preview environments.
+    /// Include this secret in preview environments (default: false).
     #[serde(default = "default_include_in_preview")]
+    #[schema(default = false)]
     pub include_in_preview: bool,
+    /// Docker Compose services allowed to read this secret, by compose
+    /// service name. Empty (the default) delivers it to every service in the
+    /// stack, which is how secrets behaved before scoping existed.
+    ///
+    /// Ignored by non-Compose presets: those deploy a single container, which
+    /// always receives every secret in scope for its environment.
+    #[serde(default)]
+    pub compose_services: Vec<String>,
 }
 
 /// Request to update a project secret. The `value` field is optional — omit it
@@ -535,6 +548,14 @@ pub struct UpdateProjectSecretRequest {
     pub environment_ids: Vec<i32>,
     #[serde(default = "default_include_in_preview")]
     pub include_in_preview: bool,
+    /// Docker Compose services allowed to read this secret, by compose
+    /// service name. Empty (the default) delivers it to every service in the
+    /// stack, which is how secrets behaved before scoping existed.
+    ///
+    /// Ignored by non-Compose presets: those deploy a single container, which
+    /// always receives every secret in scope for its environment.
+    #[serde(default)]
+    pub compose_services: Vec<String>,
 }
 
 /// Project secret metadata. There is deliberately no `value` field — secret
@@ -549,6 +570,9 @@ pub struct ProjectSecretResponse {
     pub created_at: i64,
     pub updated_at: i64,
     pub environments: Vec<ProjectSecretEnvironmentInfo>,
+    /// Compose services this secret is restricted to. Empty means every
+    /// service in the stack.
+    pub compose_services: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone)]
@@ -566,6 +590,35 @@ pub struct GetProjectSecretsQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_var_preview_inclusion_requires_explicit_opt_in() {
+        let omitted: CreateEnvironmentVariableRequest = serde_json::from_str(
+            r#"{"key":"DATABASE_URL","value":"redacted","environment_ids":[1]}"#,
+        )
+        .unwrap();
+        let enabled: CreateEnvironmentVariableRequest = serde_json::from_str(
+            r#"{"key":"DATABASE_URL","value":"redacted","environment_ids":[1],"include_in_preview":true}"#,
+        )
+        .unwrap();
+
+        assert!(!omitted.include_in_preview);
+        assert!(enabled.include_in_preview);
+    }
+
+    #[test]
+    fn project_secret_preview_inclusion_requires_explicit_opt_in() {
+        let omitted: CreateProjectSecretRequest =
+            serde_json::from_str(r#"{"key":"API_TOKEN","value":"redacted","environment_ids":[1]}"#)
+                .unwrap();
+        let enabled: CreateProjectSecretRequest = serde_json::from_str(
+            r#"{"key":"API_TOKEN","value":"redacted","environment_ids":[1],"include_in_preview":true}"#,
+        )
+        .unwrap();
+
+        assert!(!omitted.include_in_preview);
+        assert!(enabled.include_in_preview);
+    }
 
     /// The four resource fields must distinguish three JSON states so the UI's
     /// "No limit" action (which sends `null`) actually clears the stored value

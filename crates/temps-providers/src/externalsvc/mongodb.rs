@@ -115,6 +115,26 @@ fn default_docker_image() -> String {
     "gotempsh/mongodb-walg:8.0".to_string()
 }
 
+/// Repositories a restore-time `docker_image` override may name, in addition
+/// to whatever repository the source service already runs. See
+/// [`crate::externalsvc::restore_image`] for why the override is constrained.
+const RESTORE_IMAGE_REPOSITORIES: &[&str] = &["mongo", "gotempsh/mongodb-walg"];
+
+/// Environment variable an operator sets to allow additional MongoDB
+/// repositories as a restore-time `docker_image` override (comma-separated).
+/// Additive — it can only widen [`RESTORE_IMAGE_REPOSITORIES`], never shrink
+/// it, so a typo cannot block a restore that worked before. Read once; restart
+/// temps to change. Mirrors `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES`.
+pub(crate) const EXTRA_RESTORE_IMAGES_ENV: &str = "TEMPS_ALLOWED_MONGODB_DOCKER_IMAGES";
+
+/// Operator additions to [`RESTORE_IMAGE_REPOSITORIES`], read once per process.
+fn extra_restore_image_repositories() -> &'static [String] {
+    static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    EXTRA.get_or_init(|| {
+        crate::externalsvc::restore_image::extra_allowed_repositories(EXTRA_RESTORE_IMAGES_ENV)
+    })
+}
+
 fn example_docker_image() -> &'static str {
     "gotempsh/mongodb-walg:8.0"
 }
@@ -3024,7 +3044,21 @@ impl ExternalService for MongodbService {
                 new_config.port = port.to_string();
             }
             if let Some(image) = overrides.get("docker_image").and_then(|v| v.as_str()) {
-                new_config.docker_image = image.to_string();
+                // The new service inherits the SOURCE service's credentials
+                // (root user/password are cloned above), and they are handed
+                // to the container as `MONGO_INITDB_ROOT_*` env vars. An
+                // arbitrary caller-chosen image would therefore be handed the
+                // source database's password on startup — so the override may
+                // only re-tag a repository we already run.
+                let validated =
+                    crate::externalsvc::restore_image::restore_image_override_with_extra(
+                        &new_config.docker_image,
+                        image,
+                        RESTORE_IMAGE_REPOSITORIES,
+                        extra_restore_image_repositories(),
+                        Some(EXTRA_RESTORE_IMAGES_ENV),
+                    )?;
+                new_config.docker_image = validated.to_string();
             }
             if let Some(db) = overrides.get("database").and_then(|v| v.as_str()) {
                 new_config.database = db.to_string();
@@ -3351,6 +3385,62 @@ impl ExternalService for MongodbService {
 
 #[cfg(test)]
 mod tests {
+
+    /// Restoring into a new service clones the source's root credentials, so
+    /// a caller-chosen image must not be able to receive them.
+    #[test]
+    fn restore_image_override_rejects_foreign_repository() {
+        let err = crate::externalsvc::restore_image::restore_image_override(
+            "gotempsh/mongodb-walg:8.0",
+            "attacker/exfil:latest",
+            RESTORE_IMAGE_REPOSITORIES,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not permitted"), "unexpected error: {err}");
+    }
+
+    /// Re-tagging the repository the source already runs is the legitimate
+    /// use of the override (restore into a newer patch release).
+    #[test]
+    fn restore_image_override_allows_retagging_source_repository() {
+        assert_eq!(
+            crate::externalsvc::restore_image::restore_image_override(
+                "gotempsh/mongodb-walg:8.0",
+                "gotempsh/mongodb-walg:7.0",
+                RESTORE_IMAGE_REPOSITORIES
+            )
+            .unwrap(),
+            "gotempsh/mongodb-walg:7.0"
+        );
+        assert_eq!(
+            crate::externalsvc::restore_image::restore_image_override(
+                "gotempsh/mongodb-walg:8.0",
+                "mongo:7.0",
+                RESTORE_IMAGE_REPOSITORIES
+            )
+            .unwrap(),
+            "mongo:7.0"
+        );
+    }
+
+    /// Exact repository match, never a prefix test.
+    #[test]
+    fn restore_image_override_does_not_match_by_prefix() {
+        for image in ["mongo-evil:1", "evil/mongo:1", "mongodb:1"] {
+            assert!(
+                crate::externalsvc::restore_image::restore_image_override(
+                    "gotempsh/mongodb-walg:8.0",
+                    image,
+                    RESTORE_IMAGE_REPOSITORIES
+                )
+                .is_err(),
+                "{image} must not be accepted"
+            );
+        }
+    }
+
+    /// A registry port is not a tag separator.
     use super::*;
 
     #[test]

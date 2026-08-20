@@ -5,7 +5,8 @@ import { CronJobsSettings } from './settings/CronJobsSettings'
 import { DomainsSettings } from './settings/DomainsSettings'
 import { EnvironmentVariablesSettings } from './settings/EnvironmentVariablesSettings'
 import { GeneralSettings } from './settings/GeneralSettings'
-import { BuildSettings, GitSettings } from './settings/GitSettings'
+import { GitSettings } from './settings/GitSettings'
+import { BuildDeploySettings } from './settings/BuildDeploySettings'
 import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
 import { McpServersSettings } from './settings/McpServersSettings'
@@ -15,6 +16,7 @@ import { WebhooksSettings } from './settings/WebhooksSettings'
 import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
 import { EditWebhookPage } from './settings/webhooks/EditWebhookPage'
 import { WebhookDetail } from './settings/webhooks/WebhookDetail'
+import { ProjectSettingsOverview } from './settings/ProjectSettingsOverview'
 
 interface ProjectSettingsProps {
   project: ProjectResponse
@@ -25,7 +27,7 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
   return (
     <div>
       <Routes>
-        <Route index element={<Navigate to="general" replace />} />
+        <Route index element={<ProjectSettingsOverview project={project} />} />
         <Route
           path="general"
           element={<GeneralSettings project={project} refetch={refetch} />}
@@ -42,7 +44,7 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
         />
         <Route
           path="build"
-          element={<BuildSettings project={project} refetch={refetch} />}
+          element={<BuildDeploySettings project={project} refetch={refetch} />}
         />
         <Route
           path="security"

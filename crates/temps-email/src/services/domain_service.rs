@@ -1,13 +1,14 @@
 //! Domain service for managing email sending domains
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
+    EntityTrait, QueryFilter, QueryOrder,
 };
 use std::sync::Arc;
-use temps_entities::email_domains;
+use temps_entities::{email_domain_projects, email_domains, projects};
 use tracing::{debug, error, info, warn};
 
+use crate::dns::DnsVerifier;
 use crate::errors::EmailError;
 use crate::providers::{DnsRecord, DnsRecordStatus, DomainIdentityDetails, VerificationStatus};
 use crate::services::ProviderService;
@@ -82,6 +83,8 @@ impl DomainService {
             dns_records.push(mx.clone());
         }
 
+        dns_records.push(Self::dmarc_record_template(&request.domain));
+
         // Store domain in database
         let domain = email_domains::ActiveModel {
             provider_id: Set(request.provider_id),
@@ -136,6 +139,102 @@ impl DomainService {
         Ok(domain)
     }
 
+    /// Allow one project-scoped deployment credential to use a verified sender domain.
+    pub async fn authorize_project(
+        &self,
+        domain_id: i32,
+        project_id: i32,
+    ) -> Result<(), EmailError> {
+        self.get(domain_id).await?;
+        let project_exists = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !project_exists {
+            return Err(EmailError::ProjectNotFound(project_id));
+        }
+
+        email_domain_projects::Entity::insert(email_domain_projects::ActiveModel {
+            domain_id: Set(domain_id),
+            project_id: Set(project_id),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::columns([
+                email_domain_projects::Column::DomainId,
+                email_domain_projects::Column::ProjectId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec(self.db.as_ref())
+        .await?;
+
+        Ok(())
+    }
+
+    /// Remove a project's permission to use a sender domain.
+    pub async fn revoke_project(&self, domain_id: i32, project_id: i32) -> Result<(), EmailError> {
+        self.get(domain_id).await?;
+        email_domain_projects::Entity::delete_many()
+            .filter(email_domain_projects::Column::DomainId.eq(domain_id))
+            .filter(email_domain_projects::Column::ProjectId.eq(project_id))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    /// List the active projects currently allowed to send through a domain.
+    pub async fn list_authorized_projects(
+        &self,
+        domain_id: i32,
+    ) -> Result<Vec<projects::Model>, EmailError> {
+        self.get(domain_id).await?;
+
+        let project_ids = email_domain_projects::Entity::find()
+            .filter(email_domain_projects::Column::DomainId.eq(domain_id))
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|authorization| authorization.project_id)
+            .collect::<Vec<_>>();
+
+        if project_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        Ok(projects::Entity::find()
+            .filter(projects::Column::Id.is_in(project_ids))
+            .filter(projects::Column::IsDeleted.eq(false))
+            .order_by_asc(projects::Column::Name)
+            .all(self.db.as_ref())
+            .await?)
+    }
+
+    /// Whether a project-scoped deployment credential may send through this domain.
+    pub async fn is_authorized_for_project(
+        &self,
+        domain_id: i32,
+        project_id: i32,
+    ) -> Result<bool, EmailError> {
+        let project_exists = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !project_exists {
+            return Ok(false);
+        }
+
+        Ok(
+            email_domain_projects::Entity::find_by_id((domain_id, project_id))
+                .one(self.db.as_ref())
+                .await?
+                .is_some(),
+        )
+    }
+
     /// Get a domain with its DNS records (fetches fresh verification status from provider)
     /// The domain status is computed dynamically based on DNS record verification.
     ///
@@ -167,7 +266,9 @@ impl DomainService {
                     records.push(mx);
                 }
 
-                // Compute status based on all DNS records being verified
+                // Compute status based on all DNS records being verified.
+                // DMARC deliberately isn't part of this — see
+                // `dmarc_record_template`'s doc comment.
                 let all_verified = Self::are_all_records_verified(&identity_details);
                 let status = if all_verified {
                     "verified".to_string()
@@ -180,6 +281,8 @@ impl DomainService {
                         "pending".to_string()
                     }
                 };
+
+                records.push(Self::dmarc_record_live(&domain.domain).await);
 
                 (records, status)
             }
@@ -348,7 +451,8 @@ impl DomainService {
             .iter()
             .any(|r| r.status == DnsRecordStatus::Failed);
 
-        // Determine final status based on DNS record verification
+        // Determine final status based on DNS record verification. DMARC is
+        // intentionally excluded — see `dmarc_record_template`'s doc comment.
         let status = if all_dns_verified {
             debug!("All DNS records verified via DNS lookup, marking domain as verified");
             VerificationStatus::Verified
@@ -358,6 +462,8 @@ impl DomainService {
             // Use the provider's overall status for pending/other states
             identity_details.overall_status
         };
+
+        dns_records.push(Self::dmarc_record_live(&domain.domain).await);
 
         // Update domain status in database
         let mut active_model: email_domains::ActiveModel = domain.into();
@@ -431,6 +537,34 @@ impl DomainService {
         Ok(())
     }
 
+    /// The recommended DMARC policy record for a domain. Unlike SPF/DKIM/MX,
+    /// no provider API publishes or manages DMARC — it's a plain DNS TXT
+    /// record the domain owner sets independently — so it's generated here
+    /// rather than surfaced by `EmailProvider::get_identity_details`, and
+    /// deliberately left out of `are_all_records_verified`/failure checks:
+    /// requiring it would regress every already-verified domain the next
+    /// time its status is recomputed. It's informational, not required.
+    fn dmarc_record_template(domain: &str) -> DnsRecord {
+        DnsRecord {
+            record_type: "TXT".to_string(),
+            name: format!("_dmarc.{}", domain),
+            // Quarantine (not reject) by default — a safe starting policy
+            // that won't silently drop mail for a domain that hasn't
+            // fully tuned SPF/DKIM alignment yet.
+            value: "v=DMARC1; p=quarantine; pct=100".to_string(),
+            priority: None,
+            status: DnsRecordStatus::Pending,
+        }
+    }
+
+    /// DMARC record with its live-verified status, for paths that already
+    /// do a live DNS lookup for SPF/DKIM/MX.
+    async fn dmarc_record_live(domain: &str) -> DnsRecord {
+        let mut record = Self::dmarc_record_template(domain);
+        record.status = DnsVerifier::new().verify_dmarc_record(domain).await;
+        record
+    }
+
     /// Build DNS records from stored domain data (fallback when provider API unavailable)
     fn build_dns_records(&self, domain: &email_domains::Model) -> Vec<DnsRecord> {
         let mut records = Vec::new();
@@ -468,6 +602,10 @@ impl DomainService {
             });
         }
 
+        let mut dmarc = Self::dmarc_record_template(&domain.domain);
+        dmarc.status = DnsRecordStatus::Unknown;
+        records.push(dmarc);
+
         records
     }
 }
@@ -489,12 +627,22 @@ mod tests {
     }
 
     // Helper to setup test environment with real database
-    async fn setup_test_env() -> (TestDatabase, DomainService, ProviderService) {
-        let db = TestDatabase::with_migrations().await.unwrap();
+    async fn setup_test_env() -> Option<(TestDatabase, DomainService, ProviderService)> {
+        let db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
+                {
+                    eprintln!("Skipping Docker-dependent email domain test: {error}");
+                    return None;
+                }
+                panic!("Email domain test database or migrations failed: {error}");
+            }
+        };
         let encryption_service = create_test_encryption_service();
         let provider_service = ProviderService::new(db.db.clone(), encryption_service);
         let domain_service = DomainService::new(db.db.clone(), Arc::new(provider_service.clone()));
-        (db, domain_service, provider_service)
+        Some((db, domain_service, provider_service))
     }
 
     // Helper to create a test provider
@@ -642,7 +790,7 @@ mod tests {
 
         let records = service.build_dns_records(&domain);
 
-        assert_eq!(records.len(), 3); // SPF, DKIM, MX
+        assert_eq!(records.len(), 4); // SPF, DKIM, MX, DMARC
 
         // Verify SPF record
         let spf = records
@@ -659,13 +807,21 @@ mod tests {
         let mx = records.iter().find(|r| r.record_type == "MX");
         assert!(mx.is_some());
         assert_eq!(mx.unwrap().priority, Some(10));
+
+        // Verify DMARC record — always generated, unlike the provider-supplied
+        // records above, since no provider API manages it.
+        let dmarc = records.iter().find(|r| r.name == "_dmarc.example.com");
+        assert!(dmarc.is_some());
+        assert!(dmarc.unwrap().value.starts_with("v=DMARC1"));
     }
 
     // ========== Integration Tests (require Docker) ==========
 
     #[tokio::test]
     async fn test_get_domain_not_found() {
-        let (_db, domain_service, _provider_service) = setup_test_env().await;
+        let Some((_db, domain_service, _provider_service)) = setup_test_env().await else {
+            return;
+        };
 
         let result = domain_service.get(999999).await;
 
@@ -678,7 +834,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_domains_empty() {
-        let (_db, domain_service, _provider_service) = setup_test_env().await;
+        let Some((_db, domain_service, _provider_service)) = setup_test_env().await else {
+            return;
+        };
 
         let result = domain_service.list().await;
 
@@ -689,7 +847,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_verified_domains_empty() {
-        let (_db, domain_service, _provider_service) = setup_test_env().await;
+        let Some((_db, domain_service, _provider_service)) = setup_test_env().await else {
+            return;
+        };
 
         let result = domain_service.list_verified().await;
 
@@ -700,7 +860,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_by_provider_empty() {
-        let (_db, domain_service, provider_service) = setup_test_env().await;
+        let Some((_db, domain_service, provider_service)) = setup_test_env().await else {
+            return;
+        };
 
         // Create a provider
         let provider = create_test_provider(&provider_service).await;
@@ -714,8 +876,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_authorized_projects_returns_empty_for_domain_without_grants() {
+        let now = chrono::Utc::now();
+        let domain = email_domains::Model {
+            id: 17,
+            provider_id: 1,
+            domain: "mail.example.com".to_string(),
+            status: "verified".to_string(),
+            spf_record_name: None,
+            spf_record_value: None,
+            dkim_selector: None,
+            dkim_record_name: None,
+            dkim_record_value: None,
+            mx_record_name: None,
+            mx_record_value: None,
+            mx_record_priority: None,
+            provider_identity_id: None,
+            last_verified_at: Some(now),
+            verification_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![domain]])
+                .append_query_results([Vec::<email_domain_projects::Model>::new()])
+                .into_connection(),
+        );
+        let provider_service = Arc::new(ProviderService::new(
+            db.clone(),
+            create_test_encryption_service(),
+        ));
+        let service = DomainService::new(db, provider_service);
+
+        let projects = service.list_authorized_projects(17).await.unwrap();
+
+        assert!(projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_or_missing_project_cannot_use_surviving_domain_grant() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<projects::Model>::new()])
+                .into_connection(),
+        );
+        let provider_service = Arc::new(ProviderService::new(
+            db.clone(),
+            create_test_encryption_service(),
+        ));
+        let service = DomainService::new(db, provider_service);
+
+        assert!(!service.is_authorized_for_project(17, 42).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn test_provider_exists_check() {
-        let (_db, _domain_service, provider_service) = setup_test_env().await;
+        let Some((_db, _domain_service, provider_service)) = setup_test_env().await else {
+            return;
+        };
 
         // Create a provider
         let provider = create_test_provider(&provider_service).await;

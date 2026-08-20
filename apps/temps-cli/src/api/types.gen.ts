@@ -1357,6 +1357,27 @@ export type AppSettings = {
      */
     connection_limits?: ConnectionLimitSettings;
     /**
+     * Whether plain-HTTP requests to the console host (`external_url`) are
+     * redirected to HTTPS. Same tri-state contract as an environment's
+     * `force_https`:
+     *
+     * - `None` (default) — inherit the per-host heuristic: redirect only once
+     * the console hostname has actually completed TLS provisioning. An
+     * HTTP-only install, and an install whose TLS is terminated upstream,
+     * are both left alone.
+     * - `Some(true)` — always redirect. For operators who terminate TLS at
+     * Temps but have not provisioned the cert through Temps.
+     * - `Some(false)` — never redirect, even once a certificate exists.
+     *
+     * Deliberately operator-set rather than inferred. Temps cannot tell
+     * "HTTPS terminated by an upstream CDN" apart from "plain HTTP" — both
+     * arrive as a plaintext connection, and `X-Forwarded-Proto` is not
+     * trustworthy from an arbitrary peer — so inferring `true` from an
+     * `https://` `external_url` would 301 a CDN-fronted console into an
+     * infinite redirect loop with no way out but the global kill switch.
+     */
+    console_force_https?: boolean | null;
+    /**
      * Binary version tag (e.g. "v0.1.0") of the *console* process
      * (`temps serve`, role=all or role=console) that last started. Written
      * on console startup; read by the standalone `temps proxy` to detect
@@ -1381,6 +1402,13 @@ export type AppSettings = {
      */
     edge_target?: string | null;
     external_url?: string | null;
+    /**
+     * Retention policy for locally-built deployment images. Modeled as a
+     * settings row (not an env var) per CLAUDE.md so an operator can change
+     * the system-wide default at runtime without restarting the binary.
+     * Individual projects override it via `projects.image_retention_hours`.
+     */
+    image_retention?: ImageRetentionSettings;
     /**
      * Skip TLS certificate verification on outbound HTTP clients built by the
      * server (deployer, agent, remote service client). Strictly opt-in for
@@ -1450,6 +1478,12 @@ export type AppSettings = {
      * from appearing on installs that were already configured via the CLI.
      */
     setup_complete?: boolean;
+    /**
+     * Ceilings the operator places on what a *tenant* may configure for
+     * their own project/environment. Entirely unenforced by default, so an
+     * upgrade never changes what an existing config means.
+     */
+    tenant_resource_ceilings?: TenantResourceCeilings;
 };
 
 /**
@@ -1482,6 +1516,12 @@ export type AppSettingsResponse = {
      * customer app traffic. No sensitive content. See issue #646.
      */
     connection_limits: ConnectionLimitSettings;
+    /**
+     * Whether plain-HTTP requests to the console host are redirected to HTTPS.
+     * `None` inherits the per-host certificate heuristic; `Some(b)` is an
+     * explicit operator override. No sensitive content.
+     */
+    console_force_https?: boolean | null;
     container_logs: ContainerLogSettings;
     disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;
@@ -1508,6 +1548,11 @@ export type AppSettingsResponse = {
      */
     effective_observability_store: MetricsStoreKind;
     external_url?: string | null;
+    /**
+     * Deployment-image retention policy. No sensitive content, passed through
+     * as-is so the settings UI can show and edit the system-wide default.
+     */
+    image_retention: ImageRetentionSettings;
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
@@ -1561,6 +1606,12 @@ export type AppSettingsResponse = {
      * wizard checks this field on load and skips itself when true.
      */
     setup_complete: boolean;
+    /**
+     * Upper bounds a project/environment override may not exceed. No
+     * sensitive content — this is operator policy the settings UI edits
+     * directly. Unenforced by default.
+     */
+    tenant_resource_ceilings: TenantResourceCeilings;
 };
 
 /**
@@ -1729,6 +1780,15 @@ export type AuthTokenResponse = {
     access_token: string;
     expires_at: number;
     refresh_token: string;
+};
+
+/**
+ * A project authorized to send email through a sender domain.
+ */
+export type AuthorizedEmailDomainProjectResponse = {
+    id: number;
+    name: string;
+    slug: string;
 };
 
 /**
@@ -3867,7 +3927,7 @@ export type CreateEnvironmentRequest = {
 export type CreateEnvironmentVariableRequest = {
     environment_ids: Array<number>;
     /**
-     * Include this environment variable in preview environments (default: true)
+     * Include this environment variable in preview environments (default: false)
      */
     include_in_preview?: boolean;
     /**
@@ -3900,6 +3960,17 @@ export type CreateExternalServiceRequest = {
      */
     topology?: string;
     version?: string | null;
+};
+
+/**
+ * Request body for registering a new facet.
+ */
+export type CreateFacetRequest = {
+    /**
+     * The OTel attribute key to facet (e.g. `enduser.id`, `galachain.contract`).
+     * Must be non-empty, ≤200 characters, and not already registered.
+     */
+    attribute_key: string;
 };
 
 export type CreateFlagRequest = {
@@ -4346,14 +4417,24 @@ export type CreateProjectRequest = {
  * Request to create a new project secret.
  *
  * Project secrets are mounted into the container as files under
- * `/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.
+ * `/run/secrets/<KEY>` as a read-only mount, instead of as environment
+ * variables, so they do not appear in `docker inspect`.
  * Values are always encrypted at rest and never returned in plaintext from
  * the API after create. Distinct from agent secrets (global `/settings/secrets`).
  */
 export type CreateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     /**
-     * Include this secret in preview environments.
+     * Include this secret in preview environments (default: false).
      */
     include_in_preview?: boolean;
     /**
@@ -6444,8 +6525,16 @@ export type EmailStatsResponse = {
      * Emails captured without sending (Mailhog mode - no provider configured)
      */
     captured: number;
+    /**
+     * Emails whose provider accepted/rejected outcome could not be determined
+     */
+    delivery_unknown: number;
     failed: number;
     queued: number;
+    /**
+     * Emails currently owned by an active provider delivery attempt
+     */
+    sending: number;
     sent: number;
     total: number;
 };
@@ -7044,12 +7133,30 @@ export type ErrorEventResponse = {
     timestamp: string;
 };
 
+export type ErrorGroupDeploymentResponse = {
+    branch?: string | null;
+    commit_hash?: string | null;
+    commit_message?: string | null;
+    id: number;
+};
+
 export type ErrorGroupResponse = {
+    /**
+     * Count of distinct affected visitors/users within the requested time window.
+     * Present only when `start_date` and `end_date` were supplied on the list request.
+     */
+    affected_users?: number | null;
     assigned_to?: string | null;
     created_at: string;
+    deployment?: null | ErrorGroupDeploymentResponse;
     deployment_id?: number | null;
     environment_id?: number | null;
     error_type: string;
+    /**
+     * Count of error events within the requested time window.
+     * Present only when `start_date` and `end_date` were supplied on the list request.
+     */
+    events_in_range?: number | null;
     first_seen: string;
     id: number;
     last_seen: string;
@@ -7099,6 +7206,12 @@ export type ErrorTimeSeriesQuery = {
      */
     bucket?: string;
     end_time: string;
+    /**
+     * Filter chart data to a specific environment.
+     * Always AND-combined with project_id — an environment from a different project
+     * returns zero-filled buckets rather than cross-project data.
+     */
+    environment_id?: number | null;
     start_time: string;
 };
 
@@ -7843,6 +7956,53 @@ export type ExternalServiceSummary = {
     service_type: string;
 };
 
+/**
+ * Which storage engine a facet was created against. A deployment only ever
+ * runs one backend at a time (see `plugin.rs`'s storage selection), but
+ * stamping it on each row keeps the status fields unambiguous.
+ */
+export type FacetBackendKind = 'clickhouse' | 'timescaledb';
+
+/**
+ * Public representation of a registered span attribute facet.
+ */
+export type FacetInfo = {
+    /**
+     * The OTel attribute key, e.g. `enduser.id` or `galachain.contract`.
+     */
+    attribute_key: string;
+    backend: FacetBackendKind;
+    created_at: string;
+    /**
+     * Populated when `status = failed`, explaining why.
+     */
+    error_message?: string | null;
+    /**
+     * Rows backfilled so far. Only meaningful for the `timescaledb` backend
+     * — the `clickhouse` backend's mutation doesn't expose a row count
+     * until it's done, so this stays 0 there even while running.
+     */
+    rows_backfilled: number;
+    /**
+     * The slot column index 1..=20 (`facet_attr_N`).
+     */
+    slot: number;
+    status: FacetStatus;
+};
+
+/**
+ * Backfill/delete-clear lifecycle for a facet. See the module docs for how
+ * the poller advances a facet through these states.
+ */
+export type FacetStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deleting';
+
+/**
+ * Response body for facet list.
+ */
+export type FacetsResponse = {
+    data: Array<FacetInfo>;
+};
+
 export type FailureReportPreviewResponse = {
     error_message?: string | null;
     failed_job_type: string;
@@ -7858,6 +8018,13 @@ export type FailureReportPreviewResponse = {
      * opted out via `TEMPS_TELEMETRY`. The GitHub-issue path is unaffected.
      */
     reporting_enabled: boolean;
+};
+
+export type FeatureMaturity = {
+    docs_path: string;
+    key: string;
+    maturity: Maturity;
+    reason: string;
 };
 
 export type FieldResponse = {
@@ -8103,8 +8270,8 @@ export type GatewayStatus = {
      */
     host_port?: number | null;
     /**
-     * Image reference the container was created with (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway:latest`).
+     * Image reference the container was created with (e.g. an immutable
+     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
      */
     image?: string | null;
     /**
@@ -9118,6 +9285,28 @@ export type HttpChallengeDebugResponse = {
 };
 
 /**
+ * System-wide retention policy for locally-built deployment images.
+ *
+ * The nightly cleanup removes a Temps-built image only once *every*
+ * deployment that references it is older than the owning project's retention
+ * window. Deleting an image makes rollback/promotion to that deployment
+ * impossible, so the default is deliberately generous: it is a rollback
+ * window, not a cache TTL.
+ */
+export type ImageRetentionSettings = {
+    /**
+     * Default hours to keep a built deployment image when the owning project
+     * has no `image_retention_hours` override. Valid range 1..=8760.
+     */
+    default_hours?: number;
+    /**
+     * Whether the nightly pass removes expired deployment images at all.
+     * Disabling it keeps every built image forever (the pre-0.1 behaviour).
+     */
+    enabled?: boolean;
+};
+
+/**
  * Platform-specific credentials for accessing the source system.
  *
  * For platforms like Vercel and Railway, this contains the API token.
@@ -9784,6 +9973,22 @@ export type KvStatusResponse = {
     version?: string | null;
 };
 
+export type LatestDeploymentMediaResponse = {
+    /**
+     * Latest deployment media keyed by project ID. Projects with no
+     * deployments are omitted.
+     */
+    projects: {
+        [key: string]: LatestDeploymentMediaResponseItem;
+    };
+};
+
+export type LatestDeploymentMediaResponseItem = {
+    project_id: number;
+    screenshot_location?: string | null;
+    url?: string | null;
+};
+
 export type LemonSqueezyConfig = {
     product_allowlist?: Array<string>;
     variant_allowlist?: Array<string>;
@@ -10281,6 +10486,8 @@ export type ManualAction = {
  * When a manual action needs to happen relative to migration
  */
 export type ManualActionTiming = 'before-migration' | 'after-migration' | 'within-hours';
+
+export type Maturity = 'stable' | 'beta' | 'experimental';
 
 export type McpDefinitionResponse = {
     config: {
@@ -12487,6 +12694,18 @@ export type PipelineStats = {
     metrics_dropped: number;
     metrics_received: number;
     metrics_stored: number;
+    /**
+     * Cumulative count of ingest requests rejected because the per-project
+     * storage quota was exceeded (→ HTTP 413). Written to the metrics store
+     * as `otel.quota_exceeded_requests` (SourceKind::Node, node_id 0) every 60s.
+     */
+    quota_exceeded_requests: number;
+    /**
+     * Cumulative count of ingest requests rejected because the per-project
+     * rate limit was exceeded (→ HTTP 429). Written to the metrics store as
+     * `otel.rate_limited_requests` (SourceKind::Node, node_id 0) every 60s.
+     */
+    rate_limited_requests: number;
     spans_dropped: number;
     spans_received: number;
     spans_stored: number;
@@ -12830,12 +13049,29 @@ export type PreviewGatewaySettings = {
      */
     auto_upgrade?: boolean;
     /**
+     * Docker container name for this instance's gateway.
+     *
+     * A single Temps install owns the whole host, so the default is fine and
+     * operators never need to touch this. It exists for the case where
+     * several Temps instances share one Docker daemon — most obviously a
+     * development machine with multiple checkouts running at once.
+     *
+     * Without it those instances silently fight: the `shared_secret` is
+     * per-database, so each generates a different one, but they all
+     * reconcile the *same* container name. Each start-up sees the other's
+     * container as drifted, recreates it with its own secret, and every
+     * other instance's previews start failing with "missing or invalid
+     * X-Temps-Preview-Token". Giving each instance its own container name
+     * (and `host_port`) makes them independent.
+     */
+    container_name?: string;
+    /**
      * Host port to publish the gateway on (always bound to 127.0.0.1).
      * Pingora forwards `ws-*` traffic to this port after authenticating.
      */
     host_port?: number;
     /**
-     * Docker image reference for the gateway. Pinned per Temps release.
+     * Docker image reference for the gateway. Pinned by digest per Temps release.
      * Operators can override this to test a custom build.
      */
     image?: string;
@@ -13037,7 +13273,7 @@ export type ProjectEnvVarInput = {
 };
 
 /**
- * Health summary for a single project (last 1 hour)
+ * Health summary for a single project over the requested time range.
  */
 export type ProjectHealthSummary = {
     /**
@@ -13048,6 +13284,10 @@ export type ProjectHealthSummary = {
      * Error rate as a percentage (0-100)
      */
     error_rate: number;
+    /**
+     * Hourly request counts ordered by bucket start.
+     */
+    hourly_requests: Array<ProjectHourlyRequestCount>;
     project_id: number;
     /**
      * Health status: "healthy", "degraded", "down", "unknown"
@@ -13061,6 +13301,17 @@ export type ProjectHealthSummary = {
      * Total requests in the period
      */
     total_requests: number;
+};
+
+/**
+ * One hourly request-count point in a project health summary.
+ */
+export type ProjectHourlyRequestCount = {
+    /**
+     * Start of the UTC hour in RFC 3339 format.
+     */
+    bucket: string;
+    request_count: number;
 };
 
 export type ProjectInfo = {
@@ -13137,6 +13388,14 @@ export type ProjectResponse = {
      */
     ai_write_actions_enabled: boolean;
     /**
+     * Whether this project also accepts deployments from a source other than
+     * `source_type` — chiefly, whether a Git-backed project will take an
+     * uploaded source archive (`drop`). `null` or `false` means only the
+     * configured `source_type` (plus Docker images and static bundles, which
+     * every project accepts) may be deployed.
+     */
+    allow_alternate_sources?: boolean | null;
+    /**
      * Attack mode - when enabled, requires CAPTCHA verification for all project environments
      */
     attack_mode: boolean;
@@ -13179,6 +13438,11 @@ export type ProjectResponse = {
      */
     gitlab_webhook_id?: number | null;
     id: number;
+    /**
+     * Hours to retain built Docker images before nightly cleanup. Null = use the
+     * system-wide default from settings.
+     */
+    image_retention_hours?: number | null;
     /**
      * Authoritative repository visibility. A missing connection alone does
      * not imply that an incompletely configured repository is public.
@@ -13227,6 +13491,11 @@ export type ProjectSecretEnvironmentInfo = {
  * must read it from the mounted file inside the container.
  */
 export type ProjectSecretResponse = {
+    /**
+     * Compose services this secret is restricted to. Empty means every
+     * service in the stack.
+     */
+    compose_services: Array<string>;
     created_at: number;
     environments: Array<ProjectSecretEnvironmentInfo>;
     id: number;
@@ -13651,6 +13920,11 @@ export type ProvisionResponse = (DomainError & {
     type: 'pending';
 });
 
+export type ProxyLogAccessResponse = {
+    allowed: boolean;
+    reason?: string | null;
+};
+
 /**
  * Response model for proxy logs
  */
@@ -13676,9 +13950,29 @@ export type ProxyLogResponse = {
     project_id?: number | null;
     query_string?: string | null;
     referrer?: string | null;
+    /**
+     * Inbound request headers, credential values already replaced with
+     * `[REDACTED]` at ingest (see [`crate::redaction`]). `None` when the entry
+     * predates header capture or was written by a path that doesn't record
+     * them; an empty map means "captured, but no headers", which is different
+     * and worth being able to tell apart.
+     *
+     * A `BTreeMap` rather than a raw `serde_json::Value` so the schema stays
+     * typed and the UI gets a stable alphabetical ordering for free.
+     */
+    request_headers?: {
+        [key: string]: string;
+    } | null;
     request_id: string;
     request_size_bytes?: number | null;
     request_source: string;
+    /**
+     * Upstream response headers, redacted on the same terms as
+     * [`Self::request_headers`].
+     */
+    response_headers?: {
+        [key: string]: string;
+    } | null;
     response_size_bytes?: number | null;
     response_time_ms?: number | null;
     routing_status: string;
@@ -14006,6 +14300,11 @@ export type ReadRowsQuery = {
      * Sort order (asc/desc)
      */
     sort_order?: string | null;
+};
+
+export type ReassignCustomDomainRequest = {
+    target_environment_id: number;
+    target_project_id: number;
 };
 
 /**
@@ -16076,6 +16375,12 @@ export type ServiceAlertRuleResponse = {
     id: number;
     metric_name: string;
     name: string;
+    /**
+     * Node the rule is scoped to. `0` is the synthetic control-plane node
+     * (see `CONTROL_PLANE_NODE_ID`), which owns the `proxy.*` and `node.*`
+     * rules. Exactly one of `service_id`/`deployment_id`/`node_id` is set.
+     */
+    node_id?: number | null;
     service_id?: number | null;
     severity: string;
     silenced_until?: string | null;
@@ -16606,6 +16911,23 @@ export type SessionSummary = {
     started_at: string;
 };
 
+/**
+ * Opt a project in or out of accepting deployments from a source other than
+ * its configured `source_type`.
+ *
+ * Unlike `ChangeProjectSourceRequest` this leaves `source_type` alone, so a
+ * Git project keeps its repository, branch, webhook auto-deploy and
+ * rollback-rebuild behaviour and merely gains the ability to also be deployed
+ * from an uploaded source archive.
+ */
+export type SetAlternateSourcesRequest = {
+    /**
+     * `true` to also accept uploaded source archives, `false` to restrict the
+     * project to its configured source again.
+     */
+    allow_alternate_sources: boolean;
+};
+
 export type SetFlagEnvironmentRequest = {
     /**
      * The kill switch. `false` makes the flag serve its default regardless of
@@ -16925,9 +17247,10 @@ export type SmartFilter = {
 } | {
     type: 'custom_data';
     /**
-     * Match custom event_data by JSON path
+     * Match custom event properties by JSON path
      * Format: {"path": "user.plan", "value": "premium"}
-     * This will match events where event_data->'user'->>'plan' = 'premium'
+     * This will match events where props->'user'->>'plan' = 'premium',
+     * falling back to the legacy `event_data` column when `props` is NULL
      */
     value: {
         path: string;
@@ -18079,6 +18402,59 @@ export type TemplateResponse = {
 };
 
 /**
+ * Ceilings on the resource overrides a *tenant* may set for their own
+ * project or environment.
+ *
+ * The knobs these bound (`memory_limit`, `max_concurrent_connections`, the
+ * request/idle timeouts) are deliberately uncapped-by-sentinel: `0` means
+ * "unlimited". That is the right default for a single-team self-hosted
+ * install, where the person editing a project *is* the operator. It is the
+ * wrong default on a shared host, where it lets one project opt out of the
+ * operator's protection and take the node — or the shared proxy's connection
+ * budget — down with it.
+ *
+ * Every ceiling here is therefore **off by default**, and turning one on is
+ * what makes the corresponding tenant override enforceable. A caller holding
+ * `Permission::SettingsWrite` (operators: `Admin`/`PlatformAdmin`, never
+ * `Role::User`) may still exceed them — the ceiling constrains tenants, not
+ * the operator who set it.
+ *
+ * Violations are **rejected, not clamped**: silently rewriting a value the
+ * user asked for leaves them debugging a limit they believe they removed,
+ * and self-hosted operators have no support channel to ask.
+ */
+export type TenantResourceCeilings = {
+    /**
+     * Whether a project/environment may set a request, SSE or WebSocket
+     * timeout of `0` ("no timeout"). `true` (the default) preserves current
+     * behaviour.
+     *
+     * Nonzero tenant timeouts need no ceiling here: they are already clamped
+     * to [`RequestTimeoutSettings::ceiling`] at resolution time. `0` escapes
+     * that clamp by construction — it means "no timeout is configured", so
+     * there is nothing to clamp — which is precisely the hole this closes.
+     */
+    allow_unlimited_request_timeouts?: boolean;
+    /**
+     * Largest `max_concurrent_connections` a project/environment may set.
+     * `0` (the default) leaves it unenforced.
+     *
+     * As with memory, a project value of `0` means unlimited and is refused
+     * whenever this ceiling is set.
+     */
+    max_concurrent_connections?: number;
+    /**
+     * Largest `memory_limit` (MB) a project/environment may set for its
+     * containers. `0` (the default) leaves it unenforced.
+     *
+     * A project value of `0` means "no cgroup limit at all", so it is
+     * refused whenever this ceiling is set — that is the case that OOMs the
+     * host, not merely a large number.
+     */
+    max_memory_limit_mb?: number;
+};
+
+/**
  * Request body for testing an email provider
  */
 export type TestEmailRequest = {
@@ -18503,9 +18879,10 @@ export type TrafficFilter = {
 
 export type TrafficFilterOperator = 'eq' | 'not_eq' | 'contains' | 'starts_with' | 'in';
 
-export type TrafficMetric = 'requests' | 'errors' | 'error_rate' | 'latency_avg' | 'latency_min' | 'latency_max' | 'latency_p50' | 'latency_p95' | 'latency_p99' | 'unique_ips' | 'unique_paths' | 'last_seen';
+export type TrafficMetric = 'requests' | 'errors' | 'error_rate' | 'latency_avg' | 'latency_min' | 'latency_max' | 'latency_p50' | 'latency_p95' | 'latency_p99' | 'unique_ips' | 'unique_paths' | 'bot_requests' | 'robots_txt_requests' | 'last_seen';
 
 export type TrafficMetricValues = {
+    bot_requests?: number | null;
     error_rate?: number | null;
     errors?: number | null;
     last_seen?: string | null;
@@ -18516,6 +18893,7 @@ export type TrafficMetricValues = {
     latency_p95_ms?: number | null;
     latency_p99_ms?: number | null;
     requests?: number | null;
+    robots_txt_requests?: number | null;
     unique_ips?: number | null;
     unique_paths?: number | null;
 };
@@ -19238,12 +19616,14 @@ export type UpdateEnvironmentSettingsRequest = {
     sse_idle_timeout_seconds?: number | null;
     /**
      * Label selector for node-based scheduling (overrides project-level setting).
+     * Send an empty object to clear the environment-level override.
      * Same key with array value -> OR, different keys -> AND.
      * Example: `{"region": ["us", "asia"], "gpu": "true"}`
      */
     target_labels?: unknown;
     /**
-     * Optional list of node IDs to deploy to (overrides project-level setting)
+     * Optional list of node IDs to deploy to (overrides project-level setting).
+     * Send an empty list to clear the environment-level override.
      */
     target_nodes?: Array<number> | null;
     /**
@@ -19296,6 +19676,12 @@ export type UpdateEnvironmentVariableRequest = {
 };
 
 export type UpdateErrorGroupRequest = {
+    /**
+     * Assignee (email by convention).
+     * - `Some("user@example.com")` — sets the assignee.
+     * - `Some("")` (empty string) — clears the current assignment (sets to null).
+     * - `null` / field omitted — leaves the existing value unchanged.
+     */
     assigned_to?: string | null;
     status: string;
 };
@@ -19491,6 +19877,15 @@ export type UpdatePreferencesRequest = {
  * ciphertext.
  */
 export type UpdateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     include_in_preview?: boolean;
     /**
@@ -19543,6 +19938,16 @@ export type UpdateProjectSettingsRequest = {
      */
     error_source_root?: string | null;
     git_provider_connection_id?: number | null;
+    /**
+     * How long (hours) to retain built Docker images before nightly cleanup removes them.
+     * Set to null to use the system default. Valid range: 1–8760.
+     *
+     * Omitting the key leaves the current value unchanged; sending an explicit
+     * `null` clears the per-project override. `skip_serializing_if` keeps the
+     * round-trip honest — re-serializing a request that omitted the key must
+     * not emit `"image_retention_hours": null`, which would mean "reset".
+     */
+    image_retention_hours?: number | null;
     main_branch?: string | null;
     preset?: string | null;
     preset_config?: null | PresetConfigSchema;
@@ -19837,7 +20242,8 @@ export type UpgradeExternalServiceRequest = {
 export type UpgradeRequest = {
     /**
      * Image reference to pull and run (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway:latest`). Empty resets to default.
+     * an immutable `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
+     * Empty resets to default.
      */
     image: string;
 };
@@ -26560,6 +26966,48 @@ export type GetActivityGraphResponses = {
 
 export type GetActivityGraphResponse = GetActivityGraphResponses[keyof GetActivityGraphResponses];
 
+export type GetLatestDeploymentMediaData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Comma-separated project IDs. At most 100 IDs are accepted.
+         */
+        project_ids: string;
+    };
+    url: '/deployments/latest-media';
+};
+
+export type GetLatestDeploymentMediaErrors = {
+    /**
+     * Invalid project IDs
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permission or project access
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetLatestDeploymentMediaError = GetLatestDeploymentMediaErrors[keyof GetLatestDeploymentMediaErrors];
+
+export type GetLatestDeploymentMediaResponses = {
+    /**
+     * Latest deployment media keyed by project ID
+     */
+    200: LatestDeploymentMediaResponse;
+};
+
+export type GetLatestDeploymentMediaResponse = GetLatestDeploymentMediaResponses[keyof GetLatestDeploymentMediaResponses];
+
 export type GetScanByDeploymentData = {
     body?: never;
     path: {
@@ -28169,6 +28617,134 @@ export type GetDomainDnsRecordsResponses = {
 
 export type GetDomainDnsRecordsResponse = GetDomainDnsRecordsResponses[keyof GetDomainDnsRecordsResponses];
 
+export type ListEmailDomainProjectsData = {
+    body?: never;
+    path: {
+        /**
+         * Email domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/projects';
+};
+
+export type ListEmailDomainProjectsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Project visibility or database check failed
+     */
+    500: unknown;
+};
+
+export type ListEmailDomainProjectsResponses = {
+    /**
+     * Projects authorized to use this sender domain
+     */
+    200: Array<AuthorizedEmailDomainProjectResponse>;
+};
+
+export type ListEmailDomainProjectsResponse = ListEmailDomainProjectsResponses[keyof ListEmailDomainProjectsResponses];
+
+export type RevokeEmailDomainProjectData = {
+    body?: never;
+    path: {
+        /**
+         * Email domain ID
+         */
+        id: number;
+        /**
+         * Project whose authorization is revoked
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/projects/{project_id}';
+};
+
+export type RevokeEmailDomainProjectErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Only an instance or platform administrator may change global sender-domain grants
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Project access, audit, or database check failed
+     */
+    500: unknown;
+};
+
+export type RevokeEmailDomainProjectResponses = {
+    /**
+     * Project authorization revoked
+     */
+    204: void;
+};
+
+export type RevokeEmailDomainProjectResponse = RevokeEmailDomainProjectResponses[keyof RevokeEmailDomainProjectResponses];
+
+export type AuthorizeEmailDomainProjectData = {
+    body?: never;
+    path: {
+        /**
+         * Email domain ID
+         */
+        id: number;
+        /**
+         * Project allowed to send from this domain
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/projects/{project_id}';
+};
+
+export type AuthorizeEmailDomainProjectErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Only an instance or platform administrator may change global sender-domain grants
+     */
+    403: unknown;
+    /**
+     * Domain or project not found
+     */
+    404: unknown;
+    /**
+     * Project access, audit, or database check failed
+     */
+    500: unknown;
+};
+
+export type AuthorizeEmailDomainProjectResponses = {
+    /**
+     * Project authorized
+     */
+    204: void;
+};
+
+export type AuthorizeEmailDomainProjectResponse = AuthorizeEmailDomainProjectResponses[keyof AuthorizeEmailDomainProjectResponses];
+
 export type SetupDnsData = {
     body: SetupDnsRequest;
     path: {
@@ -28611,6 +29187,12 @@ export type ListEmailsResponse = ListEmailsResponses[keyof ListEmailsResponses];
 
 export type SendEmailData = {
     body: SendEmailRequestBody;
+    headers?: {
+        /**
+         * Required for deployment-token requests. Reusing a key with the same payload returns the original delivery; reusing it with a different payload returns 409.
+         */
+        'Idempotency-Key'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/emails';
@@ -28629,6 +29211,10 @@ export type SendEmailErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * Idempotency key was already used with a different payload
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -35238,6 +35824,90 @@ export type NodeMetricsGetRangeResponses = {
 
 export type NodeMetricsGetRangeResponse = NodeMetricsGetRangeResponses[keyof NodeMetricsGetRangeResponses];
 
+export type NodeMetricsGetAlertRulesData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules';
+};
+
+export type NodeMetricsGetAlertRulesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsGetAlertRulesResponses = {
+    /**
+     * List of node alert rules
+     */
+    200: Array<ServiceAlertRuleResponse>;
+};
+
+export type NodeMetricsGetAlertRulesResponse = NodeMetricsGetAlertRulesResponses[keyof NodeMetricsGetAlertRulesResponses];
+
+export type NodeMetricsUpdateAlertRuleData = {
+    body: ServiceUpdateAlertRuleRequest;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+        /**
+         * Alert rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules/{rule_id}';
+};
+
+export type NodeMetricsUpdateAlertRuleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alert rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsUpdateAlertRuleResponses = {
+    /**
+     * Updated alert rule
+     */
+    200: ServiceAlertRuleResponse;
+};
+
+export type NodeMetricsUpdateAlertRuleResponse = NodeMetricsUpdateAlertRuleResponses[keyof NodeMetricsUpdateAlertRuleResponses];
+
 export type DeletePreferencesData = {
     body?: never;
     path?: never;
@@ -36323,6 +36993,168 @@ export type UpdateDashboardResponses = {
 
 export type UpdateDashboardResponse = UpdateDashboardResponses[keyof UpdateDashboardResponses];
 
+export type ListFacetsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/otel/facets';
+};
+
+export type ListFacetsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListFacetsError = ListFacetsErrors[keyof ListFacetsErrors];
+
+export type ListFacetsResponses = {
+    /**
+     * Registered facets
+     */
+    200: FacetsResponse;
+};
+
+export type ListFacetsResponse = ListFacetsResponses[keyof ListFacetsResponses];
+
+export type CreateFacetData = {
+    body: CreateFacetRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/facets';
+};
+
+export type CreateFacetErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Already registered or capacity exceeded
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateFacetError = CreateFacetErrors[keyof CreateFacetErrors];
+
+export type CreateFacetResponses = {
+    /**
+     * Facet registered
+     */
+    201: FacetInfo;
+};
+
+export type CreateFacetResponse = CreateFacetResponses[keyof CreateFacetResponses];
+
+export type DeleteFacetData = {
+    body?: never;
+    path: {
+        /**
+         * The OTel attribute key (URL-encoded)
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/otel/facets/{key}';
+};
+
+export type DeleteFacetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Facet not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteFacetError = DeleteFacetErrors[keyof DeleteFacetErrors];
+
+export type DeleteFacetResponses = {
+    /**
+     * Facet deleted
+     */
+    204: void;
+};
+
+export type DeleteFacetResponse = DeleteFacetResponses[keyof DeleteFacetResponses];
+
+export type RetryFacetBackfillData = {
+    body?: never;
+    path: {
+        /**
+         * The OTel attribute key (URL-encoded)
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/otel/facets/{key}/retry';
+};
+
+export type RetryFacetBackfillErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Facet not found
+     */
+    404: ProblemDetails;
+    /**
+     * Facet is not in a failed state
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RetryFacetBackfillError = RetryFacetBackfillErrors[keyof RetryFacetBackfillErrors];
+
+export type RetryFacetBackfillResponses = {
+    /**
+     * Backfill retry scheduled
+     */
+    200: FacetInfo;
+};
+
+export type RetryFacetBackfillResponse = RetryFacetBackfillResponses[keyof RetryFacetBackfillResponses];
+
 export type QueryGenaiTracesData = {
     body?: never;
     path?: never;
@@ -37124,6 +37956,10 @@ export type QueryTraceSummariesData = {
          * Filter by deployment ID
          */
         deployment_id?: number;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string;
         /**
          * Filter by span name pattern (ILIKE)
          */
@@ -38198,14 +39034,22 @@ export type GetProjectsData = {
          */
         page?: number;
         /**
-         * Number of items per page
+         * Number of items per page (1-100)
          */
         per_page?: number;
+        /**
+         * Case-insensitive project name or slug filter
+         */
+        search?: string;
     };
     url: '/projects';
 };
 
 export type GetProjectsErrors = {
+    /**
+     * Invalid pagination parameters
+     */
+    400: unknown;
     /**
      * Unauthorized
      */
@@ -38279,6 +39123,42 @@ export type GetProjectBySlugResponses = {
 };
 
 export type GetProjectBySlugResponse = GetProjectBySlugResponses[keyof GetProjectBySlugResponses];
+
+export type GetVisibleCustomDomainByHostnameData = {
+    body?: never;
+    path: {
+        /**
+         * Domain hostname
+         */
+        hostname: string;
+    };
+    query?: never;
+    url: '/projects/custom-domains/by-host/{hostname}';
+};
+
+export type GetVisibleCustomDomainByHostnameErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Project access denied
+     */
+    403: unknown;
+    /**
+     * Domain is not assigned to a project
+     */
+    404: unknown;
+};
+
+export type GetVisibleCustomDomainByHostnameResponses = {
+    /**
+     * Custom domain assignment retrieved
+     */
+    200: CustomDomainResponse;
+};
+
+export type GetVisibleCustomDomainByHostnameResponse = GetVisibleCustomDomainByHostnameResponses[keyof GetVisibleCustomDomainByHostnameResponses];
 
 export type CreateProjectFromTemplateData = {
     body: CreateProjectFromTemplateRequest;
@@ -38453,6 +39333,46 @@ export type UpdateProjectResponses = {
 };
 
 export type UpdateProjectResponse = UpdateProjectResponses[keyof UpdateProjectResponses];
+
+export type SetAlternateSourcesData = {
+    body: SetAlternateSourcesRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/alternate-sources';
+};
+
+export type SetAlternateSourcesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetAlternateSourcesResponses = {
+    /**
+     * Alternate-source policy updated
+     */
+    200: ProjectResponse;
+};
+
+export type SetAlternateSourcesResponse = SetAlternateSourcesResponses[keyof SetAlternateSourcesResponses];
 
 export type GetProjectDeploymentsData = {
     body?: never;
@@ -40107,6 +41027,44 @@ export type GetApiCallersResponses = {
 };
 
 export type GetApiCallersResponse = GetApiCallersResponses[keyof GetApiCallersResponses];
+
+export type GetApiTrafficProxyLogAccessData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/api-analytics/proxy-log-access';
+};
+
+export type GetApiTrafficProxyLogAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient analytics permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project permission check failed
+     */
+    500: ProblemDetails;
+};
+
+export type GetApiTrafficProxyLogAccessError = GetApiTrafficProxyLogAccessErrors[keyof GetApiTrafficProxyLogAccessErrors];
+
+export type GetApiTrafficProxyLogAccessResponses = {
+    /**
+     * Proxy-log drilldown capability
+     */
+    200: ProxyLogAccessResponse;
+};
+
+export type GetApiTrafficProxyLogAccessResponse = GetApiTrafficProxyLogAccessResponses[keyof GetApiTrafficProxyLogAccessResponses];
 
 export type AggregateApiTrafficData = {
     body: TrafficAggregationRequest;
@@ -44105,6 +45063,12 @@ export type GetErrorTimeSeriesData = {
          * Time bucket size (e.g., "1h", "15m", "1d", "1 hour", "30 minutes")
          */
         bucket?: string;
+        /**
+         * Filter chart data to a specific environment.
+         * Always AND-combined with project_id — an environment from a different project
+         * returns zero-filled buckets rather than cross-project data.
+         */
+        environment_id?: number | null;
     };
     url: '/projects/{project_id}/error-time-series';
 };
@@ -48002,6 +48966,50 @@ export type WorkflowDryRunResponses = {
 
 export type WorkflowDryRunResponse = WorkflowDryRunResponses[keyof WorkflowDryRunResponses];
 
+export type ReassignProjectCustomDomainData = {
+    body: ReassignCustomDomainRequest;
+    path: {
+        /**
+         * Current project ID
+         */
+        source_project_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/projects/{source_project_id}/custom-domains/{domain_id}/assignment';
+};
+
+export type ReassignProjectCustomDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Write access required for both projects
+     */
+    403: unknown;
+    /**
+     * Custom domain or target environment not found in the authorized project scopes
+     */
+    404: unknown;
+    /**
+     * Domain assignment changed; refresh and retry
+     */
+    409: unknown;
+};
+
+export type ReassignProjectCustomDomainResponses = {
+    /**
+     * Domain assignment updated atomically
+     */
+    200: CustomDomainResponse;
+};
+
+export type ReassignProjectCustomDomainResponse = ReassignProjectCustomDomainResponses[keyof ReassignProjectCustomDomainResponses];
+
 export type GetProxyLogsData = {
     body?: never;
     path?: never;
@@ -48059,9 +49067,18 @@ export type GetProxyLogsData = {
          */
         path?: string | null;
         /**
+         * Filter by an exact request path
+         */
+        path_exact?: string | null;
+        /**
          * Filter by client IP address
          */
         client_ip?: string | null;
+        /**
+         * Exclude Temps status-monitor requests, including legacy monitor rows
+         * identified only by their user-agent.
+         */
+        exclude_synthetic?: boolean | null;
         /**
          * Filter by HTTP status code
          */
@@ -48248,6 +49265,11 @@ export type GetProxyLogByRequestIdData = {
         request_id: string;
     };
     query?: {
+        /**
+         * Project scope for the lookup. Required for non-administrator callers.
+         * Instance administrators may omit it for legacy global deep links.
+         */
+        project_id?: number | null;
         /**
          * Event time of the log row (ISO 8601). When provided, the lookup is
          * bounded to the hypertable chunks around this instant instead of
@@ -48858,6 +49880,11 @@ export type GetProxyLogByIdData = {
         id: number;
     };
     query?: {
+        /**
+         * Project scope for the lookup. Required for non-administrator callers.
+         * Instance administrators may omit it for legacy global deep links.
+         */
+        project_id?: number | null;
         /**
          * Event time of the log row (ISO 8601). When provided, the lookup is
          * bounded to the hypertable chunks around this instant instead of
@@ -51752,6 +52779,33 @@ export type RemoveRoleResponses = {
 };
 
 export type RemoveRoleResponse = RemoveRoleResponses[keyof RemoveRoleResponses];
+
+export type GetFeatureMaturityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/platform/feature-maturity';
+};
+
+export type GetFeatureMaturityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetFeatureMaturityResponses = {
+    /**
+     * Feature maturity registry for this build
+     */
+    200: Array<FeatureMaturity>;
+};
+
+export type GetFeatureMaturityResponse = GetFeatureMaturityResponses[keyof GetFeatureMaturityResponses];
 
 export type ListSnapshotsData = {
     body?: never;

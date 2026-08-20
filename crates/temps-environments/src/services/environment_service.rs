@@ -1,6 +1,6 @@
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
-    Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbErr, EntityTrait,
+    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use serde::Serialize;
 use slug::slugify;
@@ -12,6 +12,22 @@ use temps_core::{
 use temps_entities::{environment_domains, environments, projects};
 use thiserror::Error;
 use tracing::{info, warn};
+
+/// An empty target-node list means "remove this environment override".
+/// Persisting `Some([])` would instead create an explicit placement constraint
+/// that no node can satisfy, leaving workloads impossible to redeploy or drain.
+fn normalize_target_nodes(target_nodes: Vec<i32>) -> Option<Vec<i32>> {
+    (!target_nodes.is_empty()).then_some(target_nodes)
+}
+
+/// An empty target-label object means "remove this environment override" so
+/// the environment inherits any project-level placement constraint.
+fn normalize_target_labels(target_labels: serde_json::Value) -> Option<serde_json::Value> {
+    (!target_labels
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty))
+    .then_some(target_labels)
+}
 
 #[derive(Error, Debug)]
 pub enum EnvironmentError {
@@ -123,6 +139,83 @@ fn format_public_url(host: &str, external_url: Option<&str>, proxy_port: u16) ->
     format!("{protocol}://{host}{port_suffix}")
 }
 
+/// Longest legal hostname, per DNS.
+const MAX_HOSTNAME_LEN: usize = 253;
+/// Longest legal DNS label.
+const MAX_LABEL_LEN: usize = 63;
+
+/// Normalize and validate a hostname destined for the proxy route table.
+///
+/// Route keys are compared against the request `Host` after the proxy
+/// lowercases and strips the port, so the stored value has to arrive in that
+/// same shape or it silently never matches. Everything outside a strict
+/// LDH (letter-digit-hyphen) hostname is rejected rather than coerced: a
+/// wildcard, a scheme, a path or a port here would either shadow a broader set
+/// of hostnames than the caller owns, or produce a route that can never be hit.
+///
+/// A single bare label is allowed — that is the shape Temps itself stores for
+/// the auto-managed per-environment row.
+fn normalize_environment_domain(domain: &str) -> Result<String, EnvironmentError> {
+    let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return Err(EnvironmentError::InvalidInput(
+            "Domain cannot be empty".to_string(),
+        ));
+    }
+    if normalized.len() > MAX_HOSTNAME_LEN {
+        return Err(EnvironmentError::InvalidInput(format!(
+            "Domain '{normalized}' is {} characters; hostnames must be {MAX_HOSTNAME_LEN} or fewer",
+            normalized.len()
+        )));
+    }
+
+    for label in normalized.split('.') {
+        if label.is_empty() {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Domain '{normalized}' has an empty label"
+            )));
+        }
+        if label.len() > MAX_LABEL_LEN {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Domain '{normalized}' has a label longer than {MAX_LABEL_LEN} characters"
+            )));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Domain '{normalized}' has a label starting or ending with a hyphen"
+            )));
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Domain '{normalized}' may only contain letters, digits, hyphens and dots \
+                 (no wildcards, schemes, ports or paths)"
+            )));
+        }
+    }
+
+    Ok(normalized)
+}
+
+/// True when `host` is the zone apex or sits anywhere beneath it.
+///
+/// Compared label-wise rather than with a plain `ends_with`, so
+/// `notexample.com` is not treated as being inside `example.com`.
+fn hostname_is_inside_zone(host: &str, zone: &str) -> bool {
+    let zone = zone
+        .trim()
+        .trim_start_matches("*.")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if zone.is_empty() {
+        return false;
+    }
+    host == zone || host.ends_with(&format!(".{zone}"))
+}
+
 #[derive(Clone)]
 pub struct EnvironmentService {
     db: Arc<temps_database::DbConnection>,
@@ -190,6 +283,28 @@ impl EnvironmentService {
         )
     }
 
+    /// Serialize every activation of a preview hostname and reject an active
+    /// owner. This must be called inside the transaction that creates,
+    /// restores, or renames the environment.
+    async fn claim_environment_subdomain(
+        &self,
+        txn: &DatabaseTransaction,
+        subdomain: &str,
+        excluding_environment_id: Option<i32>,
+    ) -> Result<(), EnvironmentError> {
+        let excluded = excluding_environment_id.into_iter().collect::<Vec<_>>();
+        if environments::claim_subdomain(txn, subdomain, &excluded)
+            .await?
+            .is_some()
+        {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Subdomain '{}' is already in use",
+                subdomain
+            )));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_environment(
         &self,
@@ -219,11 +334,17 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} for branch '{}' in project {}",
                 deleted_env.id, branch, project_id
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self.db.begin().await?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.updated_at = Set(chrono::Utc::now());
             active_env.current_deployment_id = Set(None);
-            let restored = active_env.update(self.db.as_ref()).await?;
+            let restored = active_env.update(&txn).await?;
+            txn.commit().await?;
             return Ok(restored);
         }
 
@@ -231,10 +352,12 @@ impl EnvironmentService {
         let env_slug = slugify(&name);
 
         // Create main_url using project_slug-env_slug format
-        let main_url = format!("{}-{}", project.slug, env_slug);
+        let main_url = format!("{}-{}", project.slug, env_slug).to_ascii_lowercase();
 
         // Start a transaction for insert + domain creation
         let txn = self.db.begin().await?;
+        self.claim_environment_subdomain(&txn, &main_url, None)
+            .await?;
 
         // Create the new environment
         let new_environment = environments::ActiveModel {
@@ -432,13 +555,25 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} for branch '{}'",
                 deleted_env.id, branch
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self
+                .db
+                .begin()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.updated_at = Set(chrono::Utc::now());
             let restored = active_env
-                .update(self.db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            txn.commit()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
             return Ok(restored);
         }
 
@@ -506,6 +641,15 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} ('{}') in project {}",
                 deleted_env.id, name, project_id
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self
+                .db
+                .begin()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.branch = Set(Some(branch));
@@ -519,9 +663,12 @@ impl EnvironmentService {
                     }));
             }
             let restored = active_env
-                .update(self.db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            txn.commit()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
             return Ok(restored);
         }
 
@@ -530,7 +677,7 @@ impl EnvironmentService {
         let env_slug = slugify(&name);
 
         // Create main_url using project_slug-env_slug format
-        let main_url = format!("{}-{}", project.slug, env_slug);
+        let main_url = format!("{}-{}", project.slug, env_slug).to_ascii_lowercase();
 
         // Create the new environment
         let new_environment = environments::ActiveModel {
@@ -558,6 +705,8 @@ impl EnvironmentService {
             .begin()
             .await
             .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+        self.claim_environment_subdomain(&txn, &main_url, None)
+            .await?;
 
         // Insert the environment
         let environment = new_environment
@@ -585,11 +734,19 @@ impl EnvironmentService {
         Ok(environment)
     }
 
+    /// Update an environment's settings.
+    ///
+    /// `ceiling_enforcement` reflects the caller's `SettingsWrite` permission:
+    /// whoever can raise the instance-wide ceilings is by definition allowed to
+    /// exceed them, so the check would be theatre for them. Everyone else is
+    /// held to `AppSettings.tenant_resource_ceilings`, which is unenforced
+    /// until an operator configures it.
     pub async fn update_environment_settings(
         &self,
         project_id_param: i32,
         env_id: i32,
         settings: crate::handlers::UpdateEnvironmentSettingsRequest,
+        ceiling_enforcement: temps_core::CeilingEnforcement,
     ) -> Result<environments::Model, EnvironmentError> {
         // First get the environment to verify it exists and belongs to the project
         let environment = self.get_environment(project_id_param, env_id).await?;
@@ -669,11 +826,11 @@ impl EnvironmentService {
             }
             deployment_config.security = Some(security);
         }
-        if settings.target_nodes.is_some() {
-            deployment_config.target_nodes = settings.target_nodes;
+        if let Some(target_nodes) = settings.target_nodes {
+            deployment_config.target_nodes = normalize_target_nodes(target_nodes);
         }
-        if settings.target_labels.is_some() {
-            deployment_config.target_labels = settings.target_labels;
+        if let Some(target_labels) = settings.target_labels {
+            deployment_config.target_labels = normalize_target_labels(target_labels);
         }
         if let Some(anti_affinity) = settings.anti_affinity {
             deployment_config.anti_affinity = anti_affinity;
@@ -713,6 +870,29 @@ impl EnvironmentService {
         deployment_config.validate().map_err(|e| {
             EnvironmentError::InvalidInput(format!("Invalid deployment config: {}", e))
         })?;
+
+        // Checked on the environment's stored config with the request applied,
+        // not on the request alone, so a partial update is judged against the
+        // values it leaves in place rather than only the ones it names.
+        //
+        // Not merged with the *project's* config: an environment that clears an
+        // override back to `None` inherits the project value, and the project
+        // write path enforces the same ceiling, so the inherited value is
+        // already bounded — except for configs written before the operator set
+        // the ceiling, which no write path revisits (see the PR discussion on
+        // retroactive enforcement).
+        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                EnvironmentError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for environment {env_id}: {e}"
+                ))
+            })?;
+            if let Err(violations) = deployment_config
+                .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
+            {
+                return Err(EnvironmentError::InvalidInput(violations.join("; ")));
+            }
+        }
 
         // Multiple environments can track the same branch (Vercel-like model).
 
@@ -790,8 +970,8 @@ impl EnvironmentService {
     /// the proxy reloads its route table.
     ///
     /// Returns `InvalidInput` if the slugified value is empty, exceeds the
-    /// DNS label length limit, or collides with another environment in the
-    /// same project.
+    /// DNS label length limit, or collides with another active environment
+    /// globally because preview hostnames are keyed by subdomain.
     pub async fn update_environment_subdomain(
         &self,
         project_id: i32,
@@ -819,28 +999,18 @@ impl EnvironmentService {
             return Ok(environment);
         }
 
-        // Reject collisions with any other environment in the same project.
-        let conflict = environments::Entity::find()
-            .filter(environments::Column::ProjectId.eq(project_id))
-            .filter(environments::Column::Subdomain.eq(&normalized))
-            .filter(environments::Column::Id.ne(env_id))
-            .filter(environments::Column::DeletedAt.is_null())
-            .one(self.db.as_ref())
-            .await?;
-        if let Some(other) = conflict {
-            return Err(EnvironmentError::InvalidInput(format!(
-                "Subdomain '{}' is already used by environment '{}' in this project",
-                normalized, other.name
-            )));
-        }
-
-        let previous_subdomain = environment.subdomain.clone();
-
         let txn = self
             .db
             .begin()
             .await
             .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
+
+        // A row lock cannot protect the "no conflict exists" case, and a new
+        // unique index would fail upgrades that already contain duplicates.
+        self.claim_environment_subdomain(&txn, &normalized, Some(env_id))
+            .await?;
+
+        let previous_subdomain = environment.subdomain.clone();
 
         let mut active_model: environments::ActiveModel = environment.clone().into();
         active_model.subdomain = Set(normalized.clone());
@@ -984,6 +1154,18 @@ impl EnvironmentService {
         Ok(custom_domains)
     }
 
+    /// Attach a hostname to an environment.
+    ///
+    /// The value goes straight into the proxy route table as a key, with
+    /// `cert_eligible = true`, and `environment_domains` rows are loaded
+    /// *before* the platform's own generated preview routes — a hostname
+    /// already present wins. Unvalidated, that made this endpoint a
+    /// takeover primitive: claim `victim-env.<preview-zone>` and you shadow
+    /// the legitimate environment's route *and* satisfy the on-demand TLS gate,
+    /// which then issues a real ACME certificate for a name you do not own.
+    ///
+    /// So the value must be a well-formed hostname, must not name anything the
+    /// platform mints for itself, and must be globally unique.
     pub async fn add_environment_domain(
         &self,
         project_id_p: i32,
@@ -994,24 +1176,67 @@ impl EnvironmentService {
             .filter(environments::Column::ProjectId.eq(project_id_p))
             .filter(environments::Column::Id.eq(env_id))
             .one(self.db.as_ref())
-            .await?;
+            .await?
+            .ok_or_else(|| {
+                EnvironmentError::NotFound(format!("Environment {} not found", env_id))
+            })?;
 
-        if let Some(env) = environment {
-            let new_domain = environment_domains::ActiveModel {
-                environment_id: Set(env.id),
-                domain: Set(domain),
-                created_at: Set(chrono::Utc::now()),
-                ..Default::default()
-            };
+        let normalized = normalize_environment_domain(&domain)?;
 
-            let inserted_domain = new_domain.insert(self.db.as_ref()).await?;
-            return Ok(inserted_domain);
+        // Reject the platform's own namespaces. `is_reserved_hostname` covers
+        // the console hostname and the preview apex; the zone checks below
+        // cover every generated name under the preview / on-demand zones,
+        // which is where both the route shadowing and the certificate
+        // issuance would otherwise happen.
+        let settings = self
+            .config_service
+            .get_settings()
+            .await
+            .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
+        if settings.is_reserved_hostname(&normalized) {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "'{normalized}' is reserved by this Temps instance and cannot be attached to an environment"
+            )));
+        }
+        for zone in [
+            Some(settings.preview_domain.as_str()),
+            settings.on_demand_tls.zone.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if hostname_is_inside_zone(&normalized, zone) {
+                return Err(EnvironmentError::InvalidInput(format!(
+                    "'{normalized}' is inside the platform-managed zone '{zone}'; \
+                     those hostnames are generated by Temps and cannot be claimed manually"
+                )));
+            }
         }
 
-        Err(EnvironmentError::NotFound(format!(
-            "Environment {} not found",
-            env_id
-        )))
+        // Globally unique, not per-project: the route table is keyed by
+        // hostname alone, so a duplicate in *any* project is precisely the
+        // collision being prevented.
+        if let Some(existing) = environment_domains::Entity::find()
+            .filter(environment_domains::Column::Domain.eq(&normalized))
+            .one(self.db.as_ref())
+            .await?
+        {
+            if existing.environment_id != env_id {
+                return Err(EnvironmentError::InvalidInput(format!(
+                    "Domain '{normalized}' is already attached to another environment"
+                )));
+            }
+            return Ok(existing);
+        }
+
+        let new_domain = environment_domains::ActiveModel {
+            environment_id: Set(environment.id),
+            domain: Set(normalized),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        };
+
+        Ok(new_domain.insert(self.db.as_ref()).await?)
     }
 
     pub async fn delete_environment_domain(
@@ -1116,8 +1341,81 @@ impl EnvironmentService {
 
 #[cfg(test)]
 mod tests {
+
+    /// The value becomes a proxy route key compared against a lowercased,
+    /// port-stripped Host, so it has to be stored in that shape.
+    #[test]
+    fn environment_domain_is_normalized() {
+        assert_eq!(
+            super::normalize_environment_domain("  App.Example.COM.  ").unwrap(),
+            "app.example.com"
+        );
+        // A bare label is legal — it is what the auto-managed row stores.
+        assert_eq!(
+            super::normalize_environment_domain("myproj-prod").unwrap(),
+            "myproj-prod"
+        );
+    }
+
+    /// Anything that could shadow more than the caller owns, or produce a route
+    /// that can never match, is refused rather than coerced.
+    #[test]
+    fn environment_domain_rejects_malformed_values() {
+        for bad in [
+            "",
+            "   ",
+            "*.example.com",
+            "https://example.com",
+            "example.com/path",
+            "example.com:8080",
+            "-leading.example.com",
+            "trailing-.example.com",
+            "double..dot.com",
+            "under_score.example.com",
+        ] {
+            assert!(
+                super::normalize_environment_domain(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// Zone membership is label-wise: `notexample.com` is not inside
+    /// `example.com`, but `a.b.example.com` is.
+    #[test]
+    fn zone_membership_is_label_wise() {
+        assert!(super::hostname_is_inside_zone("example.com", "example.com"));
+        assert!(super::hostname_is_inside_zone(
+            "victim-env.preview.example.com",
+            "preview.example.com"
+        ));
+        assert!(super::hostname_is_inside_zone(
+            "a.b.example.com",
+            "*.example.com"
+        ));
+        assert!(!super::hostname_is_inside_zone(
+            "notexample.com",
+            "example.com"
+        ));
+        assert!(!super::hostname_is_inside_zone("example.com", ""));
+    }
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    #[test]
+    fn empty_target_nodes_clears_environment_placement_override() {
+        assert_eq!(normalize_target_nodes(Vec::new()), None);
+        assert_eq!(normalize_target_nodes(vec![1, 3]), Some(vec![1, 3]));
+    }
+
+    #[test]
+    fn empty_target_labels_clear_environment_placement_override() {
+        assert_eq!(normalize_target_labels(serde_json::json!({})), None);
+        assert_eq!(
+            normalize_target_labels(serde_json::json!({"region": "eu"})),
+            Some(serde_json::json!({"region": "eu"}))
+        );
+    }
 
     #[test]
     fn public_url_preserves_external_http_scheme_and_non_default_port() {
@@ -1360,6 +1658,9 @@ mod tests {
                     max_concurrent_connections: None,
                     password: None,
                 },
+                // These fixtures assert merge/persistence behaviour, not policy;
+                // bypassing the ceiling check keeps their mock query sequence intact.
+                temps_core::CeilingEnforcement::Bypass,
             )
             .await;
 
@@ -1466,6 +1767,9 @@ mod tests {
                     max_concurrent_connections: None,
                     password: None,
                 },
+                // These fixtures assert merge/persistence behaviour, not policy;
+                // bypassing the ceiling check keeps their mock query sequence intact.
+                temps_core::CeilingEnforcement::Bypass,
             )
             .await;
         assert!(
@@ -1483,6 +1787,178 @@ mod tests {
             !log.contains("requestTimeoutSeconds"),
             "cleared field must be omitted from the persisted deployment_config JSON, got: {log}"
         );
+    }
+
+    /// An `UpdateEnvironmentSettingsRequest` that changes nothing, so a test
+    /// can set exactly the one field it is about.
+    fn empty_settings_request() -> crate::handlers::UpdateEnvironmentSettingsRequest {
+        crate::handlers::UpdateEnvironmentSettingsRequest {
+            branch: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
+            replicas: None,
+            exposed_port: None,
+            automatic_deploy: None,
+            performance_metrics_enabled: None,
+            session_recording_enabled: None,
+            security: None,
+            target_nodes: None,
+            target_labels: None,
+            anti_affinity: None,
+            cross_architecture_builds: None,
+            protected: None,
+            attack_mode: None,
+            force_https: None,
+            on_demand: None,
+            idle_timeout_seconds: None,
+            wake_timeout_seconds: None,
+            request_timeout_seconds: None,
+            sse_idle_timeout_seconds: None,
+            websocket_idle_timeout_seconds: None,
+            max_concurrent_connections: None,
+            password: None,
+        }
+    }
+
+    fn service_with_ceilings(
+        db: Arc<sea_orm::DatabaseConnection>,
+        ceilings: temps_core::TenantResourceCeilings,
+    ) -> EnvironmentService {
+        let app_settings = temps_core::AppSettings {
+            tenant_resource_ceilings: ceilings,
+            ..Default::default()
+        };
+        let settings_row = temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::to_value(app_settings).expect("AppSettings serializes"),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let settings_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row]])
+            .into_connection();
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(settings_db),
+        ));
+        EnvironmentService::new(db, config_service)
+    }
+
+    fn env_for_ceiling_test() -> environments::Model {
+        environments::Model {
+            id: 1,
+            name: "production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "my-project-production".to_string(),
+            branch: Some("main".to_string()),
+            project_id: 10,
+            host: String::new(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_deployment: None,
+            current_deployment_id: None,
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: false,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            force_https: None,
+            last_activity_at: None,
+        }
+    }
+
+    /// `memory_limit: 0` is the "run me uncapped" sentinel. With an operator
+    /// ceiling configured it must be refused, and the message must name the
+    /// ceiling so the user can pick a value that works.
+    #[tokio::test]
+    async fn update_settings_rejects_unlimited_memory_under_an_operator_ceiling() {
+        let env = env_for_ceiling_test();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![env]])
+                .into_connection(),
+        );
+        let svc = service_with_ceilings(
+            db,
+            temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 2048,
+                ..Default::default()
+            },
+        );
+
+        let error = svc
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    memory_limit: Some(Some(0)),
+                    ..empty_settings_request()
+                },
+                temps_core::CeilingEnforcement::Enforce,
+            )
+            .await
+            .expect_err("unlimited memory must be refused under a ceiling");
+
+        assert!(
+            matches!(&error, EnvironmentError::InvalidInput(msg) if msg.contains("2048")),
+            "got: {error}"
+        );
+    }
+
+    /// The `SettingsWrite` escape hatch: an operator who can raise the ceiling
+    /// is not blocked by it.
+    #[tokio::test]
+    async fn update_settings_lets_settings_writers_past_the_ceiling() {
+        let env = env_for_ceiling_test();
+        let updated = environments::Model {
+            deployment_config: Some(temps_entities::deployment_config::DeploymentConfig {
+                memory_limit: Some(0),
+                ..Default::default()
+            }),
+            ..env.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![env]])
+                .append_query_results(vec![vec![updated]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = service_with_ceilings(
+            db,
+            temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 2048,
+                ..Default::default()
+            },
+        );
+
+        let result = svc
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    memory_limit: Some(Some(0)),
+                    ..empty_settings_request()
+                },
+                temps_core::CeilingEnforcement::Bypass,
+            )
+            .await;
+
+        assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
     fn make_env_model(on_demand: bool, sleeping: bool) -> environments::Model {
@@ -1665,6 +2141,10 @@ mod tests {
             .append_query_results(vec![vec![env]])
             // 2. conflict check returns the sibling env
             .append_query_results(vec![vec![conflict]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
             .into_connection();
         let svc = make_service(db);
 
@@ -1675,17 +2155,53 @@ mod tests {
         match result {
             Err(EnvironmentError::InvalidInput(msg)) => {
                 assert!(
-                    msg.contains("already used"),
+                    msg.contains("already in use"),
                     "Error should describe conflict: {}",
                     msg
                 );
                 assert!(
-                    msg.contains("production"),
-                    "Error should name the conflicting env: {}",
+                    !msg.contains("production"),
+                    "Error must not disclose the conflicting environment: {}",
                     msg
                 );
             }
             other => panic!("Expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_subdomain_rejects_conflict_across_projects() {
+        let env = make_env_model(false, false);
+        let conflict = environments::Model {
+            id: 2,
+            name: "victim-production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "victim".to_string(),
+            project_id: 99,
+            ..make_env_model(false, false)
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![env]])
+            .append_query_results(vec![vec![conflict]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let svc = make_service(db);
+
+        let result = svc
+            .update_environment_subdomain(10, 1, "victim".to_string())
+            .await;
+
+        match result {
+            Err(EnvironmentError::InvalidInput(msg)) => {
+                assert!(msg.contains("already in use"), "got: {msg}");
+                assert!(!msg.contains("victim-production"), "got: {msg}");
+                assert!(!msg.contains("project 99"), "got: {msg}");
+            }
+            other => panic!("Expected InvalidInput, got {other:?}"),
         }
     }
 

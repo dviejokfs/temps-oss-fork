@@ -394,8 +394,9 @@ impl DockerRuntime {
     /// rather than `/tmp` so the bind mount survives a host reboot —
     /// `/tmp` is tmpfs on most Linux distros and gets wiped, leaving
     /// containers with empty `/run/secrets` until the next redeploy.
-    fn secrets_host_dir(&self, container_name: &str) -> PathBuf {
-        self.secrets_root.join(container_name)
+    fn secrets_host_dir(&self, container_name: &str) -> std::io::Result<PathBuf> {
+        validate_secret_dir_name(container_name)?;
+        Ok(self.secrets_root.join(container_name))
     }
 
     /// Resolves the numeric (uid, gid) that the container will run as,
@@ -2029,7 +2030,12 @@ impl ContainerDeployer for DockerRuntime {
         let secrets_bind = if request.secrets.is_empty() {
             None
         } else {
-            let host_dir = self.secrets_host_dir(&request.container_name);
+            let host_dir = self
+                .secrets_host_dir(&request.container_name)
+                .map_err(|e| DeployerError::SecretMountFailed {
+                    container_name: request.container_name.clone(),
+                    reason: format!("derive host dir: {}", e),
+                })?;
             // Resolve the image's USER so we can chown the secret files to
             // the uid that the container will actually run as — otherwise
             // mode-0400 root-owned files are unreadable by nonroot images.
@@ -2084,7 +2090,12 @@ impl ContainerDeployer for DockerRuntime {
             pids_limit: Some(512),
             // Security hardening: use init process for proper signal handling and zombie reaping
             init: Some(true),
-            binds: secrets_bind.map(|b| vec![b]),
+            // Collected rather than assigned so adding a second bind here does
+            // not silently drop the secrets mount.
+            binds: {
+                let binds: Vec<String> = secrets_bind.into_iter().collect();
+                (!binds.is_empty()).then_some(binds)
+            },
             ..Default::default()
         };
 
@@ -2307,15 +2318,22 @@ impl ContainerDeployer for DockerRuntime {
         );
         if should_cleanup_secrets {
             if let Some(name) = container_name {
-                let dir = self.secrets_host_dir(&name);
-                if dir.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(&dir) {
-                        warn!(
-                            "Failed to clean up secrets host dir {}: {}",
-                            dir.display(),
-                            e
-                        );
+                match self.secrets_host_dir(&name) {
+                    Ok(dir) if dir.exists() => {
+                        if let Err(e) = std::fs::remove_dir_all(&dir) {
+                            warn!(
+                                "Failed to clean up secrets host dir {}: {}",
+                                dir.display(),
+                                e
+                            );
+                        }
                     }
+                    Ok(_) => {}
+                    Err(error) => warn!(
+                        container_name = %name,
+                        %error,
+                        "Skipping secrets host dir cleanup for invalid container name"
+                    ),
                 }
             }
         }
@@ -2477,6 +2495,15 @@ impl ContainerDeployer for DockerRuntime {
 
         let cpu_percent = cpu_percent_from_samples(&second, &first).unwrap_or(0.0);
 
+        // Host core count at sample time. For a container with no CPU limit
+        // this is its real ceiling — `cpu_utilization_percent()` needs it to
+        // avoid treating one saturated core on a multi-core host as 100%.
+        let online_cpus = second
+            .cpu_stats
+            .as_ref()
+            .and_then(|cpu| cpu.online_cpus)
+            .filter(|cpus| *cpus > 0);
+
         // Memory: subtract page cache (matches `docker stats` MEM USAGE).
         // cgroup v2 → `inactive_file`, cgroup v1 → `cache`. Both are
         // reclaimable file pages that the kernel counts as `usage` but
@@ -2512,6 +2539,7 @@ impl ContainerDeployer for DockerRuntime {
             container_name: container_info.container_name,
             cpu_percent,
             cpu_limit_cores: container_info.cpu_limit_cores,
+            online_cpus,
             memory_bytes,
             memory_limit_bytes,
             memory_percent,
@@ -2648,6 +2676,26 @@ fn default_secrets_root() -> PathBuf {
                 .join(".temps")
         });
     base.join("secrets")
+}
+
+fn validate_secret_dir_name(name: &str) -> std::io::Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "invalid container name '{}': must be a single path component",
+                name
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Writes secrets as files into a per-container host directory for Docker
@@ -3270,6 +3318,24 @@ mod docker_tests {
         if let Some(v) = prev_data {
             std::env::set_var("TEMPS_DATA_DIR", v);
         }
+    }
+
+    #[test]
+    fn test_validate_secret_dir_name_rejects_path_traversal_components() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../escaped/deployment-1",
+            "a/b",
+            "a\\b",
+            "with\0null",
+        ] {
+            let err = validate_secret_dir_name(bad).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "name={}", bad);
+        }
+
+        validate_secret_dir_name("project-1").unwrap();
     }
 
     #[test]

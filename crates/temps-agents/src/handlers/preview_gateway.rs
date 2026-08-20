@@ -57,7 +57,8 @@ pub struct LogsResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpgradeRequest {
     /// Image reference to pull and run (e.g.
-    /// `ghcr.io/gotempsh/temps-preview-gateway:latest`). Empty resets to default.
+    /// an immutable `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
+    /// Empty resets to default.
     pub image: String,
 }
 
@@ -131,9 +132,17 @@ pub async fn get_preview_gateway_logs(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
     let tail = q.tail.unwrap_or(200).min(2000);
-    let lines = preview_gateway::tail_logs(&state.docker, tail)
-        .await
-        .map_err(|e| internal(format!("failed to tail logs: {}", e)))?;
+    // Resolve the container from settings, not the default name — otherwise
+    // an instance with a custom container tails a container it doesn't own
+    // (or, more likely, none at all).
+    let settings = preview_gateway::load_settings(&state.db).await;
+    let lines = preview_gateway::tail_logs(
+        &state.docker,
+        &preview_gateway::container_name(&settings),
+        tail,
+    )
+    .await
+    .map_err(|e| internal(format!("failed to tail logs: {}", e)))?;
     Ok(Json(LogsResponse { lines }))
 }
 

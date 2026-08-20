@@ -12,6 +12,7 @@ pub mod error;
 pub mod error_builder;
 pub mod error_metrics;
 pub mod external_plugin;
+pub mod feature_maturity;
 pub mod jobs;
 pub mod node_pki;
 pub mod notifications;
@@ -99,11 +100,12 @@ pub use utils::*;
 pub use anyhow;
 pub use app_settings::{
     AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AppSettings, BuildLimitsSettings,
-    CloudSettings, ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, LetsEncryptSettings,
-    MetricsStoreKind, MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
-    ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
-    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
+    CeilingEnforcement, CloudSettings, ClusterDnsSettings, ConnectionLimitSettings,
+    ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings,
+    ImageRetentionSettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
+    MultiNodeSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
+    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, RequestTimeoutSettings,
+    ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings, TenantResourceCeilings,
 };
 pub use async_trait;
 pub use chrono;

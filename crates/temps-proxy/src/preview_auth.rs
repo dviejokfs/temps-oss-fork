@@ -26,6 +26,7 @@ use argon2::password_hash::PasswordHash;
 use argon2::{Argon2, PasswordVerifier};
 use dashmap::DashMap;
 use moka::future::Cache;
+use parking_lot::Mutex;
 use sea_orm::EntityTrait;
 use temps_core::CookieCrypto;
 use temps_database::DbConnection;
@@ -53,9 +54,28 @@ pub use temps_core::{
     PREVIEW_SESSION_GRANT_TTL, PREVIEW_SESSION_GRANT_VERSION,
 };
 
+/// Default local port the preview gateway listens on, when the instance has
+/// not configured one.
+const DEFAULT_PREVIEW_GATEWAY_PORT: u16 = 8090;
+
 /// The local TCP address where the preview gateway listens. Pingora forwards
 /// authenticated preview requests to this peer.
-pub const PREVIEW_GATEWAY_PEER: &str = "127.0.0.1:8090";
+///
+/// Read per call from `PREVIEW_GATEWAY_HOST_PORT`, which the gateway
+/// supervisor exports at reconcile time from `settings.host_port` — the same
+/// way it exports the shared secret. This used to be a `const` pinned to
+/// 8090, which made `host_port` a setting that moved the container but not
+/// the proxy: previews then 403'd with "missing or invalid
+/// X-Temps-Preview-Token", because the proxy was signing for our gateway and
+/// dialling whatever else held 8090.
+pub fn preview_gateway_peer() -> String {
+    let port = std::env::var("PREVIEW_GATEWAY_HOST_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(DEFAULT_PREVIEW_GATEWAY_PORT);
+    format!("127.0.0.1:{port}")
+}
 
 /// Maximum number of failed auth attempts allowed per (client_ip, sandbox_hex)
 /// inside [`RATE_LIMIT_WINDOW`] before the proxy starts rejecting with 429.
@@ -325,13 +345,30 @@ struct FailureState {
 /// Hard cap on distinct (ip, sandbox_hex) pairs tracked concurrently.
 /// An attacker spraying unique IPs/hex labels can no longer grow this map
 /// without bound — at the cap we sweep expired entries, and if that fails
-/// to free space we drop the oldest entry.
+/// to free space we drop an arbitrary entry in constant time.
 const MAX_TRACKED_ENTRIES: usize = 65_536;
 
+#[derive(Debug)]
+struct LimiterAdmissionState {
+    last_expiry_sweep: Instant,
+}
+
 /// In-memory rate limiter for preview auth failures.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PreviewAuthLimiter {
     failures: DashMap<(IpAddr, String), FailureState>,
+    admission: Mutex<LimiterAdmissionState>,
+}
+
+impl Default for PreviewAuthLimiter {
+    fn default() -> Self {
+        Self {
+            failures: DashMap::new(),
+            admission: Mutex::new(LimiterAdmissionState {
+                last_expiry_sweep: Instant::now(),
+            }),
+        }
+    }
 }
 
 impl PreviewAuthLimiter {
@@ -354,23 +391,48 @@ impl PreviewAuthLimiter {
 
     pub fn record_failure(&self, ip: IpAddr, hex: &str) {
         let key = (ip, hex.to_string());
-        // Cap enforcement: opportunistically evict before insert so the map
-        // cannot be weaponized as an unbounded memory sink.
-        if !self.failures.contains_key(&key) && self.failures.len() >= MAX_TRACKED_ENTRIES {
-            self.evict_expired();
+        if let Some(mut entry) = self.failures.get_mut(&key) {
+            Self::increment_failure(&mut entry);
+            return;
+        }
+
+        // Serialize admission of new keys so concurrent requests cannot race
+        // past the hard cap. Once full, sweep at most once per rate-limit
+        // window; scanning the whole map for every unique attacker turns the
+        // limiter itself into a CPU-amplification vector. If nothing expired,
+        // evict an arbitrary entry in constant time before admitting the new
+        // key. The limiter is best-effort at the cap either way, while memory
+        // and per-request work remain bounded.
+        let mut admission = self.admission.lock();
+        if let Some(mut entry) = self.failures.get_mut(&key) {
+            Self::increment_failure(&mut entry);
+            return;
+        }
+
+        if self.failures.len() >= MAX_TRACKED_ENTRIES {
+            if admission.last_expiry_sweep.elapsed() >= RATE_LIMIT_WINDOW {
+                self.evict_expired();
+                admission.last_expiry_sweep = Instant::now();
+            }
+
             if self.failures.len() >= MAX_TRACKED_ENTRIES {
-                if let Some(victim) = self
-                    .failures
-                    .iter()
-                    .min_by_key(|e| e.value().window_start)
-                    .map(|e| e.key().clone())
-                {
+                let victim = self.failures.iter().next().map(|entry| entry.key().clone());
+                if let Some(victim) = victim {
                     self.failures.remove(&victim);
                 }
             }
         }
 
-        let mut entry = self.failures.entry(key).or_default();
+        self.failures.insert(
+            key,
+            FailureState {
+                count: 1,
+                window_start: Some(Instant::now()),
+            },
+        );
+    }
+
+    fn increment_failure(entry: &mut FailureState) {
         let now = Instant::now();
         match entry.window_start {
             Some(start) if start.elapsed() <= RATE_LIMIT_WINDOW => {
@@ -962,6 +1024,37 @@ mod tests {
         assert!(
             limiter.failures.len() <= MAX_TRACKED_ENTRIES,
             "limiter grew beyond cap: {}",
+            limiter.failures.len()
+        );
+    }
+
+    #[test]
+    fn rate_limiter_hard_cap_holds_during_concurrent_flood() {
+        let limiter = Arc::new(PreviewAuthLimiter::new());
+        let worker_count = 8;
+        let attempts_per_worker = (MAX_TRACKED_ENTRIES / worker_count) + 512;
+
+        std::thread::scope(|scope| {
+            for worker in 0..worker_count {
+                let limiter = Arc::clone(&limiter);
+                scope.spawn(move || {
+                    for attempt in 0..attempts_per_worker {
+                        let index = worker * attempts_per_worker + attempt;
+                        let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                            10,
+                            ((index >> 16) & 0xff) as u8,
+                            ((index >> 8) & 0xff) as u8,
+                            (index & 0xff) as u8,
+                        ));
+                        limiter.record_failure(ip, &format!("hex{index:08x}"));
+                    }
+                });
+            }
+        });
+
+        assert!(
+            limiter.failures.len() <= MAX_TRACKED_ENTRIES,
+            "concurrent admission grew beyond cap: {}",
             limiter.failures.len()
         );
     }

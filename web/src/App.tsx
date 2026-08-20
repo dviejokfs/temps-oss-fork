@@ -30,6 +30,7 @@ import { Header } from './components/dashboard/Header'
 import AppSidebar from './components/dashboard/Sidebar'
 import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
 import { UpdateAvailableBanner } from './components/alerts/UpdateAvailableBanner'
+import { AiHarnessPendingBanner } from './components/alerts/AiHarnessPendingBanner'
 import { ProtectedLayout } from './components/layout/ProtectedLayout'
 import { SettingsLayout } from './components/settings/SettingsLayout'
 import { SidebarInset, SidebarProvider } from './components/ui/sidebar'
@@ -53,14 +54,14 @@ const Account = lazy(() =>
 const Setup = lazy(() =>
   import('./pages/Setup').then((m) => ({ default: m.Setup }))
 )
+const AiOnboarding = lazy(() =>
+  import('./pages/AiOnboarding').then((m) => ({ default: m.AiOnboarding }))
+)
+const PlatformTools = lazy(() =>
+  import('./pages/PlatformTools').then((m) => ({ default: m.PlatformTools }))
+)
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
-)
-const Drop = lazy(() =>
-  import('./pages/Drop').then((m) => ({ default: m.Drop }))
-)
-const Alarms = lazy(() =>
-  import('./pages/Alarms').then((m) => ({ default: m.Alarms }))
 )
 const Revenue = lazy(() =>
   import('./pages/Revenue').then((m) => ({ default: m.Revenue }))
@@ -418,6 +419,11 @@ const GlobalSkillDetailPage = lazy(() =>
     default: m.GlobalSkillDetail,
   }))
 )
+const OtelPipelineStatusPage = lazy(() =>
+  import('./pages/settings/OtelPipelineStatusPage').then((m) => ({
+    default: m.OtelPipelineStatusPage,
+  }))
+)
 const GlobalMcpServerDetailPage = lazy(() =>
   import('./pages/settings/GlobalMcpServerDetail').then((m) => ({
     default: m.GlobalMcpServerDetail,
@@ -491,6 +497,7 @@ const FullAppRoutes = () => {
               {/* App-wide "newer release published" banner — informational, per-
               version dismissible, links the upgrade docs. */}
               <UpdateAvailableBanner />
+              <AiHarnessPendingBanner />
               {/* Wrap header with independent error boundary */}
               <ErrorBoundary
                 fallback={(error, _errorInfo, resetError) => (
@@ -528,7 +535,14 @@ const FullAppRoutes = () => {
                   )
                 }}
               >
-                <div className="h-full overflow-y-auto py-2 px-0 sm:p-4">
+                {/* `flex-1 min-h-0`, not `h-full`. `SidebarInset` is a
+                    fixed-height (`h-dvh`) flex column holding the banners,
+                    the header and this; `h-full` resolved to the whole
+                    viewport height rather than what is left after them, so
+                    with a banner showing this box hung past the bottom of
+                    the screen. Anything sized to 100% of it — a plugin
+                    iframe, say — lost its last rows off-screen. */}
+                <div className="flex-1 min-h-0 overflow-y-auto py-2 px-0 sm:p-4">
                   <Routes>
                     {extraRoutes?.map((r) => (
                       <Route key={r.path} path={r.path} element={r.element} />
@@ -543,8 +557,15 @@ const FullAppRoutes = () => {
                     />
                     <Route path="/account" element={<Account />} />
                     <Route path="/setup" element={<Setup />} />
+                    <Route path="/setup/ai" element={<AiOnboarding />} />
+                    <Route path="/tools" element={<PlatformTools />} />
                     <Route path="/projects" element={<Projects />} />
-                    <Route path="/drop" element={<Drop />} />
+                    <Route
+                      path="/drop"
+                      element={
+                        <Navigate to="/projects/new?source=drop" replace />
+                      }
+                    />
                     <Route path="/revenue" element={<Revenue />} />
                     <Route path="/sandboxes" element={<Sandboxes />} />
                     <Route
@@ -552,14 +573,16 @@ const FullAppRoutes = () => {
                       element={<SandboxDetail />}
                     />
                     <Route path="/monitoring" element={<Monitoring />}>
+                      <Route index element={<Navigate to="alerts" replace />} />
                       <Route
-                        index
-                        element={<Navigate to="resources" replace />}
+                        path="resources"
+                        element={<Navigate to="/proxy" replace />}
                       />
-                      <Route path="alarms" element={<Alarms />} />
                       <Route
                         path="providers/add"
-                        element={<AddNotificationProvider />}
+                        element={
+                          <Navigate to="/settings/notifications/new" replace />
+                        }
                       />
                       <Route
                         path="providers/edit/:id"
@@ -567,6 +590,10 @@ const FullAppRoutes = () => {
                       />
                       <Route path=":section" element={<MonitoringSettings />} />
                     </Route>
+                    <Route
+                      path="/alarms"
+                      element={<Navigate to="/monitoring/alarms" replace />}
+                    />
                     {/* Observe section */}
                     {/* ADR-027 Phase 2: global cross-project unified trace waterfall */}
                     <Route
@@ -594,6 +621,14 @@ const FullAppRoutes = () => {
                     <Route path="/settings" element={<SettingsLayout />}>
                       <Route index element={<Settings />} />
                       <Route path="notifications" element={<Notifications />} />
+                      <Route
+                        path="notifications/new"
+                        element={<AddNotificationProvider />}
+                      />
+                      <Route
+                        path="notifications/:id"
+                        element={<EditNotificationProvider />}
+                      />
                       <Route path="users" element={<Users />} />
                       <Route path="users/new" element={<CreateUser />} />
                       <Route path="users/:userId" element={<UserDetail />} />
@@ -651,6 +686,10 @@ const FullAppRoutes = () => {
                         element={<NodeDetailPage />}
                       />
                       <Route path="plugins" element={<PluginsPage />} />
+                      <Route
+                        path="otel-pipeline"
+                        element={<OtelPipelineStatusPage />}
+                      />
                     </Route>
                     {/* Top-level resources surfaced in the main sidebar */}
                     <Route path="/domains" element={<Domains />} />

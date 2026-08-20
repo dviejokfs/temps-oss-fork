@@ -15,18 +15,19 @@ use axum::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use temps_auth::RequireAuth;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
 };
+use temps_auth::{AuthContext, RequireAuth};
 use temps_core::RequestMetadata;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::types::{
     ChangeProjectSourceRequest, CreateProjectRequest, PaginatedProjectList, PaginationParams,
-    ProjectResponse, ProjectStatisticsResponse, ReinstallWebhookResponse, TriggerPipelinePayload,
-    TriggerPipelineResponse, UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest,
-    UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
+    ProjectResponse, ProjectStatisticsResponse, ReinstallWebhookResponse,
+    SetAlternateSourcesRequest, TriggerPipelinePayload, TriggerPipelineResponse,
+    UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest, UpdateGitSettingsRequest,
+    UpdateProjectSettingsRequest,
 };
 use crate::services::types::CreateProjectEnvVar;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -48,6 +49,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/projects/by-slug/{slug}", get(get_project_by_slug))
         .route("/projects/{id}", put(update_project))
         .route("/projects/{id}/source", patch(change_project_source))
+        .route(
+            "/projects/{id}/alternate-sources",
+            patch(set_alternate_sources),
+        )
         .route("/projects/{id}", delete(delete_project))
         .route("/projects", post(create_project))
         .route("/projects", get(get_projects))
@@ -105,6 +110,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_project,
         update_project,
         change_project_source,
+        set_alternate_sources,
         delete_project,
         get_projects,
         get_project_by_slug,
@@ -129,6 +135,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             DropInspectionResponse,
             DropPresetCandidate,
             ChangeProjectSourceRequest,
+            SetAlternateSourcesRequest,
             ProjectResponse,
             PaginatedProjectList,
             PaginationParams,
@@ -627,7 +634,7 @@ pub async fn create_project(
 /// Fails the request on an infrastructure error rather than falling back
 /// to an unfiltered list — a checker that can't answer must not silently
 /// widen what a user sees.
-async fn resolve_hidden_projects(
+pub(super) async fn resolve_hidden_projects(
     state: &Arc<AppState>,
     auth: &temps_auth::context::AuthContext,
 ) -> Result<Vec<i32>, Problem> {
@@ -680,10 +687,12 @@ async fn resolve_hidden_projects(
     tag = "Projects",
     params(
         ("page" = Option<i64>, Query, description = "Page number (1-based)"),
-        ("per_page" = Option<i64>, Query, description = "Number of items per page")
+        ("per_page" = Option<i64>, Query, description = "Number of items per page (1-100)"),
+        ("search" = Option<String>, Query, description = "Case-insensitive project name or slug filter")
     ),
     responses(
         (status = 200, description = "List of projects", body = PaginatedProjectList),
+        (status = 400, description = "Invalid pagination parameters"),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Internal server error")
     ),
@@ -700,6 +709,11 @@ pub async fn get_projects(
 
     let page = params.page.unwrap_or(1);
     let per_page = params.per_page.unwrap_or(10);
+    let search = params
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
     // Per-resource guards keep a user out of a project they click on; this
     // keeps its name out of the list in the first place. Instance
@@ -708,7 +722,7 @@ pub async fn get_projects(
 
     let (projects, total) = state
         .project_service
-        .get_projects_paginated_excluding(page, per_page, &hidden)
+        .get_projects_paginated_excluding_search(page, per_page, &hidden, search)
         .await
         .map_err(Problem::from)?;
 
@@ -941,6 +955,72 @@ pub async fn change_project_source(
     Ok(Json(ProjectResponse::map_from_project(updated)).into_response())
 }
 
+/// Opt a project in or out of accepting deployments from a source other than
+/// its configured `source_type`.
+///
+/// This leaves `source_type` untouched — a Git project keeps its repository,
+/// branch, webhook-driven auto-deploy and rollback rebuild-from-source — and
+/// only changes whether the project will additionally accept an uploaded
+/// source archive (`drop`). Docker images and static bundles are accepted by
+/// every project regardless of this flag.
+#[utoipa::path(
+    patch,
+    path = "/projects/{id}/alternate-sources",
+    tag = "Projects",
+    params(("id" = i32, Path, description = "Project ID")),
+    request_body = SetAlternateSourcesRequest,
+    responses(
+        (status = 200, description = "Alternate-source policy updated", body = ProjectResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_alternate_sources(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(req): Json<SetAlternateSourcesRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, id);
+    project_access_guard!(auth, id, state.project_access_checker);
+
+    let updated = state
+        .project_service
+        .set_allow_alternate_sources(id, req.allow_alternate_sources)
+        .await?;
+
+    let audit_event = ProjectUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent,
+        },
+        project_id: updated.id,
+        project_name: updated.name.clone(),
+        project_slug: updated.slug.clone(),
+        updated_fields: ProjectUpdatedFields {
+            name: Some(updated.name.clone()),
+            repo_name: None,
+            repo_owner: None,
+            directory: None,
+            main_branch: None,
+            preset: None,
+            automatic_deploy: None,
+            compose_configuration_updated: None,
+        },
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!("Failed to create audit log: {:?}", e);
+    }
+
+    Ok(Json(ProjectResponse::map_from_project(updated)).into_response())
+}
+
 #[utoipa::path(
     delete,
     path = "/projects/{id}",
@@ -1068,6 +1148,32 @@ pub async fn update_project_settings(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    // Capture the pre-update retention window only when it's actually
+    // changing, so an unrelated settings save (slug, attack mode, ...)
+    // doesn't pay for an extra read.
+    let previous_image_retention_hours = if settings.image_retention_hours.is_some() {
+        match state.project_service.get_project(project_id).await {
+            Ok(project) => project.image_retention_hours,
+            Err(e) => {
+                // A failed read and a genuinely-unset prior value both end up
+                // `None` in the audit record below — that's an accepted gap
+                // in what the double-Option type can express, but a *silent*
+                // one would let a transient DB error read back as "there was
+                // no prior retention window" during an incident review. Log
+                // it so the ambiguity is at least visible operationally.
+                warn!(
+                    error = %e,
+                    project_id,
+                    "Could not read prior image_retention_hours before update; \
+                     audit log will record it as unset rather than unknown"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let updated_project = state
         .project_service
         .update_project_settings(
@@ -1092,6 +1198,7 @@ pub async fn update_project_settings(
             settings.error_source_context_enabled,
             settings.error_source_root.clone(),
             settings.ai_api_traffic_summary_enabled,
+            settings.image_retention_hours,
         )
         .await
         .map_err(Problem::from)?;
@@ -1111,6 +1218,8 @@ pub async fn update_project_settings(
         performance_metrics_enabled: None,
         slug: settings.slug,
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
+        image_retention_hours: settings.image_retention_hours,
+        previous_image_retention_hours,
     };
 
     let audit_event = ProjectSettingsUpdatedAudit {
@@ -1214,6 +1323,7 @@ pub async fn update_git_settings(
     Json(settings): Json<UpdateGitSettingsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    require_git_settings_permissions(&auth)?;
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
@@ -1274,6 +1384,15 @@ pub async fn update_git_settings(
     }
 
     Ok(Json(ProjectResponse::map_from_project(updated_project)))
+}
+
+/// Updating connected-repository settings makes Temps use installation-wide
+/// provider credentials for branch validation and webhook lifecycle calls.
+/// Project write access alone must not grant that Git capability.
+fn require_git_settings_permissions(auth: &AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, GitConnectionsRead);
+    permission_guard!(auth, GitRepositoriesRead);
+    Ok(())
 }
 
 /// Reinstall the GitLab webhook for a project
@@ -1391,7 +1510,15 @@ pub async fn update_project_deployment_config(
 
     let updated_project = state
         .project_service
-        .update_project_deployment_config(project_id, config.clone())
+        .update_project_deployment_config(
+            project_id,
+            config.clone(),
+            // An operator who can edit the instance-wide ceilings is not
+            // meaningfully constrained by them.
+            temps_core::CeilingEnforcement::from_has_settings_write(
+                auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
+        )
         .await
         .map_err(|e| {
             error!("Error updating deployment config: {:?}", e);
@@ -2076,6 +2203,7 @@ pub async fn create_project_from_template(
                     .git_provider_manager
                     .create_repository_and_push_template(
                         connection_id,
+                        auth.user_id(),
                         repository_name,
                         request.repository_owner.as_deref(),
                         Some(&format!("Created from template: {}", template.name)),
@@ -2269,9 +2397,57 @@ pub async fn create_project_from_template(
 mod tests {
     use super::{
         compose_path_for_candidate, parse_owner_repo_from_git_url,
-        project_created_from_template_telemetry_event,
+        project_created_from_template_telemetry_event, require_git_settings_permissions,
     };
+    use chrono::Utc;
     use std::collections::BTreeMap;
+    use temps_auth::{AuthContext, Permission};
+    use temps_entities::users;
+
+    fn custom_api_key(permissions: Vec<Permission>) -> AuthContext {
+        let now = Utc::now();
+        let user = users::Model {
+            id: 42,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        AuthContext::new_api_key(user, None, Some(permissions), "test-key".to_string(), 1)
+    }
+
+    #[test]
+    fn git_settings_require_connection_and_repository_permissions() {
+        let projects_only = custom_api_key(vec![Permission::ProjectsWrite]);
+        assert!(require_git_settings_permissions(&projects_only).is_err());
+
+        let missing_repository_read = custom_api_key(vec![
+            Permission::ProjectsWrite,
+            Permission::GitConnectionsRead,
+        ]);
+        assert!(require_git_settings_permissions(&missing_repository_read).is_err());
+
+        let authorized = custom_api_key(vec![
+            Permission::ProjectsWrite,
+            Permission::GitConnectionsRead,
+            Permission::GitRepositoriesRead,
+        ]);
+        assert!(require_git_settings_permissions(&authorized).is_ok());
+    }
 
     #[test]
     fn drop_compose_candidate_preserves_detected_modern_filename() {

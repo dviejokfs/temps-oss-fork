@@ -2623,6 +2623,16 @@ impl From<NodeError> for Problem {
                      proof of the current token, or the node must be drained/removed first",
                     name
                 )),
+            NodeError::IdentityClaimed {
+                ref claimed,
+                ref owner,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Node Identity Already Claimed")
+                .with_detail(format!(
+                    "Identity '{}' is already held by node '{}'; a node cannot register under \
+                     another node's name or address",
+                    claimed, owner
+                )),
             NodeError::Validation { ref message } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(message.clone()),
@@ -2632,6 +2642,11 @@ impl From<NodeError> for Problem {
             NodeError::InsufficientCompatibleNodes { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Insufficient Compatible Nodes")
+                    .with_detail(error.to_string())
+            }
+            NodeError::PlacementConstraintsUnsatisfied { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Placement Constraints Unsatisfied")
                     .with_detail(error.to_string())
             }
             NodeError::Database(ref e) => {
@@ -2919,6 +2934,8 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // Check for duplicate name (returns empty)
             .append_query_results(vec![Vec::<nodes::Model>::new()])
+            // Identity guard: name/address not claimed by another node
+            .append_query_results(vec![Vec::<nodes::Model>::new()])
             // Insert returns the new node
             .append_query_results(vec![vec![node.clone()]])
             .into_connection();
@@ -3105,7 +3122,8 @@ mod tests {
     async fn test_register_node_with_valid_join_token_succeeds() {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // duplicate name
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard
             .append_query_results(vec![vec![node.clone()]])
             .into_connection();
 

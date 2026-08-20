@@ -2,6 +2,7 @@ import { subDays } from 'date-fns'
 import type { DateRange } from 'react-day-picker'
 
 export const QUICK_FILTERS = [
+  { label: 'Last hour', value: 'lasthour' },
   { label: 'Today', value: 'today' },
   { label: 'Yesterday', value: 'yesterday' },
   { label: 'Last 24 hours', value: '24hours' },
@@ -30,6 +31,14 @@ export function getDateRangeFromFilter(dateFilter: AnalyticsDateFilter): {
   }
 
   switch (dateFilter.quickFilter) {
+    case 'lasthour': {
+      const oneHourAgo = new Date(now)
+      oneHourAgo.setHours(oneHourAgo.getHours() - 1)
+      return {
+        startDate: oneHourAgo,
+        endDate: now,
+      }
+    }
     case 'today':
       return {
         startDate: new Date(now.setHours(0, 0, 0, 0)),

@@ -1202,7 +1202,10 @@ export function EnvironmentVariablesSettings({
   const connectedEnvExample = useQuery({
     ...getRepositoryEnvExampleLiveOptions({
       path: { repository_id: repositoryData?.id ?? 0 },
-      query: { branch: project.main_branch },
+      query: {
+        branch: project.main_branch,
+        root_directory: project.directory || './',
+      },
     }),
     enabled: isDockerCompose && !!repositoryData?.id,
   })
@@ -1213,7 +1216,10 @@ export function EnvironmentVariablesSettings({
         owner: project.repo_owner ?? '',
         repo: project.repo_name ?? '',
       },
-      query: { branch: project.main_branch },
+      query: {
+        branch: project.main_branch,
+        root_directory: project.directory || './',
+      },
     }),
     enabled:
       isDockerCompose &&
@@ -1304,6 +1310,7 @@ export function EnvironmentVariablesSettings({
             key: variable.key,
             value: variable.value,
             environment_ids: variable.environments || [],
+            include_in_preview: false,
           },
         })
         successCount++

@@ -9,7 +9,7 @@ use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
 use flate2::read::GzDecoder;
 use futures::TryStreamExt;
-use redis::{aio::ConnectionManager, Client};
+use redis::{aio::ConnectionManager, AsyncCommands, Client};
 use schemars::JsonSchema;
 use sea_orm::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -674,18 +674,272 @@ impl RedisService {
         )
     }
 
-    /// Calculate a deterministic database number (0-15) from a resource name
-    /// This allows us to allocate databases without requiring a Redis connection
-    fn calculate_database_number(&self, resource_name: &str) -> u8 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+    fn resource_mapping_key(resource_name: &str) -> String {
+        format!("_temps:redis_db_mapping:{}", resource_name)
+    }
 
-        let mut hasher = DefaultHasher::new();
-        resource_name.hash(&mut hasher);
-        let hash = hasher.finish();
+    fn database_owner_key(db_number: u8) -> String {
+        format!("_temps:redis_db_owner:{}", db_number)
+    }
 
-        // Redis supports 16 databases (0-15), so we use modulo to get a valid number
-        (hash % 16) as u8
+    /// Owner value recorded for a logical DB that already held data when we
+    /// first looked at it. Such a DB predates this allocation scheme (it was
+    /// picked by the old hash-of-resource-name mapping, or was written to by
+    /// hand), so its contents belong to someone we cannot identify. Reserving
+    /// it under a sentinel owner keeps it out of every future allocation
+    /// without ever attributing it to a resource — which also means
+    /// `drop_database` can never be led to `FLUSHDB` it.
+    const UNMANAGED_DB_OWNER: &'static str = "_temps:unmanaged";
+
+    /// `DBSIZE` for one logical database, leaving the connection back on the
+    /// metadata DB 0 that the caller is working in.
+    async fn database_key_count(conn: &mut ConnectionManager, db_number: u8) -> Result<u64> {
+        redis::cmd("SELECT")
+            .arg(db_number)
+            .query_async::<()>(conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to select Redis DB {}: {}", db_number, e))?;
+
+        let size = redis::cmd("DBSIZE").query_async::<u64>(conn).await;
+
+        // Return to DB 0 whatever DBSIZE did — leaving the connection pointed
+        // at a workload DB would make every later metadata write land in it.
+        redis::cmd("SELECT")
+            .arg(0)
+            .query_async::<()>(conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to return to Redis metadata DB 0: {}", e))?;
+
+        size.map_err(|e| anyhow::anyhow!("Failed to read DBSIZE for Redis DB {}: {}", db_number, e))
+    }
+
+    /// Allocate a Redis logical database for a project/environment resource.
+    ///
+    /// DB 0 is reserved for Temps allocation metadata. Workload databases are
+    /// selected from DBs 1-15 and recorded in Redis before their connection
+    /// details are returned, so two resources cannot silently receive the same
+    /// logical DB. When all databases are in use, allocation fails closed.
+    ///
+    /// The "read mapping, then claim" sequence below isn't a single atomic
+    /// transaction, so a concurrent `drop_database` for the same resource
+    /// could in principle interleave between the mapping read and the
+    /// `SETNX` claim. This is an accepted race: a single Redis instance and
+    /// the short critical section make it low-risk in practice, and
+    /// allocate/drop for the same resource aren't expected to run
+    /// concurrently (provision and deprovision are serialized per resource
+    /// at the caller).
+    async fn allocate_database(&self, resource_name: &str) -> Result<u8> {
+        let mut conn = self.get_connection().await?;
+        redis::cmd("SELECT")
+            .arg(0)
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to select Redis metadata DB 0: {}", e))?;
+
+        let mapping_key = Self::resource_mapping_key(resource_name);
+        let existing: Option<u8> = conn.get(&mapping_key).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read Redis DB mapping for resource '{}': {}",
+                resource_name,
+                e
+            )
+        })?;
+        if let Some(db_number) = existing {
+            return Ok(db_number);
+        }
+
+        for db_number in 1..=15 {
+            let owner_key = Self::database_owner_key(db_number);
+            let claimed: bool = conn.set_nx(&owner_key, resource_name).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to claim Redis DB {} for resource '{}': {}",
+                    db_number,
+                    resource_name,
+                    e
+                )
+            })?;
+
+            if claimed {
+                // The owner key says the DB is free, but this Redis may have
+                // been provisioned before ownership was tracked at all — under
+                // the old hash-of-resource-name scheme a workload could be
+                // sitting in any of DBs 1-15 with no metadata to show for it.
+                // Handing such a DB out would expose that data to the new
+                // resource and let `drop_database` FLUSHDB it later, so an
+                // occupied-but-unowned DB is reserved and skipped instead.
+                // The claim is already committed at this point, but the mapping
+                // that makes it releasable is not written until below. A `?`
+                // here would therefore leave the owner key set with no mapping,
+                // and `drop_database` skips exactly that shape ("no mapping
+                // found"), so a transient SELECT/DBSIZE failure would burn one
+                // of the 15 logical DBs permanently — fifteen such blips and
+                // every future allocation fails. Release the claim before
+                // propagating so the error costs nothing but this attempt.
+                let key_count = match Self::database_key_count(&mut conn, db_number).await {
+                    Ok(count) => count,
+                    Err(probe_error) => {
+                        if let Err(release_error) =
+                            conn.del::<_, ()>(&owner_key).await.map_err(|e| {
+                                anyhow::anyhow!(
+                                    "Failed to release Redis DB {} after a failed occupancy \
+                                     probe: {}",
+                                    db_number,
+                                    e
+                                )
+                            })
+                        {
+                            // Both failed: say so, rather than reporting only
+                            // the probe error and leaving the leak unexplained.
+                            warn!(
+                                db_number,
+                                resource = resource_name,
+                                %release_error,
+                                "Could not release the Redis DB claim after a failed occupancy \
+                                 probe; this logical DB may stay reserved until cleared manually"
+                            );
+                        }
+                        return Err(probe_error);
+                    }
+                };
+                if key_count > 0 {
+                    warn!(
+                        db_number,
+                        key_count,
+                        resource = resource_name,
+                        "Redis DB holds data but has no recorded owner; reserving it as \
+                         unmanaged rather than allocating it"
+                    );
+                    conn.set::<_, _, ()>(&owner_key, Self::UNMANAGED_DB_OWNER)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to reserve unmanaged Redis DB {}: {}",
+                                db_number,
+                                e
+                            )
+                        })?;
+                    continue;
+                }
+
+                conn.set::<_, _, ()>(&mapping_key, db_number)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to store Redis DB {} mapping for resource '{}': {}",
+                            db_number,
+                            resource_name,
+                            e
+                        )
+                    })?;
+                return Ok(db_number);
+            }
+
+            let owner: Option<String> = conn.get(&owner_key).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read Redis DB {} owner while allocating resource '{}': {}",
+                    db_number,
+                    resource_name,
+                    e
+                )
+            })?;
+            if owner.as_deref() == Some(resource_name) {
+                conn.set::<_, _, ()>(&mapping_key, db_number)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to restore Redis DB {} mapping for resource '{}': {}",
+                            db_number,
+                            resource_name,
+                            e
+                        )
+                    })?;
+                return Ok(db_number);
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "No Redis logical databases are available for resource '{}'; DB 0 is reserved for metadata and DBs 1-15 are already allocated or hold unattributable data",
+            resource_name
+        ))
+    }
+
+    async fn drop_database(&self, resource_name: &str) -> Result<()> {
+        let mut conn = self.get_connection().await?;
+        redis::cmd("SELECT")
+            .arg(0)
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to select Redis metadata DB 0: {}", e))?;
+
+        let mapping_key = Self::resource_mapping_key(resource_name);
+        let db_number: Option<u8> = conn.get(&mapping_key).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read Redis DB mapping for resource '{}': {}",
+                resource_name,
+                e
+            )
+        })?;
+
+        let Some(db_number) = db_number else {
+            info!(
+                "No Redis database mapping found for resource '{}'; skipping deprovision",
+                resource_name
+            );
+            return Ok(());
+        };
+
+        redis::cmd("SELECT")
+            .arg(db_number)
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to select Redis DB {} for resource '{}': {}",
+                    db_number,
+                    resource_name,
+                    e
+                )
+            })?;
+        redis::cmd("FLUSHDB")
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to flush Redis DB {} for resource '{}': {}",
+                    db_number,
+                    resource_name,
+                    e
+                )
+            })?;
+
+        redis::cmd("SELECT")
+            .arg(0)
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to reselect Redis metadata DB 0: {}", e))?;
+        conn.del::<_, ()>(&mapping_key).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to delete Redis DB mapping for resource '{}': {}",
+                resource_name,
+                e
+            )
+        })?;
+        conn.del::<_, ()>(Self::database_owner_key(db_number))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to delete Redis DB {} owner for resource '{}': {}",
+                    db_number,
+                    resource_name,
+                    e
+                )
+            })?;
+
+        info!(
+            "Flushed Redis DB {} and removed allocation for resource '{}'",
+            db_number, resource_name
+        );
+        Ok(())
     }
 
     fn get_redis_config(&self, service_config: ServiceConfig) -> Result<RedisConfig> {
@@ -2022,9 +2276,7 @@ impl ExternalService for RedisService {
     ) -> Result<HashMap<String, String>> {
         let resource_name = format!("{}_{}", project_id, environment);
 
-        // Calculate database number using a hash instead of requiring Redis connection
-        // This allows us to generate env vars before the service is started
-        let db_number = self.calculate_database_number(&resource_name);
+        let db_number = self.allocate_database(&resource_name).await?;
 
         let mut env_vars = HashMap::new();
 
@@ -2260,11 +2512,9 @@ impl ExternalService for RedisService {
         Ok(env_vars)
     }
 
-    async fn deprovision_resource(&self, _project_id: &str, _environment: &str) -> Result<()> {
-        // No database-level deprovisioning needed
-        // Each project/environment gets a calculated database number (0-15) based on hash
-        // Cleanup would happen at the application level (flushing keys with specific prefixes)
-        Ok(())
+    async fn deprovision_resource(&self, project_id: &str, environment: &str) -> Result<()> {
+        let resource_name = format!("{}_{}", project_id, environment);
+        self.drop_database(&resource_name).await
     }
 
     /// Backup Redis data to S3.
@@ -3127,6 +3377,198 @@ mod tests {
         assert!(new_local_addr.contains("7544"), "New port should be 7544");
 
         // Cleanup
+        let _ = service.cleanup().await;
+    }
+
+    /// Regression coverage for the DB-collision bug this fix closes: two
+    /// distinct resources must never share a logical DB, re-allocating the
+    /// same resource must be idempotent, and `drop_database` must actually
+    /// free the slot for reuse rather than leaking it.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_allocate_database_isolation_and_reuse() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = RedisService::new("test-db-alloc".to_string(), docker);
+
+        let config = super::ServiceConfig {
+            name: "test-db-alloc".to_string(),
+            service_type: super::ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "7549",
+                "password": "allocpass123"
+            }),
+        };
+        service.init(config).await.expect("init should succeed");
+
+        // Two distinct resources must get distinct DBs.
+        let db_a = service
+            .allocate_database("project-a/prod")
+            .await
+            .expect("allocate resource A");
+        let db_b = service
+            .allocate_database("project-b/prod")
+            .await
+            .expect("allocate resource B");
+        assert_ne!(
+            db_a, db_b,
+            "distinct resources must not collide on the same DB"
+        );
+        assert!((1..=15).contains(&db_a), "allocated DB must be in 1-15");
+        assert!((1..=15).contains(&db_b), "allocated DB must be in 1-15");
+
+        // Re-allocating the same resource is idempotent.
+        let db_a_again = service
+            .allocate_database("project-a/prod")
+            .await
+            .expect("re-allocate resource A");
+        assert_eq!(
+            db_a, db_a_again,
+            "re-allocating the same resource must return the same DB"
+        );
+
+        // drop_database frees the slot for reuse by a different resource.
+        service
+            .drop_database("project-a/prod")
+            .await
+            .expect("drop resource A");
+        let db_c = service
+            .allocate_database("project-c/prod")
+            .await
+            .expect("allocate resource C after drop");
+        assert_eq!(db_c, db_a, "a freed DB must be reusable by a new resource");
+
+        // Cleanup
+        let _ = service.drop_database("project-b/prod").await;
+        let _ = service.drop_database("project-c/prod").await;
+        let _ = service.cleanup().await;
+    }
+
+    /// A Redis provisioned before ownership was tracked has workloads sitting
+    /// in DBs 1-15 with no owner key to show for it. Allocating one of those
+    /// to a new resource would expose the old tenant's data and let
+    /// `drop_database` FLUSHDB it later, so an occupied-but-unowned DB must be
+    /// skipped and its contents left alone.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_allocate_database_skips_legacy_unowned_data() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = RedisService::new("test-db-legacy".to_string(), docker);
+
+        let config = super::ServiceConfig {
+            name: "test-db-legacy".to_string(),
+            service_type: super::ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "7551",
+                "password": "legacypass123"
+            }),
+        };
+        service.init(config).await.expect("init should succeed");
+
+        // Stand in for the pre-metadata scheme: data in DB 1 and no owner key.
+        let mut conn = service
+            .get_connection()
+            .await
+            .expect("connection should succeed");
+        redis::cmd("SELECT")
+            .arg(1)
+            .query_async::<()>(&mut conn)
+            .await
+            .expect("select DB 1");
+        redis::cmd("SET")
+            .arg("legacy:tenant:key")
+            .arg("legacy-value")
+            .query_async::<()>(&mut conn)
+            .await
+            .expect("seed legacy data");
+
+        let allocated = service
+            .allocate_database("project-new/prod")
+            .await
+            .expect("allocate should succeed by skipping the occupied DB");
+        assert_ne!(
+            allocated, 1,
+            "a DB holding unattributable data must never be allocated"
+        );
+
+        // The legacy data must still be there, untouched.
+        redis::cmd("SELECT")
+            .arg(1)
+            .query_async::<()>(&mut conn)
+            .await
+            .expect("select DB 1");
+        let value: Option<String> = redis::cmd("GET")
+            .arg("legacy:tenant:key")
+            .query_async(&mut conn)
+            .await
+            .expect("read legacy key");
+        assert_eq!(value.as_deref(), Some("legacy-value"));
+
+        // Dropping the new resource must not touch the reserved DB either.
+        service
+            .drop_database("project-new/prod")
+            .await
+            .expect("drop new resource");
+        redis::cmd("SELECT")
+            .arg(1)
+            .query_async::<()>(&mut conn)
+            .await
+            .expect("select DB 1");
+        let value: Option<String> = redis::cmd("GET")
+            .arg("legacy:tenant:key")
+            .query_async(&mut conn)
+            .await
+            .expect("read legacy key after drop");
+        assert_eq!(
+            value.as_deref(),
+            Some("legacy-value"),
+            "deprovisioning an unrelated resource must not flush the reserved DB"
+        );
+
+        let _ = service.cleanup().await;
+    }
+
+    /// When all 15 workload DBs (1-15) are claimed, allocation for a new
+    /// resource must fail closed instead of silently colliding with an
+    /// existing resource's DB.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_allocate_database_fails_closed_when_exhausted() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = RedisService::new("test-db-exhaust".to_string(), docker);
+
+        let config = super::ServiceConfig {
+            name: "test-db-exhaust".to_string(),
+            service_type: super::ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "7550",
+                "password": "exhaustpass123"
+            }),
+        };
+        service.init(config).await.expect("init should succeed");
+
+        for i in 0..15 {
+            service
+                .allocate_database(&format!("resource-{i}"))
+                .await
+                .unwrap_or_else(|e| panic!("allocate resource-{i} should succeed: {e}"));
+        }
+
+        let result = service.allocate_database("resource-overflow").await;
+        assert!(
+            result.is_err(),
+            "allocation must fail closed once all 15 workload DBs are claimed"
+        );
+
+        // Cleanup
+        for i in 0..15 {
+            let _ = service.drop_database(&format!("resource-{i}")).await;
+        }
         let _ = service.cleanup().await;
     }
 

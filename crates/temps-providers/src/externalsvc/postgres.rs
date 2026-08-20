@@ -40,6 +40,18 @@ pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn shell_export_assignment(line: &str) -> Option<String> {
+    let (key, value) = line.split_once('=')?;
+    let valid_key = key
+        .chars()
+        .all(|character| character == '_' || character.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .next()
+            .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
+    valid_key.then(|| format!("export {key}={}", shell_escape(value)))
+}
+
 /// Rejections from same-version-only [`PostgresService::upgrade`]. The
 /// `ExternalService::upgrade` trait method returns `anyhow::Result<()>`
 /// across every provider, so this can't be a variant of a typed
@@ -327,6 +339,162 @@ fn default_docker_image() -> Option<String> {
     Some("gotempsh/postgres-walg:18-bookworm".to_string())
 }
 
+/// Every PostgreSQL-flavoured image the platform is allowed to pull and run.
+///
+/// This is an exact-match allowlist on purpose (never a substring/prefix test):
+/// a service's `docker_image` comes from client-deserializable parameters, and
+/// backup/restore helpers pull and execute it in sidecar containers, so a
+/// permissive match is remote code execution.
+///
+/// Because it is exact, it must list *every* image any other part of the
+/// product can put on a service, or that service becomes permanently
+/// un-initializable — `get_postgres_config` runs this check on every read of
+/// the config, so an unlisted image doesn't just block creation, it blocks
+/// deploys of every app linked to the service. Three sources feed it:
+///
+/// - images this repo builds (`images/*-walg/Dockerfile`),
+/// - images the console offers as upgrade targets
+///   (`web/src/components/storage/UpgradeServiceDialog.tsx`),
+/// - upstream images container discovery classifies as Postgres
+///   (`services.rs`, which matches `postgres` / `timescaledb` / `pgvector`).
+///
+/// Adding an image to any of those without adding it here is the bug this
+/// list keeps regressing into.
+///
+/// Operators can extend (never shrink) this set via
+/// `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES` — see
+/// [`extra_allowed_postgres_docker_images`].
+const ALLOWED_POSTGRES_DOCKER_IMAGES: &[&str] = &[
+    "gotempsh/postgres-walg:15-bookworm",
+    "gotempsh/postgres-walg:16-bookworm",
+    "gotempsh/postgres-walg:17-bookworm",
+    "gotempsh/postgres-walg:18-bookworm",
+    "gotempsh/pgvector-walg:pg17",
+    "gotempsh/pgvector-walg:pg18",
+    "gotempsh/timescaledb-walg:pg18",
+    "pgvector/pgvector:pg15",
+    "pgvector/pgvector:pg16",
+    "pgvector/pgvector:pg17",
+    "pgvector/pgvector:pg18",
+    "timescale/timescaledb-ha:pg17",
+    "timescale/timescaledb-ha:pg18",
+];
+
+/// Environment variable an operator sets to allow additional PostgreSQL images
+/// (comma-separated). This is deliberately host-level rather than an API
+/// setting: which images this machine may pull and execute is the operator's
+/// policy, and keeping it off the API avoids adding a write surface that can
+/// widen container execution.
+///
+/// Requires a restart to take effect, like the other process-wide operator
+/// knobs documented in `CLAUDE.md`.
+pub(crate) const EXTRA_POSTGRES_IMAGES_ENV: &str = "TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES";
+
+/// Parse the operator-provided image list.
+///
+/// Split on commas, trim, drop empties. Entries are kept verbatim otherwise —
+/// matching stays exact, so an entry without a `:tag` or `@sha256:` digest can
+/// never match a real service image. Those are returned separately as
+/// `suspicious` so startup can warn about them instead of silently ignoring
+/// them: a self-hosted operator who typo'd the variable gets told, rather than
+/// re-reading the same rejection error with no idea why their entry did
+/// nothing.
+fn parse_extra_allowed_images(raw: &str) -> (Vec<String>, Vec<String>) {
+    let mut images = Vec::new();
+    let mut suspicious = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // A tag/digest separator must appear after the final `/`, otherwise the
+        // only `:` is a registry port (e.g. `registry.internal:5000/pg`).
+        let name_start = entry.rfind('/').map_or(0, |i| i + 1);
+        if !entry[name_start..].contains(':') && !entry.contains('@') {
+            suspicious.push(entry.to_string());
+        }
+        images.push(entry.to_string());
+    }
+    (images, suspicious)
+}
+
+/// Operator-supplied additions to [`ALLOWED_POSTGRES_DOCKER_IMAGES`], read once
+/// per process.
+///
+/// Additive by design: the built-in list stays the floor so a typo in this
+/// variable cannot strand every existing Postgres service. `get_postgres_config`
+/// validates on every read of a service's config, so shrinking the allowlist
+/// would not merely block new services — it would make existing ones
+/// permanently un-initializable and block deploys of every app linked to them.
+fn extra_allowed_postgres_docker_images() -> &'static [String] {
+    static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    EXTRA.get_or_init(|| {
+        let Ok(raw) = std::env::var(EXTRA_POSTGRES_IMAGES_ENV) else {
+            return Vec::new();
+        };
+        let (images, suspicious) = parse_extra_allowed_images(&raw);
+        if !suspicious.is_empty() {
+            warn!(
+                "{} contains {} entr{} without a tag or digest ({}). Matching is exact, so \
+                 these can never match a service image — did you mean e.g. 'postgis/postgis:18-3.5'?",
+                EXTRA_POSTGRES_IMAGES_ENV,
+                suspicious.len(),
+                if suspicious.len() == 1 { "y" } else { "ies" },
+                suspicious.join(", ")
+            );
+        }
+        if !images.is_empty() {
+            info!(
+                "{} allows {} additional PostgreSQL image(s): {}",
+                EXTRA_POSTGRES_IMAGES_ENV,
+                images.len(),
+                images.join(", ")
+            );
+        }
+        images
+    })
+}
+
+/// Exact-match membership test over the built-in list plus the operator's
+/// additions.
+///
+/// Split out from [`validate_postgres_docker_image`] so the composition is
+/// testable without mutating process environment or racing the `OnceLock`.
+fn is_allowed_postgres_docker_image(docker_image: &str, extra: &[String]) -> bool {
+    ALLOWED_POSTGRES_DOCKER_IMAGES.contains(&docker_image)
+        || extra.iter().any(|allowed| allowed == docker_image)
+}
+
+pub(crate) fn validate_postgres_docker_image(docker_image: &str) -> Result<()> {
+    if is_allowed_postgres_docker_image(docker_image, extra_allowed_postgres_docker_images()) {
+        Ok(())
+    } else {
+        // Name the escape hatch. A self-hosted operator hitting this has no
+        // support channel; without this sentence the error is a dead end that
+        // reads as "temps cannot run your image" rather than "temps has not
+        // been told it may".
+        let extra = extra_allowed_postgres_docker_images();
+        Err(anyhow::anyhow!(
+            "PostgreSQL Docker image '{}' is not supported. Allowed images: {}{}. \
+             To allow additional images on this instance, set {} to a comma-separated \
+             list (e.g. {}=postgis/postgis:18-3.5) and restart temps.",
+            docker_image,
+            ALLOWED_POSTGRES_DOCKER_IMAGES.join(", "),
+            if extra.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (plus {} from {})",
+                    extra.join(", "),
+                    EXTRA_POSTGRES_IMAGES_ENV
+                )
+            },
+            EXTRA_POSTGRES_IMAGES_ENV,
+            EXTRA_POSTGRES_IMAGES_ENV
+        ))
+    }
+}
+
 // Schema example functions
 fn example_host() -> &'static str {
     "localhost"
@@ -389,8 +557,13 @@ impl PostgresService {
         let input_config: PostgresInputConfig =
             serde_json::from_value(service_config.parameters)
                 .map_err(|e| anyhow::anyhow!("Failed to parse PostgreSQL configuration: {}", e))?;
-        // Then convert to PostgresConfig which applies additional transformations
-        Ok(PostgresConfig::from(input_config))
+        let postgres_config = PostgresConfig::from(input_config);
+        // Imported-service metadata is client-deserializable and therefore
+        // cannot be used as an authorization signal. Every image must remain
+        // allowlisted because backup/restore helpers may pull and execute it
+        // even when the primary database container already exists.
+        validate_postgres_docker_image(&postgres_config.docker_image)?;
+        Ok(postgres_config)
     }
     fn get_container_name(&self) -> String {
         format!("postgres-{}", self.name)
@@ -861,7 +1034,8 @@ impl PostgresService {
             "printf '%s\\n' {} > {} && chmod 600 {}",
             env_file_lines
                 .iter()
-                .map(|line| format!("'export {}'", line.replace('\'', "'\\''")))
+                .filter_map(|line| shell_export_assignment(line)
+                    .map(|assignment| shell_escape(&assignment)))
                 .collect::<Vec<_>>()
                 .join(" "),
             walg_env_path,
@@ -1071,115 +1245,142 @@ impl PostgresService {
     /// the exact bug we're trying to avoid.
     async fn compute_desired_enable_archiving(&self) -> bool {
         let container_name = self.get_container_name();
-        let volume_name = format!("{}_data", container_name);
-        self.walg_env_exists_on_volume(&volume_name).await
+        self.walg_env_exists_in_container(&container_name).await
     }
 
-    /// Returns true iff `/var/lib/postgresql/walg.env` exists on the named
-    /// Docker volume. Runs a one-shot `busybox` container with the volume
-    /// mounted read-only. Any error (image pull, exec failure) returns
-    /// false — we err on the side of not enabling archiving.
-    async fn walg_env_exists_on_volume(&self, volume_name: &str) -> bool {
-        use bollard::query_parameters::{
-            CreateContainerOptions, CreateImageOptions, RemoveContainerOptions,
-            StartContainerOptions, WaitContainerOptions,
-        };
+    /// Returns true iff `/var/lib/postgresql/walg.env` exists on this
+    /// service's data volume. Docker's archive API can read a stopped
+    /// container's mounted volume without pulling or executing a mutable
+    /// helper image against database data.
+    ///
+    /// The live container is probed directly when it exists. Otherwise
+    /// (fresh create, `force_recreate`, an externally-removed container, or
+    /// node failover) there's no container to probe, but the volume can
+    /// still hold a `walg.env` from a prior life -- probed via a throwaway
+    /// container that only mounts the named volume and is never started
+    /// (see `walg_env_exists_on_volume`).
+    async fn walg_env_exists_in_container(&self, container_name: &str) -> bool {
+        let live = self
+            .docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .map(|containers| !containers.is_empty())
+            .unwrap_or(false);
+
+        if live {
+            return self.download_walg_env(container_name).await;
+        }
+
+        let volume_name = format!("{container_name}_data");
+        let probe_image = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|c| c.docker_image.clone())
+            .unwrap_or_else(|| {
+                let (image, tag) = self.get_default_docker_image();
+                format!("{image}:{tag}")
+            });
+        self.walg_env_exists_on_volume(&volume_name, &probe_image)
+            .await
+    }
+
+    /// Reads `/var/lib/postgresql/walg.env` from a live container's
+    /// filesystem via Docker's archive API.
+    async fn download_walg_env(&self, container_name: &str) -> bool {
+        use bollard::query_parameters::DownloadFromContainerOptions;
         use futures::StreamExt;
 
-        // Pull busybox; cheap (~700 KB) and cached after first use.
-        let mut pull_stream = self.docker.create_image(
-            Some(CreateImageOptions {
-                from_image: Some("busybox".to_string()),
-                tag: Some("latest".to_string()),
-                ..Default::default()
+        let mut archive_stream = self.docker.download_from_container(
+            container_name,
+            Some(DownloadFromContainerOptions {
+                path: "/var/lib/postgresql/walg.env".to_string(),
             }),
-            None,
-            None,
         );
-        while let Some(result) = pull_stream.next().await {
-            if result.is_err() {
-                // Best-effort; treat unavailability as "no archiving".
-                return false;
+        let mut saw_archive_data = false;
+        while let Some(chunk) = archive_stream.next().await {
+            match chunk {
+                Ok(bytes) if !bytes.is_empty() => saw_archive_data = true,
+                Ok(_) => {}
+                Err(_) => return false,
             }
         }
 
-        let probe_name = format!("temps-walg-probe-{}", uuid::Uuid::new_v4());
-        let host_config = bollard::models::HostConfig {
-            mounts: Some(vec![bollard::models::Mount {
-                target: Some("/var/lib/postgresql".to_string()),
-                source: Some(volume_name.to_string()),
-                typ: Some(bollard::models::MountTypeEnum::VOLUME),
-                read_only: Some(true),
-                ..Default::default()
-            }]),
-            auto_remove: Some(false),
-            ..Default::default()
-        };
+        saw_archive_data
+    }
+
+    /// Probes `volume_name` for `walg.env` by creating a never-started
+    /// container that mounts it at `/var/lib/postgresql`, reading it via
+    /// the same archive API `download_walg_env` uses, then removing the
+    /// probe container. The probe container is never started, so
+    /// `probe_image`'s content never executes -- it only needs to exist so
+    /// Docker can materialize the container's filesystem for the archive
+    /// read. `probe_image` is the service's own already-vetted image
+    /// (already local from the container that used to run against this
+    /// volume), so this never pulls or trusts anything new.
+    async fn walg_env_exists_on_volume(&self, volume_name: &str, probe_image: &str) -> bool {
+        let probe_name = format!("{volume_name}-walg-probe");
+
+        let _ = self
+            .docker
+            .remove_container(
+                &probe_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
 
         let create_result = self
             .docker
             .create_container(
-                Some(CreateContainerOptions {
-                    name: Some(probe_name.clone()),
-                    ..Default::default()
-                }),
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&probe_name)
+                        .build(),
+                ),
                 bollard::models::ContainerCreateBody {
-                    image: Some("busybox:latest".to_string()),
-                    cmd: Some(vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        "test -f /var/lib/postgresql/walg.env".to_string(),
-                    ]),
-                    host_config: Some(host_config),
+                    image: Some(probe_image.to_string()),
+                    host_config: Some(bollard::models::HostConfig {
+                        mounts: Some(vec![bollard::models::Mount {
+                            target: Some("/var/lib/postgresql".to_string()),
+                            source: Some(volume_name.to_string()),
+                            typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             )
             .await;
 
-        if create_result.is_err() {
-            return false;
-        }
-
-        // Best effort cleanup: always try to remove the probe container.
-        let cleanup = |name: String| async move {
-            let _ = self
-                .docker
-                .remove_container(
-                    &name,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+        let exists = match create_result {
+            Ok(_) => self.download_walg_env(&probe_name).await,
+            Err(_) => false,
         };
 
-        if self
+        let _ = self
             .docker
-            .start_container(&probe_name, None::<StartContainerOptions>)
-            .await
-            .is_err()
-        {
-            cleanup(probe_name).await;
-            return false;
-        }
+            .remove_container(
+                &probe_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
 
-        let mut wait_stream = self
-            .docker
-            .wait_container(&probe_name, None::<WaitContainerOptions>);
-
-        let mut exit_code: Option<i64> = None;
-        while let Some(item) = wait_stream.next().await {
-            if let Ok(resp) = item {
-                exit_code = Some(resp.status_code);
-                break;
-            }
-        }
-
-        cleanup(probe_name).await;
-
-        // `test -f` exits 0 when the file is present.
-        matches!(exit_code, Some(0))
+        exists
     }
 
     /// Returns true when the running container's CMD specifies an
@@ -3882,6 +4083,15 @@ impl ExternalService for PostgresService {
                 source_config.port = port.to_string();
             }
             if let Some(image) = overrides.get("docker_image").and_then(|v| v.as_str()) {
+                // Restoring into a new service clones the source's
+                // POSTGRES_PASSWORD into the new container's environment, so an
+                // unchecked override starts an attacker-named image holding the
+                // source database's root credentials. The instance's existing
+                // image allowlist is the right gate — it is exact `image:tag`
+                // equality and an operator can extend it, so this adds no new
+                // policy, it just stops the restore path from being the one
+                // place that skips it.
+                validate_postgres_docker_image(image)?;
                 source_config.docker_image = image.to_string();
             }
             if let Some(db) = overrides.get("database").and_then(|v| v.as_str()) {
@@ -4153,6 +4363,226 @@ mod tests {
     }
 
     #[test]
+    fn sourced_walg_values_are_shell_quoted() {
+        assert_eq!(
+            shell_export_assignment("WALG_S3_PREFIX=s3://bucket/ok;touch${IFS}/tmp/pwn;#"),
+            Some("export WALG_S3_PREFIX='s3://bucket/ok;touch${IFS}/tmp/pwn;#'".to_string())
+        );
+        assert_eq!(
+            shell_export_assignment("AWS_SECRET_ACCESS_KEY=abc'def"),
+            Some("export AWS_SECRET_ACCESS_KEY='abc'\\''def'".to_string())
+        );
+        assert!(shell_export_assignment("BAD-KEY=value").is_none());
+    }
+
+    #[test]
+    fn managed_postgres_images_are_allowlisted() {
+        assert!(validate_postgres_docker_image("gotempsh/postgres-walg:18-bookworm").is_ok());
+        assert!(validate_postgres_docker_image("attacker/postgres:latest").is_err());
+    }
+
+    /// Every image the console offers as an upgrade target in
+    /// `web/src/components/storage/UpgradeServiceDialog.tsx` must validate.
+    /// These were offered in the UI while being rejected by the allowlist, so
+    /// picking one was a guaranteed failure.
+    #[test]
+    fn console_upgrade_target_images_are_allowlisted() {
+        for image in [
+            "gotempsh/postgres-walg:18-bookworm",
+            "gotempsh/postgres-walg:17-bookworm",
+            "gotempsh/pgvector-walg:pg18",
+            "gotempsh/pgvector-walg:pg17",
+            "gotempsh/timescaledb-walg:pg18",
+        ] {
+            assert!(
+                validate_postgres_docker_image(image).is_ok(),
+                "console offers {image} as an upgrade target but it is not allowlisted"
+            );
+        }
+    }
+
+    /// `services.rs` classifies any discovered container whose image contains
+    /// `pgvector` as a Postgres service, so importing one must not produce a
+    /// service that can never be initialized.
+    #[test]
+    fn discovered_pgvector_images_are_allowlisted() {
+        for image in [
+            "pgvector/pgvector:pg15",
+            "pgvector/pgvector:pg16",
+            "pgvector/pgvector:pg17",
+            "pgvector/pgvector:pg18",
+        ] {
+            assert!(
+                validate_postgres_docker_image(image).is_ok(),
+                "container discovery imports {image} as Postgres but it is not allowlisted"
+            );
+        }
+    }
+
+    /// The allowlist stays exact-match: a listed image must not make an
+    /// arbitrary image sharing its repository or tag prefix acceptable.
+    #[test]
+    fn allowlist_does_not_match_by_prefix_or_repository() {
+        for image in [
+            "pgvector/pgvector:latest",
+            "pgvector/pgvector",
+            "attacker/pgvector:pg18",
+            "gotempsh/pgvector-walg:pg18-evil",
+            "timescale/timescaledb-ha:pg18-attacker",
+        ] {
+            assert!(
+                validate_postgres_docker_image(image).is_err(),
+                "{image} must not be accepted by the exact-match allowlist"
+            );
+        }
+    }
+
+    /// pgvector needs no preload library, but the WAL-G TimescaleDB variant is
+    /// still a TimescaleDB image and must keep `timescaledb` preloaded —
+    /// dropping it silently disables hypertable background workers.
+    #[test]
+    fn shared_preload_libraries_cover_new_allowlisted_images() {
+        assert_eq!(
+            PostgresService::shared_preload_libraries_for_image("pgvector/pgvector:pg18"),
+            "pg_stat_statements"
+        );
+        assert_eq!(
+            PostgresService::shared_preload_libraries_for_image("gotempsh/pgvector-walg:pg18"),
+            "pg_stat_statements"
+        );
+        assert_eq!(
+            PostgresService::shared_preload_libraries_for_image("gotempsh/timescaledb-walg:pg18"),
+            "timescaledb,pg_stat_statements"
+        );
+    }
+
+    #[test]
+    fn extra_images_env_is_split_trimmed_and_compacted() {
+        let (images, suspicious) = parse_extra_allowed_images(
+            "  postgis/postgis:18-3.5 ,,registry.internal:5000/team/pg:18 , ",
+        );
+        assert_eq!(
+            images,
+            vec![
+                "postgis/postgis:18-3.5".to_string(),
+                "registry.internal:5000/team/pg:18".to_string(),
+            ]
+        );
+        // A registry port is not a tag separator, but both entries here are
+        // properly tagged, so neither should be flagged.
+        assert!(suspicious.is_empty(), "unexpected warnings: {suspicious:?}");
+    }
+
+    #[test]
+    fn extra_images_env_empty_or_blank_yields_nothing() {
+        assert_eq!(parse_extra_allowed_images("").0, Vec::<String>::new());
+        assert_eq!(
+            parse_extra_allowed_images("  , ,, ").0,
+            Vec::<String>::new()
+        );
+    }
+
+    /// An entry with no tag can never match, since comparison is exact. It is
+    /// still accepted verbatim, but the operator is warned rather than left to
+    /// wonder why their variable did nothing.
+    #[test]
+    fn extra_images_env_flags_entries_without_tag_or_digest() {
+        let (images, suspicious) =
+            parse_extra_allowed_images("postgis/postgis,registry.internal:5000/team/pg");
+        assert_eq!(images.len(), 2);
+        assert_eq!(
+            suspicious,
+            vec![
+                "postgis/postgis".to_string(),
+                // ':5000' is a registry port, not a tag -- must still be flagged.
+                "registry.internal:5000/team/pg".to_string(),
+            ]
+        );
+
+        let (_, ok) = parse_extra_allowed_images(
+            "postgis/postgis:18-3.5,gotempsh/postgres-walg@sha256:abc123",
+        );
+        assert!(
+            ok.is_empty(),
+            "tagged/digested entries must not warn: {ok:?}"
+        );
+    }
+
+    /// End-to-end over the parse + membership composition: a value the operator
+    /// puts in the env var makes an otherwise-rejected image acceptable, and
+    /// only that exact image.
+    #[test]
+    fn extra_images_env_admits_exactly_the_operator_listed_image() {
+        let (extra, _) = parse_extra_allowed_images("postgis/postgis:18-3.5");
+
+        assert!(
+            !is_allowed_postgres_docker_image("postgis/postgis:18-3.5", &[]),
+            "image must be rejected without the operator override"
+        );
+        assert!(
+            is_allowed_postgres_docker_image("postgis/postgis:18-3.5", &extra),
+            "operator-listed image must be accepted"
+        );
+
+        // Still exact-match: the override admits one image, not a repository.
+        for near_miss in [
+            "postgis/postgis:latest",
+            "postgis/postgis",
+            "postgis/postgis:18-3.5-evil",
+            "attacker/postgis:18-3.5",
+        ] {
+            assert!(
+                !is_allowed_postgres_docker_image(near_miss, &extra),
+                "{near_miss} must not be admitted by an exact-match override"
+            );
+        }
+    }
+
+    /// The operator knob extends the allowlist; it must never be able to shrink
+    /// it, or a typo would strand every existing Postgres service.
+    #[test]
+    fn extra_images_env_cannot_remove_builtin_images() {
+        // Built-ins are checked before the env list is even consulted.
+        for image in ALLOWED_POSTGRES_DOCKER_IMAGES {
+            assert!(
+                validate_postgres_docker_image(image).is_ok(),
+                "{image} must stay allowed regardless of {EXTRA_POSTGRES_IMAGES_ENV}"
+            );
+        }
+    }
+
+    /// The rejection message must name the env var -- a self-hosted operator
+    /// has no support channel, so a bare "not supported" is a dead end.
+    #[test]
+    fn rejection_message_points_at_the_operator_override() {
+        // Deliberately an image no operator would ever allowlist, so this test
+        // cannot flip if TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES happens to be set
+        // in the environment running the suite.
+        let err = validate_postgres_docker_image("temps-test/never-allowlisted:0")
+            .expect_err("unlisted image must be rejected")
+            .to_string();
+        assert!(
+            err.contains(EXTRA_POSTGRES_IMAGES_ENV),
+            "rejection message must mention {EXTRA_POSTGRES_IMAGES_ENV}, got: {err}"
+        );
+    }
+
+    /// PGDATA is derived from the image tag, so every allowlisted image must
+    /// yield a parseable major version — otherwise the container is created
+    /// with a broken data directory path.
+    #[test]
+    fn every_allowlisted_image_yields_a_pgdata_path() {
+        for image in ALLOWED_POSTGRES_DOCKER_IMAGES {
+            let version = PostgresService::extract_postgres_version(image)
+                .unwrap_or_else(|e| panic!("no version for allowlisted image {image}: {e}"));
+            assert!(
+                (15..=18).contains(&version),
+                "unexpected major version {version} for {image}"
+            );
+        }
+    }
+
+    #[test]
     fn test_postgres_input_config_default_values() {
         let config = PostgresInputConfig {
             host: default_host(),
@@ -4327,6 +4757,89 @@ mod tests {
 
         // Cleanup
         let _ = service.cleanup().await;
+    }
+
+    /// Regression test: `compute_desired_enable_archiving()` must find a
+    /// pre-existing `walg.env` on the data volume even when there is no
+    /// live container to probe directly. Without the volume-probe fallback,
+    /// `start()`'s `need_create` path (force_recreate, node failover, or an
+    /// externally-removed container) would silently bake `archive_mode=off`
+    /// into the recreated container even though WAL-G was already
+    /// configured on the volume.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_walg_env_probed_from_volume_when_container_missing() {
+        use std::net::TcpListener;
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("failed to bind for port allocation")
+            .local_addr()
+            .expect("failed to read local addr")
+            .port();
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("test-walg-volume-probe".to_string(), docker.clone());
+
+        let config = ServiceConfig {
+            name: "test-walg-volume-probe".to_string(),
+            service_type: super::ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": port.to_string(),
+                "database": "testdb",
+                "username": "testuser",
+                "password": "testpass123",
+                "max_connections": 100,
+                "ssl_mode": "disable",
+                "docker_image": "gotempsh/postgres-walg:18-bookworm"
+            }),
+        };
+
+        service.init(config).await.expect("init should succeed");
+        let container_name = service.get_container_name();
+
+        // No walg.env written yet -- archiving must read as not desired.
+        assert!(
+            !service.compute_desired_enable_archiving().await,
+            "fresh service should not have archiving enabled"
+        );
+
+        service
+            .write_walg_env_file(&container_name, &["AWS_ACCESS_KEY_ID=test".to_string()])
+            .await
+            .expect("failed to write walg.env");
+
+        // Sanity check: the live container reports archiving desired.
+        assert!(
+            service.compute_desired_enable_archiving().await,
+            "live container should report walg.env as present"
+        );
+
+        // Remove the container but keep the volume, simulating
+        // force_recreate / node failover / an externally-removed container.
+        docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("failed to remove container");
+
+        assert!(
+            service.compute_desired_enable_archiving().await,
+            "archiving must still read as desired from the volume once the container is gone"
+        );
+
+        // Cleanup: volume (container is already gone).
+        let _ = docker
+            .remove_volume(
+                &format!("{container_name}_data"),
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
     }
 
     /// Regression test for a bug where `init()` persisted the *requested*

@@ -140,6 +140,22 @@ impl AlertEvaluator {
             warn!("AlertEvaluator: failed to seed default proxy rules on startup: {e}");
         }
 
+        // Seed the default OTel rate-limit alarm rule for the control-plane
+        // node. Idempotent via the same ON CONFLICT DO NOTHING as the proxy
+        // rules above.
+        if let Err(e) = seed_default_otel_rate_limit_rules(self.db.as_ref()).await {
+            warn!("AlertEvaluator: failed to seed default OTel rate-limit rules on startup: {e}");
+        }
+
+        // Seed default file-descriptor/socket exhaustion rules for the
+        // control-plane node. `NodeMetricsSampler` (spawned alongside the
+        // proxy metrics sampler) writes `node.*` points for node 0 whenever
+        // the proxy runs, so these defaults always have data to evaluate.
+        // Idempotent via the same ON CONFLICT DO NOTHING as the proxy rules.
+        if let Err(e) = seed_default_node_resource_rules(self.db.as_ref()).await {
+            warn!("AlertEvaluator: failed to seed default node resource rules on startup: {e}");
+        }
+
         loop {
             if let Err(e) = self.run_cycle().await {
                 error!("AlertEvaluator: cycle failed: {e}");
@@ -659,7 +675,21 @@ fn compare(lhs: f64, rhs: f64, comparator: &str) -> bool {
 }
 
 /// Map a rule to the most appropriate [`AlarmType`].
+///
+/// OTel ingest rejection metrics (`otel.rate_limited_requests` /
+/// `otel.quota_exceeded_requests`) are written on the control-plane node
+/// (`SourceKind::Node`, node_id 0).  Because they share the same source
+/// kind/ID as other node metrics, we discriminate by metric name so the fired
+/// alarm carries the purpose-built `OtelRateLimited` type instead of the
+/// generic `NodeMetricThreshold`.
 fn alarm_type_for_rule(rule: &monitoring_alert_rules::Model) -> AlarmType {
+    // OTel ingest rejection metrics keyed on the control-plane node.
+    if matches!(
+        rule.metric_name.as_str(),
+        "otel.rate_limited_requests" | "otel.quota_exceeded_requests"
+    ) {
+        return AlarmType::OtelRateLimited;
+    }
     match (rule.service_id, rule.deployment_id, rule.node_id) {
         (Some(_), None, None) => AlarmType::DatabaseMetricThreshold,
         (None, Some(_), None) => AlarmType::DeploymentMetricThreshold,
@@ -797,33 +827,97 @@ const CONTROL_PLANE_NODE_ID: i32 = 0;
 /// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
 /// `(node_id, metric_name)` so concurrent calls are safe.
 pub async fn seed_default_proxy_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
-    let seeds = proxy_default_seeds();
+    seed_node_rules(db, "seed_default_proxy_rules", &proxy_default_seeds()).await
+}
 
+/// Insert a default alert rule that fires when OTLP ingest requests are being
+/// rate-limited at a sustained high rate, indicating either a noisy client or
+/// a quota that is too low for legitimate traffic.
+///
+/// The metric `otel.rate_limited_requests` is written to the metrics store by
+/// the OTel plugin's background pipeline-stats sampler (SourceKind::Node,
+/// node_id 0) every 60 seconds as a delta counter. The default threshold of
+/// 10 rejected requests per 60-second sample fires a warning if any project
+/// is being consistently turned away. Operators can tighten or loosen this by
+/// editing the seeded rule.
+///
+/// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
+/// `(node_id, metric_name)` so concurrent calls are safe.
+pub async fn seed_default_otel_rate_limit_rules(
+    db: &DatabaseConnection,
+) -> Result<(), MetricsError> {
+    seed_node_rules(
+        db,
+        "seed_default_otel_rate_limit_rules",
+        &otel_rate_limit_default_seeds(),
+    )
+    .await
+}
+
+/// Insert default file-descriptor/socket exhaustion alert rules for the
+/// control-plane node if none exist.
+///
+/// `NodeMetricsSampler` writes `node.fd_percent` (system-wide) and
+/// `node.process_fd_percent` (this process's own `RLIMIT_NOFILE`) points for
+/// node 0 on every install where the proxy runs, so the defaults always have
+/// data to evaluate. Uses the same `(node_id, metric_name)` unique index as
+/// [`seed_default_proxy_rules`], so this is safe to call alongside it.
+pub async fn seed_default_node_resource_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
+    seed_node_rules(
+        db,
+        "seed_default_node_resource_rules",
+        &node_fd_default_seeds(),
+    )
+    .await
+}
+
+/// Shared `INSERT … ON CONFLICT DO NOTHING` loop for control-plane-node
+/// -scoped default rules, keyed on the `(node_id, metric_name)` unique index.
+///
+/// Every `RuleSeed` field is a `&'static str`/literal defined in this file
+/// (see `proxy_default_seeds`/`node_fd_default_seeds`), never user input, but
+/// this still binds via `$1..$7` rather than `format!()`-ing the SQL — the
+/// project's raw-query rule (CLAUDE.md: `$1`, `$2` parameter binding) applies
+/// regardless of whether today's callers happen to be safe, since a future
+/// caller passing an operator-supplied `String` would silently inherit
+/// whatever escaping this function does or doesn't do.
+///
+/// `caller` names the public wrapper that supplied `seeds` and is emitted as
+/// the log line's prefix, so operators grepping for `seed_default_proxy_rules`
+/// (the pre-refactor log text) still match.
+async fn seed_node_rules(
+    db: &DatabaseConnection,
+    caller: &str,
+    seeds: &[RuleSeed],
+) -> Result<(), MetricsError> {
     use sea_orm::ConnectionTrait;
-    for seed in &seeds {
-        let sql = format!(
+    for seed in seeds {
+        let statement = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO monitoring_alert_rules \
              (service_id, deployment_id, node_id, name, metric_name, threshold, comparator, severity, for_duration_secs, enabled) \
-             VALUES (NULL, NULL, {node_id}, '{name}', '{metric_name}', {threshold}, '{comparator}', '{severity}', {for_duration}, true) \
+             VALUES (NULL, NULL, $1, $2, $3, $4, $5, $6, $7, true) \
              ON CONFLICT (node_id, metric_name) WHERE node_id IS NOT NULL DO NOTHING",
-            node_id = CONTROL_PLANE_NODE_ID,
-            name = seed.name.replace('\'', "''"),
-            metric_name = seed.metric_name.replace('\'', "''"),
-            threshold = seed.threshold,
-            comparator = seed.comparator.replace('\'', "''"),
-            severity = seed.severity.replace('\'', "''"),
-            for_duration = seed.for_duration_secs,
+            [
+                CONTROL_PLANE_NODE_ID.into(),
+                seed.name.into(),
+                seed.metric_name.into(),
+                seed.threshold.into(),
+                seed.comparator.into(),
+                seed.severity.into(),
+                seed.for_duration_secs.into(),
+            ],
         );
 
-        db.execute(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-        ))
-        .await
-        .map_err(MetricsError::DatabaseError)?;
+        db.execute(statement)
+            .await
+            .map_err(MetricsError::DatabaseError)?;
     }
 
-    info!("seed_default_proxy_rules: seeded default proxy alert rules (ON CONFLICT DO NOTHING)");
+    info!(
+        rule_count = seeds.len(),
+        "{caller}: seeded default control-plane node alert rules (ON CONFLICT DO NOTHING)"
+    );
 
     Ok(())
 }
@@ -1121,13 +1215,74 @@ fn proxy_default_seeds() -> Vec<RuleSeed> {
     ]
 }
 
+/// Default alert rules over the node resource metrics written by
+/// `NodeMetricsSampler` (`node.*`, `SourceKind::Node`, control-plane node).
+/// Covers file descriptor / socket exhaustion specifically: both the
+/// system-wide ceiling (`fs.file-max`, which every open socket counts
+/// against) and this process's own `RLIMIT_NOFILE`, since either one alone
+/// can be near 100% while the other has headroom — a container typically
+/// reports an effectively infinite `fs.file-max` while its process nofile
+/// limit is the real, much lower ceiling.
+///
+/// One rule per metric, not a warning/critical pair: the
+/// `uidx_monitoring_alert_rules_node_metric` unique index is on
+/// `(node_id, metric_name)` alone (no `severity` column), so a second seed
+/// on the same metric name is a silent `ON CONFLICT DO NOTHING` no-op — a
+/// warning+critical pair here would leave the critical row never inserted.
+/// (The same trap already exists in `postgres_default_seeds`'s
+/// warning/critical pairs on `pg.connections_active`, which is scoped to
+/// `service_id` instead and pre-dates this file; out of scope to fix here.)
+/// `severity: "critical"` reflects that "near exhaustion" already means the
+/// machine may start refusing new connections.
+fn node_fd_default_seeds() -> Vec<RuleSeed> {
+    vec![
+        RuleSeed {
+            name: "System file descriptors near exhaustion",
+            metric_name: "node.fd_percent",
+            threshold: 90.0,
+            comparator: ">",
+            severity: "critical",
+            for_duration_secs: 30,
+        },
+        RuleSeed {
+            name: "Process file descriptors near limit",
+            metric_name: "node.process_fd_percent",
+            threshold: 90.0,
+            comparator: ">",
+            severity: "critical",
+            for_duration_secs: 30,
+        },
+    ]
+}
+
+/// Default alert rule for OTel ingest rate limiting.
+///
+/// Fires when the 60-second pipeline-stats sample reports more than 10 ingest
+/// requests rejected by the rate limiter.  A single noisy batch that briefly
+/// tips over the limit will not fire (it fires only when the threshold is
+/// crossed on a single sample, not sustained over time — `for_duration_secs`
+/// is 0 for immediacy).  Operators who want sustained-breach semantics can
+/// edit the rule and set `for_duration_secs`.
+fn otel_rate_limit_default_seeds() -> Vec<RuleSeed> {
+    vec![RuleSeed {
+        name: "OTel ingest rate-limited",
+        metric_name: "otel.rate_limited_requests",
+        threshold: 10.0,
+        comparator: ">",
+        severity: "warning",
+        for_duration_secs: 0,
+    }]
+}
+
 fn container_default_seeds() -> Vec<RuleSeed> {
     vec![
         RuleSeed {
-            // Threshold against utilisation relative to the container's CPU
-            // limit (100% == limit saturated), NOT raw `container.cpu_percent`
-            // where 100% == one core — a 2-core container would otherwise fire
-            // at ~95% raw (≈47% of its limit), nowhere near saturation.
+            // Threshold against utilisation relative to the CPU the container
+            // may use — its limit when set, else the host's core count (100% ==
+            // saturated) — NOT raw `container.cpu_percent` where 100% == one
+            // core. A 2-core container would otherwise fire at ~95% raw (≈47%
+            // of its limit), and an uncapped container would fire the moment it
+            // used a single core of a many-core host.
             name: "High CPU usage",
             metric_name: "container.cpu_utilization_percent",
             threshold: 90.0,
@@ -1298,6 +1453,36 @@ mod tests {
     }
 
     #[test]
+    fn alarm_type_otel_rate_limited_rule_is_otel_rate_limited() {
+        // Both rejection metrics the OTel pipeline-stats sampler writes must
+        // route to the same alarm type, regardless of (service/deployment/node)
+        // scope on the rule row — the metric name is authoritative here, not
+        // the scope columns matched by the fallback below it.
+        for metric in ["otel.rate_limited_requests", "otel.quota_exceeded_requests"] {
+            let mut rule = make_rule_with_node(None, None, Some(0));
+            rule.metric_name = metric.to_string();
+            assert_eq!(
+                alarm_type_for_rule(&rule).as_str(),
+                "otel_rate_limited",
+                "metric {metric} did not map to OtelRateLimited"
+            );
+        }
+    }
+
+    #[test]
+    fn otel_rate_limit_default_seeds_target_the_sampler_written_metric() {
+        let seeds = otel_rate_limit_default_seeds();
+        assert_eq!(seeds.len(), 1);
+        let seed = &seeds[0];
+        // Must match the metric name the plugin.rs pipeline-stats sampler
+        // actually writes, and the one `alarm_type_for_rule` recognizes above
+        // — a drift between these three would seed a rule that never fires.
+        assert_eq!(seed.metric_name, "otel.rate_limited_requests");
+        assert_eq!(seed.comparator, ">");
+        assert!(seed.threshold > 0.0);
+    }
+
+    #[test]
     fn proxy_default_seeds_are_rate_based_and_unique_per_metric() {
         let seeds = proxy_default_seeds();
         assert_eq!(seeds.len(), 2);
@@ -1310,6 +1495,32 @@ mod tests {
                 "seed {} is not rate/latency based",
                 s.metric_name
             );
+            // One rule per metric: (node_id, metric_name) is a unique index,
+            // a duplicate metric would be a silent ON CONFLICT no-op.
+            assert!(
+                names.insert(s.metric_name),
+                "duplicate seed metric {}",
+                s.metric_name
+            );
+        }
+    }
+
+    #[test]
+    fn node_fd_default_seeds_are_unique_per_metric_and_critical() {
+        let seeds = node_fd_default_seeds();
+        assert_eq!(seeds.len(), 2);
+        let mut names = std::collections::HashSet::new();
+        for s in &seeds {
+            assert!(s.metric_name.starts_with("node."));
+            assert!(
+                s.metric_name.contains("fd_percent"),
+                "seed {} is not an fd/socket exhaustion metric",
+                s.metric_name
+            );
+            // "Near exhaustion" is inherently a critical condition — see the
+            // doc comment on node_fd_default_seeds for why this can't be a
+            // warning+critical pair under the current unique index.
+            assert_eq!(s.severity, "critical");
             // One rule per metric: (node_id, metric_name) is a unique index,
             // a duplicate metric would be a silent ON CONFLICT no-op.
             assert!(

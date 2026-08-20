@@ -695,6 +695,31 @@ pub struct DockerSandboxProvider {
     config: DockerSandboxConfig,
 }
 
+/// PATH used for every command Temps runs as root inside a sandbox.
+///
+/// System directories only, and deliberately not the image's own PATH: the
+/// sandbox user can write to `~/.local/bin` and `~/.bun/bin`, which the image
+/// puts *ahead* of `/usr/bin`. Inheriting that would let sandbox-controlled
+/// binaries run as container root during ownership normalisation or recovery.
+pub(crate) const ROOT_EXEC_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Whether a Docker exec `user` string runs the command as root, and therefore
+/// must have [`ROOT_EXEC_PATH`] forced on it.
+///
+/// Docker accepts `user`, `uid`, `user:group` and `uid:gid`, so the check is on
+/// the user half only — `0:0`, `0`, `root` and `root:root` are all root, while
+/// `root-ish` names like `rootless` are not. Errs toward *not* claiming root
+/// for an unrecognised value: PATH pinning is applied on top of a privilege the
+/// caller already asked for, so a false negative leaves behaviour unchanged
+/// while a false positive would silently rewrite a non-root exec's environment.
+fn exec_runs_as_root(user: Option<&str>) -> bool {
+    matches!(
+        user.map(|u| u.split(':').next().unwrap_or(u).trim()),
+        Some("0") | Some("root")
+    )
+}
+
 impl DockerSandboxProvider {
     pub fn new(docker: Arc<Docker>, config: DockerSandboxConfig) -> Self {
         Self { docker, config }
@@ -721,6 +746,15 @@ impl DockerSandboxProvider {
                 bollard::models::ExecConfig {
                     user: Some("0:0".to_string()),
                     cmd: Some(cmd),
+                    // Root maintenance commands (`chown`, `su`, `cp`, `curl`,
+                    // `sh`) are resolved through PATH. The sandbox image puts
+                    // user-writable directories — `{home}/.local/bin`,
+                    // `{home}/.bun/bin` — ahead of the system ones, so a
+                    // sandbox user could drop their own `chown` there and have
+                    // it executed as container root on the next recovery or
+                    // restart. Pin PATH to system directories only; nothing
+                    // Temps runs as root lives in the sandbox user's tree.
+                    env: Some(vec![format!("PATH={ROOT_EXEC_PATH}")]),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     ..Default::default()
@@ -1375,7 +1409,29 @@ impl DockerSandboxProvider {
         on_event: Option<OnStreamEventCallback>,
         user: Option<String>,
     ) -> Result<SandboxExecResult, AgentError> {
-        let env_vars: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        // Pin PATH for every root exec, not just the one in `run_root_exec`.
+        //
+        // The image's own PATH puts sandbox-user-writable directories
+        // (`{home}/.local/bin`, `{home}/.bun/bin`) ahead of the system ones, so
+        // a root exec that inherits it will run a binary the sandbox user
+        // planted. `exec_as_root` reaches this function with the caller's env
+        // map, which never sets PATH — the credential-shred step before a
+        // snapshot is one such caller, and there a planted `sh`/`shred`/`rm`
+        // would run as container root *before* the credential file is wiped.
+        //
+        // Enforced here rather than at each call site so a new root-exec caller
+        // cannot reintroduce the hole by forgetting, and the caller's own PATH
+        // is overridden rather than merged: this is a privilege boundary, not a
+        // default.
+        let is_root_exec = exec_runs_as_root(user.as_deref());
+        let mut env_vars: Vec<String> = env
+            .iter()
+            .filter(|(k, _)| !(is_root_exec && k.eq_ignore_ascii_case("PATH")))
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        if is_root_exec {
+            env_vars.push(format!("PATH={ROOT_EXEC_PATH}"));
+        }
 
         let exec_config = bollard::models::ExecConfig {
             attach_stdout: Some(true),
@@ -2943,23 +2999,23 @@ impl SandboxProvider for DockerSandboxProvider {
             });
         }
 
-        // ── Tag the committed image with the public-facing name ───────────────
-        // Derive an image_ref from the label if provided, otherwise use digest.
-        let image_label = label
-            .as_deref()
-            .map(|l| {
-                // Sanitize: lowercase, replace non-alphanumeric with '-'
-                l.chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() {
-                            c.to_ascii_lowercase()
-                        } else {
-                            '-'
-                        }
-                    })
-                    .collect::<String>()
-            })
-            .unwrap_or_else(|| digest_hex[..16].to_string());
+        // ── Tag the committed image with the canonical, content-addressed name ─
+        // The tag is derived from the tarball digest, never from the caller's
+        // human label.
+        //
+        // Docker tags are mutable and shared per daemon. When the tag was
+        // `temps-snapshot/<sanitized-label>:latest`, any tenant taking a
+        // snapshot labelled "backup" re-pointed `temps-snapshot/backup:latest`
+        // at their own image — and restore only checks whether that tag
+        // *exists*, so the next tenant to restore their own "backup" snapshot
+        // would silently run the attacker's image, with their env vars and
+        // their git credentials.
+        //
+        // A content-addressed tag removes the collision entirely: two tenants
+        // can only share a tag by having byte-identical images, in which case
+        // sharing it is correct and is what the existing
+        // `content_digest`-based dedup already does.
+        let image_label = digest_hex.clone();
         let image_ref = format!("temps-snapshot/{}:latest", image_label);
 
         // Re-tag the committed image to the canonical snapshot name.
@@ -3496,6 +3552,81 @@ mod tests {
     fn docker_image_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Root maintenance commands resolve `chown`/`su`/`cp` through PATH. The
+    /// sandbox image places user-writable bin directories ahead of the system
+    /// ones, so the PATH handed to a root exec must contain system
+    /// directories only — otherwise a sandbox user can drop `~/.local/bin/chown`
+    /// and have it executed as container root on the next recovery.
+    #[test]
+    fn root_exec_path_excludes_sandbox_writable_directories() {
+        let entries: Vec<&str> = ROOT_EXEC_PATH.split(':').collect();
+        assert!(!entries.is_empty());
+
+        for entry in &entries {
+            assert!(
+                entry.starts_with('/'),
+                "PATH entry {entry:?} must be absolute"
+            );
+            assert!(
+                !entry.contains(SANDBOX_HOME),
+                "PATH entry {entry:?} is inside the sandbox user's home"
+            );
+            assert!(
+                !entry.contains('~') && !entry.is_empty() && *entry != ".",
+                "PATH entry {entry:?} must not be relative or home-relative"
+            );
+        }
+
+        // The specific directories the sandbox image prepends and the user can write.
+        for writable in [
+            "/home/temps/.local/bin",
+            "/home/temps/.bun/bin",
+            "/home/temps/.opencode/bin",
+        ] {
+            assert!(
+                !entries.contains(&writable),
+                "{writable} must not be on the root exec PATH"
+            );
+        }
+
+        // And it must still be able to find the commands we actually run.
+        assert!(entries.contains(&"/usr/bin"));
+        assert!(entries.contains(&"/bin"));
+        assert!(entries.contains(&"/usr/sbin"));
+        assert!(entries.contains(&"/sbin"));
+    }
+
+    /// Regression: the PATH pin has to cover *every* root exec, not just
+    /// `run_root_exec`.
+    ///
+    /// `exec_as_root` reaches `exec_inner` with the caller's env map, which
+    /// never sets PATH — so before this, it inherited the image PATH with the
+    /// sandbox user's writable bin directories in front. Its live caller is the
+    /// pre-snapshot credential shred, where a planted `sh`/`shred`/`rm` runs as
+    /// container root *before* the credential file is wiped.
+    #[test]
+    fn every_root_exec_form_is_recognised_for_path_pinning() {
+        // What `exec_as_root` actually passes, plus the other spellings Docker
+        // accepts for the same privilege.
+        for root in ["0:0", "0", "root", "root:root", "0:1000", "root:staff"] {
+            assert!(
+                exec_runs_as_root(Some(root)),
+                "{root:?} runs as root and must get the pinned PATH"
+            );
+        }
+
+        // Non-root execs keep their own environment untouched.
+        for non_root in ["1000:1000", "temps", "temps:temps", "rootless", "10"] {
+            assert!(
+                !exec_runs_as_root(Some(non_root)),
+                "{non_root:?} is not root and must not be rewritten"
+            );
+        }
+
+        // `None` means "the image's own user", which is the sandbox user.
+        assert!(!exec_runs_as_root(None));
     }
 
     #[test]

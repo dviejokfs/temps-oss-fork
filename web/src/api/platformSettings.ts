@@ -217,6 +217,10 @@ export async function updatePlatformSettings(
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
     edge_target: updated.edge_target,
+    // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
+    // omitting this would silently reset the console's HTTPS policy back to
+    // "automatic" whenever any other settings page is saved.
+    console_force_https: updated.console_force_https,
     screenshots: updated.screenshots,
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,
@@ -227,6 +231,11 @@ export async function updatePlatformSettings(
     build_limits: updated.build_limits,
     ai_chat_limits: updated.ai_chat_limits,
     request_timeouts: updated.request_timeouts,
+    // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
+    // omitting these would silently reset the operator's connection cap and
+    // override ceilings to "unlimited" on every unrelated settings save.
+    connection_limits: updated.connection_limits,
+    tenant_resource_ceilings: updated.tenant_resource_ceilings,
     monitoring: updated.monitoring,
     observability_compression: updated.observability_compression,
     observability_retention: updated.observability_retention,

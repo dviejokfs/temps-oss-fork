@@ -185,6 +185,17 @@ fn format_permission_answer(decision: &PermissionDecision) -> String {
 /// Tool name for the write-proposal (confirm-gated) tool.
 const TEMPS_WRITE_TOOL_NAME: &str = "temps_write";
 
+/// Client-visible tool results must not contain raw data fetched through
+/// server-side credentials. The model keeps the full result for reasoning;
+/// the live stream and persisted transcript receive only this safe status.
+fn public_tool_result(name: &str, result: &str) -> String {
+    if name == TEMPS_WRITE_TOOL_NAME {
+        return redact_json_string(result);
+    }
+
+    "Tool completed; detailed result is withheld from the chat transcript.".to_string()
+}
+
 /// System prompt for the one-shot title generator. Kept terse so even small
 /// local models return a clean label rather than a sentence.
 const TITLE_SYSTEM_PROMPT: &str = "You write a short title for a chat based on the user's first message. \
@@ -1220,7 +1231,10 @@ impl ConversationService {
         let mut tools: Vec<ChatTool> = Vec::new();
         if chat_capable {
             if let Some(p) = &provider {
-                tools.extend(p.tools(conv.project_id, &conv.context_id).await);
+                tools.extend(
+                    p.tools_with_auth(conv.project_id, &conv.context_id, auth)
+                        .await,
+                );
             }
             // ADR-024: merge the generic API meta-tools from the sentinel provider.
             // This is done for EVERY conversation context so the model can always
@@ -1228,7 +1242,7 @@ impl ConversationService {
             if let Some(api_tools_provider) = self.providers.get("__api_tools__") {
                 tools.extend(
                     api_tools_provider
-                        .tools(conv.project_id, &conv.context_id)
+                        .tools_with_auth(conv.project_id, &conv.context_id, auth)
                         .await,
                 );
             }
@@ -1238,12 +1252,18 @@ impl ConversationService {
             // (project, alert, deployment, error-group, …) so the model can always
             // explore the source tree when a repo is connected, regardless of which
             // context_type seeded the chat.
-            if let Some(repo_tools_provider) = self.providers.get("__repo_tools__") {
-                tools.extend(
-                    repo_tools_provider
-                        .tools(conv.project_id, &conv.context_id)
-                        .await,
-                );
+            // ...but only for callers who hold the Git repository read
+            // permission: the tools read private source with the project's
+            // stored provider token, so `ProjectsRead` alone must not unlock
+            // them (see `caller_may_use_repo_tools`).
+            if caller_may_use_repo_tools(auth) {
+                if let Some(repo_tools_provider) = self.providers.get("__repo_tools__") {
+                    tools.extend(
+                        repo_tools_provider
+                            .tools_with_auth(conv.project_id, &conv.context_id, auth)
+                            .await,
+                    );
+                }
             }
 
             // Write tool: offered only when write support is wired AND the project
@@ -1836,7 +1856,7 @@ impl ConversationService {
                         .await
                     };
                     let display_arguments = redact_json_string(&tc.arguments);
-                    let display_result = redact_json_string(&result);
+                    let display_result = public_tool_result(&tc.name, &result);
                     // Surface the result right after — live.
                     if tx
                         .send(Ok(ChatStreamEvent::ToolResult {
@@ -2297,6 +2317,21 @@ struct ToolExecutionState {
     seen_calls: std::collections::HashMap<String, String>,
 }
 
+/// Whether this caller may drive the Git repo-exploration tools
+/// (`read_repo_file`, `list_repo_dir`, `list_repo_branches`, `list_repo_tags`).
+///
+/// These tools read the project's private source through the stored Git
+/// provider connection token, and their raw output is streamed straight back
+/// to the caller in a `tool_result` SSE frame before anything could filter it.
+/// The chat endpoints themselves only require `ProjectsRead`/`ProjectsWrite`,
+/// so without this check a caller with no Git permission at all could ask the
+/// model to read `.env`, credentials or any source file and get the bytes
+/// verbatim — the repository permission would be enforced on
+/// `/git/repositories/*` and nowhere else.
+fn caller_may_use_repo_tools(auth: &AuthContext) -> bool {
+    auth.has_permission(&temps_auth::permissions::Permission::GitRepositoriesRead)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_conversation_tool(
     call: &ToolCall,
@@ -2343,9 +2378,18 @@ async fn dispatch_conversation_tool(
         call.name.as_str(),
         "read_repo_file" | "list_repo_dir" | "list_repo_branches" | "list_repo_tags"
     ) {
-        if let Some(provider) = repo_tools {
+        if !caller_may_use_repo_tools(auth) {
+            // Defence in depth: the tool was never offered to the model for
+            // this caller, but a model can still emit the call name from
+            // memory, and dispatch must not honour it.
+            format!(
+                "Tool '{}' is not available: it requires the {} permission.",
+                call.name,
+                temps_auth::permissions::Permission::GitRepositoriesRead
+            )
+        } else if let Some(provider) = repo_tools {
             provider
-                .execute_tool(project_id, context_id, &call.name, &call.arguments)
+                .execute_tool_with_auth(project_id, context_id, &call.name, &call.arguments, auth)
                 .await
         } else {
             format!(
@@ -3136,6 +3180,49 @@ mod tests {
         AuthContext::new_session(user, temps_auth::permissions::Role::Admin)
     }
 
+    fn auth_with_role(role: temps_auth::permissions::Role) -> AuthContext {
+        let mut auth = test_auth();
+        auth.effective_role = role;
+        auth
+    }
+
+    /// The chat endpoints require only `ProjectsRead`/`ProjectsWrite`, but the
+    /// repo tools read private source through the project's stored Git token
+    /// and stream it back verbatim in a `tool_result` frame. Without the
+    /// repository permission the caller must not reach them.
+    #[test]
+    fn repo_tools_require_the_git_repository_read_permission() {
+        use temps_auth::permissions::{Permission, Role};
+
+        // Admin holds everything, including GitRepositoriesRead.
+        assert!(caller_may_use_repo_tools(&auth_with_role(Role::Admin)));
+
+        // A role that can read projects but not repositories must be refused —
+        // otherwise `projects:read` silently grants source-code access.
+        let reader = auth_with_role(Role::Reader);
+        if !reader.has_permission(&Permission::GitRepositoriesRead) {
+            assert!(
+                !caller_may_use_repo_tools(&reader),
+                "a caller without {} must not reach the repo tools",
+                Permission::GitRepositoriesRead
+            );
+        }
+
+        // A custom API key scoped to projects only is the concrete case from
+        // the report: ProjectsWrite, no Git permission at all.
+        let mut custom = auth_with_role(Role::Custom);
+        custom.custom_permissions = Some(vec![Permission::ProjectsRead, Permission::ProjectsWrite]);
+        assert!(!caller_may_use_repo_tools(&custom));
+
+        // The same key with the repository permission added is allowed.
+        custom.custom_permissions = Some(vec![
+            Permission::ProjectsRead,
+            Permission::ProjectsWrite,
+            Permission::GitRepositoriesRead,
+        ]);
+        assert!(caller_may_use_repo_tools(&custom));
+    }
+
     fn assistant_msg_model() -> ai_messages::Model {
         ai_messages::Model {
             id: 1,
@@ -3226,6 +3313,18 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn public_tool_results_hide_privileged_read_data() {
+        assert_eq!(
+            public_tool_result("read_repo_file", "SECRET_TOKEN=abc123"),
+            "Tool completed; detailed result is withheld from the chat transcript."
+        );
+        assert_eq!(
+            public_tool_result(TEMPS_WRITE_TOOL_NAME, r#"{"status":"proposed"}"#),
+            r#"{"status":"proposed"}"#
+        );
+    }
+
     // (a) a round calls a tool, the next round answers in prose -> the tool is
     // executed (ToolCall -> ToolResult, live) and the prose streams as the answer.
     #[tokio::test]
@@ -3270,7 +3369,9 @@ mod tests {
                 ChatStreamEvent::ToolResult {
                     id: "c1".to_string(),
                     name: "echo".to_string(),
-                    content: "tool result".to_string(),
+                    content:
+                        "Tool completed; detailed result is withheld from the chat transcript."
+                            .to_string(),
                 },
                 ChatStreamEvent::Token("final ".to_string()),
                 ChatStreamEvent::Token("answer".to_string()),
@@ -3834,6 +3935,7 @@ mod tests {
         let now = Utc::now();
         temps_entities::projects::Model {
             id,
+            image_retention_hours: None,
             name: name.to_string(),
             repo_name: "r".to_string(),
             repo_owner: "o".to_string(),
@@ -3855,6 +3957,7 @@ mod tests {
             attack_mode: false,
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
+            allow_alternate_sources: None,
             ai_debug_chat_enabled: toggle,
             ai_write_actions_enabled: false,
             error_source_context_enabled: false,

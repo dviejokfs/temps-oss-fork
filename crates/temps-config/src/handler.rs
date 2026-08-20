@@ -2,7 +2,7 @@ use crate::disk_status::DiskSpaceCheckResult;
 use crate::{ConfigService, EffectiveTelemetryPolicies};
 use axum::{
     extract::{Extension, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
@@ -16,10 +16,10 @@ use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AppSettings, AuditContext,
     AuditLogger, AuditOperation, BuildLimitsSettings, CloudSettings, ClusterDnsSettings,
-    ContainerLogSettings, DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind,
-    MonitoringSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
-    PublicHostnameStrategy, RateLimitSettings, RequestMetadata, RequestTimeoutSettings,
-    ScreenshotSettings, SecurityHeadersSettings,
+    ContainerLogSettings, DiskSpaceAlertSettings, ImageRetentionSettings, LetsEncryptSettings,
+    MetricsStoreKind, MonitoringSettings, ObservabilityCompressionSettings,
+    ObservabilityRetentionSettings, PublicHostnameStrategy, RateLimitSettings, RequestMetadata,
+    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -126,6 +126,10 @@ pub struct AppSettingsResponse {
     pub preview_domain: String,
     /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
     pub edge_target: Option<String>,
+    /// Whether plain-HTTP requests to the console host are redirected to HTTPS.
+    /// `None` inherits the per-host certificate heuristic; `Some(b)` is an
+    /// explicit operator override. No sensitive content.
+    pub console_force_https: Option<bool>,
     /// Port the main Pingora proxy listens on (parsed from `--address`), the
     /// same value `ConfigService::proxy_port()` feeds into
     /// `compute_deployment_url`/`compute_environment_url` when `external_url`
@@ -226,11 +230,18 @@ pub struct AppSettingsResponse {
     /// Per-upstream concurrent-connection cap applied by the proxy to
     /// customer app traffic. No sensitive content. See issue #646.
     pub connection_limits: temps_core::ConnectionLimitSettings,
+    /// Upper bounds a project/environment override may not exceed. No
+    /// sensitive content — this is operator policy the settings UI edits
+    /// directly. Unenforced by default.
+    pub tenant_resource_ceilings: temps_core::TenantResourceCeilings,
     /// Whether admins may apply a release from the console. This is the
     /// database-backed toggle only — a server started with
     /// `--disable-self-update` refuses regardless of what this says, which
     /// `GET /settings/update` reports as the authoritative answer.
     pub self_update: temps_core::SelfUpdateSettings,
+    /// Deployment-image retention policy. No sensitive content, passed through
+    /// as-is so the settings UI can show and edit the system-wide default.
+    pub image_retention: ImageRetentionSettings,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -353,6 +364,7 @@ impl From<AppSettings> for AppSettingsResponse {
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
             edge_target: settings.edge_target,
+            console_force_https: settings.console_force_https,
             // Overridden by the handler via `with_proxy_port` — this struct
             // has no access to `ConfigService` here, only the DB-backed
             // `AppSettings` row. 8080 mirrors `ConfigService::proxy_port()`'s
@@ -455,7 +467,9 @@ impl From<AppSettings> for AppSettingsResponse {
             ai_chat_limits: settings.ai_chat_limits,
             request_timeouts: settings.request_timeouts,
             connection_limits: settings.connection_limits,
+            tenant_resource_ceilings: settings.tenant_resource_ceilings,
             self_update,
+            image_retention: settings.image_retention,
         }
     }
 }
@@ -545,6 +559,7 @@ impl AppSettingsResponse {
         start_update,
         check_for_update,
         get_disk_status,
+        get_feature_maturity,
         update_settings,
         generate_join_token,
         revoke_join_token,
@@ -594,6 +609,8 @@ impl AppSettingsResponse {
         temps_core::SelfUpdateStatus,
         temps_core::ReleaseCheckResult,
         temps_core::SupervisorKind,
+        temps_core::feature_maturity::FeatureMaturity,
+        temps_core::feature_maturity::Maturity,
     )),
     info(
         title = "Settings API",
@@ -615,6 +632,7 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
         )
         .route("/settings/update/check", post(check_for_update))
         .route("/settings/disk-status", get(get_disk_status))
+        .route("/v1/platform/feature-maturity", get(get_feature_maturity))
         .route("/settings/join-token/generate", post(generate_join_token))
         .route("/settings/join-token", delete(revoke_join_token))
         .route("/settings/join-token/status", get(get_join_token_status))
@@ -627,6 +645,28 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
             delete(revoke_enrollment_token),
         )
         .route("/settings/routes/refresh", post(refresh_route_table))
+}
+
+/// Return the build-time compatibility promise for every user-facing feature.
+#[utoipa::path(
+    tag = "Platform",
+    get,
+    path = "/v1/platform/feature-maturity",
+    responses(
+        (status = 200, description = "Feature maturity registry for this build", body = [temps_core::feature_maturity::FeatureMaturity]),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_feature_maturity(
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, PlatformInfoRead);
+    Ok((
+        [(header::CACHE_CONTROL, "private, max-age=3600")],
+        Json(temps_core::feature_maturity::FEATURE_MATURITY),
+    ))
 }
 
 // ── Node enrollment tokens (ADR-020 WS-1.1) ──────────────────────────────────

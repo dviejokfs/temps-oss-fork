@@ -29,6 +29,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
     ),
     components(schemas(
         ErrorGroupResponse,
+        ErrorGroupDeploymentResponse,
         ErrorEventResponse,
         ErrorGroupStatsResponse,
         ErrorDashboardStatsResponse,
@@ -110,6 +111,10 @@ pub struct ListErrorEventsQuery {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateErrorGroupRequest {
     pub status: String,
+    /// Assignee (email by convention).
+    /// - `Some("user@example.com")` — sets the assignee.
+    /// - `Some("")` (empty string) — clears the current assignment (sets to null).
+    /// - `null` / field omitted — leaves the existing value unchanged.
     pub assigned_to: Option<String>,
 }
 
@@ -121,6 +126,10 @@ pub struct ErrorTimeSeriesQuery {
     #[serde(default = "default_interval")]
     #[schema(example = "1h")]
     pub bucket: String,
+    /// Filter chart data to a specific environment.
+    /// Always AND-combined with project_id — an environment from a different project
+    /// returns zero-filled buckets rather than cross-project data.
+    pub environment_id: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -175,6 +184,23 @@ pub struct ErrorGroupResponse {
     pub visitor_id: Option<i32>,
     pub created_at: String,
     pub updated_at: String,
+    /// Count of error events within the requested time window.
+    /// Present only when `start_date` and `end_date` were supplied on the list request.
+    pub events_in_range: Option<i64>,
+    /// Count of distinct affected visitors/users within the requested time window.
+    /// Present only when `start_date` and `end_date` were supplied on the list request.
+    pub affected_users: Option<i64>,
+    /// The deployment this group's `deployment_id` points to, resolved to its commit info.
+    /// `None` when the group has no linked deployment.
+    pub deployment: Option<ErrorGroupDeploymentResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ErrorGroupDeploymentResponse {
+    pub id: i32,
+    pub commit_hash: Option<String>,
+    pub commit_message: Option<String>,
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -247,6 +273,14 @@ impl From<ErrorGroupDomain> for ErrorGroupResponse {
             visitor_id: group.visitor_id,
             created_at: group.created_at.to_rfc3339(),
             updated_at: group.updated_at.to_rfc3339(),
+            events_in_range: group.events_in_range,
+            affected_users: group.affected_users,
+            deployment: group.deployment.map(|d| ErrorGroupDeploymentResponse {
+                id: d.id,
+                commit_hash: d.commit_hash,
+                commit_message: d.commit_message,
+                branch: d.branch,
+            }),
         }
     }
 }
@@ -389,6 +423,8 @@ pub async fn list_error_groups(
             query.environment_id,
             query.sort_by,
             Some(query.sort_order),
+            query.start_date.map(|d| d.into()),
+            query.end_date.map(|d| d.into()),
         )
         .await?;
 
@@ -677,6 +713,7 @@ pub async fn get_error_time_series(
             query.start_time.into(),
             query.end_time.into(),
             &query.bucket,
+            query.environment_id,
         )
         .await?;
 

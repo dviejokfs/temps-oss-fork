@@ -23,6 +23,26 @@ use tracing::{debug, error, info, warn};
 const MARIADB_INTERNAL_PORT: &str = "3306";
 const MARIADB_IMAGE_REFERENCE_EXAMPLE: &str =
     "ghcr.io/gotempsh/mariadb-walg@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// Repositories a restore-time `docker_image` override may name, in addition
+/// to whatever repository the source service already runs. See
+/// [`crate::externalsvc::restore_image`] for why the override is constrained.
+const RESTORE_IMAGE_REPOSITORIES: &[&str] = &["mariadb", "mysql"];
+
+/// Environment variable an operator sets to allow additional MariaDB
+/// repositories as a restore-time `docker_image` override (comma-separated).
+/// Additive — it can only widen [`RESTORE_IMAGE_REPOSITORIES`], never shrink
+/// it, so a typo cannot block a restore that worked before. Read once; restart
+/// temps to change. Mirrors `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES`.
+pub(crate) const EXTRA_RESTORE_IMAGES_ENV: &str = "TEMPS_ALLOWED_MARIADB_DOCKER_IMAGES";
+
+/// Operator additions to [`RESTORE_IMAGE_REPOSITORIES`], read once per process.
+fn extra_restore_image_repositories() -> &'static [String] {
+    static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    EXTRA.get_or_init(|| {
+        crate::externalsvc::restore_image::extra_allowed_repositories(EXTRA_RESTORE_IMAGES_ENV)
+    })
+}
 const MIN_PASSWORD_LENGTH: usize = 8;
 const MARIADB_BACKUP_EXEC_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 const MARIADB_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -304,6 +324,35 @@ impl std::io::Read for BoundedChunkReader {
             }
         }
     }
+}
+
+/// Longest binlog filename we will accept. Real names are ~20 characters
+/// (`mysql-bin.000007`); this only exists to bound the S3 key we build.
+#[cfg(test)]
+const MAX_BINLOG_FILE_NAME_LEN: usize = 255;
+
+/// Whether `file` is a safe bare binlog filename.
+///
+/// The manifest is read back from S3, and PITR restore can be pointed at a
+/// caller-supplied backup location / S3 source. Restore writes each entry to
+/// `dest_dir.join(file)` on the control-plane host, and `PathBuf::join` does
+/// not confine an absolute path or `..` to the base directory — so a manifest
+/// entry like `/tmp/payload` or `../../etc/cron.d/x` would be an arbitrary
+/// host file write. The same string is also interpolated into an S3 object
+/// key, where `..` would read outside the service's own binlog prefix.
+///
+/// Accept only what MariaDB actually produces: a single path component of
+/// `[A-Za-z0-9._-]`, never `.` or `..`.
+#[cfg(test)]
+pub(crate) fn is_safe_binlog_file_name(file: &str) -> bool {
+    if file.is_empty() || file.len() > MAX_BINLOG_FILE_NAME_LEN {
+        return false;
+    }
+    if file == "." || file == ".." {
+        return false;
+    }
+    file.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Input configuration for creating a MariaDB service.
@@ -1791,7 +1840,14 @@ impl MariaDbService {
 
         let manifest = serde_json::from_slice::<BinlogManifest>(&bytes)
             .map_err(|error| anyhow::anyhow!("Failed to parse binlog manifest: {}", error))?;
-        Self::validate_binlog_manifest(&manifest)?;
+        Self::validate_binlog_manifest(&manifest).map_err(|error| {
+            anyhow::anyhow!(
+                "Binlog manifest s3://{}/{} is unsafe or invalid: {}. Refusing to use this manifest.",
+                bucket,
+                key,
+                error
+            )
+        })?;
         Ok(manifest)
     }
 
@@ -2913,6 +2969,17 @@ impl MariaDbService {
     ) -> Result<Vec<(std::path::PathBuf, String)>> {
         Self::validate_binlog_filename(start_file)?;
 
+        // Propagate, don't default. `read_binlog_manifest` rejects a manifest
+        // outright when any entry has an unsafe filename, precisely so a
+        // partial replay cannot report success — and `unwrap_or_default()` here
+        // turned that rejection into a replay of *zero* segments that still
+        // completes green. A PITR restore that silently drops every
+        // transaction after the base backup is the worst possible outcome:
+        // the operator believes they recovered to the requested point.
+        //
+        // A genuinely absent manifest is a different case and is still handled
+        // below — `read_binlog_manifest` returns an empty list for that rather
+        // than an error.
         let manifest = self
             .read_binlog_manifest(s3_client, bucket, prefix, source_name)
             .await?;
@@ -3181,7 +3248,22 @@ impl MariaDbService {
                 config.port = port.to_string();
             }
             if let Some(image) = overrides.get("docker_image").and_then(|v| v.as_str()) {
-                config.docker_image = image.to_string();
+                // Restoring into a new service clones the source's
+                // MARIADB_ROOT_PASSWORD into the new container's environment,
+                // so an unchecked override starts an attacker-named image
+                // holding the source database's root credentials. Unlike
+                // PostgreSQL there is no exact-image allowlist for MariaDB, so
+                // the constraint is repository-level: the source's own
+                // repository, or a known MariaDB one. Only the tag is free.
+                let validated =
+                    crate::externalsvc::restore_image::restore_image_override_with_extra(
+                        &config.docker_image,
+                        image,
+                        RESTORE_IMAGE_REPOSITORIES,
+                        extra_restore_image_repositories(),
+                        Some(EXTRA_RESTORE_IMAGES_ENV),
+                    )?;
+                config.docker_image = validated.to_string();
             }
             if let Some(db) = overrides.get("database").and_then(|v| v.as_str()) {
                 config.database = db.to_string();
@@ -4283,6 +4365,79 @@ impl ExternalService for MariaDbService {
 mod tests {
     use super::*;
     use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
+
+    /// A manifest read back from S3 drives both an S3 key and a host file
+    /// write during PITR restore, so anything that is not a bare filename has
+    /// to be rejected — `PathBuf::join` would otherwise escape `dest_dir`.
+    #[test]
+    fn rejects_unsafe_binlog_file_names() {
+        for good in [
+            "mysql-bin.000001",
+            "mariadb-bin.999999",
+            "binlog_file-2.000042",
+            "a",
+        ] {
+            assert!(is_safe_binlog_file_name(good), "{good} should be accepted");
+        }
+
+        for bad in [
+            "",
+            ".",
+            "..",
+            "/tmp/payload",
+            "../../etc/cron.d/x",
+            "sub/dir/mysql-bin.000001",
+            "mysql-bin.000001/../../escape",
+            "back\\slash",
+            "space here",
+            "semi;colon",
+            "new\nline",
+            "nul\0byte",
+        ] {
+            assert!(!is_safe_binlog_file_name(bad), "{bad:?} should be rejected");
+        }
+
+        // Length bound.
+        assert!(!is_safe_binlog_file_name(
+            &"a".repeat(MAX_BINLOG_FILE_NAME_LEN + 1)
+        ));
+        assert!(is_safe_binlog_file_name(
+            &"a".repeat(MAX_BINLOG_FILE_NAME_LEN)
+        ));
+    }
+
+    /// The traversal name must not survive into an S3 key either: the key is
+    /// built by string interpolation, so `..` there reads outside the
+    /// service's own binlog prefix.
+    #[test]
+    fn unsafe_binlog_name_would_escape_both_host_path_and_s3_key() {
+        let dest = std::path::Path::new("/var/tmp/temps-pitr");
+
+        // Absolute entry: `join` discards the base entirely. Demonstrating
+        // exactly that is the point of this test, hence the allow.
+        let absolute = "/tmp/payload";
+        assert!(!is_safe_binlog_file_name(absolute));
+        #[allow(clippy::join_absolute_paths)]
+        let escaped = dest.join(absolute);
+        assert_eq!(escaped, std::path::Path::new("/tmp/payload"));
+
+        // Relative traversal: `join` keeps the `..` components verbatim, so the
+        // path the OS finally resolves is outside `dest`.
+        let traversal = "../../../../tmp/payload";
+        assert!(!is_safe_binlog_file_name(traversal));
+        let joined = dest.join(traversal);
+        assert!(
+            joined
+                .components()
+                .any(|c| c == std::path::Component::ParentDir),
+            "join() leaves '..' unresolved, so the name must be validated: {}",
+            joined.display()
+        );
+
+        // The same string is interpolated into an S3 key, where `..` reads
+        // outside the service's own binlog prefix.
+        assert!(MariaDbService::binlog_object_key("p", "svc", traversal).is_err());
+    }
 
     #[test]
     fn normalizes_database_names() {

@@ -1250,22 +1250,22 @@ impl WorkflowExecutionService {
                     let target_nodes = environment
                         .deployment_config
                         .as_ref()
-                        .and_then(|c| c.target_nodes.clone())
+                        .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
                         .or_else(|| {
                             project
                                 .deployment_config
                                 .as_ref()
-                                .and_then(|c| c.target_nodes.clone())
+                                .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
                         });
                     let target_labels = environment
                         .deployment_config
                         .as_ref()
-                        .and_then(|c| c.target_labels.clone())
+                        .and_then(|c| c.configured_target_labels().cloned())
                         .or_else(|| {
                             project
                                 .deployment_config
                                 .as_ref()
-                                .and_then(|c| c.target_labels.clone())
+                                .and_then(|c| c.configured_target_labels().cloned())
                         });
 
                     match scheduler
@@ -1281,6 +1281,9 @@ impl WorkflowExecutionService {
                             builder = builder.target_platforms(platforms);
                         }
                         Ok(_) => {}
+                        Err(crate::services::node_service::NodeError::Validation { message }) => {
+                            return Err(WorkflowExecutionError::InvalidJobConfig(message));
+                        }
                         // Not being able to enumerate nodes must not block a
                         // build: fall back to the native-only build and let the
                         // deploy path's architecture check catch a mismatch.
@@ -1414,24 +1417,24 @@ impl WorkflowExecutionService {
                 let target_nodes = environment
                     .deployment_config
                     .as_ref()
-                    .and_then(|c| c.target_nodes.clone())
+                    .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
                     .or_else(|| {
                         project
                             .deployment_config
                             .as_ref()
-                            .and_then(|c| c.target_nodes.clone())
+                            .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
                     });
 
                 // Resolve target_labels from environment or project config
                 let target_labels = environment
                     .deployment_config
                     .as_ref()
-                    .and_then(|c| c.target_labels.clone())
+                    .and_then(|c| c.configured_target_labels().cloned())
                     .or_else(|| {
                         project
                             .deployment_config
                             .as_ref()
-                            .and_then(|c| c.target_labels.clone())
+                            .and_then(|c| c.configured_target_labels().cloned())
                     });
 
                 // Resolve CPU/memory limits + requests from environment first,
@@ -2172,6 +2175,8 @@ impl WorkflowExecutionService {
                     .and_then(|v| v.as_i64())
                     .map(|id| id as i32);
 
+                let image_registry = PullExternalImageJob::registry_from_image_ref(&image_ref);
+
                 let mut job = PullExternalImageJob::new(
                     db_job.job_id.clone(),
                     image_ref,
@@ -2180,19 +2185,37 @@ impl WorkflowExecutionService {
                 )
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
-                // Pass private registry credentials when configured
+                // Pass private registry credentials only to the configured registry.
                 if let Ok(settings) = self.config_service.get_settings().await {
                     let reg = &settings.docker_registry;
                     if reg.enabled {
-                        if let (Some(username), Some(password)) =
-                            (reg.username.clone(), reg.password.clone())
-                        {
-                            job = job.with_registry_credentials(bollard::auth::DockerCredentials {
-                                username: Some(username),
-                                password: Some(password),
-                                serveraddress: reg.registry_url.clone(),
-                                ..Default::default()
-                            });
+                        if let (Some(username), Some(password), Some(registry_url)) = (
+                            reg.username.clone(),
+                            reg.password.clone(),
+                            reg.registry_url.clone(),
+                        ) {
+                            let configured_registry =
+                                PullExternalImageJob::registry_host_from_url(&registry_url);
+                            if matches!(
+                                (&image_registry, &configured_registry),
+                                (Some(image_registry), Some(configured_registry))
+                                    if image_registry == configured_registry
+                            ) {
+                                job = job.with_registry_credentials(
+                                    bollard::auth::DockerCredentials {
+                                        username: Some(username),
+                                        password: Some(password),
+                                        serveraddress: Some(registry_url),
+                                        ..Default::default()
+                                    },
+                                );
+                            } else {
+                                warn!(
+                                    image_registry = ?image_registry,
+                                    configured_registry = ?configured_registry,
+                                    "Skipping Docker registry credentials because the image registry does not match"
+                                );
+                            }
                         }
                     }
                 }
@@ -2353,6 +2376,25 @@ impl WorkflowExecutionService {
                     "build_args",
                 )
                 .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
+                // Absent on jobs queued before compose secret support; the
+                // reader returns an empty map, so those deploy unchanged.
+                let secrets = crate::services::sensitive_envelope::read_sealed(
+                    config,
+                    self.encryption_service.get(),
+                    "secrets",
+                )
+                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
+                // Plain JSON, not sealed: service names are not sensitive.
+                // Absent on jobs queued before scoping shipped, which reads as
+                // "every secret goes to every service" — the prior behaviour.
+                let secret_compose_services: std::collections::HashMap<String, Vec<String>> =
+                    config
+                        .get("secret_compose_services")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?
+                        .unwrap_or_default();
 
                 // Projects created before directory normalization was applied on
                 // every write path can hold "" or "/" here. Both are rejected by
@@ -2429,6 +2471,8 @@ impl WorkflowExecutionService {
                     .public_ports(public_ports)
                     .download_job_id(download_job_id)
                     .environment_vars(env_vars)
+                    .secrets(secrets)
+                    .secret_compose_services(secret_compose_services)
                     .build_args(build_args)
                     .log_id(Some(db_job.log_id.clone()))
                     .log_service(self.log_service.clone())

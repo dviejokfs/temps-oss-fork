@@ -19,11 +19,25 @@ pub enum EmailError {
     #[error("Domain not verified: {0}")]
     DomainNotVerified(String),
 
+    #[error("Email domain '{domain}' is not authorized for project {project_id}")]
+    DomainNotAuthorized { domain: String, project_id: i32 },
+
+    #[error("Project not found: {0}")]
+    ProjectNotFound(i32),
+
+    #[error("Idempotency key '{key}' was reused with a different email payload")]
+    IdempotencyConflict { key: String },
+
     #[error("Invalid provider type: {0}")]
     InvalidProviderType(String),
 
     #[error("Provider error: {0}")]
     ProviderError(String),
+
+    /// The provider request may have been accepted, but no definitive response
+    /// reached Temps. Retrying this outcome could deliver a duplicate email.
+    #[error("Provider delivery outcome is unknown: {0}")]
+    ProviderDeliveryUnknown(String),
 
     #[error("Encryption error: {0}")]
     Encryption(String),

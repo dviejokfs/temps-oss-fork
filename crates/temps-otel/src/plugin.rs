@@ -15,6 +15,7 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::anomaly::detector::{AnomalyDetector, AnomalyDetectorConfig};
 use crate::handlers;
 use crate::handlers::dashboard_handler;
+use crate::handlers::facet_handler;
 use crate::handlers::ingest_handler;
 use crate::handlers::metric_alert_handler;
 use crate::handlers::query_handler;
@@ -22,6 +23,7 @@ use crate::ingest::auth::OtelAuthService;
 use crate::ingest::rate_limit::RateLimiter;
 use crate::relay::OtelRelay;
 use crate::services::cross_project::{prune_stale_hints, CrossProjectTraceService, TraceHintMsg};
+use crate::services::facet_service::FacetService;
 use crate::services::health_service::HealthComputeService;
 use crate::services::OtelService;
 use crate::storage::clickhouse::{ClickHouseOtelConfig, ClickHouseOtelStorage};
@@ -211,6 +213,10 @@ fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
         query_handler::get_genai_trace,
         query_handler::get_cross_project_trace_siblings,
         query_handler::get_unified_trace,
+        facet_handler::list_facets,
+        facet_handler::create_facet,
+        facet_handler::delete_facet,
+        facet_handler::retry_facet_backfill,
         dashboard_handler::list_dashboards,
         dashboard_handler::create_dashboard,
         dashboard_handler::get_dashboard,
@@ -271,6 +277,11 @@ fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
             crate::services::cross_project::ProjectRef,
             crate::services::cross_project::SiblingRef,
             crate::services::cross_project::TraceProjectRef,
+            facet_handler::CreateFacetRequest,
+            facet_handler::FacetsResponse,
+            crate::services::FacetInfo,
+            crate::services::FacetStatus,
+            crate::services::FacetBackendKind,
             dashboard_handler::CreateDashboardRequest,
             dashboard_handler::UpdateDashboardRequest,
             dashboard_handler::OtelDashboardResponse,
@@ -308,6 +319,7 @@ fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
     tags(
         (name = "OTel Ingest", description = "OTLP/HTTP ingest endpoints (protobuf)"),
         (name = "OTel", description = "Query endpoints for the monitoring UI"),
+        (name = "OTel Facets", description = "Span attribute facet registration (fast-filter slots)"),
         (name = "GenAI", description = "GenAI agent activity tracing endpoints")
     )
 )]
@@ -408,14 +420,27 @@ impl TempsPlugin for OtelPlugin {
             // used for everything — the default, unchanged path.
             let ch_config = read_clickhouse_otel_config_from_env();
 
+            // ── Facet cache ──────────────────────────────────────────────────
+            //
+            // Created before both storage backends so ClickHouse, TimescaleDB
+            // (whichever is the ingest/query fast-path) and FacetService
+            // (create/delete) all share the same Arc. The cache starts empty;
+            // FacetService loads initial data from Postgres below.
+            let facet_cache: crate::services::FacetCache = Arc::new(
+                arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
+            );
+
             // TimescaleDbStorage is always constructed: it is the sole
             // backend when CH is disabled, and the inner delegate when
-            // CH is enabled.
+            // CH is enabled. It also needs the facet cache directly since
+            // it's the default backend and handles its own slot-column
+            // ingest/query when ClickHouse isn't configured.
             let timescale_storage = Arc::new(TimescaleDbStorage::with_config(
                 db.clone(),
                 s3_client,
                 config.retention_days,
                 config.quota_bytes_per_project,
+                Some(facet_cache.clone()),
             ));
 
             let storage: Arc<dyn crate::storage::OtelStorage> = if let Some(ch_cfg) = ch_config {
@@ -435,6 +460,7 @@ impl TempsPlugin for OtelPlugin {
                     ch_cfg.clone(),
                     timescale_storage,
                     retention_slot as Arc<dyn temps_core::RetentionResolver>,
+                    Some(facet_cache.clone()),
                 ));
                 // Run migrations in a background task so plugin init
                 // returns promptly. If migrations fail, the first
@@ -564,6 +590,39 @@ impl TempsPlugin for OtelPlugin {
                 Arc::new(crate::services::MetricAlertService::new(db.clone()));
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
+            // ── Facet service ────────────────────────────────────────────────
+            //
+            // Obtain a ClickHouse client for DDL mutations (backfill/clear).
+            // When CH is not configured, `ch_client_for_facets` is None and
+            // create/delete operations warn and skip the mutation step.
+            let ch_client_for_facets: Option<::clickhouse::Client> = {
+                let ch_cfg = read_clickhouse_otel_config_from_env();
+                ch_cfg.map(|cfg| {
+                    ::clickhouse::Client::default()
+                        .with_url(&cfg.url)
+                        .with_database(&cfg.database)
+                        .with_user(&cfg.user)
+                        .with_password(&cfg.password)
+                })
+            };
+            let facet_service = Arc::new(FacetService::new(
+                db.clone(),
+                ch_client_for_facets,
+                facet_cache.clone(),
+            ));
+            // Load initial facet→slot mapping from Postgres into the shared cache.
+            // Non-fatal: if Postgres is unavailable at startup, the cache stays
+            // empty and facet filtering falls back to JSONExtractString.
+            if let Err(e) = facet_service.refresh_cache().await {
+                warn!(
+                    error = %e,
+                    "Failed to load initial OTel facet cache from Postgres; \
+                     facet-accelerated filtering will not be available until the next successful \
+                     create/delete or server restart"
+                );
+            }
+            context.register_service(facet_service.clone());
+
             // 5. Metric alert evaluator
             //
             // Builds its own AlarmService instance (separate from console.rs's)
@@ -613,6 +672,7 @@ impl TempsPlugin for OtelPlugin {
                 otel_service: otel_service.clone(),
                 metrics_store: Some(metrics_store.clone()),
                 metrics_write_tx: Some(metrics_write_tx),
+                facet_service: facet_service.clone(),
                 dashboard_service: dashboard_service.clone(),
                 metric_alert_service: metric_alert_service.clone(),
                 metric_alert_evaluator: metric_alert_evaluator.clone(),
@@ -651,6 +711,34 @@ impl TempsPlugin for OtelPlugin {
                     if let Err(e) = apply_retention_all(&retention_storage, retention_days).await {
                         error!(error = %e, "OTel retention cleanup failed");
                     }
+                }
+            });
+
+            // 1a2. Facet backfill/clear poller.
+            //
+            // Advances every non-terminal facet (pending/running/deleting) by
+            // one bounded unit of work per tick — see
+            // `FacetService::advance_pending_facets` for why this is a poller
+            // rather than a task spawned from the create/delete HTTP handlers
+            // (a handler-spawned task's progress would be lost on a process
+            // restart; this poller's progress lives entirely in the
+            // `otel_span_facets` row, so a restart just resumes).
+            //
+            // 5s keeps facet creation feeling responsive (an admin pinning an
+            // attribute sees `running` within a few seconds) without adding
+            // meaningful load: each tick is a handful of cheap Postgres/CH
+            // status queries plus at most one bounded batch/mutation per
+            // in-flight facet, and there are at most 20 facets ever (one per
+            // slot).
+            const FACET_POLL_INTERVAL_SECS: u64 = 5;
+            let facet_poller_service = facet_service.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(FACET_POLL_INTERVAL_SECS));
+                interval.tick().await; // discard the immediate first tick
+                loop {
+                    interval.tick().await;
+                    facet_poller_service.advance_pending_facets().await;
                 }
             });
 
@@ -709,6 +797,122 @@ impl TempsPlugin for OtelPlugin {
                         relay_slot.relay(msg).await;
                     }
                     info!("OTel relay consumer stopped (channel closed)");
+                });
+            }
+
+            // 1c-stats. Background sampler: OTel pipeline rejection stats → MetricsStore.
+            //
+            // Reads `otel_service.pipeline_stats()` every 60 seconds, computes
+            // the delta since the previous sample, and writes two counter points
+            // to the unified MetricsStore (SourceKind::Node, node_id 0):
+            //
+            //   otel.rate_limited_requests  — ingest rejections from the rate limiter
+            //   otel.quota_exceeded_requests — ingest rejections from quota enforcement
+            //
+            // Using delta values (not cumulative) matches the proxy metrics sampler
+            // pattern: each store point represents "rejections in the last N seconds"
+            // so the AlertEvaluator threshold (e.g. "> 10") is intuitive to an
+            // operator ("more than 10 rejections this sample window").
+            //
+            // The 60-second interval is independent of `monitoring.scrape_interval_secs`
+            // because the pipeline stats are process-internal counters rather than
+            // externally-scraped ones; re-reading the config each cycle would add an
+            // unnecessary DB round-trip on an ingest-hot path.
+            //
+            // Every cycle writes both points, even when the delta is zero. The
+            // AlertEvaluator's `query_latest` only looks back 15 minutes
+            // (`LATEST_WINDOW`), so if a burst of rejections is followed by
+            // silence, skipping the zero-delta write would leave that burst's
+            // non-zero point as the "latest" value for up to 15 minutes,
+            // keeping the alarm falsely active. Always writing — including
+            // zeros — lets the metric self-resolve on the next cycle, exactly
+            // like the proxy sampler's fixed-size point set does. The storage
+            // cost is two rows per minute regardless of ingest volume.
+            {
+                const OTEL_STATS_SAMPLE_INTERVAL_SECS: u64 = 60;
+                /// Synthetic node ID of the control plane (mirrors proxy metrics sampler).
+                const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+                let stats_otel_service = otel_service.clone();
+                let stats_metrics_store = metrics_store.clone();
+                tokio::spawn(async move {
+                    use chrono::Utc;
+                    use std::collections::HashMap;
+                    use temps_metrics::{MetricKind, MetricPoint, SourceKind};
+
+                    info!(
+                        "OTel pipeline stats sampler started (interval={}s)",
+                        OTEL_STATS_SAMPLE_INTERVAL_SECS
+                    );
+                    let mut interval =
+                        tokio::time::interval(Duration::from_secs(OTEL_STATS_SAMPLE_INTERVAL_SECS));
+                    interval.tick().await; // discard the immediate first tick
+
+                    let mut prev_rate_limited: u64 = 0;
+                    let mut prev_quota_exceeded: u64 = 0;
+
+                    loop {
+                        interval.tick().await;
+                        let snap = stats_otel_service.pipeline_stats();
+
+                        // Compute monotonic deltas; saturating_sub guards against a
+                        // counter reset (process restart resets all atomics to 0).
+                        let delta_rate_limited =
+                            snap.rate_limited_requests.saturating_sub(prev_rate_limited);
+                        let delta_quota_exceeded = snap
+                            .quota_exceeded_requests
+                            .saturating_sub(prev_quota_exceeded);
+
+                        let now = Utc::now();
+                        let points = vec![
+                            MetricPoint {
+                                time: now,
+                                source_kind: SourceKind::Node,
+                                source_id: CONTROL_PLANE_NODE_ID,
+                                name: "otel.rate_limited_requests".to_string(),
+                                value: delta_rate_limited as f64,
+                                kind: MetricKind::Counter,
+                                engine: Some("otel".to_string()),
+                                environment: None,
+                                node_id: Some(CONTROL_PLANE_NODE_ID),
+                                labels: HashMap::new(),
+                            },
+                            MetricPoint {
+                                time: now,
+                                source_kind: SourceKind::Node,
+                                source_id: CONTROL_PLANE_NODE_ID,
+                                name: "otel.quota_exceeded_requests".to_string(),
+                                value: delta_quota_exceeded as f64,
+                                kind: MetricKind::Counter,
+                                engine: Some("otel".to_string()),
+                                environment: None,
+                                node_id: Some(CONTROL_PLANE_NODE_ID),
+                                labels: HashMap::new(),
+                            },
+                        ];
+
+                        // Only advance the checkpoints once the write actually lands.
+                        // Advancing them unconditionally would discard this cycle's
+                        // deltas forever on a transient store failure; leaving them
+                        // in place means the next successful write's delta widens to
+                        // cover the missed cycle too, so no rejection is lost from
+                        // the series.
+                        if let Err(e) = stats_metrics_store.write_batch(points).await {
+                            warn!(
+                                error = %e,
+                                "OTel pipeline stats write failed (non-fatal); \
+                                 checkpoints held back so the next successful write \
+                                 includes this cycle's deltas"
+                            );
+                        } else {
+                            prev_rate_limited = snap.rate_limited_requests;
+                            prev_quota_exceeded = snap.quota_exceeded_requests;
+                            debug!(
+                                delta_rate_limited,
+                                delta_quota_exceeded, "OTel pipeline stats sampled and written"
+                            );
+                        }
+                    }
                 });
             }
 

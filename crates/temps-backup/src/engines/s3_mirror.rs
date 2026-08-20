@@ -162,7 +162,10 @@ impl BackupEngine for S3MirrorEngine {
         );
 
         // ── One-shot mc mirror container ─────────────────────────────────────
-        super::image_pull::ensure_image_pulled_v2(MC_IMAGE, ENGINE_KEY).await?;
+        // This helper receives both source and destination credentials. Refresh
+        // the registry tag before each run so a poisoned local cache entry
+        // cannot execute with those secrets.
+        super::image_pull::force_pull_image_v2(MC_IMAGE, ENGINE_KEY).await?;
 
         let env_vars = vec![
             format!(
@@ -319,5 +322,6 @@ mod tests {
         assert!(MC_IMAGE.contains("minio/mc:RELEASE.2025-08-13T08-35-41Z@"));
         assert!(MC_IMAGE
             .contains("sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"));
+        assert!(MC_IMAGE.contains("@sha256:"));
     }
 }

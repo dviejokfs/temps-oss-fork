@@ -26,9 +26,8 @@ use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
     build_set_cookie_sandbox, check_preview_auth, combine_cookie_header_values,
     encode_preview_cookie_subject, extract_cookie_values, parse_preview_host,
-    preview_cookie_needs_refresh, preview_peer_group_key, verify_argon2, PreviewAuthLimiter,
-    PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
-    PREVIEW_GATEWAY_PEER,
+    preview_cookie_needs_refresh, preview_gateway_peer, preview_peer_group_key, verify_argon2,
+    PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
 };
 use crate::service::cert_host_cache::CertHostCache;
 use crate::service::challenge_service::ChallengeService;
@@ -385,6 +384,12 @@ pub const LOG_STATIC_ASSETS: bool = false;
 /// Encrypt validation can never be redirected out from under the CA.
 pub const ACME_HTTP01_PREFIX: &str = "/.well-known/acme-challenge/";
 
+/// Path prefix for control-plane↔node cluster management (registration,
+/// heartbeat, DNS sync). A worker joining the cluster speaks plaintext HTTP
+/// before any TLS material exists, so these calls must never be answered with
+/// a redirect to a certificate that has not been issued yet.
+pub const INTERNAL_CLUSTER_PREFIX: &str = "/api/internal/";
+
 /// Decide whether a request on the plain-HTTP listener should be answered with
 /// a 301 to the HTTPS URL.
 ///
@@ -400,7 +405,10 @@ pub const ACME_HTTP01_PREFIX: &str = "/.well-known/acme-challenge/";
 ///   redirect to an HTTPS endpoint whose certificate is precisely the one that
 ///   has expired or does not exist yet. This exemption applies even when the
 ///   host has a valid certificate, because renewal happens while the old
-///   certificate is still installed.
+///   certificate is still installed. [`INTERNAL_CLUSTER_PREFIX`] is exempt for
+///   the same reason: a worker registering with the control plane speaks
+///   plaintext HTTP before it holds any TLS material, and those calls land on
+///   the console host — the one an operator is most likely to force to HTTPS.
 /// - `env_force_https` — the per-environment override. `None` inherits
 ///   `host_has_cert`; `Some(b)` wins outright.
 /// - `host_has_cert` — the default heuristic: redirect only hosts that actually
@@ -423,11 +431,223 @@ fn should_redirect_to_https(
         return false;
     }
 
-    if path.starts_with(ACME_HTTP01_PREFIX) {
+    if path.starts_with(ACME_HTTP01_PREFIX) || path.starts_with(INTERNAL_CLUSTER_PREFIX) {
         return false;
     }
 
     env_force_https.unwrap_or_else(host_has_cert)
+}
+
+fn deployment_asset_path_matches(
+    current_deployment_slug: Option<&str>,
+    requested_deployment_slug: &str,
+) -> bool {
+    current_deployment_slug == Some(requested_deployment_slug)
+}
+
+fn inherited_https_policy(production_https: bool, host_has_cert: bool) -> bool {
+    production_https || host_has_cert
+}
+
+/// Whether the "production" HTTPS-by-default assumption (no `external_url`
+/// configured -> treat every host as production) should even be consulted for
+/// this request.
+///
+/// Scoped to resolved project traffic only (`has_environment`): requests whose
+/// `Host` never matched a project domain — the admin/console UI, and internal
+/// cluster-management API calls such as node registration/heartbeat — must
+/// never be redirected off this default. Cluster bootstrap traffic runs over
+/// plaintext HTTP by design, before any TLS material exists to redirect to.
+///
+/// The console deliberately does **not** ride on this default. An `https://`
+/// `external_url` says how users reach the platform, not who terminates the
+/// TLS: with an upstream CDN or reverse proxy in front, Temps sees a plaintext
+/// connection and holds no certificate, so redirecting would bounce the
+/// browser back to the CDN and into an infinite loop. Operators who want the
+/// console forced to HTTPS say so explicitly via
+/// `AppSettings::console_force_https`, which flows in through the same
+/// `force_https` parameter an environment uses.
+fn should_apply_production_https_default(
+    disable_https_redirect: bool,
+    is_tls: bool,
+    path: &str,
+    force_https: Option<bool>,
+    has_environment: bool,
+) -> bool {
+    !disable_https_redirect
+        && !is_tls
+        && !path.starts_with(ACME_HTTP01_PREFIX)
+        && !path.starts_with(INTERNAL_CLUSTER_PREFIX)
+        && force_https.is_none()
+        && has_environment
+}
+
+#[cfg(test)]
+mod deployment_asset_scope_tests {
+    use super::{
+        deployment_asset_path_matches, inherited_https_policy,
+        should_apply_production_https_default, should_redirect_to_https,
+    };
+
+    #[test]
+    fn prefixed_asset_must_name_the_current_deployment() {
+        assert!(deployment_asset_path_matches(Some("deploy-a"), "deploy-a"));
+        assert!(!deployment_asset_path_matches(Some("deploy-a"), "deploy-b"));
+        assert!(!deployment_asset_path_matches(None, "deploy-a"));
+    }
+
+    #[test]
+    fn production_https_cannot_be_bypassed_with_an_unknown_host() {
+        assert!(inherited_https_policy(true, false));
+        assert!(!inherited_https_policy(false, false));
+        assert!(inherited_https_policy(false, true));
+    }
+
+    #[test]
+    fn production_https_default_never_applies_without_a_resolved_environment() {
+        // Unresolved Host (admin/console UI, internal cluster API like node
+        // registration) — must not be redirected even though every other gate
+        // would otherwise allow it.
+        assert!(!should_apply_production_https_default(
+            false,
+            false,
+            "/api/internal/nodes/register",
+            None,
+            false
+        ));
+        // Resolved project traffic with everything else the same — applies.
+        assert!(should_apply_production_https_default(
+            false, false, "/", None, true
+        ));
+    }
+
+    /// Cluster bootstrap speaks plaintext HTTP before any TLS material exists,
+    /// so internal node calls are never redirected — not by the production
+    /// default, and not by an explicit `force_https` either. A worker registers
+    /// against the console host, which is exactly the host an operator is
+    /// likeliest to force to HTTPS.
+    #[test]
+    fn internal_cluster_calls_are_never_redirected() {
+        assert!(!should_apply_production_https_default(
+            false,
+            false,
+            "/api/internal/nodes/1/heartbeat",
+            None,
+            true
+        ));
+        // Even with the override switched on and a certificate present.
+        assert!(!should_redirect_to_https(
+            false,
+            false,
+            "/api/internal/nodes/register",
+            Some(true),
+            || true
+        ));
+    }
+
+    /// The console gets no implicit HTTPS default. Temps cannot distinguish
+    /// "TLS terminated by an upstream CDN" from "plain HTTP" — both arrive as
+    /// a plaintext connection with no local certificate — so redirecting on the
+    /// strength of an `https://` external_url would loop the browser between
+    /// the CDN and Temps forever. Only an explicit operator override redirects.
+    #[test]
+    fn console_https_is_opt_in_not_inferred() {
+        // No override: falls through to the per-host certificate heuristic.
+        // No cert (CDN-fronted, or plain HTTP install) → no redirect.
+        assert!(!should_redirect_to_https(
+            false,
+            false,
+            "/login",
+            None,
+            || false
+        ));
+        // Cert provisioned through Temps → redirect, as it always has.
+        assert!(should_redirect_to_https(
+            false,
+            false,
+            "/login",
+            None,
+            || true
+        ));
+        // Explicit opt-in redirects even with no local certificate.
+        assert!(should_redirect_to_https(
+            false,
+            false,
+            "/login",
+            Some(true),
+            || false
+        ));
+        // Explicit opt-out wins over a provisioned certificate.
+        assert!(!should_redirect_to_https(
+            false,
+            false,
+            "/login",
+            Some(false),
+            || true
+        ));
+        // The global kill switch still outranks the override.
+        assert!(!should_redirect_to_https(
+            true,
+            false,
+            "/login",
+            Some(true),
+            || true
+        ));
+    }
+
+    /// Regression: the CDN redirect loop.
+    ///
+    /// Browser →(https)→ CDN →(http)→ Temps. `is_tls` is false because Temps
+    /// only trusts its own TLS digest, and no certificate exists locally
+    /// because the CDN holds it. If any rule inferred "redirect" from the
+    /// `https://` external_url alone, Temps would 301 back to the CDN, which
+    /// would forward plain HTTP again — forever, with the global kill switch
+    /// as the only escape.
+    #[test]
+    fn a_cdn_fronted_console_is_never_redirected_by_inference() {
+        let cdn_fronted_console = || {
+            should_redirect_to_https(
+                /* globally_disabled */ false,
+                /* is_tls */ false,
+                "/login",
+                // No environment resolved, and the operator set no override.
+                None,
+                // TLS terminated upstream, so Temps holds no certificate.
+                || false,
+            )
+        };
+        assert!(!cdn_fronted_console());
+
+        // And the production-HTTPS default cannot reach this request either:
+        // it is gated on a resolved environment, which the console never has.
+        assert!(!should_apply_production_https_default(
+            false, false, "/login", None, false
+        ));
+    }
+
+    #[test]
+    fn production_https_default_respects_the_other_gates() {
+        assert!(!should_apply_production_https_default(
+            true, false, "/", None, true
+        ));
+        assert!(!should_apply_production_https_default(
+            false, true, "/", None, true
+        ));
+        assert!(!should_apply_production_https_default(
+            false,
+            false,
+            "/.well-known/acme-challenge/token",
+            None,
+            true
+        ));
+        assert!(!should_apply_production_https_default(
+            false,
+            false,
+            "/",
+            Some(false),
+            true
+        ));
+    }
 }
 
 /// Proxy context for tracking request state
@@ -547,7 +767,7 @@ pub struct LoadBalancer {
     route_table: Option<Arc<temps_routes::CachedPeerTable>>,
     file_store: Option<Arc<dyn temps_file_store::FileStore>>,
     /// In-memory moka cache for `static_asset_cache` DB lookups. Keyed on
-    /// `(project_id, url_path)`; values are `Option<content_hash>` so that
+    /// `(project_id, environment_id, deployment_id, url_path)`; values are `Option<content_hash>` so that
     /// **negative results (no row found) are cached too** — the miss case is
     /// the common path for container deployments where most assets are served
     /// by upstream, not the fallback store. TTL 60 s, max ~50 k entries. See
@@ -963,9 +1183,30 @@ impl LoadBalancer {
 
     /// Returns true when a page view should be tracked (visitor/session created).
     /// This replaces the old `VisitorManager::should_track_visitor` trait method.
-    pub fn should_track_page(path: &str, content_type: Option<&str>, status_code: u16) -> bool {
-        // Don't track internal API calls
-        if path.starts_with(ROUTE_PREFIX_TEMPS) {
+    pub fn should_track_page(
+        path: &str,
+        content_type: Option<&str>,
+        method: &str,
+        accept: Option<&str>,
+        fetch_destination: Option<&str>,
+    ) -> bool {
+        // API responses never represent a browser page, even when a framework
+        // returns an HTML error document for an API-prefixed route.
+        if path == "/api"
+            || path.starts_with("/api/")
+            || path == "/_temps"
+            || path.starts_with("/_temps/")
+            || path.starts_with(ROUTE_PREFIX_TEMPS)
+        {
+            return false;
+        }
+
+        // Visitor analytics describe browser navigations, not every HTTP
+        // client that happens to receive HTML. Browsers advertise document
+        // navigation with both an HTML Accept value and Fetch Metadata that
+        // identifies a top-level document. Requiring both excludes generic
+        // HTTP clients, framework data fetches, and embedded resources.
+        if !is_browser_document_request(method, accept, fetch_destination) {
             return false;
         }
 
@@ -981,12 +1222,40 @@ impl LoadBalancer {
             return false;
         }
 
-        // Track HTML pages or error pages
-        let is_html = content_type
-            .map(|ct| ct.starts_with("text/html"))
-            .unwrap_or(false);
+        // A status code cannot distinguish a browser document from an API
+        // response. Only HTML documents create visitor/session state; this
+        // still includes genuine HTML 4xx/5xx error pages.
+        content_type
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
+    }
 
-        is_html || status_code >= 400
+    async fn ensure_static_visitor_session(
+        &self,
+        session: &PingoraSession,
+        ctx: &mut ProxyContext,
+        content_type: &str,
+    ) {
+        let request_accept = session
+            .req_header()
+            .headers
+            .get("accept")
+            .and_then(|value| value.to_str().ok());
+        let fetch_destination = session
+            .req_header()
+            .headers
+            .get("sec-fetch-dest")
+            .and_then(|value| value.to_str().ok());
+
+        if Self::should_track_page(
+            &ctx.path,
+            Some(content_type),
+            &ctx.method,
+            request_accept,
+            fetch_destination,
+        ) {
+            self.ensure_visitor_session(ctx).await;
+        }
     }
 
     async fn finalize_response(
@@ -1794,11 +2063,11 @@ impl LoadBalancer {
         use std::path::PathBuf;
         use tokio::fs;
 
-        let mut requested_path = ctx.path.trim_start_matches('/');
+        let mut requested_path = ctx.path.trim_start_matches('/').to_owned();
 
         // Handle root path -> index.html
         if requested_path.is_empty() {
-            requested_path = "index.html";
+            requested_path = "index.html".to_owned();
         }
 
         // Security: ALWAYS join with base static directory
@@ -1814,7 +2083,7 @@ impl LoadBalancer {
         // Always join with base static directory from config
         let absolute_static_dir = self.config_service.static_dir().join(relative_static_dir);
 
-        let file_path = absolute_static_dir.join(requested_path);
+        let file_path = absolute_static_dir.join(&requested_path);
 
         // Security check: ensure the resolved path is still within static_dir
         let canonical_static_dir = fs::canonicalize(&absolute_static_dir).await.map_err(|e| {
@@ -1869,6 +2138,13 @@ impl LoadBalancer {
             )
         })?;
 
+        // Resolve the actual response MIME before creating analytics state.
+        // Static SPA fallbacks and extensionless paths otherwise look like
+        // pages from the request path alone, including /api-style requests.
+        let content_type = Self::infer_content_type(final_path.to_str().unwrap_or("index.html"));
+        self.ensure_static_visitor_session(session, ctx, content_type)
+            .await;
+
         // Generate ETag for cache validation
         let etag = Self::generate_etag(&file_content);
 
@@ -1886,7 +2162,7 @@ impl LoadBalancer {
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
 
                 // Add cache headers
-                if Self::is_cacheable_static_asset(requested_path) {
+                if Self::is_cacheable_static_asset(&requested_path) {
                     resp.insert_header(
                         header::CACHE_CONTROL,
                         "public, max-age=31536000, immutable",
@@ -1907,9 +2183,6 @@ impl LoadBalancer {
                 return Ok(true);
             }
         }
-
-        // Infer content type
-        let content_type = Self::infer_content_type(final_path.to_str().unwrap_or("index.html"));
 
         // Check if we should compress the content
         let client_accepts_gzip = Self::accepts_gzip(session);
@@ -1963,7 +2236,7 @@ impl LoadBalancer {
         }
 
         // Add cache headers for static assets
-        if Self::is_cacheable_static_asset(requested_path) {
+        if Self::is_cacheable_static_asset(&requested_path) {
             resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
         } else {
             resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
@@ -2057,8 +2330,8 @@ impl LoadBalancer {
 
     /// Serve a static asset from CAS via the in-memory lookup cache.
     ///
-    /// `static_asset_lookup` resolves `(project_id, url_path) → content_hash`
-    /// using a moka TTL cache (60 s) so the `static_asset_cache` table is not
+    /// `static_asset_lookup` resolves the exact routed project/environment/
+    /// deployment and URL path using a moka TTL cache (60 s), so the table is not
     /// queried on every cacheable-asset request. Both hits and misses are cached;
     /// the miss case (no fallback row — the common path for container deployments)
     /// is the most important one to protect. See WS4 / `static_asset_lookup.rs`.
@@ -2075,16 +2348,18 @@ impl LoadBalancer {
             None => return Ok(false),
         };
 
-        // Resolve project_id, then look up the content hash via cache (no DB on hit/cached-miss).
-        let content_hash = match ctx.project.as_ref().map(|p| p.id) {
-            Some(pid) => match self
-                .static_asset_lookup
-                .get_content_hash(pid, url_path)
-                .await
-            {
-                Some(hash) => hash,
-                None => return Ok(false),
-            },
+        let scope = match (&ctx.project, &ctx.environment, &ctx.deployment) {
+            (Some(project), Some(environment), Some(deployment)) => {
+                (project.id, environment.id, deployment.id)
+            }
+            _ => return Ok(false),
+        };
+        let content_hash = match self
+            .static_asset_lookup
+            .get_content_hash(scope.0, scope.1, scope.2, url_path)
+            .await
+        {
+            Some(hash) => hash,
             None => return Ok(false),
         };
 
@@ -2453,6 +2728,64 @@ fn is_event_stream_content_type(value: &str) -> bool {
         .split(';')
         .next()
         .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+/// Whether a request looks like a browser navigating to a top-level document,
+/// as opposed to a data fetch, an embedded subresource, or a generic HTTP
+/// client that happens to accept HTML.
+///
+/// `Sec-Fetch-Dest` is the strong signal and is used whenever it is present:
+/// a browser labels a navigation `document` and a `fetch()`/XHR `empty`, so
+/// "present and not `document`" is a definitive no. But it is **not** present
+/// on every real page view. Per the Fetch Metadata spec, user agents append
+/// `Sec-Fetch-*` only for potentially trustworthy URLs — HTTPS and localhost —
+/// and Safari only began sending them in 16.4. A self-hosted Temps serving an
+/// app over plain HTTP therefore receives no Fetch Metadata at all, and
+/// treating that absence as "not a browser" would silently zero out every
+/// visitor, session and page view for that operator, with nothing in the UI
+/// to explain why.
+///
+/// So absence falls back to the weaker `Accept` + `text/html` response pair
+/// (the caller checks the response content-type). That is spoofable, but the
+/// thing it admits is an unauthenticated visitor row — analytics noise, not a
+/// trust decision — and a client must still both ask for HTML and be served
+/// HTML at a non-asset, non-API path. A browser-issued `fetch()` defaults to
+/// `Accept: */*` and is excluded by that alone, which is what keeps framework
+/// data fetches out on HTTP origins too.
+///
+/// Known cost of the fallback: on a plain-HTTP origin an `<iframe>` embed is
+/// indistinguishable from a navigation here, because the `Sec-Fetch-Dest:
+/// iframe` that would reject it is exactly what the browser withholds — the
+/// same goes for prefetch/prerender, whose `Sec-Purpose` is also absent. Those
+/// count as page views on HTTP. That is a regression against #700 but not
+/// against the behaviour before it, and it is scoped to origins that already
+/// get no Fetch Metadata at all. `Upgrade-Insecure-Requests` would tighten the
+/// generic-client case (issue #715) but does not separate an iframe from a
+/// document either.
+fn is_browser_document_request(
+    method: &str,
+    accept: Option<&str>,
+    fetch_destination: Option<&str>,
+) -> bool {
+    if method != "GET" {
+        return false;
+    }
+
+    let accepts_html = accept.is_some_and(|value| {
+        value.split(',').any(|part| {
+            part.split(';')
+                .next()
+                .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
+        })
+    });
+    if !accepts_html {
+        return false;
+    }
+
+    match fetch_destination {
+        Some(destination) => destination.eq_ignore_ascii_case("document"),
+        None => true,
+    }
 }
 
 /// Console/control-plane traffic always gets a fixed timeout, regardless of
@@ -4318,14 +4651,78 @@ impl ProxyHttp for LoadBalancer {
         // WS3: cert-host check is now a lock-free ArcSwap snapshot read; the
         // background `CertHostCache::run_refresh_loop` keeps it current (±30 s).
         let env_force_https = ctx.environment.as_ref().and_then(|env| env.force_https);
+        // An unresolved Host falls through to the console upstream. The console
+        // has its own operator-set override rather than inheriting a project's,
+        // and it is consulted only when no environment matched — `get_settings`
+        // is TTL-cached, so this costs nothing on the project hot path.
+        //
+        // On a settings read failure this yields `None` (inherit the per-host
+        // certificate heuristic), not `Some(true)`: guessing "redirect" here
+        // would turn a transient database blip into a console that 301s to a
+        // certificate it may not have.
+        let console_force_https = if ctx.environment.is_none() {
+            match self.config_service.get_settings().await {
+                Ok(settings) => {
+                    let request_host = ctx
+                        .host
+                        .split(':')
+                        .next()
+                        .unwrap_or(&ctx.host)
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase();
+                    if settings.console_hostname().as_deref() == Some(request_host.as_str()) {
+                        settings.console_force_https
+                    } else {
+                        None
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Failed to read app settings; falling back to the per-host certificate heuristic for HTTPS policy"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // Exactly one of these can be set: `console_force_https` is only
+        // computed when no environment resolved.
+        let force_https = env_force_https.or(console_force_https);
+        let production_https = if should_apply_production_https_default(
+            self.disable_https_redirect,
+            self.is_tls_connection(session),
+            &ctx.path,
+            force_https,
+            ctx.environment.is_some(),
+        ) {
+            match self.config_service.get_url_scheme().await {
+                Ok(scheme) => scheme != "http",
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Failed to read external URL scheme; enforcing HTTPS"
+                    );
+                    true
+                }
+            }
+        } else {
+            false
+        };
         let needs_redirect = should_redirect_to_https(
             self.disable_https_redirect,
             self.is_tls_connection(session),
             &ctx.path,
-            env_force_https,
+            force_https,
             // Lock-free ArcSwap snapshot read, and only reached when the
             // environment has no explicit override.
-            || self.cert_host_cache.has_cert_for_host(&ctx.host),
+            || {
+                inherited_https_policy(
+                    production_https,
+                    self.cert_host_cache.has_cert_for_host(&ctx.host),
+                )
+            },
         );
         if needs_redirect {
             // Build the HTTPS redirect URL preserving path and query string
@@ -4526,34 +4923,6 @@ impl ProxyHttp for LoadBalancer {
             // IMPORTANT: Skip static file serving for /api/_temps/* paths
             // These must ALWAYS be proxied to the console address (admin API)
             if !ctx.path.starts_with("/api/_temps/") {
-                // Only create visitor/session for HTML page requests, not static assets.
-                // Without this guard, concurrent requests for JS/CSS/images on first visit
-                // (before the browser has received the Set-Cookie response) each create a
-                // separate visitor record, causing duplicate "live visitors".
-                let is_static_asset = ctx.path.contains('.')
-                    && (ctx.path.ends_with(".js")
-                        || ctx.path.ends_with(".css")
-                        || ctx.path.ends_with(".png")
-                        || ctx.path.ends_with(".jpg")
-                        || ctx.path.ends_with(".jpeg")
-                        || ctx.path.ends_with(".gif")
-                        || ctx.path.ends_with(".svg")
-                        || ctx.path.ends_with(".ico")
-                        || ctx.path.ends_with(".woff")
-                        || ctx.path.ends_with(".woff2")
-                        || ctx.path.ends_with(".ttf")
-                        || ctx.path.ends_with(".eot")
-                        || ctx.path.ends_with(".map")
-                        || ctx.path.ends_with(".webp")
-                        || ctx.path.ends_with(".avif")
-                        || ctx.path.ends_with(".json")
-                        || ctx.path.ends_with(".xml")
-                        || ctx.path.ends_with(".txt"));
-
-                if !is_static_asset {
-                    self.ensure_visitor_session(ctx).await;
-                }
-
                 // Serve static file
                 match self.serve_static_file(session, ctx, &static_dir).await {
                     Ok(served) => {
@@ -4592,6 +4961,9 @@ impl ProxyHttp for LoadBalancer {
                             );
                             let mut resp = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
                             resp.insert_header(header::CONTENT_TYPE, "text/html")?;
+
+                            self.ensure_static_visitor_session(session, ctx, "text/html")
+                                .await;
 
                             // Set tracking cookies for 404 response
                             self.set_tracking_cookies(session, &mut resp, ctx).await?;
@@ -4632,6 +5004,9 @@ impl ProxyHttp for LoadBalancer {
                         let mut resp =
                             ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
                         resp.insert_header(header::CONTENT_TYPE, "text/html")?;
+
+                        self.ensure_static_visitor_session(session, ctx, "text/html")
+                            .await;
 
                         // Set tracking cookies for 500 response
                         self.set_tracking_cookies(session, &mut resp, ctx).await?;
@@ -4674,8 +5049,15 @@ impl ProxyHttp for LoadBalancer {
         if ctx.path.starts_with("/_temps/assets/") {
             let after_prefix = &ctx.path["/_temps/assets/".len()..];
             if let Some(slash_pos) = after_prefix.find('/') {
+                let deployment_slug = &after_prefix[..slash_pos];
                 let asset_path = after_prefix[slash_pos + 1..].to_string();
-                if Self::is_cacheable_static_asset(&asset_path) {
+                if deployment_asset_path_matches(
+                    ctx.deployment
+                        .as_ref()
+                        .map(|deployment| deployment.slug.as_str()),
+                    deployment_slug,
+                ) && Self::is_cacheable_static_asset(&asset_path)
+                {
                     if let Ok(true) = self.serve_asset_from_store(session, ctx, &asset_path).await {
                         ctx.routing_status = "prefixed_asset".to_string();
                         return Ok(true);
@@ -4950,42 +5332,30 @@ impl ProxyHttp for LoadBalancer {
         }
 
         // Determine if this needs visitor tracking
-        let is_html_content = ctx
-            .content_type
-            .as_ref()
-            .map(|ct| ct.starts_with("text/html"))
-            .unwrap_or(false);
-
         let status_code = upstream_response.status.as_u16();
-        let is_error_page = status_code >= 400;
-
-        let is_static_asset = ctx.path.contains(".")
-            && (ctx.path.ends_with(".js")
-                || ctx.path.ends_with(".css")
-                || ctx.path.ends_with(".png")
-                || ctx.path.ends_with(".jpg")
-                || ctx.path.ends_with(".jpeg")
-                || ctx.path.ends_with(".gif")
-                || ctx.path.ends_with(".svg")
-                || ctx.path.ends_with(".ico")
-                || ctx.path.ends_with(".woff")
-                || ctx.path.ends_with(".woff2")
-                || ctx.path.ends_with(".ttf")
-                || ctx.path.ends_with(".eot"));
-
-        let is_api_endpoint = ctx.path.starts_with("/api/") || ctx.path.starts_with("/_temps/");
+        let request_accept = ctx
+            .request_headers
+            .as_ref()
+            .and_then(|headers| headers.get("accept"))
+            .map(String::as_str);
+        let fetch_destination = ctx
+            .request_headers
+            .as_ref()
+            .and_then(|headers| headers.get("sec-fetch-dest"))
+            .map(String::as_str);
 
         // Check if we should track this page view
-        let should_track =
-            Self::should_track_page(&ctx.path, ctx.content_type.as_deref(), status_code);
+        let should_track = Self::should_track_page(
+            &ctx.path,
+            ctx.content_type.as_deref(),
+            &ctx.method,
+            request_accept,
+            fetch_destination,
+        );
 
-        // Only create visitor/session for appropriate requests (skip for SSE)
-        if !ctx.skip_tracking
-            && should_track
-            && (is_html_content || is_error_page)
-            && !is_static_asset
-            && !is_api_endpoint
-        {
+        // Only browser HTML documents create visitor/session state (skip SSE,
+        // API responses, assets, and other non-document traffic).
+        if !ctx.skip_tracking && should_track {
             self.ensure_visitor_session(ctx).await;
         } else {
             debug!(
@@ -5047,13 +5417,14 @@ impl ProxyHttp for LoadBalancer {
             } else {
                 std::time::Duration::from_secs(60)
             };
-            let mut peer = Box::new(HttpPeer::new(PREVIEW_GATEWAY_PEER, false, String::new()));
+            let gateway_peer = preview_gateway_peer();
+            let mut peer = Box::new(HttpPeer::new(gateway_peer.as_str(), false, String::new()));
             peer.group_key = preview_peer_group_key(host);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
             peer.options.read_timeout = Some(preview_io_timeout);
             peer.options.write_timeout = Some(preview_io_timeout);
             peer.options.idle_timeout = Some(preview_io_timeout);
-            ctx.upstream_host = Some(PREVIEW_GATEWAY_PEER.to_string());
+            ctx.upstream_host = Some(gateway_peer);
             return Ok(peer);
         }
 

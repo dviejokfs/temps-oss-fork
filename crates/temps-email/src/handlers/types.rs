@@ -8,7 +8,7 @@ use crate::services::{
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_core::AuditLogger;
+use temps_core::{AuditLogger, ProjectAccessChecker};
 use temps_dns::services::DnsProviderService;
 use utoipa::{IntoParams, ToSchema};
 
@@ -20,6 +20,9 @@ pub struct AppState {
     pub validation_service: Arc<ValidationService>,
     pub tracking_service: Arc<TrackingService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    /// Optional team/project visibility policy supplied by an extension plugin.
+    /// Plain OSS installations intentionally leave this unset.
+    pub project_access_checker: Option<Arc<dyn ProjectAccessChecker>>,
     /// DNS provider service for automatic DNS record setup
     pub dns_provider_service: Option<Arc<DnsProviderService>>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
@@ -360,6 +363,24 @@ pub struct EmailDomainWithDnsResponse {
     pub dns_records: Vec<DnsRecordResponse>,
 }
 
+/// A project authorized to send email through a sender domain.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuthorizedEmailDomainProjectResponse {
+    pub id: i32,
+    pub name: String,
+    pub slug: String,
+}
+
+impl From<temps_entities::projects::Model> for AuthorizedEmailDomainProjectResponse {
+    fn from(project: temps_entities::projects::Model) -> Self {
+        Self {
+            id: project.id,
+            name: project.name,
+            slug: project.slug,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 pub struct ListDomainsQuery {
     /// Only return domains belonging to this provider
@@ -407,7 +428,7 @@ pub struct SetupDnsResponse {
 // Email Types
 // ========================================
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct SendEmailRequestBody {
     /// Sender email address (domain will be auto-extracted for lookup)
     #[schema(example = "hello@updates.example.com")]
@@ -507,6 +528,10 @@ pub struct EmailStatsResponse {
     pub queued: u64,
     /// Emails captured without sending (Mailhog mode - no provider configured)
     pub captured: u64,
+    /// Emails currently owned by an active provider delivery attempt
+    pub sending: u64,
+    /// Emails whose provider accepted/rejected outcome could not be determined
+    pub delivery_unknown: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

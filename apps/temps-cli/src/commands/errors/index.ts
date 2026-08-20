@@ -69,6 +69,7 @@ interface TimelineOptions {
   projectId: string
   days?: string
   bucket?: string
+  environmentId?: string
   json?: boolean
 }
 
@@ -255,6 +256,7 @@ export function registerErrorsCommands(program: Command): void {
     .requiredOption('--project-id <id>', 'Project ID')
     .option('--days <days>', 'Number of days to show', '7')
     .option('--bucket <bucket>', 'Time bucket size (e.g., "1h", "15m", "1d")', '1h')
+    .option('--environment-id <id>', 'Filter chart data to a specific environment ID')
     .option('--json', 'Output in JSON format')
     .action(getErrorTimelineAction)
 
@@ -675,6 +677,8 @@ async function getErrorTimelineAction(options: TimelineOptions): Promise<void> {
   const startTime = new Date()
   startTime.setDate(startTime.getDate() - days)
 
+  const environmentId = options.environmentId ? parseInt(options.environmentId, 10) : undefined
+
   const timeSeries = await withSpinner('Fetching error timeline...', async () => {
     const { data, error } = await getErrorTimeSeries({
       client,
@@ -683,6 +687,7 @@ async function getErrorTimelineAction(options: TimelineOptions): Promise<void> {
         start_time: startTime.toISOString(),
         end_time: endTime.toISOString(),
         bucket: options.bucket,
+        ...(environmentId && { environment_id: environmentId }),
       },
     })
     if (error) {
