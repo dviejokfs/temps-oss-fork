@@ -97,6 +97,7 @@ export async function updateProjectAction(
 export async function updateSettingsAction(
   options: {
     project?: string
+    name?: string
     slug?: string
     attackMode?: boolean
     previewEnvs?: boolean
@@ -168,12 +169,14 @@ export async function updateSettingsAction(
   })
 
   // Collect settings interactively if not provided via options
+  let name = options.name
   let slug = options.slug
   let attackMode = options.attackMode
   let previewEnvs = options.previewEnvs
 
   // Only prompt if no flags provided AND not in automation mode
   if (
+    name === undefined &&
     slug === undefined &&
     attackMode === undefined &&
     previewEnvs === undefined &&
@@ -184,6 +187,11 @@ export async function updateSettingsAction(
     header('Update Project Settings')
     info(`Current settings for "${project.name}"`)
     newline()
+
+    name = await promptText({
+      message: 'Project name (display name)',
+      default: project.name,
+    })
 
     slug = await promptText({
       message: 'Project slug (URL-friendly identifier)',
@@ -206,6 +214,7 @@ export async function updateSettingsAction(
       client,
       path: { project_id: project.id },
       body: {
+        name: name ?? undefined,
         slug: slug ?? undefined,
         attack_mode: attackMode ?? undefined,
         enable_preview_environments: previewEnvs ?? undefined,
@@ -229,6 +238,7 @@ export async function updateSettingsAction(
   }
 
   success('Project settings updated successfully')
+  keyValue('Name', name ?? project.name)
   keyValue('Slug', slug ?? project.slug)
   keyValue('Attack Mode', attackMode ? colors.success('Enabled') : colors.muted('Disabled'))
   keyValue('Preview Environments', previewEnvs ? colors.success('Enabled') : colors.muted('Disabled'))

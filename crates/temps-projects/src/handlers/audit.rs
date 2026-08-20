@@ -170,6 +170,10 @@ pub struct ProjectSettingsUpdatedAudit {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectSettingsUpdatedFields {
+    /// New display name, when the request changed it. Audited so a project that
+    /// suddenly reports under a different name in dashboards and alerts can be
+    /// traced back to who renamed it.
+    pub name: Option<String>,
     pub slug: Option<String>,
     pub cpu_request: Option<i32>,
     pub cpu_limit: Option<i32>,
@@ -331,6 +335,7 @@ mod tests {
             project_name: "example".to_string(),
             project_slug: "example".to_string(),
             updated_settings: ProjectSettingsUpdatedFields {
+                name: None,
                 slug: None,
                 cpu_request: None,
                 cpu_limit: None,

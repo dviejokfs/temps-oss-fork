@@ -689,6 +689,10 @@ where
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateProjectSettingsRequest {
+    /// Human-facing project display name. Unlike `slug` this is not part of any
+    /// URL and is not required to be unique. Changing it also changes the
+    /// `OTEL_SERVICE_NAME` injected into subsequent deployments.
+    pub name: Option<String>,
     pub slug: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub main_branch: Option<String>,

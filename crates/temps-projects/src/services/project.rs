@@ -1302,6 +1302,7 @@ impl ProjectService {
     pub async fn update_project_settings(
         &self,
         project_id: i32,
+        new_name: Option<String>,
         new_slug: Option<String>,
         git_provider_connection_id: Option<i32>,
         main_branch: Option<String>,
@@ -1361,6 +1362,29 @@ impl ProjectService {
                 project_id
             )))?;
         let initial_public_ports = compose_public_ports(project.preset_config.as_ref());
+
+        // Update the display name if provided. The name is a human-facing label
+        // only — the slug remains the routing identifier — so it is not
+        // uniqueness-checked and changing it never rewrites a subdomain. It is
+        // deliberately applied before the slug block: the slug path rebuilds
+        // `project` from its own transaction, and `Model -> ActiveModel` leaves
+        // unset columns `Unchanged`, so the two writes don't clobber each other.
+        if let Some(name_value) = new_name {
+            let name_value = name_value.trim().to_string();
+            if name_value.is_empty() || name_value.chars().count() > 100 {
+                return Err(ProjectError::InvalidInput(
+                    "Project name must contain 1-100 characters".to_string(),
+                ));
+            }
+
+            if name_value != project.name {
+                let mut active_project: projects::ActiveModel = project.clone().into();
+                active_project.name = Set(name_value.clone());
+                active_project.updated_at = Set(chrono::Utc::now());
+                active_project.update(self.db.as_ref()).await?;
+                project.name = name_value;
+            }
+        }
 
         // Update the slug if provided
         if let Some(slug_value) = new_slug {
@@ -4318,6 +4342,136 @@ mod tests {
         }
     }
 
+    /// Renaming must change only the display name — the slug is the routing
+    /// identifier, and a rename that silently moved a project's URL would break
+    /// every domain already pointing at it.
+    #[tokio::test]
+    async fn test_update_project_settings_renames_without_touching_slug() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Old Name".to_string()),
+            slug: Set("rename-keeps-slug".to_string()),
+            repo_name: Set("rename-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("rename-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        let updated = project_service
+            .update_project_settings(
+                inserted_project.id,
+                Some("  New Display Name  ".to_string()),
+                None, // slug deliberately untouched
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("rename should succeed");
+
+        // Trimmed, persisted, and the slug is exactly as it was.
+        assert_eq!(updated.name, "New Display Name");
+        assert_eq!(updated.slug, "rename-keeps-slug");
+
+        let reloaded = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(reloaded.name, "New Display Name");
+        assert_eq!(reloaded.slug, "rename-keeps-slug");
+    }
+
+    #[tokio::test]
+    async fn test_update_project_settings_rejects_blank_and_overlong_names() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Keep Me".to_string()),
+            slug: Set("rename-validation".to_string()),
+            repo_name: Set("rename-validation-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("rename-validation".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        for candidate in ["   ".to_string(), "x".repeat(101)] {
+            let result = project_service
+                .update_project_settings(
+                    inserted_project.id,
+                    Some(candidate.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(ProjectError::InvalidInput(_))),
+                "name {:?} should be rejected as invalid input",
+                candidate
+            );
+        }
+
+        // A rejected rename must not have partially applied.
+        let reloaded = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(reloaded.name, "Keep Me");
+    }
+
     #[tokio::test]
     async fn test_update_project_settings_emits_event() {
         // Setup test database
@@ -4349,6 +4503,7 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 inserted_project.id,
+                None,
                 Some("new-slug".to_string()),
                 None,
                 Some("develop".to_string()),
@@ -4820,6 +4975,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(serde_json::json!({ "nixpacksConfig": toml })),
                 None,
                 None,
@@ -4893,6 +5049,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(serde_json::json!({ "excludedServices": ["postgres"] })),
                 None,
                 None,
@@ -4930,6 +5087,7 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
+                None,
                 None,
                 None,
                 None,
@@ -4995,6 +5153,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(serde_json::json!({
                     "composeServices": [
                         {"name": "hub", "image": "ghcr.io/getpaseo/hub:latest", "looksLikeDatabase": false}
@@ -5040,6 +5199,7 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
+                None,
                 None,
                 None,
                 None,
@@ -5126,6 +5286,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(serde_json::json!({ "relaxedCapabilityServices": ["gitea"] })),
                 None,
                 None,
@@ -5195,6 +5356,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(serde_json::json!({ "relaxedCapabilityServices": ["does-not-exist"] })),
                 None,
                 None,
@@ -5243,6 +5405,7 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
+                None,
                 None,
                 None,
                 None,
@@ -5356,6 +5519,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(serde_json::json!({ "providers": ["not-real"] })),
                 None,
                 None,
@@ -5444,6 +5608,7 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 created.id,
+                None,
                 None,
                 None,
                 None,
@@ -5564,6 +5729,7 @@ mod tests {
         project_service
             .update_project_settings(
                 created.id,
+                None,
                 None,
                 None,
                 None,
@@ -5802,6 +5968,7 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
+                None,
                 None,
                 None,
                 None,
@@ -6136,6 +6303,7 @@ mod tests {
                 inserted_project.id,
                 None,
                 None,
+                None,
                 Some("main".to_string()),
                 None,
                 None,
@@ -6206,6 +6374,7 @@ mod tests {
         let update_with_hours = |hours: i32| {
             project_service.update_project_settings(
                 inserted_project.id,
+                None,
                 None,
                 None,
                 None,

@@ -1178,6 +1178,7 @@ pub async fn update_project_settings(
         .project_service
         .update_project_settings(
             project_id,
+            settings.name.clone(),
             settings.slug.clone(),
             settings.git_provider_connection_id,
             settings.main_branch.clone(),
@@ -1216,6 +1217,7 @@ pub async fn update_project_settings(
         memory_request: None,
         memory_limit: None,
         performance_metrics_enabled: None,
+        name: settings.name,
         slug: settings.slug,
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
         image_retention_hours: settings.image_retention_hours,

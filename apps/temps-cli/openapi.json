@@ -43292,6 +43292,13 @@
               "null"
             ]
           },
+          "name": {
+            "description": "Human-facing project display name. Unlike `slug` this is not part of any\nURL and is not required to be unique. Changing it also changes the\n`OTEL_SERVICE_NAME` injected into subsequent deployments.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "preset": {
             "type": [
               "string",

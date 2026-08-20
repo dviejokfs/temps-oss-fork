@@ -31,6 +31,7 @@ import {
   FormField,
   FormItem,
   FormLabel,
+  FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -49,7 +50,12 @@ interface GeneralSettingsProps {
 }
 
 const projectSchema = z.object({
-  name: z.string().min(1, 'Project name is required'),
+  name: z
+    .string()
+    .trim()
+    .min(1, 'Project name is required')
+    .max(100, 'Project name must be 100 characters or fewer'),
+  slug: z.string().min(1, 'Project slug is required'),
 })
 
 type ProjectFormValues = z.infer<typeof projectSchema>
@@ -67,7 +73,8 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const projectForm = useForm<ProjectFormValues>({
     resolver: zodResolver(projectSchema),
     defaultValues: {
-      name: project?.slug || '',
+      name: project?.name || '',
+      slug: project?.slug || '',
     },
   })
 
@@ -78,7 +85,8 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       updateProjectSettings.mutateAsync({
         path: { project_id: project.id! },
         body: {
-          slug: values.name,
+          name: values.name,
+          slug: values.slug,
         },
       }),
       {
@@ -88,7 +96,8 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       }
     )
     refetch()
-    navigate(`/projects/${values.name}/settings/general`)
+    // The slug is the URL identifier, so only it determines where we land.
+    navigate(`/projects/${values.slug}/settings/general`)
   }
 
   const handleToggleCrossProjectTraceSharing = async (enabled: boolean) => {
@@ -179,6 +188,26 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                 name="name"
                 render={({ field }) => (
                   <FormItem>
+                    <FormLabel>Project Name</FormLabel>
+                    <FormControl>
+                      <Input {...field} className="max-w-[400px]" />
+                    </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      The display name shown on the dashboard, in alerts, and in
+                      notifications. Also used as the OpenTelemetry service name
+                      for future deployments, so renaming starts a new series in
+                      traces and metrics.
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={projectForm.control}
+                name="slug"
+                render={({ field }) => (
+                  <FormItem>
                     <FormLabel>Project Slug</FormLabel>
                     <FormControl>
                       <Input {...field} className="max-w-[400px]" />
@@ -186,6 +215,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                     <FormDescription className="text-muted-foreground">
                       This will be used in your project&apos;s URL
                     </FormDescription>
+                    <FormMessage />
                   </FormItem>
                 )}
               />
