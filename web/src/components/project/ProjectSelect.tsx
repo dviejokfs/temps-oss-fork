@@ -77,7 +77,11 @@ export function ProjectSelect({
   }
 
   const triggerLabel =
-    value == null ? 'All projects' : (selected?.name ?? placeholder)
+    value == null
+      ? allowAll
+        ? 'All projects'
+        : placeholder
+      : (selected?.name ?? placeholder)
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
