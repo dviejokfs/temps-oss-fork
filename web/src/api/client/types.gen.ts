@@ -6462,16 +6462,16 @@ export type EmailStatsResponse = {
      */
     captured: number;
     /**
-     * Provider transport completed without a definitive delivery result; never retried automatically
+     * Emails whose provider accepted/rejected outcome could not be determined
      */
     delivery_unknown: number;
     failed: number;
     queued: number;
-    sent: number;
     /**
-     * Emails currently protected by a delivery lease
+     * Emails currently owned by an active provider delivery attempt
      */
     sending: number;
+    sent: number;
     total: number;
 };
 
@@ -28474,7 +28474,7 @@ export type RevokeEmailDomainProjectErrors = {
      */
     401: unknown;
     /**
-     * Only an instance administrator may change global sender-domain grants
+     * Only an instance or platform administrator may change global sender-domain grants
      */
     403: unknown;
     /**
@@ -28518,7 +28518,7 @@ export type AuthorizeEmailDomainProjectErrors = {
      */
     401: unknown;
     /**
-     * Only an instance administrator may change global sender-domain grants
+     * Only an instance or platform administrator may change global sender-domain grants
      */
     403: unknown;
     /**
@@ -28986,7 +28986,7 @@ export type SendEmailData = {
         /**
          * Required for deployment-token requests. Reusing a key with the same payload returns the original delivery; reusing it with a different payload returns 409.
          */
-        'Idempotency-Key'?: string;
+        'Idempotency-Key'?: string | null;
     };
     path?: never;
     query?: never;
@@ -38829,7 +38829,7 @@ export type GetProjectsData = {
          */
         page?: number;
         /**
-         * Number of items per page
+         * Number of items per page (1-100)
          */
         per_page?: number;
         /**
