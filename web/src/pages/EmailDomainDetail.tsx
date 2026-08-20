@@ -4,6 +4,10 @@ import {
   deleteEmailDomain,
   getDomain,
   getEmailStats,
+  getProjects,
+  listEmailDomainProjects,
+  authorizeEmailDomainProject,
+  revokeEmailDomainProject,
   listDnsProviders,
   listEmailProviders,
   setupDns,
@@ -12,6 +16,8 @@ import {
   type EmailDomainWithDnsResponse,
   type EmailProviderResponse,
   type EmailStatsResponse,
+  type AuthorizedEmailDomainProjectResponse,
+  type ProjectResponse,
   type SetupDnsResponse,
 } from '@/api/client'
 import {
@@ -54,21 +60,21 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Input } from '@/components/ui/input'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useDebounce } from '@/hooks/useDebounce'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
-  Archive,
   ArrowLeft,
   CheckCircle2,
-  Clock,
   Globe,
+  KeyRound,
   Loader2,
-  Mail,
-  MailX,
   RefreshCw,
   Settings2,
   Trash2,
@@ -116,41 +122,66 @@ async function fetchEmailStats(domainId: number): Promise<EmailStatsResponse> {
   return response.data
 }
 
-function StatCard({
-  title,
-  value,
-  icon: Icon,
-}: {
-  title: string
-  value: number
-  icon: React.ComponentType<{ className?: string }>
-}) {
+async function fetchAuthorizedProjects(domainId: number): Promise<AuthorizedEmailDomainProjectResponse[]> {
+  const response = await listEmailDomainProjects({ path: { id: domainId } })
+  if (response.error) {
+    throw new Error(problemMessage(response.error, 'Failed to fetch authorized projects'))
+  }
+  return response.data ?? []
+}
+
+async function fetchProjects(search: string): Promise<ProjectResponse[]> {
+  const response = await getProjects({
+    query: { page: 1, per_page: 25, search: search.trim() || undefined },
+  })
+  if (response.error || !response.data) {
+    throw new Error(problemMessage(response.error, 'Failed to fetch projects'))
+  }
+  return response.data.projects
+}
+
+const STAT_DIVIDER_CLASSES = cn(
+  // Mobile: 2 columns — vertical divider on the right column, horizontal
+  // divider once a second row starts (items 3+, since there are 5 items).
+  '[&:nth-child(2n)]:border-l',
+  '[&:nth-child(n+3)]:border-t',
+  // Desktop: single row — only a vertical divider between siblings,
+  // no leftover horizontal divider from the mobile layout.
+  '@min-3xl:border-t-0',
+  '@min-3xl:[&:not(:first-child)]:border-l',
+  '@min-3xl:[&:nth-child(2n)]:border-l'
+)
+
+function StatPanel({ stats }: { stats: { label: string; value: number }[] }) {
   return (
-    <Card>
-      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-        <CardTitle className="text-sm font-medium">{title}</CardTitle>
-        <Icon className="h-4 w-4 text-muted-foreground" />
-      </CardHeader>
-      <CardContent>
-        <div className="text-2xl font-bold">{value.toLocaleString()}</div>
-      </CardContent>
-    </Card>
+    <div className="@container rounded-lg border">
+      <dl className="grid grid-cols-2 @min-3xl:grid-cols-7">
+        {stats.map((stat) => (
+          <div key={stat.label} className={cn('space-y-1 p-4', STAT_DIVIDER_CLASSES)}>
+            <dt className="truncate text-sm font-medium text-muted-foreground">
+              {stat.label}
+            </dt>
+            <dd className="text-2xl font-semibold tabular-nums">
+              {stat.value.toLocaleString()}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </div>
   )
 }
 
 function StatsSkeleton() {
   return (
-    <div className="grid gap-4 grid-cols-2 md:grid-cols-5">
-      {[1, 2, 3, 4, 5].map((i) => (
-        <Card key={i}>
-          <CardHeader className="pb-2">
+    <div className="@container rounded-lg border">
+      <dl className="grid grid-cols-2 @min-3xl:grid-cols-7">
+        {[1, 2, 3, 4, 5, 6, 7].map((i) => (
+          <div key={i} className={cn('space-y-2 p-4', STAT_DIVIDER_CLASSES)}>
             <Skeleton className="h-4 w-16" />
-          </CardHeader>
-          <CardContent>
-            <Skeleton className="h-8 w-12" />
-          </CardContent>
-        </Card>
-      ))}
+            <Skeleton className="h-7 w-12" />
+          </div>
+        ))}
+      </dl>
     </div>
   )
 }
@@ -161,9 +192,15 @@ export function EmailDomainDetail() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const { user } = useAuth()
+  const canManageAuthorizations = user?.role === 'admin' || user?.role === 'platform_admin'
 
   const [selectedDnsProviderId, setSelectedDnsProviderId] = useState<number | null>(null)
   const [dnsSetupResult, setDnsSetupResult] = useState<SetupDnsResponse | null>(null)
+  const [selectedProjectId, setSelectedProjectId] = useState<string>('')
+  const [projectSearch, setProjectSearch] = useState('')
+  const debouncedProjectSearch = useDebounce(projectSearch, 300)
+  const [projectToRevoke, setProjectToRevoke] = useState<AuthorizedEmailDomainProjectResponse | null>(null)
 
   const {
     data: domainDetails,
@@ -195,9 +232,34 @@ export function EmailDomainDetail() {
     queryFn: fetchDnsProviders,
   })
 
+  const {
+    data: authorizedProjects = [],
+    isLoading: isLoadingAuthorizations,
+    error: authorizationsError,
+    refetch: refetchAuthorizations,
+  } = useQuery({
+    queryKey: ['email-domain-projects', id],
+    queryFn: () => fetchAuthorizedProjects(id!),
+    enabled: !!id,
+  })
+
+  const {
+    data: allProjects = [],
+    isLoading: isLoadingProjects,
+    error: projectsError,
+    refetch: refetchProjects,
+  } = useQuery({
+    queryKey: ['projects', 'email-domain-authorization', debouncedProjectSearch],
+    queryFn: () => fetchProjects(debouncedProjectSearch),
+    enabled: canManageAuthorizations,
+  })
+
   const domain = domainDetails?.domain
   const dnsRecords = domainDetails?.dns_records ?? []
   const provider = providers?.find((p) => p.id === domain?.provider_id)
+  const availableProjects = allProjects.filter(
+    project => !authorizedProjects.some(authorized => authorized.id === project.id),
+  )
 
   useEffect(() => {
     setBreadcrumbs([
@@ -295,6 +357,38 @@ export function EmailDomainDetail() {
     onError: (err: Error) => {
       toast.error('Failed to setup DNS records', { description: err.message })
     },
+  })
+
+  const authorizeProjectMutation = useMutation({
+    mutationFn: async (projectId: number) => {
+      const response = await authorizeEmailDomainProject({ path: { id: id!, project_id: projectId } })
+      if (response.error) {
+        throw new Error(problemMessage(response.error, 'Failed to authorize project'))
+      }
+    },
+    onSuccess: () => {
+      setSelectedProjectId('')
+      queryClient.invalidateQueries({ queryKey: ['email-domain-projects', id] })
+      toast.success('Project authorized', {
+        description: 'Deployments in this project can now send from this domain.',
+      })
+    },
+    onError: (error: Error) => toast.error('Failed to authorize project', { description: error.message }),
+  })
+
+  const revokeProjectMutation = useMutation({
+    mutationFn: async (projectId: number) => {
+      const response = await revokeEmailDomainProject({ path: { id: id!, project_id: projectId } })
+      if (response.error) {
+        throw new Error(problemMessage(response.error, 'Failed to revoke project'))
+      }
+    },
+    onSuccess: () => {
+      setProjectToRevoke(null)
+      queryClient.invalidateQueries({ queryKey: ['email-domain-projects', id] })
+      toast.success('Project access revoked')
+    },
+    onError: (error: Error) => toast.error('Failed to revoke project', { description: error.message }),
   })
 
   if (isLoading) {
@@ -499,13 +593,17 @@ export function EmailDomainDetail() {
           </Alert>
         ) : (
           emailStats && (
-            <div className="grid gap-4 grid-cols-2 md:grid-cols-5">
-              <StatCard title="Total Emails" value={emailStats.total} icon={Mail} />
-              <StatCard title="Sent" value={emailStats.sent} icon={CheckCircle2} />
-              <StatCard title="Captured" value={emailStats.captured} icon={Archive} />
-              <StatCard title="Queued" value={emailStats.queued} icon={Clock} />
-              <StatCard title="Failed" value={emailStats.failed} icon={MailX} />
-            </div>
+            <StatPanel
+              stats={[
+                { label: 'Total Emails', value: emailStats.total },
+                { label: 'Sent', value: emailStats.sent },
+                { label: 'Captured', value: emailStats.captured },
+                { label: 'Queued', value: emailStats.queued },
+                { label: 'Sending', value: emailStats.sending },
+                { label: 'Delivery unknown', value: emailStats.delivery_unknown },
+                { label: 'Failed', value: emailStats.failed },
+              ]}
+            />
           )
         )}
 
@@ -543,7 +641,7 @@ export function EmailDomainDetail() {
                         Automatic DNS setup
                       </CardTitle>
                       <CardDescription>
-                        If you've connected a DNS provider in Temps, we can create
+                        If you&apos;ve connected a DNS provider in Temps, we can create
                         these records for you.
                       </CardDescription>
                     </CardHeader>
@@ -725,9 +823,162 @@ export function EmailDomainDetail() {
                 </dl>
               </CardContent>
             </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <KeyRound className="size-4" />
+                  Authorized projects
+                </CardTitle>
+                <CardDescription>
+                  Choose which project deployment tokens may send email from {domain.domain}.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {canManageAuthorizations && !authorizationsError && !projectsError && <div className="space-y-2">
+                  <Input
+                    aria-label="Search projects"
+                    value={projectSearch}
+                    onChange={event => {
+                      setProjectSearch(event.target.value)
+                      setSelectedProjectId('')
+                    }}
+                    placeholder="Search projects by name or slug"
+                  />
+                  <div className="flex gap-2">
+                  <Select value={selectedProjectId} onValueChange={setSelectedProjectId}>
+                    <SelectTrigger
+                      aria-label="Project to authorize"
+                      className="min-w-0 flex-1"
+                      disabled={isLoadingProjects}
+                    >
+                      <SelectValue placeholder={isLoadingProjects ? 'Loading projects…' : 'Select a project'} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {availableProjects.length === 0 ? (
+                        <div className="px-2 py-6 text-center text-sm text-muted-foreground">
+                          No matching projects
+                        </div>
+                      ) : (
+                        availableProjects.map(project => (
+                          <SelectItem key={project.id} value={String(project.id)}>
+                            {project.name}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectContent>
+                  </Select>
+                  <Button
+                    variant="outline"
+                    onClick={() => authorizeProjectMutation.mutate(Number(selectedProjectId))}
+                    disabled={!selectedProjectId || authorizeProjectMutation.isPending}
+                  >
+                    {authorizeProjectMutation.isPending && <Loader2 className="mr-2 size-4 animate-spin" />}
+                    Authorize
+                  </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {availableProjects.length === 0
+                      ? 'No projects match this search or all matches are already authorized.'
+                      : `Showing ${availableProjects.length} of up to 25 matches. Refine the search to find another project.`}
+                  </p>
+                </div>}
+
+                {isLoadingAuthorizations ? (
+                  <Skeleton className="h-16 w-full" />
+                ) : authorizationsError ? (
+                  <Alert variant="destructive">
+                    <AlertCircle className="size-4" />
+                    <AlertTitle>Could not load project authorizations</AlertTitle>
+                    <AlertDescription className="flex items-center justify-between gap-3">
+                      <span>{authorizationsError.message}</span>
+                      <Button variant="outline" size="sm" onClick={() => refetchAuthorizations()}>
+                        Retry
+                      </Button>
+                    </AlertDescription>
+                  </Alert>
+                ) : projectsError && canManageAuthorizations ? (
+                  <Alert variant="destructive">
+                    <AlertCircle className="size-4" />
+                    <AlertTitle>Could not load available projects</AlertTitle>
+                    <AlertDescription className="flex items-center justify-between gap-3">
+                      <span>{projectsError.message}</span>
+                      <Button variant="outline" size="sm" onClick={() => refetchProjects()}>
+                        Retry
+                      </Button>
+                    </AlertDescription>
+                  </Alert>
+                ) : authorizedProjects.length === 0 ? (
+                  <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+                    No projects are authorized yet. Deployment tokens cannot send from this domain until you add one.
+                  </div>
+                ) : (
+                  <div className="divide-y rounded-md border">
+                    {authorizedProjects.map(project => (
+                      <div key={project.id} className="flex items-center justify-between gap-3 p-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium">{project.name}</p>
+                          <p className="truncate font-mono text-xs text-muted-foreground">{project.slug}</p>
+                        </div>
+                        {canManageAuthorizations && <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={revokeProjectMutation.isPending}
+                          onClick={() => setProjectToRevoke(project)}
+                        >
+                          Revoke
+                        </Button>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {!canManageAuthorizations && (
+                  <p className="text-sm text-muted-foreground">
+                    Only an instance or platform administrator can change sender-domain project access.
+                  </p>
+                )}
+              </CardContent>
+            </Card>
           </div>
         </div>
       </div>
+
+      <AlertDialog
+        open={projectToRevoke !== null}
+        onOpenChange={(open) => {
+          if (!open && !revokeProjectMutation.isPending) {
+            setProjectToRevoke(null)
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Revoke project access?</AlertDialogTitle>
+            <AlertDialogDescription>
+              <span className="font-medium text-foreground">{projectToRevoke?.name}</span>
+              {' '}will no longer be able to send email from{' '}
+              <span className="font-medium text-foreground">{domain.domain}</span>.
+              Existing deployments using this sender may begin failing immediately.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={revokeProjectMutation.isPending}>
+              Keep access
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={revokeProjectMutation.isPending || projectToRevoke === null}
+              onClick={(event) => {
+                event.preventDefault()
+                if (projectToRevoke) {
+                  revokeProjectMutation.mutate(projectToRevoke.id)
+                }
+              }}
+            >
+              {revokeProjectMutation.isPending ? 'Revoking...' : 'Revoke access'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
@@ -735,8 +986,8 @@ export function EmailDomainDetail() {
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="grid grid-cols-3 gap-3 py-2.5 text-sm first:pt-0 last:pb-0">
-      <dt className="text-muted-foreground">{label}</dt>
-      <dd className="col-span-2 min-w-0">{children}</dd>
+      <dt className="font-medium">{label}</dt>
+      <dd className="col-span-2 min-w-0 text-muted-foreground">{children}</dd>
     </div>
   )
 }

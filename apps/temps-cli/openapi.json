@@ -2950,6 +2950,7 @@
           "preview_gateway": {
             "default": {
               "auto_upgrade": true,
+              "container_name": "temps-preview-gateway",
               "host_port": 8090,
               "image": "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9"
             },
@@ -3576,6 +3577,27 @@
           "access_token",
           "refresh_token",
           "expires_at"
+        ],
+        "type": "object"
+      },
+      "AuthorizedEmailDomainProjectResponse": {
+        "description": "A project authorized to send email through a sender domain.",
+        "properties": {
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug"
         ],
         "type": "object"
       },
@@ -13526,12 +13548,24 @@
             "minimum": 0,
             "type": "integer"
           },
+          "delivery_unknown": {
+            "description": "Emails whose provider accepted/rejected outcome could not be determined",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "failed": {
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
           "queued": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sending": {
+            "description": "Emails currently owned by an active provider delivery attempt",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -13552,7 +13586,9 @@
           "sent",
           "failed",
           "queued",
-          "captured"
+          "captured",
+          "sending",
+          "delivery_unknown"
         ],
         "type": "object"
       },
@@ -27625,6 +27661,18 @@
             "minimum": 0,
             "type": "integer"
           },
+          "quota_exceeded_requests": {
+            "description": "Cumulative count of ingest requests rejected because the per-project\nstorage quota was exceeded (→ HTTP 413). Written to the metrics store\nas `otel.quota_exceeded_requests` (SourceKind::Node, node_id 0) every 60s.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rate_limited_requests": {
+            "description": "Cumulative count of ingest requests rejected because the per-project\nrate limit was exceeded (→ HTTP 429). Written to the metrics store as\n`otel.rate_limited_requests` (SourceKind::Node, node_id 0) every 60s.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "spans_dropped": {
             "format": "int64",
             "minimum": 0,
@@ -27652,7 +27700,9 @@
           "logs_stored_db",
           "logs_stored_s3",
           "logs_dropped",
-          "ingest_errors"
+          "ingest_errors",
+          "rate_limited_requests",
+          "quota_exceeded_requests"
         ],
         "type": "object"
       },
@@ -28135,6 +28185,12 @@
             "description": "When true (default), the supervisor will pull and apply the image\npinned in the Temps binary on every startup. When false, the\ncurrently-running image is left alone — operators upgrade manually\nfrom the settings UI.",
             "example": true,
             "type": "boolean"
+          },
+          "container_name": {
+            "default": "temps-preview-gateway",
+            "description": "Docker container name for this instance's gateway.\n\nA single Temps install owns the whole host, so the default is fine and\noperators never need to touch this. It exists for the case where\nseveral Temps instances share one Docker daemon — most obviously a\ndevelopment machine with multiple checkouts running at once.\n\nWithout it those instances silently fight: the `shared_secret` is\nper-database, so each generates a different one, but they all\nreconcile the *same* container name. Each start-up sees the other's\ncontainer as drifted, recreates it with its own secret, and every\nother instance's previews start failing with \"missing or invalid\nX-Temps-Preview-Token\". Giving each instance its own container name\n(and `host_port`) makes them independent.",
+            "example": "temps-preview-gateway",
+            "type": "string"
           },
           "host_port": {
             "default": 8090,
@@ -37440,7 +37496,7 @@
             "type": "object"
           },
           {
-            "description": "Match custom event_data by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where event_data->'user'->>'plan' = 'premium'",
+            "description": "Match custom event properties by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where props->'user'->>'plan' = 'premium',\nfalling back to the legacy `event_data` column when `props` is NULL",
             "properties": {
               "type": {
                 "enum": [
@@ -37449,7 +37505,7 @@
                 "type": "string"
               },
               "value": {
-                "description": "Match custom event_data by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where event_data->'user'->>'plan' = 'premium'",
+                "description": "Match custom event properties by JSON path\nFormat: {\"path\": \"user.plan\", \"value\": \"premium\"}\nThis will match events where props->'user'->>'plan' = 'premium',\nfalling back to the legacy `event_data` column when `props` is NULL",
                 "properties": {
                   "path": {
                     "type": "string"
@@ -58312,6 +58368,160 @@
         ]
       }
     },
+    "/email-domains/{id}/projects": {
+      "get": {
+        "operationId": "list_email_domain_projects",
+        "parameters": [
+          {
+            "description": "Email domain ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AuthorizedEmailDomainProjectResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Projects authorized to use this sender domain"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "500": {
+            "description": "Project visibility or database check failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Email Domains"
+        ]
+      }
+    },
+    "/email-domains/{id}/projects/{project_id}": {
+      "delete": {
+        "operationId": "revoke_email_domain_project",
+        "parameters": [
+          {
+            "description": "Email domain ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Project whose authorization is revoked",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Project authorization revoked"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Only an instance or platform administrator may change global sender-domain grants"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "500": {
+            "description": "Project access, audit, or database check failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Email Domains"
+        ]
+      },
+      "post": {
+        "operationId": "authorize_email_domain_project",
+        "parameters": [
+          {
+            "description": "Email domain ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Project allowed to send from this domain",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Project authorized"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Only an instance or platform administrator may change global sender-domain grants"
+          },
+          "404": {
+            "description": "Domain or project not found"
+          },
+          "500": {
+            "description": "Project access, audit, or database check failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Email Domains"
+        ]
+      }
+    },
     "/email-domains/{id}/setup-dns": {
       "post": {
         "operationId": "setup_dns",
@@ -58940,6 +59150,20 @@
       },
       "post": {
         "operationId": "send_email",
+        "parameters": [
+          {
+            "description": "Required for deployment-token requests. Reusing a key with the same payload returns the original delivery; reusing it with a different payload returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -58969,6 +59193,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "Idempotency key was already used with a different payload"
           },
           "500": {
             "description": "Internal server error"
@@ -74493,13 +74720,22 @@
             }
           },
           {
-            "description": "Number of items per page",
+            "description": "Number of items per page (1-100)",
             "in": "query",
             "name": "per_page",
             "required": false,
             "schema": {
               "format": "int64",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Case-insensitive project name or slug filter",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -74513,6 +74749,9 @@
               }
             },
             "description": "List of projects"
+          },
+          "400": {
+            "description": "Invalid pagination parameters"
           },
           "401": {
             "description": "Unauthorized"

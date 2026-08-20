@@ -687,10 +687,12 @@ pub(super) async fn resolve_hidden_projects(
     tag = "Projects",
     params(
         ("page" = Option<i64>, Query, description = "Page number (1-based)"),
-        ("per_page" = Option<i64>, Query, description = "Number of items per page")
+        ("per_page" = Option<i64>, Query, description = "Number of items per page (1-100)"),
+        ("search" = Option<String>, Query, description = "Case-insensitive project name or slug filter")
     ),
     responses(
         (status = 200, description = "List of projects", body = PaginatedProjectList),
+        (status = 400, description = "Invalid pagination parameters"),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Internal server error")
     ),
@@ -707,6 +709,11 @@ pub async fn get_projects(
 
     let page = params.page.unwrap_or(1);
     let per_page = params.per_page.unwrap_or(10);
+    let search = params
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
     // Per-resource guards keep a user out of a project they click on; this
     // keeps its name out of the list in the first place. Instance
@@ -715,7 +722,7 @@ pub async fn get_projects(
 
     let (projects, total) = state
         .project_service
-        .get_projects_paginated_excluding(page, per_page, &hidden)
+        .get_projects_paginated_excluding_search(page, per_page, &hidden, search)
         .await
         .map_err(Problem::from)?;
 

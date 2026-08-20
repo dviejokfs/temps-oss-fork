@@ -57,6 +57,33 @@ fn extract_ses_error_details<E: std::fmt::Display + std::fmt::Debug>(
     }
 }
 
+fn map_ses_send_error<E: std::fmt::Display + std::fmt::Debug>(
+    error: aws_sdk_sesv2::error::SdkError<E>,
+) -> EmailError {
+    use aws_sdk_sesv2::error::SdkError;
+
+    let details = extract_ses_error_details(&error);
+    match error {
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
+            EmailError::ProviderDeliveryUnknown(format!(
+                "AWS SES request may have been accepted: {details}"
+            ))
+        }
+        SdkError::ServiceError(_) | SdkError::ConstructionFailure(_) => EmailError::AwsSes(details),
+        _ => EmailError::ProviderDeliveryUnknown(format!(
+            "AWS SES request returned an indeterminate transport result: {details}"
+        )),
+    }
+}
+
+fn require_ses_message_id(message_id: Option<&str>) -> Result<String, EmailError> {
+    message_id.map(str::to_owned).ok_or_else(|| {
+        EmailError::ProviderDeliveryUnknown(
+            "AWS SES accepted the request but returned no message ID".to_string(),
+        )
+    })
+}
+
 /// AWS SES credentials configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SesCredentials {
@@ -468,17 +495,13 @@ impl EmailProvider for SesProvider {
         // Attach SES Configuration Set for event notifications (bounces, complaints, deliveries)
         send_request = send_request.configuration_set_name(&self.configuration_set_name);
 
-        let result = send_request.send().await.map_err(|e| {
-            // Extract detailed error information from AWS SDK error
-            let error_message = extract_ses_error_details(&e);
-            error!("Failed to send email via SES: {}", error_message);
-            EmailError::AwsSes(error_message)
+        let result = send_request.send().await.map_err(|error| {
+            let mapped = map_ses_send_error(error);
+            error!("Failed to send email via SES: {mapped}");
+            mapped
         })?;
 
-        let message_id = result
-            .message_id()
-            .ok_or_else(|| EmailError::AwsSes("No message ID returned".to_string()))?
-            .to_string();
+        let message_id = require_ses_message_id(result.message_id())?;
 
         debug!("Email sent successfully, message_id: {}", message_id);
 
@@ -493,6 +516,17 @@ impl EmailProvider for SesProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_response_without_message_id_is_delivery_unknown() {
+        let result = require_ses_message_id(None);
+
+        assert!(matches!(
+            result,
+            Err(EmailError::ProviderDeliveryUnknown(reason))
+                if reason.contains("returned no message ID")
+        ));
+    }
 
     #[test]
     fn test_ses_credentials_serialization() {

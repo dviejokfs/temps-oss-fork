@@ -23,6 +23,7 @@ pub struct MockEmailProvider {
     pub should_fail_send: bool,
     pub should_fail_verify: bool,
     pub verification_status: VerificationStatus,
+    pub send_delay: std::time::Duration,
 }
 
 impl Default for MockEmailProvider {
@@ -41,11 +42,17 @@ impl MockEmailProvider {
             should_fail_send: false,
             should_fail_verify: false,
             verification_status: VerificationStatus::Verified,
+            send_delay: std::time::Duration::ZERO,
         }
     }
 
     pub fn with_send_failure(mut self) -> Self {
         self.should_fail_send = true;
+        self
+    }
+
+    pub fn with_send_delay(mut self, delay: std::time::Duration) -> Self {
+        self.send_delay = delay;
         self
     }
 
@@ -175,6 +182,10 @@ impl EmailProvider for MockEmailProvider {
 
     async fn send(&self, _email: &SendEmailRequest) -> Result<SendEmailResponse, EmailError> {
         self.send_count.fetch_add(1, Ordering::SeqCst);
+
+        if !self.send_delay.is_zero() {
+            tokio::time::sleep(self.send_delay).await;
+        }
 
         if self.should_fail_send {
             return Err(EmailError::ProviderError("Mock send failure".to_string()));

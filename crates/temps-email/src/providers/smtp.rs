@@ -227,6 +227,20 @@ impl EmailProvider for SmtpProvider {
         }
         if let Some(headers) = &email.headers {
             for (name, value) in headers {
+                let is_application_metadata = name.len() > "X-Temps-".len()
+                    && name
+                        .get(.."X-Temps-".len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("X-Temps-"))
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    && !value.bytes().any(|byte| byte == b'\r' || byte == b'\n');
+                if !is_application_metadata {
+                    return Err(EmailError::Smtp(
+                        "A custom header is not allowed; only single-line X-Temps-* metadata headers are accepted"
+                            .to_string(),
+                    ));
+                }
                 // lettre rejects malformed header names with an Err — surface that
                 // as a typed SMTP error instead of swallowing.
                 let header_name = lettre::message::header::HeaderName::new_from_ascii(name.clone())
@@ -279,7 +293,9 @@ impl EmailProvider for SmtpProvider {
 
         self.transport.send(message).await.map_err(|e| {
             error!("Failed to send email via SMTP: {}", e);
-            EmailError::Smtp(format!("Failed to send email: {}", e))
+            EmailError::ProviderDeliveryUnknown(format!(
+                "SMTP transport failed after delivery began: {e}"
+            ))
         })?;
 
         debug!("Email sent via SMTP, message_id: {}", message_id);
@@ -450,6 +466,40 @@ mod tests {
         match err {
             EmailError::Smtp(msg) => assert!(msg.contains("body")),
             other => panic!("expected Smtp body error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_rejects_protected_custom_headers_before_delivery() {
+        let creds = SmtpCredentials {
+            host: "smtp.example.com".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            encryption: SmtpEncryption::Starttls,
+            accept_invalid_certs: false,
+        };
+        let provider = SmtpProvider::new(&creds).unwrap();
+        let req = SendEmailRequest {
+            from: "authorized@example.com".to_string(),
+            from_name: None,
+            to: vec!["recipient@example.com".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: "x".to_string(),
+            html: None,
+            text: Some("hi".to_string()),
+            headers: Some(std::collections::HashMap::from([(
+                "From".to_string(),
+                "attacker@example.test".to_string(),
+            )])),
+        };
+
+        let err = provider.send(&req).await.unwrap_err();
+        match err {
+            EmailError::Smtp(message) => assert!(message.contains("not allowed")),
+            other => panic!("expected protected-header error, got {other:?}"),
         }
     }
 }

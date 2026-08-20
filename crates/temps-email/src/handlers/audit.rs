@@ -236,6 +236,104 @@ pub struct EmailDomainDeletedAudit {
     pub domain: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailDomainProjectAuthorizedAudit {
+    pub context: AuditContext,
+    pub correlation_id: uuid::Uuid,
+    pub domain_id: i32,
+    pub project_id: i32,
+    pub success: bool,
+}
+
+/// Durable intent record written before changing a project/domain grant.
+///
+/// The corresponding result event is still emitted after the mutation, but
+/// requiring this event first guarantees that a privileged change is never
+/// performed without an attributable audit record.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailDomainProjectChangeRequestedAudit {
+    pub context: AuditContext,
+    pub correlation_id: uuid::Uuid,
+    pub domain_id: i32,
+    pub project_id: i32,
+    pub action: String,
+}
+
+impl AuditOperation for EmailDomainProjectChangeRequestedAudit {
+    fn operation_type(&self) -> String {
+        "EMAIL_DOMAIN_PROJECT_CHANGE_REQUESTED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
+impl AuditOperation for EmailDomainProjectAuthorizedAudit {
+    fn operation_type(&self) -> String {
+        "EMAIL_DOMAIN_PROJECT_AUTHORIZED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailDomainProjectRevokedAudit {
+    pub context: AuditContext,
+    pub correlation_id: uuid::Uuid,
+    pub domain_id: i32,
+    pub project_id: i32,
+    pub success: bool,
+}
+
+impl AuditOperation for EmailDomainProjectRevokedAudit {
+    fn operation_type(&self) -> String {
+        "EMAIL_DOMAIN_PROJECT_REVOKED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
 impl AuditOperation for EmailDomainDeletedAudit {
     fn operation_type(&self) -> String {
         "EMAIL_DOMAIN_DELETED".to_string()
@@ -262,33 +360,176 @@ impl AuditOperation for EmailDomainDeletedAudit {
 // Email Audit Types
 // ========================================
 
+/// Durable intent record written before any provider call is allowed.
 #[derive(Debug, Clone, Serialize)]
-pub struct EmailSentAudit {
-    pub context: AuditContext,
-    pub email_id: uuid::Uuid,
-    pub from: String,
-    pub to: Vec<String>,
-    pub subject: String,
+pub struct EmailSendRequestedAudit {
+    pub user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub deployment_principal: Option<DeploymentEmailPrincipal>,
+    pub correlation_id: uuid::Uuid,
+    pub sender_domain: String,
+    pub recipient_count: usize,
+    pub request_fingerprint: String,
 }
 
-impl AuditOperation for EmailSentAudit {
+impl AuditOperation for EmailSendRequestedAudit {
     fn operation_type(&self) -> String {
-        "EMAIL_SENT".to_string()
+        "EMAIL_SEND_REQUESTED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {
-        Some(self.context.user_id)
+        self.user_id
     }
 
     fn ip_address(&self) -> Option<String> {
-        self.context.ip_address.clone()
+        self.ip_address.clone()
     }
 
     fn user_agent(&self) -> &str {
-        &self.context.user_agent
+        &self.user_agent
     }
 
     fn serialize(&self) -> anyhow::Result<String> {
         serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailSentAudit {
+    pub user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub deployment_principal: Option<DeploymentEmailPrincipal>,
+    pub correlation_id: uuid::Uuid,
+    pub email_id: uuid::Uuid,
+    pub sender_domain: String,
+    pub recipient_count: usize,
+    pub request_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentEmailPrincipal {
+    pub token_id: i32,
+    pub token_name: String,
+    pub project_id: i32,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
+}
+
+impl AuditOperation for EmailSentAudit {
+    fn operation_type(&self) -> String {
+        // This records the result returned for a request. A replay may produce
+        // another completion event, but never another provider delivery event.
+        "EMAIL_SEND_REQUEST_COMPLETED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> AuditContext {
+        AuditContext {
+            user_id: 7,
+            ip_address: Some("127.0.0.1".to_string()),
+            user_agent: "audit-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn project_sender_grants_and_revocations_are_distinct_attributable_events() {
+        let correlation_id = uuid::Uuid::new_v4();
+        let requested = EmailDomainProjectChangeRequestedAudit {
+            context: context(),
+            correlation_id,
+            domain_id: 2,
+            project_id: 70,
+            action: "authorize".to_string(),
+        };
+        let authorized = EmailDomainProjectAuthorizedAudit {
+            context: context(),
+            correlation_id,
+            domain_id: 2,
+            project_id: 70,
+            success: true,
+        };
+        let revoked = EmailDomainProjectRevokedAudit {
+            context: context(),
+            correlation_id,
+            domain_id: 2,
+            project_id: 70,
+            success: false,
+        };
+
+        assert_eq!(
+            authorized.operation_type(),
+            "EMAIL_DOMAIN_PROJECT_AUTHORIZED"
+        );
+        assert_eq!(
+            requested.operation_type(),
+            "EMAIL_DOMAIN_PROJECT_CHANGE_REQUESTED"
+        );
+        assert_eq!(revoked.operation_type(), "EMAIL_DOMAIN_PROJECT_REVOKED");
+        let authorized_json = AuditOperation::serialize(&authorized).unwrap();
+        let revoked_json = AuditOperation::serialize(&revoked).unwrap();
+        for serialized in [&authorized_json, &revoked_json] {
+            assert!(serialized.contains("\"domain_id\":2"));
+            assert!(serialized.contains("\"project_id\":70"));
+            assert!(serialized.contains("\"user_id\":7"));
+            assert!(serialized.contains("127.0.0.1"));
+        }
+        assert!(authorized_json.contains("\"success\":true"));
+        assert!(revoked_json.contains("\"success\":false"));
+    }
+
+    #[test]
+    fn deployment_email_audit_uses_machine_principal_without_fake_user() {
+        let audit = EmailSentAudit {
+            user_id: None,
+            ip_address: Some("127.0.0.1".to_string()),
+            user_agent: "deployment-agent".to_string(),
+            deployment_principal: Some(DeploymentEmailPrincipal {
+                token_id: 9,
+                token_name: "production-mailer".to_string(),
+                project_id: 70,
+                environment_id: Some(4),
+                deployment_id: Some(12),
+            }),
+            correlation_id: uuid::Uuid::new_v4(),
+            email_id: uuid::Uuid::nil(),
+            sender_domain: "example.test".to_string(),
+            recipient_count: 1,
+            request_fingerprint: "sha256-fixture".to_string(),
+        };
+
+        assert_eq!(AuditOperation::user_id(&audit), None);
+        assert_eq!(
+            AuditOperation::operation_type(&audit),
+            "EMAIL_SEND_REQUEST_COMPLETED"
+        );
+        let serialized = AuditOperation::serialize(&audit).unwrap();
+        assert!(serialized.contains("\"user_id\":null"));
+        assert!(serialized.contains("\"token_id\":9"));
+        assert!(serialized.contains("\"project_id\":70"));
+        assert!(!serialized.contains("\"user_id\":0"));
+        assert!(!serialized.contains("recipient@example.test"));
+        assert!(!serialized.contains("Status update"));
     }
 }

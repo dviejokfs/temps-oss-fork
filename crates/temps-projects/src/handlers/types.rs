@@ -293,6 +293,8 @@ fn default_performance_metrics() -> bool {
 pub struct PaginationParams {
     pub page: Option<i64>,
     pub per_page: Option<i64>,
+    /// Optional case-insensitive project name or slug filter.
+    pub search: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

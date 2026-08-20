@@ -52,6 +52,9 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         domains::verify_domain,
         domains::delete_email_domain,
         domains::setup_dns,
+        domains::list_email_domain_projects,
+        domains::authorize_email_domain_project,
+        domains::revoke_email_domain_project,
         // Emails
         emails::send_email,
         emails::list_emails,
@@ -90,6 +93,7 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
             types::SetupDnsRequest,
             types::SetupDnsResponse,
             types::DnsRecordSetupResult,
+            types::AuthorizedEmailDomainProjectResponse,
             // Email types
             types::SendEmailRequestBody,
             types::SendEmailResponseBody,

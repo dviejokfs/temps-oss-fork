@@ -458,6 +458,15 @@ class Email {
   verifyDomain = (options: Parameters<typeof sdk.verifyDomain>[0]) =>
     sdk.verifyDomain({ ...options, client: this.client });
 
+  listAuthorizedProjects = (options: Parameters<typeof sdk.listEmailDomainProjects>[0]) =>
+    sdk.listEmailDomainProjects({ ...options, client: this.client });
+
+  authorizeProject = (options: Parameters<typeof sdk.authorizeEmailDomainProject>[0]) =>
+    sdk.authorizeEmailDomainProject({ ...options, client: this.client });
+
+  revokeProject = (options: Parameters<typeof sdk.revokeEmailDomainProject>[0]) =>
+    sdk.revokeEmailDomainProject({ ...options, client: this.client });
+
   // Emails
   send = (options: Parameters<typeof sdk.sendEmail>[0]) =>
     sdk.sendEmail({ ...options, client: this.client });

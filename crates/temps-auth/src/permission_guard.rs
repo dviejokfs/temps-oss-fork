@@ -1169,6 +1169,7 @@ mod tests {
             "temps-analytics-session-replay",
             "temps-blob",
             "temps-deployments",
+            "temps-email",
             "temps-environments",
             "temps-error-tracking",
             "temps-flags",
