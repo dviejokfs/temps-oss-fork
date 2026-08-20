@@ -1,12 +1,23 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
+    FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, Set, Statement,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
-use temps_entities::{error_events, error_groups};
+use temps_entities::{deployments, error_events, error_groups};
 
-use super::types::{ErrorEventDomain, ErrorGroupDomain, ErrorTrackingError};
+use super::types::{
+    ErrorEventDomain, ErrorGroupDeploymentSummary, ErrorGroupDomain, ErrorTrackingError,
+};
+
+/// Aggregate counts of events and distinct affected users for one error group in a time window.
+#[derive(FromQueryResult)]
+struct ErrorGroupRangeAggregate {
+    error_group_id: i32,
+    events_in_range: i64,
+    affected_users: i64,
+}
 
 /// Service for CRUD operations on error groups and events
 pub struct ErrorCRUDService {
@@ -211,7 +222,14 @@ impl ErrorCRUDService {
         }
     }
 
-    /// List error groups with filtering and pagination
+    /// List error groups with filtering and pagination.
+    ///
+    /// When both `start_date` and `end_date` are supplied, only groups that have at least one
+    /// `error_events` row with `timestamp` in `[start_date, end_date]` are returned.  The query
+    /// against `error_events` is always time-bounded so it uses the hypertable indexes safely.
+    ///
+    /// The returned `ErrorGroupDomain` items will have `events_in_range` and `affected_users`
+    /// set (for the current page only) when a date range is provided; they are `None` otherwise.
     #[allow(clippy::too_many_arguments)]
     pub async fn list_error_groups(
         &self,
@@ -222,6 +240,8 @@ impl ErrorCRUDService {
         environment_id: Option<i32>,
         sort_by: Option<String>,
         sort_order: Option<String>,
+        start_date: Option<DateTime<Utc>>,
+        end_date: Option<DateTime<Utc>>,
     ) -> Result<(Vec<ErrorGroupDomain>, u64), ErrorTrackingError> {
         let page = page.unwrap_or(1);
         let page_size = std::cmp::min(page_size.unwrap_or(20), 100);
@@ -236,6 +256,23 @@ impl ErrorCRUDService {
 
         if let Some(env_id) = environment_id {
             query = query.filter(error_groups::Column::EnvironmentId.eq(env_id));
+        }
+
+        // Apply time-range filter: restrict to groups that have at least one event in the window.
+        // The inner query is always time-bounded to keep hypertable lookups safe.
+        let date_range = match (start_date, end_date) {
+            (Some(start), Some(end)) => Some((start, end)),
+            _ => None,
+        };
+
+        if let Some((start, end)) = date_range {
+            let candidate_ids = self
+                .get_candidate_group_ids(project_id, start, end, environment_id)
+                .await?;
+            if candidate_ids.is_empty() {
+                return Ok((vec![], 0));
+            }
+            query = query.filter(error_groups::Column::Id.is_in(candidate_ids));
         }
 
         // Apply sorting (default: last_seen DESC)
@@ -262,7 +299,7 @@ impl ErrorCRUDService {
         let total = paginator.num_items().await?;
         let groups = paginator.fetch_page(page - 1).await?;
 
-        let domain_groups = groups
+        let mut domain_groups: Vec<ErrorGroupDomain> = groups
             .into_iter()
             .map(|group| ErrorGroupDomain {
                 id: group.id,
@@ -280,10 +317,203 @@ impl ErrorCRUDService {
                 visitor_id: group.visitor_id,
                 created_at: group.created_at,
                 updated_at: group.updated_at,
+                events_in_range: None,
+                affected_users: None,
+                deployment: None,
             })
             .collect();
 
+        // Compute per-group windowed aggregates for the current page only.
+        // Only runs when a date range was requested, never unbounded against error_events.
+        if let Some((start, end)) = date_range {
+            let group_ids: Vec<i32> = domain_groups.iter().map(|g| g.id).collect();
+            if !group_ids.is_empty() {
+                let aggregates = self
+                    .compute_range_aggregates(project_id, &group_ids, start, end, environment_id)
+                    .await?;
+                let agg_map: HashMap<i32, (i64, i64)> = aggregates
+                    .into_iter()
+                    .map(|a| (a.error_group_id, (a.events_in_range, a.affected_users)))
+                    .collect();
+                for group in &mut domain_groups {
+                    let (events, users) = agg_map.get(&group.id).copied().unwrap_or((0, 0));
+                    group.events_in_range = Some(events);
+                    group.affected_users = Some(users);
+                }
+            }
+        }
+
+        // Resolve `deployment_id` -> commit info for the current page only. `deployments` is a
+        // small regular table (not a hypertable), and the lookup is bounded by page size, so
+        // this is independent of the date-range filter above.
+        let deployment_ids: Vec<i32> = domain_groups
+            .iter()
+            .filter_map(|g| g.deployment_id)
+            .collect();
+        if !deployment_ids.is_empty() {
+            let deployment_map = self.resolve_deployments(&deployment_ids).await?;
+            for group in &mut domain_groups {
+                if let Some(dep_id) = group.deployment_id {
+                    group.deployment = deployment_map.get(&dep_id).cloned();
+                }
+            }
+        }
+
         Ok((domain_groups, total))
+    }
+
+    /// Batch-resolve deployment IDs to lightweight commit summaries. Not N+1 — one query for
+    /// however many distinct deployment IDs appear on the current page (bounded by page size).
+    async fn resolve_deployments(
+        &self,
+        deployment_ids: &[i32],
+    ) -> Result<HashMap<i32, ErrorGroupDeploymentSummary>, ErrorTrackingError> {
+        let rows = deployments::Entity::find()
+            .filter(deployments::Column::Id.is_in(deployment_ids.to_vec()))
+            .all(self.db.as_ref())
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|d| {
+                (
+                    d.id,
+                    ErrorGroupDeploymentSummary {
+                        id: d.id,
+                        commit_hash: d.commit_sha,
+                        commit_message: d.commit_message,
+                        branch: d.branch_ref,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Return the set of `error_group_id` values that have at least one event in the given
+    /// time window for the project (and optionally a specific environment).
+    ///
+    /// Always time-bounded — safe to call against the TimescaleDB hypertable.
+    async fn get_candidate_group_ids(
+        &self,
+        project_id: i32,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        environment_id: Option<i32>,
+    ) -> Result<Vec<i32>, ErrorTrackingError> {
+        #[derive(FromQueryResult)]
+        struct ErrorGroupIdRow {
+            error_group_id: i32,
+        }
+
+        let rows = if let Some(env_id) = environment_id {
+            ErrorGroupIdRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"
+                    SELECT DISTINCT error_group_id
+                    FROM error_events
+                    WHERE project_id = $1
+                        AND timestamp >= $2
+                        AND timestamp <= $3
+                        AND environment_id = $4
+                "#,
+                vec![project_id.into(), start.into(), end.into(), env_id.into()],
+            ))
+            .all(self.db.as_ref())
+            .await?
+        } else {
+            ErrorGroupIdRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"
+                    SELECT DISTINCT error_group_id
+                    FROM error_events
+                    WHERE project_id = $1
+                        AND timestamp >= $2
+                        AND timestamp <= $3
+                "#,
+                vec![project_id.into(), start.into(), end.into()],
+            ))
+            .all(self.db.as_ref())
+            .await?
+        };
+
+        Ok(rows.into_iter().map(|r| r.error_group_id).collect())
+    }
+
+    /// Compute `events_in_range` and `affected_users` for a specific set of group IDs within
+    /// the given time window.  Runs a single aggregation query — not N+1 per group.
+    ///
+    /// `COUNT(DISTINCT visitor_id)` inherently skips NULLs in PostgreSQL.
+    async fn compute_range_aggregates(
+        &self,
+        project_id: i32,
+        group_ids: &[i32],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        environment_id: Option<i32>,
+    ) -> Result<Vec<ErrorGroupRangeAggregate>, ErrorTrackingError> {
+        if group_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build individual placeholders starting at $4 for group IDs.
+        // Page size is capped at 100, so this list is always bounded.
+        let id_placeholders: String = group_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("${}", i + 4))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut params: Vec<sea_orm::Value> = vec![project_id.into(), start.into(), end.into()];
+        for id in group_ids {
+            params.push((*id).into());
+        }
+
+        let sql = if let Some(env_id) = environment_id {
+            let env_placeholder = format!("${}", group_ids.len() + 4);
+            params.push(env_id.into());
+            format!(
+                r#"
+                    SELECT
+                        error_group_id,
+                        COUNT(*) AS events_in_range,
+                        COUNT(DISTINCT visitor_id) AS affected_users
+                    FROM error_events
+                    WHERE project_id = $1
+                        AND timestamp >= $2
+                        AND timestamp <= $3
+                        AND error_group_id IN ({})
+                        AND environment_id = {}
+                    GROUP BY error_group_id
+                "#,
+                id_placeholders, env_placeholder
+            )
+        } else {
+            format!(
+                r#"
+                    SELECT
+                        error_group_id,
+                        COUNT(*) AS events_in_range,
+                        COUNT(DISTINCT visitor_id) AS affected_users
+                    FROM error_events
+                    WHERE project_id = $1
+                        AND timestamp >= $2
+                        AND timestamp <= $3
+                        AND error_group_id IN ({})
+                    GROUP BY error_group_id
+                "#,
+                id_placeholders
+            )
+        };
+
+        ErrorGroupRangeAggregate::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            params,
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(ErrorTrackingError::Database)
     }
 
     /// Get error group by ID
@@ -297,6 +527,12 @@ impl ErrorCRUDService {
             .one(self.db.as_ref())
             .await?
             .ok_or(ErrorTrackingError::GroupNotFound)?;
+
+        let deployment = if let Some(dep_id) = group.deployment_id {
+            self.resolve_deployments(&[dep_id]).await?.remove(&dep_id)
+        } else {
+            None
+        };
 
         Ok(ErrorGroupDomain {
             id: group.id,
@@ -314,6 +550,9 @@ impl ErrorCRUDService {
             visitor_id: group.visitor_id,
             created_at: group.created_at,
             updated_at: group.updated_at,
+            events_in_range: None,
+            affected_users: None,
+            deployment,
         })
     }
 
@@ -333,8 +572,17 @@ impl ErrorCRUDService {
 
         let mut group: error_groups::ActiveModel = group.into();
         group.status = Set(status);
-        if let Some(assignee) = assigned_to {
-            group.assigned_to = Set(Some(assignee));
+        match assigned_to {
+            Some(ref s) if s.is_empty() => {
+                // Empty string is the sentinel for "clear the assignment"
+                group.assigned_to = Set(None);
+            }
+            Some(assignee) => {
+                group.assigned_to = Set(Some(assignee));
+            }
+            None => {
+                // Field omitted — leave the existing value untouched
+            }
         }
         group.updated_at = Set(Utc::now());
 
@@ -652,7 +900,17 @@ mod tests {
 
         // Test pagination
         let (groups, total) = service
-            .list_error_groups(project_id, Some(1), Some(3), None, None, None, None)
+            .list_error_groups(
+                project_id,
+                Some(1),
+                Some(3),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("Failed to list groups");
 
@@ -681,6 +939,8 @@ mod tests {
                 Some(1),
                 Some(10),
                 Some("unresolved".to_string()),
+                None,
+                None,
                 None,
                 None,
                 None,

@@ -185,6 +185,26 @@ function SelectedRangeLabel({
   )
 }
 
+function MarkerLabel({
+  viewBox,
+  text,
+  title,
+}: {
+  viewBox?: { x?: number; y?: number }
+  text: string
+  title?: string
+}) {
+  const x = viewBox?.x ?? 0
+  const y = viewBox?.y ?? 0
+
+  return (
+    <text x={x + 4} y={y + 10} fill="var(--chart-5)" fontSize={9}>
+      {title && <title>{title}</title>}
+      {text}
+    </text>
+  )
+}
+
 /**
  * Themed line chart with optional horizontal threshold reference lines (e.g.
  * Core Web Vitals "Good" / "Poor" bands). `series` is either a single line
@@ -600,14 +620,9 @@ export function ThresholdLineChart({
             strokeDasharray="3 3"
             strokeOpacity={0.85}
             label={
-              m.label
-                ? {
-                    value: m.label,
-                    position: 'insideTopRight',
-                    fill: 'var(--chart-5)',
-                    fontSize: 9,
-                  }
-                : undefined
+              m.label ? (
+                <MarkerLabel text={m.label} title={m.title} />
+              ) : undefined
             }
           />
         ))}

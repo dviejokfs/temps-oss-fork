@@ -14838,8 +14838,46 @@
         ],
         "type": "object"
       },
+      "ErrorGroupDeploymentResponse": {
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
       "ErrorGroupResponse": {
         "properties": {
+          "affected_users": {
+            "description": "Count of distinct affected visitors/users within the requested time window.\nPresent only when `start_date` and `end_date` were supplied on the list request.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "assigned_to": {
             "type": [
               "string",
@@ -14848,6 +14886,17 @@
           },
           "created_at": {
             "type": "string"
+          },
+          "deployment": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ErrorGroupDeploymentResponse",
+                "description": "The deployment this group's `deployment_id` points to, resolved to its commit info.\n`None` when the group has no linked deployment."
+              }
+            ]
           },
           "deployment_id": {
             "format": "int32",
@@ -14865,6 +14914,14 @@
           },
           "error_type": {
             "type": "string"
+          },
+          "events_in_range": {
+            "description": "Count of error events within the requested time window.\nPresent only when `start_date` and `end_date` were supplied on the list request.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "first_seen": {
             "type": "string"
@@ -15053,6 +15110,14 @@
           "end_time": {
             "format": "date-time",
             "type": "string"
+          },
+          "environment_id": {
+            "description": "Filter chart data to a specific environment.\nAlways AND-combined with project_id — an environment from a different project\nreturns zero-filled buckets rather than cross-project data.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "start_time": {
             "format": "date-time",
@@ -42621,6 +42686,7 @@
       "UpdateErrorGroupRequest": {
         "properties": {
           "assigned_to": {
+            "description": "Assignee (email by convention).\n- `Some(\"user@example.com\")` — sets the assignee.\n- `Some(\"\")` (empty string) — clears the current assignment (sets to null).\n- `null` / field omitted — leaves the existing value unchanged.",
             "type": [
               "string",
               "null"
@@ -83930,6 +83996,19 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Filter chart data to a specific environment.\nAlways AND-combined with project_id — an environment from a different project\nreturns zero-filled buckets rather than cross-project data.",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           }
         ],

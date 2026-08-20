@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
 use std::sync::Arc;
 use temps_core::UtcDateTime;
@@ -208,7 +209,11 @@ impl ErrorTrackingService {
         Ok(group_id)
     }
 
-    /// List error groups (delegates to CRUD service)
+    /// List error groups (delegates to CRUD service).
+    ///
+    /// When `start_date` and `end_date` are both provided, the result is restricted to groups
+    /// that have at least one event in that window, and each returned group will have
+    /// `events_in_range` / `affected_users` populated.
     #[allow(clippy::too_many_arguments)]
     pub async fn list_error_groups(
         &self,
@@ -219,6 +224,8 @@ impl ErrorTrackingService {
         environment_id: Option<i32>,
         sort_by: Option<String>,
         sort_order: Option<String>,
+        start_date: Option<DateTime<Utc>>,
+        end_date: Option<DateTime<Utc>>,
     ) -> Result<(Vec<ErrorGroupDomain>, u64), ErrorTrackingError> {
         self.crud
             .list_error_groups(
@@ -229,6 +236,8 @@ impl ErrorTrackingService {
                 environment_id,
                 sort_by,
                 sort_order,
+                start_date,
+                end_date,
             )
             .await
     }
@@ -300,16 +309,20 @@ impl ErrorTrackingService {
             .await
     }
 
-    /// Get error time series (delegates to analytics service)
+    /// Get error time series (delegates to analytics service).
+    ///
+    /// `environment_id` is AND-combined with `project_id` in the underlying query so providing
+    /// an environment from a different project simply returns zero-filled buckets.
     pub async fn get_error_time_series(
         &self,
         project_id: i32,
         start_time: UtcDateTime,
         end_time: UtcDateTime,
         interval: &str,
+        environment_id: Option<i32>,
     ) -> Result<Vec<ErrorTimeSeriesPoint>, ErrorTrackingError> {
         self.analytics
-            .get_error_time_series(project_id, start_time, end_time, interval)
+            .get_error_time_series(project_id, start_time, end_time, interval, environment_id)
             .await
     }
 

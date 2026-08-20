@@ -6462,16 +6462,16 @@ export type EmailStatsResponse = {
      */
     captured: number;
     /**
-     * Provider transport completed without a definitive delivery result; never retried automatically
+     * Emails whose provider accepted/rejected outcome could not be determined
      */
     delivery_unknown: number;
     failed: number;
     queued: number;
-    sent: number;
     /**
-     * Emails currently protected by a delivery lease
+     * Emails currently owned by an active provider delivery attempt
      */
     sending: number;
+    sent: number;
     total: number;
 };
 
@@ -7065,12 +7065,30 @@ export type ErrorEventResponse = {
     timestamp: string;
 };
 
+export type ErrorGroupDeploymentResponse = {
+    branch?: string | null;
+    commit_hash?: string | null;
+    commit_message?: string | null;
+    id: number;
+};
+
 export type ErrorGroupResponse = {
+    /**
+     * Count of distinct affected visitors/users within the requested time window.
+     * Present only when `start_date` and `end_date` were supplied on the list request.
+     */
+    affected_users?: number | null;
     assigned_to?: string | null;
     created_at: string;
+    deployment?: null | ErrorGroupDeploymentResponse;
     deployment_id?: number | null;
     environment_id?: number | null;
     error_type: string;
+    /**
+     * Count of error events within the requested time window.
+     * Present only when `start_date` and `end_date` were supplied on the list request.
+     */
+    events_in_range?: number | null;
     first_seen: string;
     id: number;
     last_seen: string;
@@ -7120,6 +7138,12 @@ export type ErrorTimeSeriesQuery = {
      */
     bucket?: string;
     end_time: string;
+    /**
+     * Filter chart data to a specific environment.
+     * Always AND-combined with project_id — an environment from a different project
+     * returns zero-filled buckets rather than cross-project data.
+     */
+    environment_id?: number | null;
     start_time: string;
 };
 
@@ -19560,6 +19584,12 @@ export type UpdateEnvironmentVariableRequest = {
 };
 
 export type UpdateErrorGroupRequest = {
+    /**
+     * Assignee (email by convention).
+     * - `Some("user@example.com")` — sets the assignee.
+     * - `Some("")` (empty string) — clears the current assignment (sets to null).
+     * - `null` / field omitted — leaves the existing value unchanged.
+     */
     assigned_to?: string | null;
     status: string;
 };
@@ -28444,7 +28474,7 @@ export type RevokeEmailDomainProjectErrors = {
      */
     401: unknown;
     /**
-     * Only an instance administrator may change global sender-domain grants
+     * Only an instance or platform administrator may change global sender-domain grants
      */
     403: unknown;
     /**
@@ -28488,7 +28518,7 @@ export type AuthorizeEmailDomainProjectErrors = {
      */
     401: unknown;
     /**
-     * Only an instance administrator may change global sender-domain grants
+     * Only an instance or platform administrator may change global sender-domain grants
      */
     403: unknown;
     /**
@@ -28956,7 +28986,7 @@ export type SendEmailData = {
         /**
          * Required for deployment-token requests. Reusing a key with the same payload returns the original delivery; reusing it with a different payload returns 409.
          */
-        'Idempotency-Key'?: string;
+        'Idempotency-Key'?: string | null;
     };
     path?: never;
     query?: never;
@@ -38799,7 +38829,7 @@ export type GetProjectsData = {
          */
         page?: number;
         /**
-         * Number of items per page
+         * Number of items per page (1-100)
          */
         per_page?: number;
         /**
@@ -44767,6 +44797,12 @@ export type GetErrorTimeSeriesData = {
          * Time bucket size (e.g., "1h", "15m", "1d", "1 hour", "30 minutes")
          */
         bucket?: string;
+        /**
+         * Filter chart data to a specific environment.
+         * Always AND-combined with project_id — an environment from a different project
+         * returns zero-filled buckets rather than cross-project data.
+         */
+        environment_id?: number | null;
     };
     url: '/projects/{project_id}/error-time-series';
 };

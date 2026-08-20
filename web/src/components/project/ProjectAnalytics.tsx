@@ -331,6 +331,8 @@ export interface AnalyticsFiltersProps {
   isRefreshing: boolean
   /** Extra page-level actions rendered before the refresh button. */
   actions?: React.ReactNode
+  /** Extra controls rendered next to the environment selector, on the left side. */
+  leftActions?: React.ReactNode
 }
 
 export function AnalyticsFilters({
@@ -344,6 +346,7 @@ export function AnalyticsFilters({
   onRefresh,
   isRefreshing,
   actions,
+  leftActions,
 }: AnalyticsFiltersProps) {
   const { data: environments } = useQuery({
     ...getEnvironmentsOptions({
@@ -355,23 +358,26 @@ export function AnalyticsFilters({
 
   return (
     <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-      <Select
-        value={selectedEnvironment?.toString()}
-        onValueChange={(value) =>
-          onEnvironmentChange(value ? parseInt(value) : undefined)
-        }
-      >
-        <SelectTrigger className="w-[200px]">
-          <SelectValue placeholder="All environments" />
-        </SelectTrigger>
-        <SelectContent>
-          {environments?.map((env) => (
-            <SelectItem key={env.id} value={env.id.toString()}>
-              {env.name}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+      <div className="flex items-center gap-2">
+        {leftActions}
+        <Select
+          value={selectedEnvironment?.toString()}
+          onValueChange={(value) =>
+            onEnvironmentChange(value ? parseInt(value) : undefined)
+          }
+        >
+          <SelectTrigger className="w-[200px]">
+            <SelectValue placeholder="All environments" />
+          </SelectTrigger>
+          <SelectContent>
+            {environments?.map((env) => (
+              <SelectItem key={env.id} value={env.id.toString()}>
+                {env.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
 
       <div className="flex items-center sm:justify-end gap-2">
         <div className="flex items-center gap-2">
