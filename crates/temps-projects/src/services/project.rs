@@ -1143,9 +1143,11 @@ impl ProjectService {
         active_project.updated_at = Set(chrono::Utc::now());
 
         let project_found = active_project.update(self.db.as_ref()).await?;
-        let project_found = self.map_written_project(project_found).await;
 
-        // Emit ProjectUpdated job
+        // Emit ProjectUpdated before reading anything else. Everything after
+        // the commit is a fresh await point, and a cancelled request (client
+        // disconnect, timeout) drops the task there — so the notification goes
+        // out first, and only the response can be lost.
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
             project_id: project_found.id,
             project_name: project_found.name.clone(),
@@ -1163,7 +1165,7 @@ impl ProjectService {
             );
         }
 
-        Ok(project_found)
+        Ok(self.map_written_project(project_found).await)
     }
 
     /// Change a project's source type to a Git-less type (docker_image /
@@ -1206,9 +1208,10 @@ impl ProjectService {
         active_project.source_type = Set(source_type);
         active_project.updated_at = Set(chrono::Utc::now());
         let updated = active_project.update(self.db.as_ref()).await?;
-        let updated = self.map_written_project(updated).await;
 
-        // Deploy routing / behavior keys off source_type — notify consumers.
+        // Deploy routing / behavior keys off source_type — notify consumers
+        // before anything else awaits, so a cancelled request can only cost
+        // the response, never the notification.
         if let Err(e) = self
             .queue_service
             .send(Job::ProjectUpdated(ProjectUpdatedJob {
@@ -1222,7 +1225,7 @@ impl ProjectService {
                 updated.id, e
             );
         }
-        Ok(updated)
+        Ok(self.map_written_project(updated).await)
     }
 
     /// Toggle whether the project accepts deployments from a source other than
@@ -1763,22 +1766,22 @@ impl ProjectService {
                 self.reload_routes_after_compose_port_change(project_id)
                     .await?;
             }
-            let project_found = self.map_written_project(updated_project).await;
-
-            // Emit ProjectUpdated job
+            // Notify before the provider lookup: past the commit, every await
+            // is a point the task can be cancelled at, and losing the response
+            // is recoverable where losing the notification is not.
             let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
-                project_id: project_found.id,
-                project_name: project_found.name.clone(),
+                project_id: updated_project.id,
+                project_name: updated_project.name.clone(),
             });
 
             if let Err(e) = self.queue_service.send(project_updated_job).await {
                 warn!(
                     "Failed to emit ProjectUpdated job for project {}: {}",
-                    project_found.id, e
+                    updated_project.id, e
                 );
             }
 
-            return Ok(project_found);
+            return Ok(self.map_written_project(updated_project).await);
         }
 
         // Always reload the final project state before returning
@@ -1790,22 +1793,19 @@ impl ProjectService {
                 project_id
             )))?;
 
-        let project_found = self.map_written_project(final_project).await;
-
-        // Emit ProjectUpdated job
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
-            project_id: project_found.id,
-            project_name: project_found.name.clone(),
+            project_id: final_project.id,
+            project_name: final_project.name.clone(),
         });
 
         if let Err(e) = self.queue_service.send(project_updated_job).await {
             warn!(
                 "Failed to emit ProjectUpdated job for project {}: {}",
-                project_found.id, e
+                final_project.id, e
             );
         }
 
-        Ok(project_found)
+        Ok(self.map_written_project(final_project).await)
     }
 
     pub async fn update_automatic_deploy(
