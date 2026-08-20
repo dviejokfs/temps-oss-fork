@@ -30,6 +30,7 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import {
+  AlertTriangle,
   Archive,
   CheckCircle2,
   ChevronLeft,
@@ -184,7 +185,7 @@ export function EmailsSentList() {
 
       {/* Stats Cards */}
       {stats && (
-        <div className="grid gap-4 md:grid-cols-5">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-7">
           <StatsCard
             title="Total Emails"
             value={stats.total}
@@ -208,6 +209,18 @@ export function EmailsSentList() {
             value={stats.queued}
             icon={Clock}
             description="Pending delivery"
+          />
+          <StatsCard
+            title="Sending"
+            value={stats.sending}
+            icon={Clock}
+            description="Provider request active"
+          />
+          <StatsCard
+            title="Unknown"
+            value={stats.delivery_unknown}
+            icon={AlertTriangle}
+            description="Needs manual review"
           />
           <StatsCard
             title="Failed"
@@ -252,6 +265,8 @@ export function EmailsSentList() {
             <SelectItem value="sent">Sent</SelectItem>
             <SelectItem value="captured">Captured</SelectItem>
             <SelectItem value="queued">Queued</SelectItem>
+            <SelectItem value="sending">Sending</SelectItem>
+            <SelectItem value="delivery_unknown">Delivery unknown</SelectItem>
             <SelectItem value="failed">Failed</SelectItem>
           </SelectContent>
         </Select>

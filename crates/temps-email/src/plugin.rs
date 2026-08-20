@@ -89,6 +89,8 @@ impl TempsPlugin for EmailPlugin {
 
             // Get AuditService dependency from other plugins
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+            let project_access_checker =
+                context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
             // Try to get DnsProviderService if available (optional dependency)
             let dns_provider_service = context.get_service::<DnsProviderService>();
@@ -107,6 +109,7 @@ impl TempsPlugin for EmailPlugin {
                 validation_service,
                 tracking_service,
                 audit_service,
+                project_access_checker,
                 dns_provider_service,
                 telemetry,
                 tracking_setup_service,

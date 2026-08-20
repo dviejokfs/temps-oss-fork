@@ -83,6 +83,9 @@ import type {
   AttachScheduleServicesData,
   AttachScheduleServicesErrors,
   AttachScheduleServicesResponses,
+  AuthorizeEmailDomainProjectData,
+  AuthorizeEmailDomainProjectErrors,
+  AuthorizeEmailDomainProjectResponses,
   BlobCopyData,
   BlobCopyErrors,
   BlobCopyResponses,
@@ -1531,6 +1534,9 @@ import type {
   ListDsnsData,
   ListDsnsErrors,
   ListDsnsResponses,
+  ListEmailDomainProjectsData,
+  ListEmailDomainProjectsErrors,
+  ListEmailDomainProjectsResponses,
   ListEmailDomainsData,
   ListEmailDomainsErrors,
   ListEmailDomainsResponses,
@@ -2011,6 +2017,9 @@ import type {
   RevokeDsnData,
   RevokeDsnErrors,
   RevokeDsnResponses,
+  RevokeEmailDomainProjectData,
+  RevokeEmailDomainProjectErrors,
+  RevokeEmailDomainProjectResponses,
   RevokeEnrollmentTokenData,
   RevokeEnrollmentTokenErrors,
   RevokeEnrollmentTokenResponses,
@@ -6016,6 +6025,59 @@ export const getDomainDnsRecords = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/email-domains/{id}/dns-records",
+    ...options,
+  });
+
+export const listEmailDomainProjects = <ThrowOnError extends boolean = false>(
+  options: Options<ListEmailDomainProjectsData, ThrowOnError>,
+): RequestResult<
+  ListEmailDomainProjectsResponses,
+  ListEmailDomainProjectsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListEmailDomainProjectsResponses,
+    ListEmailDomainProjectsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/email-domains/{id}/projects",
+    ...options,
+  });
+
+export const revokeEmailDomainProject = <ThrowOnError extends boolean = false>(
+  options: Options<RevokeEmailDomainProjectData, ThrowOnError>,
+): RequestResult<
+  RevokeEmailDomainProjectResponses,
+  RevokeEmailDomainProjectErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    RevokeEmailDomainProjectResponses,
+    RevokeEmailDomainProjectErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/email-domains/{id}/projects/{project_id}",
+    ...options,
+  });
+
+export const authorizeEmailDomainProject = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<AuthorizeEmailDomainProjectData, ThrowOnError>,
+): RequestResult<
+  AuthorizeEmailDomainProjectResponses,
+  AuthorizeEmailDomainProjectErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    AuthorizeEmailDomainProjectResponses,
+    AuthorizeEmailDomainProjectErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/email-domains/{id}/projects/{project_id}",
     ...options,
   });
 

@@ -4,8 +4,8 @@ use temps_core::url_validation::{redact_url_password, validate_git_url};
 use tracing::{info, warn};
 
 use sea_orm::{
-    prelude::Uuid, ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    prelude::Uuid, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use temps_core::{
     ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
@@ -70,6 +70,16 @@ fn slugify(name: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+fn escape_like_literal(value: &str) -> String {
+    value.chars().fold(String::new(), |mut escaped, character| {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+        escaped
+    })
 }
 
 fn compose_public_ports(
@@ -2820,19 +2830,61 @@ impl ProjectService {
         per_page: i64,
         hidden: &[i32],
     ) -> Result<(Vec<Project>, i64), ProjectError> {
+        self.get_projects_paginated_excluding_search(page, per_page, hidden, None)
+            .await
+    }
+
+    pub async fn get_projects_paginated_excluding_search(
+        &self,
+        page: i64,
+        per_page: i64,
+        hidden: &[i32],
+        search: Option<&str>,
+    ) -> Result<(Vec<Project>, i64), ProjectError> {
+        use sea_orm::sea_query::extension::postgres::PgExpr;
+        use sea_orm::sea_query::LikeExpr;
         use sea_orm::PaginatorTrait;
         use sea_orm::QueryOrder;
 
-        // Calculate offset
-        let offset = ((page - 1) * per_page) as u64;
+        if page < 1 {
+            return Err(ProjectError::InvalidInput(
+                "page must be greater than or equal to 1".to_string(),
+            ));
+        }
+        if !(1..=100).contains(&per_page) {
+            return Err(ProjectError::InvalidInput(
+                "per_page must be between 1 and 100".to_string(),
+            ));
+        }
+
+        let offset = page
+            .checked_sub(1)
+            .and_then(|zero_based_page| zero_based_page.checked_mul(per_page))
+            .and_then(|offset| u64::try_from(offset).ok())
+            .ok_or_else(|| {
+                ProjectError::InvalidInput("page produces an invalid pagination offset".to_string())
+            })?;
 
         let filtered = || {
-            let query = projects::Entity::find();
-            if hidden.is_empty() {
-                query
-            } else {
-                query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()))
+            let mut query = projects::Entity::find();
+            if !hidden.is_empty() {
+                query = query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()));
             }
+            if let Some(search) = search {
+                let pattern = format!("%{}%", escape_like_literal(search));
+                query = query.filter(
+                    Condition::any()
+                        .add(
+                            sea_orm::sea_query::Expr::col(projects::Column::Name)
+                                .ilike(LikeExpr::new(pattern.clone())),
+                        )
+                        .add(
+                            sea_orm::sea_query::Expr::col(projects::Column::Slug)
+                                .ilike(LikeExpr::new(pattern.clone())),
+                        ),
+                );
+            }
+            query
         };
 
         // Get total count
@@ -4433,6 +4485,95 @@ mod tests {
             storage_service_ids: vec![],
             source_type: temps_entities::source_type::SourceType::Git,
             template_slug: None,
+        }
+    }
+
+    async fn insert_search_test_project(
+        db: &temps_database::DbConnection,
+        name: &str,
+        slug: &str,
+    ) -> temps_entities::projects::Model {
+        temps_entities::projects::ActiveModel {
+            name: Set(name.to_string()),
+            slug: Set(slug.to_string()),
+            repo_name: Set(slug.to_string()),
+            repo_owner: Set("search-tests".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert search test project")
+    }
+
+    #[tokio::test]
+    async fn project_search_is_case_insensitive_bounded_and_honors_hidden_projects() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        let alpha = insert_search_test_project(db.as_ref(), "Acme Alpha", "alpha").await;
+        let beta = insert_search_test_project(db.as_ref(), "ACME Beta", "beta").await;
+        let slug_match = insert_search_test_project(db.as_ref(), "Gamma", "Special-SLUG").await;
+        let hidden = insert_search_test_project(db.as_ref(), "Acme Secret", "acme-secret").await;
+        insert_search_test_project(db.as_ref(), "Unrelated", "unrelated").await;
+        let literal_wildcard =
+            insert_search_test_project(db.as_ref(), "Percent%Project", "percent-project").await;
+
+        let (first_page, total) = service
+            .get_projects_paginated_excluding_search(1, 1, &[hidden.id], Some("aCmE"))
+            .await
+            .expect("mixed-case name search");
+        let (second_page, second_total) = service
+            .get_projects_paginated_excluding_search(2, 1, &[hidden.id], Some("ACME"))
+            .await
+            .expect("second filtered page");
+
+        assert_eq!(
+            total, 2,
+            "filtered total must omit hidden and unrelated rows"
+        );
+        assert_eq!(second_total, 2);
+        let visible_ids = [first_page[0].id, second_page[0].id];
+        assert!(visible_ids.contains(&alpha.id));
+        assert!(visible_ids.contains(&beta.id));
+        assert!(!visible_ids.contains(&hidden.id));
+
+        let (slug_results, slug_total) = service
+            .get_projects_paginated_excluding_search(1, 25, &[], Some("special-slug"))
+            .await
+            .expect("mixed-case slug search");
+        assert_eq!(slug_total, 1);
+        assert_eq!(slug_results[0].id, slug_match.id);
+
+        let (literal_results, literal_total) = service
+            .get_projects_paginated_excluding_search(1, 25, &[], Some("%"))
+            .await
+            .expect("LIKE wildcard characters are treated literally");
+        assert_eq!(literal_total, 1);
+        assert_eq!(literal_results[0].id, literal_wildcard.id);
+
+        for result in [
+            service
+                .get_projects_paginated_excluding_search(0, 25, &[], None)
+                .await,
+            service
+                .get_projects_paginated_excluding_search(1, 0, &[], None)
+                .await,
+            service
+                .get_projects_paginated_excluding_search(1, 101, &[], None)
+                .await,
+            service
+                .get_projects_paginated_excluding_search(i64::MAX, 100, &[], None)
+                .await,
+        ] {
+            assert!(matches!(result, Err(ProjectError::InvalidInput(_))));
         }
     }
 

@@ -1774,6 +1774,15 @@ export type AuthTokenResponse = {
 };
 
 /**
+ * A project authorized to send email through a sender domain.
+ */
+export type AuthorizedEmailDomainProjectResponse = {
+    id: number;
+    name: string;
+    slug: string;
+};
+
+/**
  * Auto-watch (Watchdog-style) detector parameters (stub — not evaluated).
  */
 export type AutoWatchParams = {
@@ -6452,9 +6461,17 @@ export type EmailStatsResponse = {
      * Emails captured without sending (Mailhog mode - no provider configured)
      */
     captured: number;
+    /**
+     * Provider transport completed without a definitive delivery result; never retried automatically
+     */
+    delivery_unknown: number;
     failed: number;
     queued: number;
     sent: number;
+    /**
+     * Emails currently protected by a delivery lease
+     */
+    sending: number;
     total: number;
 };
 
@@ -28395,6 +28412,134 @@ export type GetDomainDnsRecordsResponses = {
 
 export type GetDomainDnsRecordsResponse = GetDomainDnsRecordsResponses[keyof GetDomainDnsRecordsResponses];
 
+export type ListEmailDomainProjectsData = {
+    body?: never;
+    path: {
+        /**
+         * Email domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/projects';
+};
+
+export type ListEmailDomainProjectsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Project visibility or database check failed
+     */
+    500: unknown;
+};
+
+export type ListEmailDomainProjectsResponses = {
+    /**
+     * Projects authorized to use this sender domain
+     */
+    200: Array<AuthorizedEmailDomainProjectResponse>;
+};
+
+export type ListEmailDomainProjectsResponse = ListEmailDomainProjectsResponses[keyof ListEmailDomainProjectsResponses];
+
+export type RevokeEmailDomainProjectData = {
+    body?: never;
+    path: {
+        /**
+         * Email domain ID
+         */
+        id: number;
+        /**
+         * Project whose authorization is revoked
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/projects/{project_id}';
+};
+
+export type RevokeEmailDomainProjectErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Only an instance administrator may change global sender-domain grants
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Project access, audit, or database check failed
+     */
+    500: unknown;
+};
+
+export type RevokeEmailDomainProjectResponses = {
+    /**
+     * Project authorization revoked
+     */
+    204: void;
+};
+
+export type RevokeEmailDomainProjectResponse = RevokeEmailDomainProjectResponses[keyof RevokeEmailDomainProjectResponses];
+
+export type AuthorizeEmailDomainProjectData = {
+    body?: never;
+    path: {
+        /**
+         * Email domain ID
+         */
+        id: number;
+        /**
+         * Project allowed to send from this domain
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/projects/{project_id}';
+};
+
+export type AuthorizeEmailDomainProjectErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Only an instance administrator may change global sender-domain grants
+     */
+    403: unknown;
+    /**
+     * Domain or project not found
+     */
+    404: unknown;
+    /**
+     * Project access, audit, or database check failed
+     */
+    500: unknown;
+};
+
+export type AuthorizeEmailDomainProjectResponses = {
+    /**
+     * Project authorized
+     */
+    204: void;
+};
+
+export type AuthorizeEmailDomainProjectResponse = AuthorizeEmailDomainProjectResponses[keyof AuthorizeEmailDomainProjectResponses];
+
 export type SetupDnsData = {
     body: SetupDnsRequest;
     path: {
@@ -28837,6 +28982,12 @@ export type ListEmailsResponse = ListEmailsResponses[keyof ListEmailsResponses];
 
 export type SendEmailData = {
     body: SendEmailRequestBody;
+    headers?: {
+        /**
+         * Required for deployment-token requests. Reusing a key with the same payload returns the original delivery; reusing it with a different payload returns 409.
+         */
+        'Idempotency-Key'?: string;
+    };
     path?: never;
     query?: never;
     url: '/emails';
@@ -28855,6 +29006,10 @@ export type SendEmailErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * Idempotency key was already used with a different payload
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -38677,11 +38832,19 @@ export type GetProjectsData = {
          * Number of items per page
          */
         per_page?: number;
+        /**
+         * Case-insensitive project name or slug filter
+         */
+        search?: string;
     };
     url: '/projects';
 };
 
 export type GetProjectsErrors = {
+    /**
+     * Invalid pagination parameters
+     */
+    400: unknown;
     /**
      * Unauthorized
      */

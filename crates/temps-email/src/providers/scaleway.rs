@@ -401,7 +401,11 @@ impl EmailProvider for ScalewayProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| EmailError::Scaleway(format!("Failed to send email: {}", e)))?;
+            .map_err(|e| {
+                EmailError::ProviderDeliveryUnknown(format!(
+                    "Scaleway request may have been accepted: {e}"
+                ))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -416,17 +420,22 @@ impl EmailProvider for ScalewayProvider {
             )));
         }
 
-        let email_response: ScalewayEmailResponse = response
-            .json()
-            .await
-            .map_err(|e| EmailError::Scaleway(format!("Failed to parse email response: {}", e)))?;
+        let email_response: ScalewayEmailResponse = response.json().await.map_err(|e| {
+            EmailError::ProviderDeliveryUnknown(format!(
+                "Scaleway accepted the request but returned an unreadable response: {e}"
+            ))
+        })?;
 
         let message_id = email_response
             .emails
             .first()
             .and_then(|e| e.message_id.clone())
             .or_else(|| email_response.emails.first().map(|e| e.id.clone()))
-            .ok_or_else(|| EmailError::Scaleway("No message ID returned".to_string()))?;
+            .ok_or_else(|| {
+                EmailError::ProviderDeliveryUnknown(
+                    "Scaleway accepted the request but returned no message ID".to_string(),
+                )
+            })?;
 
         debug!("Email sent successfully, message_id: {}", message_id);
 

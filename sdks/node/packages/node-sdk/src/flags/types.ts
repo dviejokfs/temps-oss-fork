@@ -78,6 +78,10 @@ export interface FlagsClientOptions {
   /**
    * Background refresh interval in milliseconds. Default 30s. Unchanged flags
    * cost a 304, not a payload.
+   *
+   * Falls back to `TEMPS_FLAGS_REFRESH_INTERVAL_MS` when unset, so a
+   * deployment can tighten (or loosen) polling without a code change or
+   * redeploy of the SDK itself — just the env var.
    */
   refreshIntervalMs?: number;
   /** Per-request timeout in milliseconds. Default 5s. */
