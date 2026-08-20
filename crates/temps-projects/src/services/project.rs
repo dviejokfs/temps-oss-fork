@@ -933,7 +933,7 @@ impl ProjectService {
             project_found_db
         };
 
-        self.map_written_project(project_found_db).await
+        Ok(self.map_written_project(project_found_db).await)
     }
 
     /// Post-insert steps for `create_project`. Returns the default environment
@@ -1143,7 +1143,7 @@ impl ProjectService {
         active_project.updated_at = Set(chrono::Utc::now());
 
         let project_found = active_project.update(self.db.as_ref()).await?;
-        let project_found = self.map_written_project(project_found).await?;
+        let project_found = self.map_written_project(project_found).await;
 
         // Emit ProjectUpdated job
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
@@ -1206,7 +1206,7 @@ impl ProjectService {
         active_project.source_type = Set(source_type);
         active_project.updated_at = Set(chrono::Utc::now());
         let updated = active_project.update(self.db.as_ref()).await?;
-        let updated = self.map_written_project(updated).await?;
+        let updated = self.map_written_project(updated).await;
 
         // Deploy routing / behavior keys off source_type — notify consumers.
         if let Err(e) = self
@@ -1247,7 +1247,7 @@ impl ProjectService {
         active_project.allow_alternate_sources = Set(Some(allow));
         active_project.updated_at = Set(chrono::Utc::now());
         let updated = active_project.update(self.db.as_ref()).await?;
-        self.map_written_project(updated).await
+        Ok(self.map_written_project(updated).await)
     }
 
     /// Persist deletion intent before cancelling workflows or touching Docker.
@@ -1763,7 +1763,7 @@ impl ProjectService {
                 self.reload_routes_after_compose_port_change(project_id)
                     .await?;
             }
-            let project_found = self.map_written_project(updated_project).await?;
+            let project_found = self.map_written_project(updated_project).await;
 
             // Emit ProjectUpdated job
             let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
@@ -1790,7 +1790,7 @@ impl ProjectService {
                 project_id
             )))?;
 
-        let project_found = self.map_written_project(final_project).await?;
+        let project_found = self.map_written_project(final_project).await;
 
         // Emit ProjectUpdated job
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
@@ -1832,7 +1832,7 @@ impl ProjectService {
 
         let updated_project = active_project.update(self.db.as_ref()).await?;
 
-        self.map_written_project(updated_project).await
+        Ok(self.map_written_project(updated_project).await)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2194,7 +2194,7 @@ impl ProjectService {
                 .await?;
         }
 
-        self.map_written_project(updated_project).await
+        Ok(self.map_written_project(updated_project).await)
     }
 
     /// Public Compose ports are read directly from `projects.preset_config`
@@ -3101,7 +3101,7 @@ impl ProjectService {
             );
         }
 
-        self.map_written_project(updated_project).await
+        Ok(self.map_written_project(updated_project).await)
     }
 
     /// Update a project's deployment config.
@@ -3219,7 +3219,7 @@ impl ProjectService {
             );
         }
 
-        self.map_written_project(updated_project).await
+        Ok(self.map_written_project(updated_project).await)
     }
 
     /// Generate a unique project slug by checking for collisions and appending a short UUID if needed.
@@ -3313,30 +3313,42 @@ impl ProjectService {
     /// null` would tell a client that a connected project has no provider, and
     /// any client that trusts its own mutation response would downgrade a
     /// GitLab project back to a guess until its next read.
-    async fn map_written_project(
-        &self,
-        db_project: projects::Model,
-    ) -> Result<Project, ProjectError> {
+    ///
+    /// Deliberately infallible. This runs *after* the write has committed, and
+    /// it reads a display label — failing here would report a change the
+    /// database has already accepted as a failed request, and would skip the
+    /// `ProjectUpdated` job that several callers emit straight after this call,
+    /// leaving routes and notifications unaware of a change that did happen. A
+    /// lookup that fails is logged and leaves the field empty; the next read
+    /// fills it in.
+    async fn map_written_project(&self, db_project: projects::Model) -> Project {
         let git_provider_type = match db_project.git_provider_connection_id {
             None => None,
-            Some(connection_id) => git_provider_connections::Entity::find_by_id(connection_id)
-                .select_only()
-                .column(git_providers::Column::ProviderType)
-                .inner_join(git_providers::Entity)
-                .into_tuple::<String>()
-                .one(self.db.as_ref())
-                .await
-                .map_err(|e| {
-                    ProjectError::Other(format!(
-                        "Failed to read the git provider type for connection {} of project {}: {}",
-                        connection_id, db_project.id, e
-                    ))
-                })?,
+            Some(connection_id) => {
+                match git_provider_connections::Entity::find_by_id(connection_id)
+                    .select_only()
+                    .column(git_providers::Column::ProviderType)
+                    .inner_join(git_providers::Entity)
+                    .into_tuple::<String>()
+                    .one(self.db.as_ref())
+                    .await
+                {
+                    Ok(provider_type) => provider_type,
+                    Err(e) => {
+                        warn!(
+                            "Failed to read the git provider type for connection {} of project {} \
+                             after a successful write; responding without it: {}",
+                            connection_id, db_project.id, e
+                        );
+                        None
+                    }
+                }
+            }
         };
 
         let mut project = Self::map_db_project_to_project(db_project);
         project.git_provider_type = git_provider_type;
-        Ok(project)
+        project
     }
 
     /// Maps the project row alone, leaving `git_provider_type` empty.
