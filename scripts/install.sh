@@ -183,13 +183,20 @@ if [[ ${#positional[@]} -eq 0 ]]; then
     #   release. This is GitHub's contract — it's exactly what we want.
     #   404 means there are zero stable releases yet; fall through to a
     #   helpful error.
-    # - beta: /releases/latest skips betas, so we walk the first page of
-    #   /releases (newest-first) and take the first `tag_name` that is NOT a
-    #   nightly build (mirrors `temps upgrade`'s `UpgradeChannel::Beta`,
-    #   which excludes `-nightly.` tags so a deliberate beta opt-in never
-    #   silently resolves to an automated nightly).
-    # - nightly: same page, but take the first `tag_name` that IS a nightly
-    #   build (contains `-nightly.`), minted by the "Nightly Release" workflow.
+    # - beta: /releases/latest skips betas, so we walk /releases
+    #   (newest-first) and take the first `tag_name` that is NOT a nightly
+    #   build (mirrors `temps upgrade`'s `UpgradeChannel::Beta`, which
+    #   excludes `-nightly.` tags so a deliberate beta opt-in never silently
+    #   resolves to an automated nightly).
+    # - nightly: same listing, but take the first `tag_name` that IS a
+    #   nightly build (contains `-nightly.`), minted by the "Nightly
+    #   Release" workflow.
+    #
+    # Pagination: nightlies are cut once a day from `main`, so a gap of more
+    # than one page's worth of days between beta releases (or, in principle,
+    # between nightly releases) means the desired tag isn't on page 1. Walk
+    # up to 5 pages of 100 releases (500 releases of headroom) and stop as
+    # soon as a match is found or the API runs out of releases.
     #
     # Why "first tag_name" (no draft check):
     #   We don't ship draft releases publicly — anything visible on the
@@ -205,21 +212,25 @@ if [[ ${#positional[@]} -eq 0 ]]; then
                     grep '"tag_name":' |
                     head -n 1 |
                     sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
-    elif [[ "$channel" = "nightly" ]]; then
-        # GitHub orders releases newest-first; take the first tag_name that
-        # contains the `-nightly.` marker.
-        temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases?per_page=20" |
-                    grep -oE '"tag_name": *"[^"]*-nightly\.[^"]*"' |
-                    head -n 1 |
-                    sed -E 's/.*"([^"]+)"$/\1/' 2>/dev/null)
     else
-        # beta: GitHub orders releases newest-first; take the first
-        # tag_name that is NOT a nightly build.
-        temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases?per_page=20" |
-                    grep '"tag_name":' |
-                    grep -v -- '-nightly\.' |
-                    head -n 1 |
-                    sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
+        temps_tag=""
+        page=1
+        while [[ -z "$temps_tag" && $page -le 5 ]]; do
+            page_tags=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases?per_page=100&page=$page" |
+                        grep -oE '"tag_name": *"[^"]*"' |
+                        sed -E 's/.*"([^"]+)"$/\1/')
+            [[ -z "$page_tags" ]] && break
+
+            if [[ "$channel" = "nightly" ]]; then
+                # First tag_name that IS a nightly build.
+                temps_tag=$(echo "$page_tags" | grep -- '-nightly\.' | head -n 1)
+            else
+                # beta: first tag_name that is NOT a nightly build.
+                temps_tag=$(echo "$page_tags" | grep -v -- '-nightly\.' | head -n 1)
+            fi
+
+            page=$((page + 1))
+        done
     fi
     set -e
 
