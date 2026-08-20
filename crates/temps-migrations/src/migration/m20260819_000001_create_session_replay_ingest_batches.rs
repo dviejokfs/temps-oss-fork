@@ -48,9 +48,13 @@ impl MigrationTrait for Migration {
                             .integer()
                             .not_null(),
                     )
+                    // Bounded, not a bare `varchar`: the value is
+                    // client-supplied and indexed, and a btree tuple over
+                    // ~2704 bytes would fail the insert outright. The service
+                    // enforces the same 128 limit before it gets here.
                     .col(
                         ColumnDef::new(SessionReplayIngestBatches::BatchId)
-                            .string()
+                            .string_len(128)
                             .not_null(),
                     )
                     .col(

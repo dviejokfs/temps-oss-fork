@@ -4,7 +4,7 @@ use crate::services::service::{
     SessionReplayWithVisitor, Viewport,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::Json,
     routing::{get, post, put},
@@ -381,6 +381,13 @@ impl From<SessionReplayError> for Problem {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Database error")
             }
             SessionReplayError::IoError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "IO error"),
+            SessionReplayError::InvalidBatchId { .. } => {
+                (StatusCode::BAD_REQUEST, "Invalid batch id")
+            }
+            SessionReplayError::BatchTooLarge { .. } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Session replay batch too large",
+            ),
         };
 
         ErrorBuilder::new(status)
@@ -968,6 +975,14 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
 }
 
+/// Largest request body accepted on the unauthenticated replay ingest routes.
+///
+/// Caps the compressed payload before axum buffers it, so a client cannot hold
+/// a worker thread by drip-feeding a huge body. The service applies a second,
+/// independent cap to the *decompressed* size — this limit alone would not
+/// bound that, since zlib expands roughly 1000:1 on repetitive input.
+const SESSION_REPLAY_INGEST_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
 /// Public ingest routes for session replay — called directly by browser SDKs.
 pub fn configure_public_routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -976,6 +991,7 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
             "/_temps/session-replay/events",
             post(add_session_replay_events),
         )
+        .layer(DefaultBodyLimit::max(SESSION_REPLAY_INGEST_BODY_LIMIT))
 }
 
 #[cfg(test)]

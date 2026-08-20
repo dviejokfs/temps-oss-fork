@@ -217,6 +217,11 @@ export type AddEnvironmentDomainRequest = {
 };
 
 export type AddEventsRequest = {
+    /**
+     * Client-generated id, stable across retries of the same batch. When
+     * present the append is idempotent; omitted, delivery is at-least-once.
+     */
+    batchId?: string | null;
     events: string;
 };
 
@@ -16715,6 +16720,11 @@ export type SessionLogsResponse = {
 };
 
 export type SessionReplayEventsRequest = {
+    /**
+     * Client-generated id, stable across retries of the same batch. When
+     * present the append is idempotent; omitted, delivery is at-least-once.
+     */
+    batchId?: string | null;
     events: string;
     sessionId: string;
 };

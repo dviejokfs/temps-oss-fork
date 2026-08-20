@@ -29,6 +29,55 @@ use temps_entities::{
 /// payload modest — rrweb full-snapshot events can each be tens of kilobytes.
 const EVENT_INSERT_CHUNK_SIZE: usize = 1000;
 
+/// Longest accepted client-supplied `batch_id`.
+///
+/// The SDK emits a UUID (36 chars) or a `batch_<ts>_<9 chars>` fallback, so
+/// this is generous. A bound is required rather than optional: the value is
+/// unauthenticated, lands in a unique btree index — whose ~2704-byte tuple
+/// limit would otherwise turn a long id into a guaranteed 500 — and is echoed
+/// into logs.
+const MAX_BATCH_ID_LEN: usize = 128;
+
+/// Largest payload a single ingest request may decompress to.
+///
+/// zlib expands roughly 1000:1 on repetitive input, so the request body limit
+/// alone does not bound the work: this is what stops an attacker choosing how
+/// much this endpoint allocates and inserts. Generous next to a real flush,
+/// where a full-snapshot batch runs to a few megabytes at most.
+const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Most rrweb events one ingest request may carry.
+///
+/// Checked before the transaction opens so the pooled connection is never held
+/// for an attacker-chosen number of inserts.
+const MAX_EVENTS_PER_BATCH: usize = 20_000;
+
+/// Whether a client-supplied batch id is one the SDK could have produced.
+///
+/// Deliberately strict: UUIDs and the SDK's fallback id use only these
+/// characters, so anything else is either a bug or an attempt to smuggle
+/// newlines or control characters into the logs.
+fn batch_id_rejection_reason(batch_id: &str) -> Option<String> {
+    if batch_id.is_empty() {
+        return Some("must not be empty".to_string());
+    }
+    if batch_id.len() > MAX_BATCH_ID_LEN {
+        return Some(format!(
+            "must be at most {MAX_BATCH_ID_LEN} characters, got {}",
+            batch_id.len()
+        ));
+    }
+    if let Some(bad) = batch_id
+        .chars()
+        .find(|c| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | ':' | '-'))
+    {
+        return Some(format!(
+            "may only contain letters, digits and '.', '_', ':', '-' (found {bad:?})"
+        ));
+    }
+    None
+}
+
 #[derive(Error, Debug)]
 pub enum SessionReplayError {
     #[error("Database error: {0}")]
@@ -66,6 +115,27 @@ pub enum SessionReplayError {
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+
+    /// The client-supplied batch id is not something the SDK could have
+    /// produced. It reaches an unauthenticated route and lands in a unique
+    /// index and the logs, so it is validated rather than trusted.
+    #[error("Invalid batch id for session {session_replay_id}: {reason}")]
+    InvalidBatchId {
+        session_replay_id: String,
+        reason: String,
+    },
+
+    /// The batch decompressed to more data, or more events, than a single
+    /// ingest request is allowed to write.
+    #[error(
+        "Session replay batch for {session_replay_id} exceeds the ingest limit: {actual} {unit} (max {limit})"
+    )]
+    BatchTooLarge {
+        session_replay_id: String,
+        unit: &'static str,
+        actual: usize,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +457,17 @@ impl SessionReplayService {
     ) -> Result<usize, SessionReplayError> {
         info!("Adding events to session: {}", session_id);
 
+        // Validate before touching the database: this route is unauthenticated,
+        // so the cheapest rejection has to come first.
+        if let Some(batch_id) = batch_id {
+            if let Some(reason) = batch_id_rejection_reason(batch_id) {
+                return Err(SessionReplayError::InvalidBatchId {
+                    session_replay_id: session_id.to_string(),
+                    reason,
+                });
+            }
+        }
+
         // Verify session exists by session_replay_id AND project_id to prevent
         // cross-tenant injection: an attacker who guesses another tenant's
         // session_replay_id must not be able to append events to it.
@@ -412,19 +493,60 @@ impl SessionReplayService {
             });
         }
 
-        // Decode and decompress events
+        // Decode and decompress events.
+        //
+        // Read one byte past the limit rather than trusting the stream: zlib
+        // expands roughly 1000:1 on repetitive input, so the request body cap
+        // does not bound what this allocates. Overshooting by a byte is what
+        // makes "hit the limit" distinguishable from "exactly at the limit".
         let compressed = STANDARD.decode(events_base64)?;
-        let mut decoder = ZlibDecoder::new(&compressed[..]);
+        let decoder = ZlibDecoder::new(&compressed[..]);
         let mut decompressed = String::new();
-        decoder.read_to_string(&mut decompressed).map_err(|e| {
-            SessionReplayError::DecompressionError(format!("Failed to decompress events: {}", e))
-        })?;
+        decoder
+            .take(MAX_DECOMPRESSED_BYTES as u64 + 1)
+            .read_to_string(&mut decompressed)
+            .map_err(|e| {
+                SessionReplayError::DecompressionError(format!(
+                    "Failed to decompress events: {}",
+                    e
+                ))
+            })?;
+
+        if decompressed.len() > MAX_DECOMPRESSED_BYTES {
+            return Err(SessionReplayError::BatchTooLarge {
+                session_replay_id: session_id.to_string(),
+                unit: "decompressed bytes",
+                actual: decompressed.len(),
+                limit: MAX_DECOMPRESSED_BYTES,
+            });
+        }
 
         let events: Value = serde_json::from_str(&decompressed)?;
 
         // Extract events handling both formats
         let events_to_store = self.extract_events_from_json(&events)?;
         let event_count = events_to_store.len();
+
+        if event_count > MAX_EVENTS_PER_BATCH {
+            return Err(SessionReplayError::BatchTooLarge {
+                session_replay_id: session_id.to_string(),
+                unit: "events",
+                actual: event_count,
+                limit: MAX_EVENTS_PER_BATCH,
+            });
+        }
+
+        // A batch with nothing in it must not reach the transaction. Claiming a
+        // marker for it would write a row per request while storing no events —
+        // an unauthenticated client could grow the dedup table using empty
+        // payloads. There is also nothing to deduplicate.
+        if event_count == 0 {
+            debug!(
+                session_replay_id = %session_id,
+                "Ignoring session replay batch that carried no events"
+            );
+            return Ok(0);
+        }
 
         // The marker and the events go in together. Claiming the batch outside
         // a transaction would let a failed event insert leave the marker
@@ -459,9 +581,12 @@ impl SessionReplayService {
 
             if claimed == 0 {
                 txn.rollback().await?;
+                // `?batch_id` (Debug) rather than `%` — the value is
+                // client-supplied, and Debug escapes control characters so a
+                // crafted id cannot forge lines in an operator's log.
                 debug!(
                     session_replay_id = %session_id,
-                    batch_id = %batch_id,
+                    ?batch_id,
                     "Discarded duplicate session replay batch"
                 );
                 return Ok(0);
@@ -1963,6 +2088,133 @@ mod tests {
             "omitting batchId must not touch the dedup table"
         );
         assert_eq!(count_event_inserts(&log), 1);
+    }
+
+    /// A batch id the SDK could never have produced is rejected before the
+    /// service touches the database. The value is unauthenticated, lands in a
+    /// unique btree index and is echoed into logs, so it is validated rather
+    /// than trusted.
+    #[tokio::test]
+    async fn add_events_rejects_malformed_batch_ids() {
+        // Over the 128-char bound; a long enough id would otherwise blow the
+        // btree tuple limit and 500 inside the transaction.
+        let too_long = "a".repeat(MAX_BATCH_ID_LEN + 1);
+        // Newline: the log-forgery vector.
+        let cases = [
+            ("", "empty"),
+            (too_long.as_str(), "over length"),
+            ("batch\nINFO forged log line", "newline"),
+            ("batch\u{1b}[31m", "ansi escape"),
+            ("batch'; DROP TABLE--", "quote"),
+        ];
+
+        for (bad_id, label) in cases {
+            // No query results queued: reaching the DB at all would error
+            // differently, which is itself the assertion.
+            let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+            let service = SessionReplayService::new(Arc::new(db));
+            let payload = encode_events(&make_events(1));
+
+            let err = service
+                .add_session_events(1, "session-x", &payload, Some(bad_id))
+                .await
+                .expect_err(&format!("{label} batch id must be rejected"));
+
+            assert!(
+                matches!(err, SessionReplayError::InvalidBatchId { .. }),
+                "{label} batch id should be InvalidBatchId, got {err:?}"
+            );
+        }
+    }
+
+    /// Ids the SDK actually emits must survive validation.
+    #[test]
+    fn batch_id_validation_accepts_what_the_sdk_emits() {
+        // crypto.randomUUID()
+        assert_eq!(
+            batch_id_rejection_reason("3f8a1c2e-9b4d-4a7f-8e11-2c5d6a7b8c90"),
+            None
+        );
+        // the SDK's non-secure-context fallback
+        assert_eq!(
+            batch_id_rejection_reason("batch_1787127505294_k3j2h1g0f"),
+            None
+        );
+        assert_eq!(
+            batch_id_rejection_reason(&"a".repeat(MAX_BATCH_ID_LEN)),
+            None
+        );
+    }
+
+    /// Regression: an empty batch used to claim a marker row while storing no
+    /// events, giving an unauthenticated client a way to grow the dedup table
+    /// with empty payloads. It must not reach the transaction at all.
+    #[tokio::test]
+    async fn add_events_ignores_an_empty_batch_without_claiming_a_marker() {
+        let session = make_session_model(42, "session-empty", 1);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![session]])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let service = SessionReplayService::new(db.clone());
+        let payload = encode_events(&[]);
+
+        let stored = service
+            .add_session_events(1, "session-empty", &payload, Some("batch-empty"))
+            .await
+            .expect("an empty batch is not an error");
+        assert_eq!(stored, 0);
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service should be the only other Arc holder")
+            .into_transaction_log();
+
+        assert_eq!(
+            count_marker_inserts(&log),
+            0,
+            "an empty batch must not write a dedup marker"
+        );
+        assert_eq!(count_event_inserts(&log), 0);
+    }
+
+    /// The event-count cap is applied before the transaction opens, so the
+    /// pooled connection is never held for an attacker-chosen number of
+    /// inserts.
+    #[tokio::test]
+    async fn add_events_rejects_a_batch_over_the_event_cap() {
+        let session = make_session_model(42, "session-huge", 1);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![session]])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let service = SessionReplayService::new(db.clone());
+        let payload = encode_events(&make_events(MAX_EVENTS_PER_BATCH + 1));
+
+        let err = service
+            .add_session_events(1, "session-huge", &payload, Some("batch-huge"))
+            .await
+            .expect_err("an oversized batch must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                SessionReplayError::BatchTooLarge { unit: "events", .. }
+            ),
+            "expected BatchTooLarge, got {err:?}"
+        );
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service should be the only other Arc holder")
+            .into_transaction_log();
+        assert_eq!(
+            count_event_inserts(&log),
+            0,
+            "nothing may be written for a rejected batch"
+        );
     }
 
     /// get_project_id_for_session returns the correct project_id when the
