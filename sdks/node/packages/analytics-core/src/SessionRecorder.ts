@@ -142,6 +142,13 @@ export class SessionRecorder {
   private lastSendAttempt: number = 0;
   private isSending: boolean = false;
   private starting: boolean = false;
+  /**
+   * Bumped by every `stopRecording`. `startRecording` captures it before
+   * awaiting session init and re-checks afterwards: a stop that lands while
+   * init is in flight cannot clean up state that does not exist yet, so the
+   * starter has to notice it was superseded and release the session itself.
+   */
+  private stopGeneration: number = 0;
   private paused: boolean = false;
   private lastActivityAt: number = Date.now();
   private droppedEvents: number = 0;
@@ -347,11 +354,7 @@ export class SessionRecorder {
         });
 
         if (response.status === 404) {
-          this.sessionInitialized = false;
-          this.sessionId = "";
-          if (typeof localStorage !== "undefined") {
-            localStorage.removeItem("currentRecordingSessionId");
-          }
+          this.clearSession();
           this.stopRecording();
           this.inflight = null;
           this.pending = [];
@@ -424,10 +427,19 @@ export class SessionRecorder {
     if (!this.shouldRecord()) return;
 
     this.starting = true;
+    const generation = this.stopGeneration;
     try {
       const ok = await this.initializeSession();
       if (!ok) return;
-      if (this.stopFn || !this.enabled) return;
+
+      // A stop()/destroy() during init — a StrictMode double-mount, or the
+      // React binding's effect cleanup — returned before this session existed,
+      // so it could not tear it down. Release it here instead of leaving a
+      // server-side session that never receives an event.
+      if (this.stopGeneration !== generation || this.stopFn || !this.enabled) {
+        this.clearSession();
+        return;
+      }
 
       const stopFn = record({
         emit: (event: eventWithTime) => {
@@ -470,6 +482,15 @@ export class SessionRecorder {
     }
   }
 
+  /** Forget the server session and any client state pointing at it. */
+  private clearSession(): void {
+    this.sessionInitialized = false;
+    this.sessionId = "";
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem("currentRecordingSessionId");
+    }
+  }
+
   private detachRecorder(): void {
     if (!this.stopFn) return;
     this.stopFn();
@@ -498,17 +519,17 @@ export class SessionRecorder {
   }
 
   private stopRecording(): void {
-    if (!this.stopFn && !this.paused) return;
+    // `starting` and `sessionInitialized` are part of the condition: guarding
+    // on `stopFn` alone skipped cleanup entirely while init was in flight,
+    // stranding the session it was about to create.
+    if (!this.stopFn && !this.paused && !this.starting && !this.sessionInitialized) return;
+    this.stopGeneration++;
     this.detachRecorder();
     this.stopFlushTimer();
     this.stopIdleTimer();
     this.paused = false;
     void this.sendEvents(true);
-    this.sessionInitialized = false;
-    this.sessionId = "";
-    if (typeof localStorage !== "undefined") {
-      localStorage.removeItem("currentRecordingSessionId");
-    }
+    this.clearSession();
     this.initRetryCount = 0;
     this.initFailed = false;
   }

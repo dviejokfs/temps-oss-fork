@@ -229,6 +229,56 @@ describe("idle and visibility pausing", () => {
   });
 });
 
+describe("stop during session init", () => {
+  it("does not leave a session behind when stop() lands mid-init", async () => {
+    // Hold /init open so stop() lands while the request is in flight.
+    let releaseInit: (value: { status: number; ok: boolean }) => void = () => {};
+    fetchMock.mockImplementationOnce(
+      () => new Promise((resolve) => { releaseInit = resolve; }),
+    );
+
+    const recorder = newRecorder({ enabled: true });
+    await vi.waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/session-replay/init")),
+      ).toHaveLength(1),
+    );
+
+    // Stop before init resolves — the shape a StrictMode double-mount or an
+    // effect cleanup produces through the React binding.
+    recorder.stop();
+    releaseInit({ status: 201, ok: true });
+    await vi.advanceTimersByTimeAsync(50);
+
+    // Previously the stop early-returned, then init populated sessionId and
+    // localStorage, stranding a server session that never receives an event.
+    expect(recorder.getSessionId()).toBeNull();
+    expect(localStorage.getItem("currentRecordingSessionId")).toBeNull();
+    expect(recordCalls).toHaveLength(0);
+  });
+
+  it("does not attach a recorder when destroy() lands mid-init", async () => {
+    let releaseInit: (value: { status: number; ok: boolean }) => void = () => {};
+    fetchMock.mockImplementationOnce(
+      () => new Promise((resolve) => { releaseInit = resolve; }),
+    );
+
+    const recorder = newRecorder({ enabled: true });
+    await vi.waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/session-replay/init")),
+      ).toHaveLength(1),
+    );
+
+    recorder.destroy();
+    releaseInit({ status: 201, ok: true });
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(recordCalls).toHaveLength(0);
+    expect(recorder.getSessionId()).toBeNull();
+  });
+});
+
 describe("buffer bound", () => {
   it("drops the oldest events instead of growing without limit", async () => {
     // Never resolve, so nothing drains and the buffer has to defend itself.
