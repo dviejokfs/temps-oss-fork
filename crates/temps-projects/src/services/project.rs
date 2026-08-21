@@ -17,8 +17,8 @@ use temps_git::services::public_repo::PublicRepoProviderFactory;
 use serde::Serialize;
 
 use super::types::{
-    CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectSettingsUpdate,
-    ProjectStatistics, UpdateDeploymentSettingsRequest,
+    CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectRename,
+    ProjectSettingsUpdate, ProjectStatistics, UpdateDeploymentSettingsRequest,
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::UpdateDeploymentConfigRequest;
@@ -1790,7 +1790,7 @@ impl ProjectService {
             // before the transaction: that copy predates the lock and a
             // concurrent rename could have landed in between, which would make
             // the reported transition fiction.
-            let mut renamed_from = None;
+            let mut rename = None;
             if let Some(ref name_value) = new_name {
                 let locked = projects::Entity::find_by_id(project_id)
                     .lock_exclusive()
@@ -1801,7 +1801,10 @@ impl ProjectService {
                         project_id
                     )))?;
                 if locked.name != *name_value {
-                    renamed_from = Some(locked.name);
+                    rename = Some(ProjectRename {
+                        from: locked.name,
+                        to: name_value.clone(),
+                    });
                 }
                 active_project.name = Set(name_value.clone());
             }
@@ -1833,18 +1836,19 @@ impl ProjectService {
 
             return Ok(ProjectSettingsUpdate {
                 project: self.map_written_project(updated_project).await,
-                renamed_from,
+                rename,
             });
         }
 
         // Persist the rename last, once every other fallible step has
         // succeeded, so a failed request never leaves a renamed project behind.
-        // Read and write under one transaction holding the row lock, so the
-        // previous name reported back describes the transition this update
-        // actually performed rather than whatever a concurrent rename left
-        // behind between the read and the write.
-        let mut renamed_from = None;
-        if let Some(name_value) = new_name {
+        // The locked read, the write, and the read-back of the final state all
+        // ride one transaction: committing before the read-back would let a
+        // failure there report an error over an already-persisted rename, and
+        // reading back outside the lock would let a concurrent rename supply
+        // the "after" half of a transition whose "before" half came from here.
+        let mut rename = None;
+        let final_project = if let Some(name_value) = new_name {
             let txn = self.db.begin().await?;
             let current = projects::Entity::find_by_id(project_id)
                 .lock_exclusive()
@@ -1856,23 +1860,35 @@ impl ProjectService {
                 )))?;
 
             if current.name != name_value {
-                renamed_from = Some(current.name.clone());
+                rename = Some(ProjectRename {
+                    from: current.name.clone(),
+                    to: name_value.clone(),
+                });
                 let mut active_project: projects::ActiveModel = current.into();
                 active_project.name = Set(name_value);
                 active_project.updated_at = Set(chrono::Utc::now());
                 active_project.update(&txn).await?;
             }
-            txn.commit().await?;
-        }
 
-        // Always reload the final project state before returning
-        let final_project = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(ProjectError::NotFound(format!(
-                "Project {} not found",
-                project_id
-            )))?;
+            let final_project = projects::Entity::find_by_id(project_id)
+                .one(&txn)
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+            txn.commit().await?;
+            final_project
+        } else {
+            // No mutation to lose here, so a plain read is enough.
+            projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?
+        };
 
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
             project_id: final_project.id,
@@ -1888,7 +1904,7 @@ impl ProjectService {
 
         Ok(ProjectSettingsUpdate {
             project: self.map_written_project(final_project).await,
-            renamed_from,
+            rename,
         })
     }
 
@@ -4758,9 +4774,12 @@ mod tests {
             .await
             .expect("rename should succeed");
 
-        // The service reports the transition it actually performed, so the
-        // audit never has to infer it from a racy read-before-write.
-        assert_eq!(updated.renamed_from.as_deref(), Some("Old Name"));
+        // The service reports the transition it actually performed — both ends
+        // captured under one lock — so the audit never has to infer it from a
+        // racy read-before-write, nor splice two requests' renames together.
+        let rename = updated.rename.as_ref().expect("a rename was performed");
+        assert_eq!(rename.from, "Old Name");
+        assert_eq!(rename.to, "New Display Name");
 
         let updated = updated.project;
 
@@ -4830,8 +4849,8 @@ mod tests {
             .await
             .expect("no-op rename should succeed");
 
-        assert_eq!(
-            updated.renamed_from, None,
+        assert!(
+            updated.rename.is_none(),
             "a no-op rename must not report a transition"
         );
         assert_eq!(updated.project.name, "Unchanged Name");

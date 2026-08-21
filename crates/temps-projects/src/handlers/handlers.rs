@@ -1224,11 +1224,8 @@ pub async fn update_project_settings(
         memory_request: None,
         memory_limit: None,
         performance_metrics_enabled: None,
-        name: update
-            .renamed_from
-            .as_ref()
-            .map(|_| update.project.name.clone()),
-        previous_name: update.renamed_from,
+        name: update.rename.as_ref().map(|rename| rename.to.clone()),
+        previous_name: update.rename.map(|rename| rename.from),
         slug: settings.slug,
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
         image_retention_hours: settings.image_retention_hours,

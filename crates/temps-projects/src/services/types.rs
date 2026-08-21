@@ -108,6 +108,21 @@ pub struct Project {
     pub image_retention_hours: Option<i32>,
 }
 
+/// A display-name change that actually happened.
+///
+/// Both ends are captured inside the transaction that performed the write and
+/// under the same row lock, so the pair always describes one real transition.
+/// Reading either half outside that lock would allow a concurrent rename to
+/// supply one end of a transition whose other end came from a different
+/// request.
+#[derive(Serialize)]
+pub struct ProjectRename {
+    /// The display name immediately before this update.
+    pub from: String,
+    /// The display name this update wrote.
+    pub to: String,
+}
+
 /// Outcome of a project settings update.
 ///
 /// Carries what the service actually *did* rather than leaving the caller to
@@ -119,12 +134,9 @@ pub struct Project {
 pub struct ProjectSettingsUpdate {
     /// The project as it stands after the update.
     pub project: Project,
-    /// The display name immediately before this update, set only when this
-    /// update actually renamed the project. `None` when no name was supplied,
-    /// or when the supplied name matched what was already stored. Captured
-    /// under the same row lock as the write, so it always describes a real
-    /// transition.
-    pub renamed_from: Option<String>,
+    /// The rename this update performed, or `None` when no name was supplied
+    /// or the supplied name matched what was already stored.
+    pub rename: Option<ProjectRename>,
 }
 
 /// One environment variable supplied while creating a project.
