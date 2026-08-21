@@ -2439,10 +2439,15 @@ impl ProjectService {
     ///
     /// Best-effort. NOTIFY is not durable — it reaches only sessions holding a
     /// `LISTEN` at commit time — so a queue failure here is not automatically
-    /// harmless. What makes it recoverable is the listener itself: a dropped
-    /// connection surfaces as an error and its reconnect path runs a full route
-    /// reload, so a signal missed while the listener was down is picked up then.
-    /// Do not weaken that reconnect-reload while trusting this comment.
+    /// harmless. What makes it recoverable is the listener itself, which
+    /// reloads the full route table on two independent triggers: after a
+    /// reconnect (catching signals missed while it was down) and after an idle
+    /// window elapses with no notification (catching a connection that died
+    /// without ever reporting an error). The second is what bounds the damage
+    /// here — without it, losing both the NOTIFY and this queue send would
+    /// leave a withdrawn public port reachable indefinitely. Do not weaken
+    /// either trigger while trusting this comment; see
+    /// `temps_routes::project_change_listener::IDLE_RECONCILE_INTERVAL`.
     async fn enqueue_route_reload(&self, project_id: i32) {
         if let Err(e) = self
             .queue_service
