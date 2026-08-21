@@ -84,7 +84,12 @@ export function IpAccessControl() {
       setIsCreateDialogOpen(false)
     },
     onError: (error: any) => {
-      toast.error(error?.message || 'Failed to create IP access control rule')
+      toast.error(
+        error?.detail ||
+          error?.title ||
+          error?.message ||
+          'Failed to create IP access control rule'
+      )
     },
   })
 
@@ -97,7 +102,12 @@ export function IpAccessControl() {
       setEditingRule(null)
     },
     onError: (error: any) => {
-      toast.error(error?.message || 'Failed to update IP access control rule')
+      toast.error(
+        error?.detail ||
+          error?.title ||
+          error?.message ||
+          'Failed to update IP access control rule'
+      )
     },
   })
 
@@ -108,7 +118,12 @@ export function IpAccessControl() {
       toast.success('IP access control rule deleted successfully')
     },
     onError: (error: any) => {
-      toast.error(error?.message || 'Failed to delete IP access control rule')
+      toast.error(
+        error?.detail ||
+          error?.title ||
+          error?.message ||
+          'Failed to delete IP access control rule'
+      )
     },
   })
 
