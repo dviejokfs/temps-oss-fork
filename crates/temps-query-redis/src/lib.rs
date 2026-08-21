@@ -259,12 +259,14 @@ return {1, estimated, has_more, values}
                 observed,
             ));
         }
-        let values = flat_values
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| (pair[0].clone(), pair[1].clone()))
-            .collect();
+        // The reply is a flat [field, value, field, value, …] list. Pair it up
+        // by consuming the Vec, so neither half is cloned; a trailing unpaired
+        // element (a malformed reply) is dropped.
+        let mut flat = flat_values.into_iter();
+        let mut values = Vec::with_capacity(flat.len() / 2);
+        while let (Some(field), Some(value)) = (flat.next(), flat.next()) {
+            values.push((field, value));
+        }
         Ok((values, has_more != 0))
     }
 
@@ -362,16 +364,19 @@ return {1, estimated, has_more, values}
                 observed,
             ));
         }
-        let mut values = Vec::with_capacity(flat_values.len() / 2);
-        for pair in flat_values.as_chunks::<2>().0 {
-            let score = pair[1].parse::<f64>().map_err(|error| {
+        // Flat [member, score, member, score, …], paired by consuming the Vec
+        // so the member string is moved rather than cloned.
+        let mut flat = flat_values.into_iter();
+        let mut values = Vec::with_capacity(flat.len() / 2);
+        while let (Some(member), Some(raw_score)) = (flat.next(), flat.next()) {
+            let score = raw_score.parse::<f64>().map_err(|error| {
                 error!(error = %error, "failed to decode Redis sorted-set score");
                 DataError::BackendQueryFailed {
                     backend: "Redis",
                     entity: key.to_string(),
                 }
             })?;
-            values.push((pair[0].clone(), score));
+            values.push((member, score));
         }
         Ok((values, has_more != 0))
     }

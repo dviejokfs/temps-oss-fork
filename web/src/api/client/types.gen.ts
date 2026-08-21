@@ -13336,6 +13336,17 @@ export type ProjectResponse = {
     error_source_root?: string | null;
     git_provider_connection_id?: number | null;
     /**
+     * Git provider behind `git_provider_connection_id`: `github`,
+     * `github_app`, `gitlab`, `gitea`, `bitbucket` or `generic`. `null` when
+     * the project has no connection (public repository, Docker image or
+     * uploaded source).
+     *
+     * Clients must use this rather than guessing the host from `git_url`: a
+     * self-hosted GitLab/Gitea/Bitbucket instance can live on any domain, and
+     * a connected project may have no clone URL stored at all.
+     */
+    git_provider_type?: string | null;
+    /**
      * Git clone URL for the repository (used for public repos without a provider connection)
      */
     git_url?: string | null;

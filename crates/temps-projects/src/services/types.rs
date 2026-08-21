@@ -60,6 +60,17 @@ pub struct Project {
     pub is_public_repo: bool,
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
+    /// Provider type behind `git_provider_connection_id` (`github`,
+    /// `github_app`, `gitlab`, `gitea`, `bitbucket`, `generic`), resolved from
+    /// the connection's provider row. `None` when the project has no
+    /// connection (public repo, Docker image, uploaded source) or when the
+    /// caller fetched the project through a path that doesn't resolve it.
+    ///
+    /// This is the only authoritative answer to "which Git host is this
+    /// project on" — the clone URL's hostname is not, because a self-hosted
+    /// instance can live on any domain and a project may have no clone URL at
+    /// all.
+    pub git_provider_type: Option<String>,
     pub is_on_demand: bool,
     pub deployment_config: Option<temps_entities::prelude::DeploymentConfig>,
     pub attack_mode: bool,
