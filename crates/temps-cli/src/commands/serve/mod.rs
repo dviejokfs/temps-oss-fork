@@ -722,7 +722,10 @@ impl ServeCommand {
         // availability guarantee above still holds — the failure mode
         // just becomes a loud, bounded, logged exposure window instead of
         // a silent, unbounded one.
-        match rt.block_on(tokio::time::timeout(PROJECT_IP_GATE_STARTUP_GRACE, ready_rx)) {
+        match rt.block_on(tokio::time::timeout(
+            PROJECT_IP_GATE_STARTUP_GRACE,
+            ready_rx,
+        )) {
             Ok(Ok(())) => {
                 info!(
                     "✅ Console API is ready — any project IP gate a licensed plugin \
