@@ -19868,6 +19868,12 @@ export type UpdateProjectSettingsRequest = {
      */
     image_retention_hours?: number | null;
     main_branch?: string | null;
+    /**
+     * Human-facing project display name. Unlike `slug` this is not part of any
+     * URL and is not required to be unique. Changing it also changes the
+     * `OTEL_SERVICE_NAME` injected into subsequent deployments.
+     */
+    name?: string | null;
     preset?: string | null;
     preset_config?: null | PresetConfigSchema;
     /**

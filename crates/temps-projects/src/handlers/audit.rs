@@ -170,6 +170,19 @@ pub struct ProjectSettingsUpdatedAudit {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectSettingsUpdatedFields {
+    /// The project's persisted display name after a rename, set only when the
+    /// name actually changed (the value is post-trim, so it is what reached the
+    /// database — not the raw request). Audited so a project that suddenly
+    /// reports under a different name in dashboards and alerts can be traced
+    /// back to who renamed it.
+    pub name: Option<String>,
+    /// The display name immediately before this update. Set only alongside
+    /// `name` — the two are recorded as a pair, because a previous name with no
+    /// new name reads like a half-finished rename. Recorded because the new
+    /// value alone doesn't tell an incident reviewer what the project used to be
+    /// called, which is the whole question when older traces and alerts refer to
+    /// it by the old name.
+    pub previous_name: Option<String>,
     pub slug: Option<String>,
     pub cpu_request: Option<i32>,
     pub cpu_limit: Option<i32>,
@@ -331,6 +344,8 @@ mod tests {
             project_name: "example".to_string(),
             project_slug: "example".to_string(),
             updated_settings: ProjectSettingsUpdatedFields {
+                name: None,
+                previous_name: None,
                 slug: None,
                 cpu_request: None,
                 cpu_limit: None,

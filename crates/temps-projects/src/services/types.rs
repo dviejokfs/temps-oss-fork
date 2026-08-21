@@ -108,6 +108,72 @@ pub struct Project {
     pub image_retention_hours: Option<i32>,
 }
 
+/// Sparse set of project settings to change.
+///
+/// A struct rather than a positional parameter list: the settings endpoint
+/// carries 22 optional fields, several of which share a type. `name` and `slug`
+/// in particular are adjacent `Option<String>`s whose meanings are not
+/// interchangeable — one is a display label, the other is the routing
+/// identifier — and as positional arguments they could be transposed without a
+/// compile error. Every field is `None` by default; only what is set changes.
+#[derive(Debug, Default, Clone)]
+pub struct UpdateProjectSettingsParams {
+    pub name: Option<String>,
+    pub slug: Option<String>,
+    pub git_provider_connection_id: Option<i32>,
+    pub main_branch: Option<String>,
+    pub repo_owner: Option<String>,
+    pub repo_name: Option<String>,
+    pub preset: Option<String>,
+    pub directory: Option<String>,
+    pub attack_mode: Option<bool>,
+    pub enable_preview_environments: Option<bool>,
+    pub preview_envs_on_demand: Option<bool>,
+    pub preview_envs_idle_timeout_seconds: Option<i32>,
+    pub preview_envs_wake_timeout_seconds: Option<i32>,
+    pub preset_config: Option<serde_json::Value>,
+    pub ai_alert_summaries_enabled: Option<bool>,
+    pub ai_debug_chat_enabled: Option<bool>,
+    pub ai_write_actions_enabled: Option<bool>,
+    pub cross_project_trace_sharing: Option<bool>,
+    pub error_source_context_enabled: Option<bool>,
+    pub error_source_root: Option<String>,
+    pub ai_api_traffic_summary_enabled: Option<bool>,
+    /// Outer `None` leaves the retention window unchanged; `Some(None)` clears
+    /// the per-project override back to the system default.
+    pub image_retention_hours: Option<Option<i32>>,
+}
+
+/// A display-name change that actually happened.
+///
+/// Both ends are captured inside the transaction that performed the write and
+/// under the same row lock, so the pair always describes one real transition.
+/// Reading either half outside that lock would allow a concurrent rename to
+/// supply one end of a transition whose other end came from a different
+/// request.
+#[derive(Debug, Clone)]
+pub struct ProjectRename {
+    /// The display name immediately before this update.
+    pub from: String,
+    /// The display name this update wrote.
+    pub to: String,
+}
+
+/// Outcome of a project settings update.
+///
+/// Carries what the service actually *did* rather than leaving the caller to
+/// infer it by reading the row before and after. A caller comparing its own
+/// pre-read against the result would be racing any concurrent update: two
+/// overlapping renames could pair one request's stale pre-read with the other's
+/// persisted name and report a transition that never happened.
+pub struct ProjectSettingsUpdate {
+    /// The project as it stands after the update.
+    pub project: Project,
+    /// The rename this update performed, or `None` when no name was supplied
+    /// or the supplied name matched what was already stored.
+    pub rename: Option<ProjectRename>,
+}
+
 /// One environment variable supplied while creating a project.
 ///
 /// Deserializes from either shape so clients written before `is_secret`
@@ -272,13 +338,23 @@ pub enum ProjectError {
     #[error("Failed to remove deployment containers for project {project_id}: {reason}")]
     DeploymentCleanupFailed { project_id: i32, reason: String },
 
+    /// The proxy route-reload signal could not be published, so the write that
+    /// changed the public ports was rolled back.
+    ///
+    /// `rolled_back_scope` describes *what* was rolled back, because it differs
+    /// by caller and an operator debugging this alone cannot see which path they
+    /// hit. `update_git_settings` performs all of its writes in the one
+    /// transaction, so nothing survives. `update_project_settings` is a chain of
+    /// independent commits and only its final transaction rolls back — earlier
+    /// steps in the same request may already be persisted. Claiming "nothing was
+    /// saved" there would be false.
     #[error(
-        "Project {project_id} was saved, but its proxy routes could not be reloaded (queue: {queue_reason}; database notification: {database_reason})"
+        "Project {project_id}'s proxy routes could not be signalled for reload. \
+         {rolled_back_scope} Retry once the database is reachable."
     )]
     RouteReloadFailed {
         project_id: i32,
-        queue_reason: String,
-        database_reason: String,
+        rolled_back_scope: String,
     },
 
     #[error("Other error: {0}")]
