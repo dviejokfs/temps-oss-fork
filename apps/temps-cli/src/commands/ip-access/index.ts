@@ -80,7 +80,7 @@ export function registerIpAccessCommands(program: Command): void {
     .command('create')
     .alias('add')
     .description('Create a new IP access control rule')
-    .option('--ip <ip_or_cidr>', 'IP address or CIDR range (e.g., "192.168.1.1" or "10.0.0.0/24")')
+    .option('--ip <ip_or_cidr>', 'IPv4 or IPv6 address or CIDR range (e.g., "192.168.1.1", "10.0.0.0/24", or "2001:db8::/32")')
     .option('--action <action>', 'Action to take: "allow" or "deny"')
     .option('--description <desc>', 'Optional description/reason for the rule')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
