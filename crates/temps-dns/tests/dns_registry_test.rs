@@ -11,7 +11,7 @@ use std::sync::Arc;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use temps_dns::services::{DnsRegistry, EndpointDraft, OwnerKind, RecordType};
 use temps_migrations::{Migrator, MigratorTrait};
-use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 async fn boot_db() -> Option<Arc<DatabaseConnection>> {
     if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
@@ -21,10 +21,18 @@ async fn boot_db() -> Option<Arc<DatabaseConnection>> {
     }
 
     let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        // Without this, `start()` returns before PostgreSQL accepts clients
+        // and the test races the database ("Connection reset by peer").
+        // Must match on stderr: the temporary initdb server logs its "ready"
+        // line to stdout, the real server to stderr.
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_startup_timeout(std::time::Duration::from_secs(120))
         .start()
         .await
     {

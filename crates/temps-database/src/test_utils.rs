@@ -62,12 +62,19 @@ use tokio::sync::{Mutex, OnceCell};
 /// The postgres/timescaledb entrypoint starts a temporary server to run
 /// initdb + init scripts, shuts it down, then starts the real server --
 /// "database system is ready to accept connections" is logged once for
-/// each. This waits for the first (temporary-server) occurrence -- same
-/// wait condition already proven reliable elsewhere in this workspace
+/// each.
+///
+/// The two go to DIFFERENT streams. Verified against
+/// `timescale/timescaledb-ha:pg18`, the temporary server logs to **stdout**
+/// (`[40] LOG: ...`) and the real server to **stderr** (`[1] LOG: ...`).
+/// Matching on stderr therefore already targets the real server -- this does
+/// not need a trailing buffer sleep to "clear the restart window", and it must
+/// not be changed to match stdout or to wait for two occurrences, because each
+/// stream only ever carries one.
+///
+/// Same wait condition already proven reliable elsewhere in this workspace
 /// (temps-providers/src/pg_stat_statements.rs,
-/// temps-metrics/tests/postgres_checkpoint_stats_integration.rs) -- and
-/// callers add a short buffer sleep afterward to clear the temp-server
-/// shutdown/real-server restart window before connecting.
+/// temps-metrics/tests/postgres_checkpoint_stats_integration.rs).
 fn postgres_ready_wait_for() -> WaitFor {
     WaitFor::message_on_stderr("database system is ready to accept connections")
 }
@@ -174,9 +181,10 @@ impl SharedContainer {
             username, password, port, db_name
         );
 
-        // The wait strategy fires on the temp-server's "ready" line, but
-        // postgres shuts that server down and restarts a second one right
-        // after -- a short buffer clears that window before we connect.
+        // The wait strategy above already fires on the REAL server's "ready"
+        // line (see `postgres_ready_wait_for`), so this is not closing a
+        // restart window -- it is just a small margin for the mapped port to
+        // start accepting. Callers retry on top of it.
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
         Ok(Self {
@@ -574,12 +582,13 @@ impl TestDatabase {
             username, password, port, db_name
         );
 
-        // The wait strategy fires on the temp-server's "ready" line, but
-        // postgres shuts that server down and restarts a second one right
-        // after -- a short buffer clears that window before we connect.
+        // The wait strategy above already fires on the REAL server's "ready"
+        // line (see `postgres_ready_wait_for`), so this is not closing a
+        // restart window -- it is just a small margin for the mapped port to
+        // start accepting.
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        // Connect with retries as a safety net on top of the buffer above.
+        // Connect with retries as a safety net on top of the margin above.
         let db = Self::connect_with_retry(&database_url, 10).await?;
 
         let test_db = TestDatabase {

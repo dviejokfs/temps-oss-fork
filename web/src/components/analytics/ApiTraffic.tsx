@@ -114,6 +114,44 @@ function trafficDimension(row: TrafficAggregationRow, name: string): string {
   return row.dimensions.find((item) => item.dimension === name)?.value ?? '—'
 }
 
+/// The aggregation endpoint rejects requests the client can legitimately build
+/// — a window wider than the cap for the requested dimensions/metrics is the
+/// common one — and answers with RFC 7807 Problem Details. `JSON.stringify`ing
+/// that into a bare `Error` threw away the one field that tells the user what
+/// to change, so the card could only say "refresh to try again" for a failure
+/// no refresh will ever fix. Keep the status and the server's own wording.
+class TrafficQueryError extends Error {
+  readonly status?: number
+  readonly title?: string
+  readonly detail?: string
+
+  constructor(args: { status?: number; title?: string; detail?: string }) {
+    super(args.detail ?? args.title ?? 'Traffic aggregation request failed')
+    this.name = 'TrafficQueryError'
+    this.status = args.status
+    this.title = args.title
+    this.detail = args.detail
+  }
+
+  /// 4xx means the request itself is wrong. Retrying re-sends the same body.
+  get isClientError(): boolean {
+    return this.status !== undefined && this.status >= 400 && this.status < 500
+  }
+}
+
+function toTrafficQueryError(error: unknown, status?: number) {
+  const problem = (error ?? {}) as {
+    status?: number
+    title?: string
+    detail?: string
+  }
+  return new TrafficQueryError({
+    status: problem.status ?? status,
+    title: problem.title,
+    detail: problem.detail,
+  })
+}
+
 async function queryTraffic(
   projectId: number,
   body: TrafficAggregationRequest
@@ -124,7 +162,7 @@ async function queryTraffic(
       body: requestBody,
     })
 
-  let { data, error } = await request(body)
+  let { data, error, response } = await request(body)
 
   // A console can be upgraded before its proxy/analytics process during a
   // rolling deployment. Older backends do not know the crawler metrics added
@@ -139,11 +177,18 @@ async function queryTraffic(
           metric !== 'bot_requests' && metric !== 'robots_txt_requests'
       ),
     }
-    ;({ data, error } = await request(compatibleBody))
+    ;({ data, error, response } = await request(compatibleBody))
   }
 
-  if (error || !data) throw new Error(JSON.stringify(error ?? 'No response'))
+  if (error || !data) throw toTrafficQueryError(error, response?.status)
   return data
+}
+
+/// React Query retries by default. A validation rejection is deterministic, so
+/// retrying only delays the message the user needs by several seconds.
+function retryUnlessClientError(failureCount: number, error: unknown): boolean {
+  if (error instanceof TrafficQueryError && error.isClientError) return false
+  return failureCount < 3
 }
 
 const API_TRAFFIC_SUMMARY_SCHEMA = {
@@ -353,7 +398,10 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
           'latency_min',
           'latency_max',
           'latency_p95',
-          'unique_ips',
+          // No `unique_ips` here: nothing renders it and it cannot be a sort
+          // key, but asking for it capped this card at a 7-day window because
+          // exact distinct counts are the one aggregate whose cost pagination
+          // can't bound. Dropping it is what lets "Last 30 Days" work.
           'bot_requests',
           'robots_txt_requests',
           'last_seen',
@@ -370,6 +418,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         page_size: pageSize,
       }),
     enabled,
+    retry: retryUnlessClientError,
   })
 
   const callersQuery = useQuery({
@@ -398,7 +447,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
           'latency_min',
           'latency_max',
           'latency_p95',
-          'unique_paths',
+          // Dropped for the same reason as `unique_ips` on the routes card.
           'bot_requests',
           'robots_txt_requests',
           'last_seen',
@@ -415,6 +464,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         page_size: pageSize,
       }),
     enabled,
+    retry: retryUnlessClientError,
   })
 
   const detailQuery = useQuery({
@@ -473,6 +523,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       })
     },
     enabled: enabled && detail !== null,
+    retry: retryUnlessClientError,
   })
 
   // Stable first-page context for the summary. These legacy response shapes
@@ -895,7 +946,10 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
             {routesQuery.isPending ? (
               <Skeleton className="h-[240px] w-full" />
             ) : routesQuery.isError ? (
-              <QueryErrorState label="route data" />
+              <QueryErrorState
+                label="route data"
+                error={routesQuery.error}
+              />
             ) : (routesQuery.data?.rows.length ?? 0) === 0 ? (
               <p className="text-sm text-muted-foreground">
                 No API traffic for this period.
@@ -1010,7 +1064,10 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
             {callersQuery.isPending ? (
               <Skeleton className="h-[240px] w-full" />
             ) : callersQuery.isError ? (
-              <QueryErrorState label="caller data" />
+              <QueryErrorState
+                label="caller data"
+                error={callersQuery.error}
+              />
             ) : (callersQuery.data?.rows.length ?? 0) === 0 ? (
               <p className="text-sm text-muted-foreground">
                 No API traffic for this period.
@@ -1096,6 +1153,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         data={detailQuery.data}
         isPending={detailQuery.isPending}
         isError={detailQuery.isError}
+        error={detailQuery.error}
         page={detailPage}
         pageSize={pageSize}
         sort={detailSort}
@@ -1160,6 +1218,7 @@ function TrafficDetailSheet({
   data,
   isPending,
   isError,
+  error,
   page,
   pageSize,
   sort,
@@ -1177,6 +1236,7 @@ function TrafficDetailSheet({
   data: TrafficAggregationResponse | undefined
   isPending: boolean
   isError: boolean
+  error?: unknown
   page: number
   pageSize: number
   sort: TrafficSort<TrafficMetric>
@@ -1208,7 +1268,7 @@ function TrafficDetailSheet({
           {isPending ? (
             <Skeleton className="h-[360px] w-full" />
           ) : isError ? (
-            <QueryErrorState label="traffic detail" />
+            <QueryErrorState label="traffic detail" error={error} />
           ) : (data?.rows.length ?? 0) === 0 ? (
             <>
               <p className="text-sm text-muted-foreground">
@@ -1515,10 +1575,30 @@ function StatTile({
   )
 }
 
-function QueryErrorState({ label }: { label: string }) {
+function QueryErrorState({
+  label,
+  error,
+}: {
+  label: string
+  error?: unknown
+}) {
+  const problem = error instanceof TrafficQueryError ? error : undefined
+  // A rejected request states its own reason far better than a generic
+  // fallback can — the server knows which cap was exceeded and by what.
+  const detail = problem?.detail
+  const isClientError = problem?.isClientError ?? false
+
   return (
-    <div className="rounded-md border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">
-      Could not load {label}. Refresh to try again.
+    <div className="space-y-1 rounded-md border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">
+      <p className="font-medium">
+        {problem?.title ?? `Could not load ${label}.`}
+      </p>
+      {detail ? <p className="text-destructive/90">{detail}</p> : null}
+      <p className="text-destructive/80">
+        {isClientError
+          ? 'Adjust the time range or filters above — retrying the same request will fail again.'
+          : `Could not load ${label}. Refresh to try again.`}
+      </p>
     </div>
   )
 }

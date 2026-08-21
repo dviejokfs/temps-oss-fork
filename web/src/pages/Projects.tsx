@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
+import { useProjectsMonitorHealth } from '@/hooks/useProjectsMonitorHealth'
 import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboarding'
@@ -98,6 +99,9 @@ export function Projects() {
   )
 
   const dashboardHealth = useDashboardHealth(projectIds, startDate, endDate)
+  // Uptime monitors answer for projects that simply had no visitors, which
+  // traffic-derived health cannot. See project-card-health.ts.
+  const monitorHealth = useProjectsMonitorHealth(projectIds)
   const latestDeploymentMedia = useLatestDeploymentMedia(projectIds)
 
   const renderProjectCards = () =>
@@ -112,6 +116,7 @@ export function Projects() {
         healthLoading={dashboardHealth.isLoading}
         healthError={dashboardHealth.isError}
         health={dashboardHealth.data?.projects?.[String(project.id)]}
+        monitorHealth={monitorHealth.data?.projects?.[String(project.id)]}
         latestDeploymentMedia={
           latestDeploymentMedia.data?.projects?.[String(project.id)]
         }

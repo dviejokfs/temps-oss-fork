@@ -26,6 +26,23 @@ pub enum ProxyLogServiceError {
     #[error("Traffic aggregation exceeded its {timeout_seconds}-second execution deadline")]
     TrafficAggregationTimeout { timeout_seconds: u64 },
 
+    /// The grouping produced more distinct groups than the storage backend will
+    /// aggregate (ClickHouse `max_rows_to_group_by` with
+    /// `group_by_overflow_mode = throw`).
+    ///
+    /// This is the ceiling that the old blanket 7-day cap on high-cardinality
+    /// dimensions was standing in for. Reporting it directly is strictly better:
+    /// it fires only for the projects that actually exceed the limit, and it can
+    /// say what to change. Grouping by raw `path` is the usual trigger, since
+    /// paths are not template-normalized and `/users/1` and `/users/2` count as
+    /// two groups.
+    #[error(
+        "Traffic aggregation grouped by {dimensions} produced more than {max_groups} \
+         distinct groups over this time range. Narrow the range, add a filter, or \
+         group by fewer dimensions."
+    )]
+    TrafficAggregationTooManyGroups { dimensions: String, max_groups: u64 },
+
     /// A ClickHouse operation failed. `operation` names the storage method
     /// (e.g. `list_with_filters`, `write_batch`) so logs/responses can identify
     /// exactly which read/write path hit the backend error. Not a `#[from]` of

@@ -776,16 +776,72 @@ impl MongodbService {
         }
     }
 
+    /// Render a container's health state as a one-line, log-safe diagnostic.
+    ///
+    /// The MongoDB healthcheck embeds the root password in its command line, so
+    /// anything derived from it is treated as credential-bearing: only the
+    /// healthcheck's captured `output` is surfaced (never the command itself),
+    /// it is truncated, and newlines are flattened so a multi-line mongosh
+    /// stack trace cannot smear across the log.
+    fn describe_container_health(state: &bollard::models::ContainerState) -> String {
+        const MAX_OUTPUT: usize = 400;
+
+        let status = state
+            .health
+            .as_ref()
+            .and_then(|h| h.status.as_ref())
+            .map(|s| format!("{:?}", s))
+            .unwrap_or_else(|| "<no healthcheck reported>".to_string());
+
+        let streak = state
+            .health
+            .as_ref()
+            .and_then(|h| h.failing_streak)
+            .unwrap_or(0);
+
+        let last_output = state
+            .health
+            .as_ref()
+            .and_then(|h| h.log.as_ref())
+            .and_then(|log| log.last())
+            .and_then(|entry| entry.output.as_ref())
+            .map(|out| {
+                let flattened = out.split_whitespace().collect::<Vec<_>>().join(" ");
+                if flattened.chars().count() > MAX_OUTPUT {
+                    let truncated: String = flattened.chars().take(MAX_OUTPUT).collect();
+                    format!("{truncated}... (truncated)")
+                } else {
+                    flattened
+                }
+            })
+            .unwrap_or_else(|| "<no healthcheck output captured>".to_string());
+
+        format!(
+            "status={status}, container_status={:?}, failing_streak={streak}, last_probe_output=\"{last_output}\"",
+            state.status
+        )
+    }
+
     async fn wait_for_container_health(&self, docker: &Docker, container_id: &str) -> Result<()> {
         let mut delay = Duration::from_millis(500);
         let mut total_wait = Duration::from_secs(0);
         let max_wait = Duration::from_secs(90);
         let max_delay = Duration::from_secs(2);
+        // Captured on every poll so the timeout error below can explain WHY the
+        // container never became healthy. Without this the operator (and CI)
+        // only ever sees "health check timed out", which is unactionable —
+        // the healthcheck's own stderr is the one thing that identifies
+        // whether MongoDB is still initialising, rejecting the credentials, or
+        // missing `mongosh` entirely.
+        let mut last_health_diagnostic = String::from("no health status was ever reported");
 
         while total_wait < max_wait {
             let info = docker
                 .inspect_container(container_id, None::<InspectContainerOptions>)
                 .await?;
+            if let Some(ref state) = info.state {
+                last_health_diagnostic = Self::describe_container_health(state);
+            }
             if let Some(state) = info.state {
                 // Considered ready if it's running and either has a HEALTHY
                 // Docker healthcheck status or no healthcheck is defined at
@@ -817,7 +873,11 @@ impl MongodbService {
             delay = std::cmp::min(delay.mul_f32(1.5), max_delay);
         }
 
-        Err(anyhow::anyhow!("MongoDB container health check timed out"))
+        Err(anyhow::anyhow!(
+            "MongoDB container health check timed out after {}s. Last health status: {}",
+            max_wait.as_secs(),
+            last_health_diagnostic
+        ))
     }
 
     async fn get_mongo_client(&self) -> Result<MongoClient> {

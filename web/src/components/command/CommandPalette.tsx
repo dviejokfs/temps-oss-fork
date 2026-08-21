@@ -22,6 +22,7 @@ import { normalizeFrecency } from '@/lib/frecency'
 import {
   buildCommandSampleQueries,
   dedupeCommandDestinations,
+  hoistResultFirst,
   resolveExplicitNamedProjectDestination,
   resolveExplicitProjectEnvironment,
   toCommandExtendedQuery,
@@ -972,6 +973,8 @@ const projectNavItems: NavigationItem[] = [
 export function CommandPalette() {
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
+  // The highlighted row, controlled so it always matches the ranked list.
+  const [activeValue, setActiveValue] = useState('')
   const navigate = useNavigate()
   const location = useLocation()
   const { platformNavEntries, settingsNavEntries, projectNavEntries } =
@@ -1613,13 +1616,14 @@ export function CommandPalette() {
     return query ? commandDestinationFuse.search(query).slice(0, 8) : []
   }, [commandDestinationFuse, search])
 
-  const getConstrainedLocalMatch = () => {
+  const constrainedDestination = useMemo(() => {
     const query = search.trim()
     if (!query) return undefined
 
+    const projectSlugs = projects.map((project) => project.slug)
     const explicitProjectEnvironment = resolveExplicitProjectEnvironment(
       query,
-      projects.map((project) => project.slug),
+      projectSlugs,
       commandDestinations,
       currentProjectSlug
     )
@@ -1627,33 +1631,60 @@ export function CommandPalette() {
 
     return resolveExplicitNamedProjectDestination(
       query,
-      projects.map((project) => project.slug),
+      projectSlugs,
       localMatches.map(({ item }) => item)
     )
-  }
+  }, [search, projects, commandDestinations, currentProjectSlug, localMatches])
 
-  const openBestLocalMatch = () => {
-    if (!search.trim()) return false
+  // What the list renders IS what Enter opens. The explicit resolvers above
+  // used to run only on the Enter key, so a query they answered navigated to a
+  // row that was never highlighted (and often never even first).
+  const visibleResults = useMemo<RankedResult[]>(() => {
+    if (!constrainedDestination) return rankedResults
+    const existing = rankedResults.find(
+      (result) => result.key === constrainedDestination.url
+    )
+    return hoistResultFirst(
+      rankedResults,
+      existing ?? {
+        key: constrainedDestination.url,
+        title: constrainedDestination.title,
+        category: constrainedDestination.category,
+        icon: <Search className="h-4 w-4" />,
+        score: Number.POSITIVE_INFINITY,
+        run: () => navigate(constrainedDestination.url),
+      }
+    )
+  }, [rankedResults, constrainedDestination, navigate])
 
-    const constrainedDestination = getConstrainedLocalMatch()
-    if (constrainedDestination) {
-      runWithFrecency(constrainedDestination.url, () =>
-        navigate(constrainedDestination.url)
-      )
-      return true
-    }
+  const visibleLocalMatches = useMemo(
+    () =>
+      localMatches
+        .filter(
+          ({ item }) =>
+            !visibleResults.some((result) => result.key === item.url)
+        )
+        .slice(0, 8),
+    [localMatches, visibleResults]
+  )
 
-    const rankedResult = rankedResults[0]
-    if (rankedResult) {
-      runWithFrecency(rankedResult.key, rankedResult.run)
-      return true
-    }
-
-    const destination = localMatches[0]?.item
-    if (!destination) return false
-    runWithFrecency(destination.url, () => navigate(destination.url))
-    return true
-  }
+  // cmdk owns the highlighted row, but with `shouldFilter={false}` it only
+  // re-selects the first item on a scheduled pass that can land before this
+  // re-ranked list has rendered — leaving the highlight (and therefore the
+  // Enter target) on a stale row. Driving `value` ourselves keeps the two in
+  // sync on every keystroke.
+  const firstResultValue = search
+    ? (visibleResults[0]?.key ??
+      (visibleLocalMatches[0]
+        ? `local-${visibleLocalMatches[0].item.id}`
+        : undefined))
+    : undefined
+  useEffect(() => {
+    // cmdk is the external widget being synchronised here: its highlight has
+    // to be pushed back to the head of the list whenever re-ranking moves it.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setActiveValue(firstResultValue ?? '')
+  }, [firstResultValue])
 
   // Resolve recent frecency keys into renderable items (icon + title + run).
   interface RecentEntry {
@@ -1791,6 +1822,7 @@ export function CommandPalette() {
     setOpen(nextOpen)
     if (!nextOpen) {
       setSearch('')
+      setActiveValue('')
     }
   }
 
@@ -1804,6 +1836,8 @@ export function CommandPalette() {
         className="rounded-none border-0 shadow-none"
         loop
         shouldFilter={false}
+        value={activeValue}
+        onValueChange={setActiveValue}
       >
         <div className="relative overflow-hidden border-b bg-muted/40 px-5 pb-4 pt-5 sm:px-6">
           <div className="pointer-events-none absolute -right-16 -top-24 size-64 rounded-full bg-blue-500/10 blur-3xl" />
@@ -1830,12 +1864,6 @@ export function CommandPalette() {
             placeholder={'Try “production environment for project-slug”'}
             value={search}
             onValueChange={setSearch}
-            onKeyDown={(event) => {
-              if (event.key !== 'Enter') return
-              event.preventDefault()
-              event.stopPropagation()
-              openBestLocalMatch()
-            }}
             className="h-14 text-base font-medium"
           />
           <div className="mt-2 flex justify-end gap-2 pr-1 text-[10px] text-muted-foreground">
@@ -1877,9 +1905,9 @@ export function CommandPalette() {
           {/* Typing: one list, best match first, regardless of section. The
               section name rides along as a right-aligned label so you can
               still tell a project page from a settings page. */}
-          {search && rankedResults.length > 0 && (
+          {search && visibleResults.length > 0 && (
             <CommandGroup heading="Results">
-              {rankedResults.slice(0, 30).map((entry) => (
+              {visibleResults.slice(0, 30).map((entry) => (
                 <CommandItem
                   key={entry.key}
                   value={entry.key}
@@ -1901,32 +1929,26 @@ export function CommandPalette() {
             </CommandGroup>
           )}
 
-          {search && localMatches.length > 0 && (
+          {search && visibleLocalMatches.length > 0 && (
             <CommandGroup heading="Instance-wide matches">
-              {localMatches
-                .filter(
-                  ({ item }) =>
-                    !rankedResults.some((result) => result.key === item.url)
-                )
-                .slice(0, 8)
-                .map(({ item }) => (
-                  <CommandItem
-                    key={item.id}
-                    value={`local-${item.id}`}
-                    onSelect={() =>
-                      runWithFrecency(item.url, () => navigate(item.url))
-                    }
-                    className="flex items-center gap-3 rounded-xl py-3"
-                  >
-                    <Search className="size-4 text-muted-foreground" />
-                    <span className="min-w-0 flex-1 truncate font-medium">
-                      {item.title}
-                    </span>
-                    <span className="shrink-0 text-xs text-muted-foreground">
-                      {item.category}
-                    </span>
-                  </CommandItem>
-                ))}
+              {visibleLocalMatches.map(({ item }) => (
+                <CommandItem
+                  key={item.id}
+                  value={`local-${item.id}`}
+                  onSelect={() =>
+                    runWithFrecency(item.url, () => navigate(item.url))
+                  }
+                  className="flex items-center gap-3 rounded-xl py-3"
+                >
+                  <Search className="size-4 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate font-medium">
+                    {item.title}
+                  </span>
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {item.category}
+                  </span>
+                </CommandItem>
+              ))}
             </CommandGroup>
           )}
 
