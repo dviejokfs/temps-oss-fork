@@ -22,6 +22,11 @@ import { VisitorSparkline } from './VisitorSparkline'
 import { ProjectCardMedia } from './ProjectCardMedia'
 import { projectCardTraffic } from './project-card-traffic'
 import {
+  projectHealthIndicator,
+  type ProjectHealthIndicator,
+  type ProjectHealthTone,
+} from './project-card-health'
+import {
   deploymentLabel,
   projectBuildSource,
   projectPresetLabel,
@@ -44,26 +49,37 @@ interface ProjectCardProps {
   }
 }
 
-function HealthStatusDot({ status }: { status: string }) {
-  const colors: Record<string, string> = {
-    operational: 'bg-emerald-500',
-    healthy: 'bg-emerald-500',
-    degraded: 'bg-amber-500',
-    down: 'bg-red-500',
-    no_monitors: 'bg-zinc-400',
-    unknown: 'bg-zinc-400',
-  }
-  const label =
-    status === 'no_monitors'
-      ? 'No monitors'
-      : status.charAt(0).toUpperCase() + status.slice(1)
+const HEALTH_TONE_STYLES: Record<
+  ProjectHealthTone,
+  { dot: string; text: string }
+> = {
+  healthy: {
+    dot: 'bg-emerald-500',
+    text: 'text-emerald-600 dark:text-emerald-400',
+  },
+  degraded: { dot: 'bg-amber-500', text: 'text-amber-600 dark:text-amber-400' },
+  down: { dot: 'bg-red-500', text: 'text-red-700 dark:text-red-400' },
+  idle: { dot: 'bg-zinc-300', text: 'text-muted-foreground' },
+  unavailable: { dot: 'bg-zinc-400', text: 'text-muted-foreground' },
+  pending: { dot: 'bg-zinc-300 animate-pulse', text: 'text-muted-foreground' },
+}
+
+/**
+ * Always rendered. There is no health state — including "we could not measure
+ * it" — that is better communicated by drawing nothing.
+ */
+function ProjectHealth({ indicator }: { indicator: ProjectHealthIndicator }) {
+  const tone = HEALTH_TONE_STYLES[indicator.tone]
 
   return (
     <span
-      className={`inline-block size-2 rounded-full ${colors[status] || colors.unknown}`}
-      title={label}
-      aria-label={label}
-    />
+      className={`inline-flex shrink-0 items-center gap-1.5 text-xs ${tone.text}`}
+      title={indicator.detail}
+    >
+      <span className={`inline-block size-2 rounded-full ${tone.dot}`} />
+      <span className="whitespace-nowrap">{indicator.label}</span>
+      <span className="sr-only">. {indicator.detail}</span>
+    </span>
   )
 }
 
@@ -117,6 +133,11 @@ export function ProjectCard({
   const buildSource = projectBuildSource(project)
   const totalVisitors = analytics?.unique_visitors ?? 0
   const apiRequests = health?.total_requests ?? 0
+  const healthIndicator = projectHealthIndicator({
+    health,
+    loading: healthLoading,
+    error: healthError,
+  })
   const traffic = projectCardTraffic(
     analytics?.hourly_visits,
     health?.hourly_requests,
@@ -188,9 +209,7 @@ export function ProjectCard({
                 <span className="truncate font-semibold group-hover:underline">
                   {project.name}
                 </span>
-                {health && health.status !== 'unknown' && (
-                  <HealthStatusDot status={health.status} />
-                )}
+                <ProjectHealth indicator={healthIndicator} />
               </div>
               <p className="truncate text-xs text-muted-foreground">
                 {project.slug}
@@ -266,9 +285,7 @@ export function ProjectCard({
               <span className="truncate text-sm font-medium group-hover:underline">
                 {project.name}
               </span>
-              {health && health.status !== 'unknown' && (
-                <HealthStatusDot status={health.status} />
-              )}
+              <ProjectHealth indicator={healthIndicator} />
             </div>
             <p className="truncate text-xs text-muted-foreground">
               {project.slug}
@@ -321,9 +338,7 @@ export function ProjectCard({
             <span className="truncate font-medium group-hover:underline">
               {project.name}
             </span>
-            {health && health.status !== 'unknown' && (
-              <HealthStatusDot status={health.status} />
-            )}
+            <ProjectHealth indicator={healthIndicator} />
           </div>
           <p className="truncate text-xs text-muted-foreground">
             {project.slug}
