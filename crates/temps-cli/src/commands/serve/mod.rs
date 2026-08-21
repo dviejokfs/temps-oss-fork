@@ -697,44 +697,54 @@ impl ServeCommand {
             }
         });
 
-        // Wait *briefly* for the console to finish plugin initialization
-        // before the proxy starts serving traffic — this is deliberately
-        // NOT the same thing as waiting for the console to be fully
-        // healthy (that could hang indefinitely on an unrelated console
-        // failure — Docker check, GeoIP validation, etc. — which is
-        // exactly the "proxied traffic goes down because of a console
-        // problem" failure mode the comment above exists to avoid).
+        // Wait for the console's plugin two-phase init to finish before the
+        // proxy starts serving traffic — this is deliberately NOT the same
+        // thing as waiting for the console to be fully healthy (routers,
+        // middleware, admin gate, listener bind), which could take much
+        // longer or hang on something unrelated (Docker check, GeoIP
+        // validation, etc.) — exactly the "proxied traffic goes down because
+        // of a console problem" failure mode the comment above exists to
+        // avoid.
         //
         // The reason this wait exists at all: `project_ip_gate_slot` (see
         // the security guardrail comment above) starts as `OpenIpGate`
-        // (allow everything) and is only claimed once plugin
-        // initialization completes — the exact point `ready_signal` fires
-        // ("Plugins are fully initialized at this point", console.rs).
-        // Starting the proxy before that point meant every IP-restricted
-        // project was reachable by any client on every single boot, for
-        // however long console init happened to take (P1 security finding
-        // on PR #725 — a client that a configured gate would deny could
-        // reach a restricted project during this window). A short, bounded
-        // wait closes the gap entirely in the normal case (plugin
-        // registration is fast — no HTTP listener bind, no migration wait,
-        // just service registration) while still guaranteeing the proxy
-        // starts even if console init is slow or fails outright, so the
-        // availability guarantee above still holds — the failure mode
-        // just becomes a loud, bounded, logged exposure window instead of
-        // a silent, unbounded one.
-        match rt.block_on(tokio::time::timeout(
-            PROJECT_IP_GATE_STARTUP_GRACE,
-            ready_rx,
-        )) {
+        // (allow everything) and is only claimed once plugin two-phase init
+        // completes — `ProxyPlugin::initialize` claims it from whatever
+        // `Arc<dyn ProjectIpGate>` an EE plugin registered, and that runs
+        // inside `initialize_plugins()`, nothing later. `console.rs` fires
+        // `ready_signal` (see its call site, right after "All plugins
+        // initialized successfully") at exactly that point — not at the end
+        // of `start_console_api` like it used to. Before that change
+        // (P1 security finding on PR #725), this wait was tied to the FULL
+        // console being ready, so every IP-restricted project was reachable
+        // by any client for however long the rest of console startup took,
+        // on every single boot. Now the wait resolves as soon as the one
+        // thing it actually depends on is done — deterministically, since
+        // plugin registration+init is in-memory service wiring with no
+        // listener bind, no HTTP router construction, and (bar a
+        // pathological plugin) no long-running I/O. The timeout below is a
+        // backstop against a genuinely hung plugin `initialize()`, not the
+        // expected path.
+        // `tokio::time::timeout(..)` must be constructed *inside* the
+        // runtime context `block_on` establishes, not as a bare argument
+        // evaluated on this plain sync thread before `block_on` starts --
+        // it eagerly builds a `Sleep` that registers with the current
+        // runtime's timer driver via `Handle::current()`, which panics
+        // ("there is no reactor running") if called with no ambient
+        // runtime. Wrapping it in an `async` block defers construction
+        // until `block_on` is already polling it.
+        match rt
+            .block_on(async { tokio::time::timeout(PROJECT_IP_GATE_STARTUP_GRACE, ready_rx).await })
+        {
             Ok(Ok(())) => {
                 info!(
-                    "✅ Console API is ready — any project IP gate a licensed plugin \
+                    "✅ Plugin init complete — any project IP gate a licensed plugin \
                      installed is in place before the proxy starts serving"
                 );
             }
             Ok(Err(_)) => {
                 tracing::error!(
-                    "❌ Console API failed to become ready — check error logs above. \
+                    "❌ Console plugin initialization failed — check error logs above. \
                      Starting the proxy anyway (proxied traffic to deployed applications \
                      is not held hostage by a console failure), but note: any \
                      project-scoped IP restriction will NOT be enforced until the console \
@@ -743,11 +753,13 @@ impl ServeCommand {
             }
             Err(_) => {
                 tracing::warn!(
-                    "⏳ Console API did not become ready within {:?} — starting the proxy \
-                     anyway rather than blocking indefinitely. Any project-scoped IP \
-                     restriction will not be enforced until console plugin initialization \
-                     finishes; this is a bounded, logged exposure window, not the \
-                     unbounded one this wait exists to close.",
+                    "⏳ Console plugin initialization did not complete within {:?} — this \
+                     should not happen in normal operation (it means a plugin's own \
+                     initialize() is hung, not merely that console startup is slow). \
+                     Starting the proxy anyway rather than blocking indefinitely. Any \
+                     project-scoped IP restriction will not be enforced until plugin \
+                     initialization finishes; this is a bounded, logged exposure window, \
+                     not the unbounded one this wait exists to close.",
                     PROJECT_IP_GATE_STARTUP_GRACE
                 );
             }
