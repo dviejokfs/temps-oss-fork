@@ -2,7 +2,7 @@ use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, Transact
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use temps_migrations::Migrator;
 use temps_migrations::NormalizedManagedDomainIndexMigration;
-use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 const INDEX_NAME: &str = "idx_dns_managed_domains_normalized_domain";
 
@@ -60,6 +60,13 @@ async fn test_normalized_managed_domain_index_migration_is_used_and_reversible(
     }
 
     let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        // Without this, `start()` returns before PostgreSQL accepts clients
+        // and the test races the database ("Connection reset by peer").
+        // Must match on stderr: the temporary initdb server logs its "ready"
+        // line to stdout, the real server to stderr.
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -69,6 +76,7 @@ async fn test_normalized_managed_domain_index_migration_is_used_and_reversible(
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(std::time::Duration::from_secs(120))
         .start()
         .await
     {

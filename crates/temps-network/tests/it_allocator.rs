@@ -19,7 +19,7 @@ use std::sync::Arc;
 use temps_entities::nodes;
 use temps_migrations::Migrator;
 use temps_network::allocator::{AllocatorError, ComputeNetworkAllocator, PostgresAllocator};
-use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -37,10 +37,18 @@ async fn fixture() -> Option<Fixture> {
         return None;
     }
     let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        // Without this, `start()` returns before PostgreSQL accepts clients
+        // and the test races the database ("Connection reset by peer").
+        // Must match on stderr: the temporary initdb server logs its "ready"
+        // line to stdout, the real server to stderr.
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_startup_timeout(std::time::Duration::from_secs(120))
         .start()
         .await
     {
