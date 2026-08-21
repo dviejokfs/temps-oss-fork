@@ -18,6 +18,13 @@ pub use proxy::start_proxy_server;
 const POST_MIGRATION_INDEX_INITIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 const POST_MIGRATION_INDEX_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Bound on how long single-binary proxy startup waits for console plugin
+/// initialization (specifically, for a licensed plugin to claim
+/// `project_ip_gate_slot`) before starting to serve traffic anyway. See the
+/// comment at the call site for why this exists and why it is bounded
+/// rather than an unconditional wait.
+const PROJECT_IP_GATE_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn next_post_migration_index_retry(current: std::time::Duration) -> std::time::Duration {
     current
         .saturating_mul(2)
@@ -610,6 +617,12 @@ impl ServeCommand {
         // contexts this way.
         let retention_resolver_slot = Arc::new(temps_core::RetentionResolverSlot::new_default());
 
+        // See the field doc on `ConsoleApiParams::project_ip_gate_slot` —
+        // same shared-slot mechanism and construction site as
+        // retention_resolver_slot immediately above, flagged for security
+        // review as an explicit exception rather than a second precedent.
+        let project_ip_gate_slot = Arc::new(temps_core::ProjectIpGateSlot::new_default());
+
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let params = console::ConsoleApiParams {
@@ -628,6 +641,7 @@ impl ServeCommand {
             admin_gate_service: Some(admin_gate_service),
             admin_gate_handle: Some(admin_gate_handle.clone()),
             retention_resolver_slot: retention_resolver_slot.clone(),
+            project_ip_gate_slot: project_ip_gate_slot.clone(),
             update_status,
             self_updater,
         };
@@ -683,29 +697,75 @@ impl ServeCommand {
             }
         });
 
-        // Monitor console readiness in a background thread so we can log it,
-        // but do NOT block proxy startup on it.
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("Failed to create runtime for console monitor: {}", e);
-                    return;
-                }
-            };
-            match rt.block_on(ready_rx) {
-                Ok(()) => {
-                    info!("✅ Console API is ready");
-                }
-                Err(_) => {
-                    tracing::error!(
-                        "❌ Console API failed to become ready — check error logs above"
-                    );
-                }
+        // Wait for the console's plugin two-phase init to finish before the
+        // proxy starts serving traffic — this is deliberately NOT the same
+        // thing as waiting for the console to be fully healthy (routers,
+        // middleware, admin gate, listener bind), which could take much
+        // longer or hang on something unrelated (Docker check, GeoIP
+        // validation, etc.) — exactly the "proxied traffic goes down because
+        // of a console problem" failure mode the comment above exists to
+        // avoid.
+        //
+        // The reason this wait exists at all: `project_ip_gate_slot` (see
+        // the security guardrail comment above) starts as `OpenIpGate`
+        // (allow everything) and is only claimed once plugin two-phase init
+        // completes — `ProxyPlugin::initialize` claims it from whatever
+        // `Arc<dyn ProjectIpGate>` an EE plugin registered, and that runs
+        // inside `initialize_plugins()`, nothing later. `console.rs` fires
+        // `ready_signal` (see its call site, right after "All plugins
+        // initialized successfully") at exactly that point — not at the end
+        // of `start_console_api` like it used to. Before that change
+        // (P1 security finding on PR #725), this wait was tied to the FULL
+        // console being ready, so every IP-restricted project was reachable
+        // by any client for however long the rest of console startup took,
+        // on every single boot. Now the wait resolves as soon as the one
+        // thing it actually depends on is done — deterministically, since
+        // plugin registration+init is in-memory service wiring with no
+        // listener bind, no HTTP router construction, and (bar a
+        // pathological plugin) no long-running I/O. The timeout below is a
+        // backstop against a genuinely hung plugin `initialize()`, not the
+        // expected path.
+        // `tokio::time::timeout(..)` must be constructed *inside* the
+        // runtime context `block_on` establishes, not as a bare argument
+        // evaluated on this plain sync thread before `block_on` starts --
+        // it eagerly builds a `Sleep` that registers with the current
+        // runtime's timer driver via `Handle::current()`, which panics
+        // ("there is no reactor running") if called with no ambient
+        // runtime. Wrapping it in an `async` block defers construction
+        // until `block_on` is already polling it.
+        match rt
+            .block_on(async { tokio::time::timeout(PROJECT_IP_GATE_STARTUP_GRACE, ready_rx).await })
+        {
+            Ok(Ok(())) => {
+                info!(
+                    "✅ Plugin init complete — any project IP gate a licensed plugin \
+                     installed is in place before the proxy starts serving"
+                );
             }
-        });
+            Ok(Err(_)) => {
+                tracing::error!(
+                    "❌ Console plugin initialization failed — check error logs above. \
+                     Starting the proxy anyway (proxied traffic to deployed applications \
+                     is not held hostage by a console failure), but note: any \
+                     project-scoped IP restriction will NOT be enforced until the console \
+                     problem is resolved and the process is restarted."
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "⏳ Console plugin initialization did not complete within {:?} — this \
+                     should not happen in normal operation (it means a plugin's own \
+                     initialize() is hung, not merely that console startup is slow). \
+                     Starting the proxy anyway rather than blocking indefinitely. Any \
+                     project-scoped IP restriction will not be enforced until plugin \
+                     initialization finishes; this is a bounded, logged exposure window, \
+                     not the unbounded one this wait exists to close.",
+                    PROJECT_IP_GATE_STARTUP_GRACE
+                );
+            }
+        }
 
-        info!("Starting proxy server (console API initializing in background)...");
+        info!("Starting proxy server...");
 
         // Start proxy server (this will block until shutdown)
         start_proxy_server(
@@ -721,6 +781,7 @@ impl ServeCommand {
             on_demand_manager,
             Some(admin_gate_handle),
             retention_resolver_slot as Arc<dyn temps_core::RetentionResolver>,
+            project_ip_gate_slot as Arc<dyn temps_core::ProjectIpGate>,
         )
     }
 }

@@ -401,7 +401,7 @@ export default function AppSidebar() {
   const { isMinimal, isMobile } = useSidebar()
   const { platformNavEntries } = usePluginsContext()
   const location = useLocation()
-  const { logoBadge } = useConsoleExtensions()
+  const { logoBadge, logoText, logoIcon } = useConsoleExtensions()
 
   // Convert plugin nav entries to sidebar item format
   const pluginItems = useMemo(
@@ -460,16 +460,18 @@ export default function AppSidebar() {
                   compact && 'w-6 h-6'
                 )}
               >
-                <img
-                  src="/svg/temps-icon.svg"
-                  alt="logo"
-                  className="size-full"
-                />
+                {logoIcon ?? (
+                  <img
+                    src="/svg/temps-icon.svg"
+                    alt="logo"
+                    className="size-full"
+                  />
+                )}
               </div>
               {!compact && (
                 <div className="grid flex-1 text-left text-sm leading-tight">
                   <span className="flex items-center gap-1.5 truncate font-semibold">
-                    Temps
+                    {logoText ?? 'Temps'}
                     {logoBadge}
                   </span>
                   <span className="truncate text-xs">
@@ -1133,6 +1135,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
     ...getProjectBySlugOptions({ path: { slug } }),
   })
   const { projectNavEntries } = usePluginsContext()
+  const { projectToolLinks } = useConsoleExtensions()
   const location = useLocation()
   const { isMinimal, isMobile, setOpenMobile } = useSidebar()
   const compact = isMinimal && !isMobile
@@ -1270,6 +1273,32 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
                         compact
                       />
                     )}
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            ))}
+          </SidebarMenu>
+        </SidebarGroup>
+      )}
+      {projectToolLinks && projectToolLinks.length > 0 && (
+        <SidebarGroup className="py-1">
+          <SidebarGroupLabel className={compact ? 'hidden' : ''}>
+            Enterprise
+          </SidebarGroupLabel>
+          <SidebarMenu>
+            {projectToolLinks.map((link) => (
+              <SidebarMenuItem key={link.id}>
+                <SidebarMenuButton
+                  asChild
+                  tooltip={compact ? link.title : undefined}
+                  className={cn(compact ? 'justify-center' : 'justify-start')}
+                >
+                  <Link
+                    to={link.href(project)}
+                    onClick={() => isMobile && setOpenMobile(false)}
+                  >
+                    {link.icon}
+                    {!compact && <span>{link.title}</span>}
                   </Link>
                 </SidebarMenuButton>
               </SidebarMenuItem>

@@ -1170,6 +1170,12 @@ pub struct ConsoleApiParams {
     pub encryption_service: Arc<EncryptionService>,
     pub route_table: Arc<temps_proxy::CachedPeerTable>,
     pub queue: Arc<dyn temps_core::JobQueue>,
+    /// Fires once, right after plugin two-phase init completes (see the call
+    /// site in `start_console_api`) — earlier and narrower than `/readyz`,
+    /// which additionally waits for routers/middleware/listeners. The caller
+    /// (`commands/serve/mod.rs`, single-binary mode) blocks the proxy's
+    /// startup on this specifically to know whether the `project_ip_gate`
+    /// slot has been claimed before serving any proxied traffic.
     pub ready_signal: Option<tokio::sync::oneshot::Sender<()>>,
     pub additional_templates: Vec<std::path::PathBuf>,
     pub on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
@@ -1208,6 +1214,21 @@ pub struct ConsoleApiParams {
     /// connection handling. Any future object shared this same way requires an
     /// explicit security review before being added here.
     pub retention_resolver_slot: Arc<temps_core::RetentionResolverSlot>,
+    /// Shared per-project/environment IP-restriction gate. Uses the exact
+    /// same cross-context shared-slot mechanism as `retention_resolver_slot`
+    /// immediately above — for the same structural reason: the Pingora
+    /// proxy bootstraps in a wholly separate plugin context and has no
+    /// other way to see something a plugin registered into the console's
+    /// registry.
+    ///
+    /// **This is explicitly the category of object the guardrail above says
+    /// requires review, not an exception to it.** `ProjectIpGate` decides
+    /// which requests reach a deployed project/environment at all — it is a
+    /// routing/authorization decision, not inert metadata. It is wired this
+    /// way pending a security review, not because the guardrail was judged
+    /// not to apply. Do not treat this as a second precedent for adding
+    /// further objects to the shared-slot pattern without their own review.
+    pub project_ip_gate_slot: Arc<temps_core::ProjectIpGateSlot>,
     /// Shared "a newer release exists" slot. Owned by the caller
     /// (`commands/serve/mod.rs`), which spawns the background update
     /// notifier that writes into it; registered into the service registry
@@ -1303,17 +1324,22 @@ fn build_ch_metrics_store(config: &ServerConfig) -> Option<Arc<dyn temps_metrics
 ///   serving HTTP. It does not assert that plugins finished initializing, so a
 ///   supervisor can tell "process is up" from "process is wedged" without
 ///   restarting a console that is merely mid-warmup.
-/// - `GET /readyz` — **readiness**: `200 OK` only after plugin two-phase init
-///   has completed (the shared `ready` flag is flipped at the same point the
-///   legacy oneshot `ready_signal` fires, immediately before `axum::serve`).
-///   Returns `503 Service Unavailable` while warming up. This is the gate the
-///   split-topology upgrade flow polls before declaring a console upgrade
-///   successful — binding the port is NOT sufficient, because the router would
-///   otherwise answer 200 while every real route still 500s during warmup.
+/// - `GET /readyz` — **readiness**: `200 OK` only once routers, middleware,
+///   the admin gate, and the listener(s) are all built and about to serve —
+///   the shared `ready` flag flips immediately before `axum::serve`, later
+///   than plugin init alone. Returns `503 Service Unavailable` while warming
+///   up. This is the gate the split-topology upgrade flow polls before
+///   declaring a console upgrade successful — binding the port is NOT
+///   sufficient, because the router would otherwise answer 200 while every
+///   real route still 500s during warmup.
 ///
 /// The flag lives in an `Arc<AtomicBool>` shared with the serve loop rather
-/// than reading the oneshot, so the probe stays truthful for the entire process
-/// lifetime (the oneshot fires exactly once and is then consumed).
+/// than reading a oneshot, so the probe stays truthful for the entire process
+/// lifetime. It is deliberately later and separate from the `ready_signal`
+/// oneshot `commands/serve/mod.rs` waits on to gate proxy startup — that one
+/// fires as soon as plugin two-phase init completes (see its call site),
+/// which is the earliest point the `project_ip_gate` slot's fate is settled,
+/// well before routers/listeners are ready.
 fn health_router(ready: Arc<std::sync::atomic::AtomicBool>) -> Router {
     use axum::routing::get;
 
@@ -2087,6 +2113,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         admin_gate_service: provided_admin_gate_service,
         admin_gate_handle: provided_admin_gate_handle,
         retention_resolver_slot,
+        project_ip_gate_slot,
         update_status,
         self_updater,
     } = params;
@@ -2106,11 +2133,15 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     }
 
     // Readiness flag for the `/readyz` probe. Starts `false` (not ready) and is
-    // flipped to `true` at the same point the legacy `ready_signal` fires —
-    // after the full plugin system has initialized and immediately before the
-    // listeners begin serving. The health router (mounted on the public surface
-    // below) reads this so a supervisor or the split-topology upgrade gate can
-    // tell "warming up" (503) from "serving" (200) for the process's lifetime.
+    // flipped to `true` immediately before the listeners begin serving — after
+    // routers, middleware, and the admin gate are all built, not merely after
+    // plugin init. The health router (mounted on the public surface below)
+    // reads this so a supervisor or the split-topology upgrade gate can tell
+    // "warming up" (503) from "serving" (200) for the process's lifetime.
+    //
+    // This is deliberately a *later* point than `ready_signal` below now fires
+    // at (see that call site) — `/readyz` needs "actually able to serve a
+    // request", `ready_signal` needs only "plugin two-phase init is done".
     let ready_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // PRE-VALIDATE all plugin dependencies BEFORE initializing plugin manager
@@ -2193,6 +2224,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // slot instance instead of creating its own — see the field doc on
     // `ConsoleApiParams::retention_resolver_slot`.
     service_context.register_service(retention_resolver_slot.clone());
+    // Same pre-registration reasoning as retention_resolver_slot above —
+    // see the field doc on `ConsoleApiParams::project_ip_gate_slot` (ADR
+    // 0022) for why this is flagged for security review rather than a
+    // routine addition.
+    service_context.register_service(project_ip_gate_slot.clone());
     // Update-notifier slot: the background loop in serve/mod.rs writes into
     // it; ConfigPlugin's `GET /settings/update-status` reads it so the web
     // console can render the upgrade banner.
@@ -2577,6 +2613,31 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         ));
     }
     debug!("All plugins initialized successfully");
+
+    // `project_ip_gate_slot` (see the security guardrail comment on
+    // `ConsoleApiParams::project_ip_gate_slot`) is fully resolved at this
+    // exact point: `ProxyPlugin::initialize` -- which claims the slot from
+    // whatever `Arc<dyn ProjectIpGate>` an EE plugin registered in phase 1,
+    // if any did -- already ran as part of `initialize_plugins()` above
+    // (two-phase: ALL plugins register, THEN ALL plugins initialize). There
+    // is nothing left between here and the end of this function that could
+    // change that outcome, so signal it now rather than after routers,
+    // middleware, the admin gate, and the TCP listener are also built.
+    //
+    // `commands/serve/mod.rs` holds the proxy's startup on this signal
+    // specifically to close a P1 security race (PR #725): before this fix,
+    // the wait was tied to the FULL console being ready (whatever that
+    // happened to take), so every IP-restricted project was reachable by
+    // any client for however long console startup took, on every boot.
+    // Firing here means the wait now resolves as soon as the one thing it
+    // actually depends on is done, deterministically, in the overwhelming
+    // majority of cases -- the bounded timeout on the other end becomes a
+    // backstop against a genuinely hung plugin `initialize()`, not the
+    // expected path.
+    if let Some(signal) = ready_signal {
+        let _ = signal.send(());
+        debug!("Project IP gate slot resolved; signaled ready_signal early");
+    }
 
     // Check if any users exist, if not prompt for admin email
     let service_context = plugin_manager.service_context();
@@ -3406,13 +3467,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             let admin_listener = TcpListener::bind(admin_addr).await?;
             info!("Console ADMIN API server listening on {}", admin_addr);
 
-            // Plugins are fully initialized at this point; flip readiness so
-            // `/readyz` answers 200 and notify the legacy oneshot waiter.
+            // Routers, middleware, and both listeners are ready; flip
+            // `/readyz` to 200. `ready_signal` already fired earlier, right
+            // after plugin init -- see that call site for why the two are
+            // deliberately decoupled.
             ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some(signal) = ready_signal {
-                let _ = signal.send(());
-                debug!("Console API ready signal sent");
-            }
 
             let public_fut = axum::serve(
                 public_listener,
@@ -3438,13 +3497,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             let listener = TcpListener::bind(&config.console_address).await?;
             info!("Console API server listening on {}", config.console_address);
 
-            // Plugins are fully initialized at this point; flip readiness so
-            // `/readyz` answers 200 and notify the legacy oneshot waiter.
+            // Routers, middleware, and the listener are ready; flip `/readyz`
+            // to 200. `ready_signal` already fired earlier, right after
+            // plugin init -- see that call site for why the two are
+            // deliberately decoupled.
             ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some(signal) = ready_signal {
-                let _ = signal.send(());
-                debug!("Console API ready signal sent");
-            }
 
             axum::serve(
                 listener,
