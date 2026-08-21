@@ -1,8 +1,34 @@
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 use sea_orm_migration::MigratorTrait;
-use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 use temps_migrations::Migrator;
+
+/// Wait until the *real* PostgreSQL server is accepting connections.
+///
+/// Without this, `start()` returns as soon as the container is running, which
+/// is long before PostgreSQL can serve clients — the tests then raced the
+/// database and failed intermittently in CI with
+/// `error communicating with database: Connection reset by peer (os error 104)`
+/// and `FATAL: the database system is starting up`.
+///
+/// The stream matters. The `timescaledb-ha` entrypoint boots a *temporary*
+/// server to run initdb, shuts it down, then starts the real one, and each
+/// logs "database system is ready to accept connections" once. Verified
+/// against `timescale/timescaledb-ha:pg18`, the temporary server logs to
+/// **stdout** (`[40] LOG: …`) and the real server to **stderr** (`[1] LOG: …`).
+/// Matching on stderr therefore targets the real server directly — do not
+/// "fix" this by matching stdout or by waiting for two occurrences, because
+/// each stream only ever carries one.
+fn postgres_ready_wait_for() -> WaitFor {
+    WaitFor::message_on_stderr("database system is ready to accept connections")
+}
+
+/// testcontainers' default startup timeout is 60s. This repository's
+/// convention is to run many Docker-backed integration tests concurrently, so
+/// a container can legitimately take longer than that to become ready under
+/// contention. Matches the budget used by `temps_database::test_utils`.
+const CONTAINER_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 async fn env_var_preview_default(db: &DatabaseConnection) -> anyhow::Result<String> {
     let row = db
@@ -70,6 +96,7 @@ async fn test_preview_inclusion_default_migration_up_and_down() -> anyhow::Resul
     }
 
     let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -79,6 +106,7 @@ async fn test_preview_inclusion_default_migration_up_and_down() -> anyhow::Resul
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
     {
@@ -92,7 +120,6 @@ async fn test_preview_inclusion_default_migration_up_and_down() -> anyhow::Resul
     };
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
 
     let target = "m20260815_000001_default_preview_inclusion_off";
@@ -175,6 +202,7 @@ async fn test_step_up_session_expiration_migration_up_and_down() -> anyhow::Resu
     }
 
     let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -184,6 +212,7 @@ async fn test_step_up_session_expiration_migration_up_and_down() -> anyhow::Resu
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
     {
@@ -197,7 +226,6 @@ async fn test_step_up_session_expiration_migration_up_and_down() -> anyhow::Resu
     };
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
 
     let target = "m20260803_000002_add_step_up_expires_at_to_sessions";
@@ -248,6 +276,7 @@ async fn test_migration_up() -> anyhow::Result<()> {
 
     // Start TimescaleDB container
     let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -264,6 +293,7 @@ async fn test_migration_up() -> anyhow::Result<()> {
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -276,27 +306,7 @@ async fn test_migration_up() -> anyhow::Result<()> {
     // Create database connection string
     let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
-    // Wait a bit for the database to be ready, then connect with retries
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-    let mut retries = 5;
-    let db = loop {
-        match Database::connect(&db_url).await {
-            Ok(db) => break db,
-            Err(e) if retries > 0 => {
-                retries -= 1;
-                println!(
-                    "Database connection failed, retrying in 2s... ({} retries left)",
-                    retries
-                );
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                if retries == 0 {
-                    panic!("Failed to connect to database after retries: {}", e);
-                }
-            }
-            Err(e) => panic!("Failed to connect to database: {}", e),
-        }
-    };
+    let db = connect_with_retries(&db_url).await?;
 
     // Run migrations
     let result = Migrator::up(&db, None).await;
@@ -325,6 +335,7 @@ async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() 
     }
 
     let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -341,6 +352,7 @@ async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() 
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
     {
@@ -352,7 +364,6 @@ async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() 
     };
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
 
     let target = "m20260714_000001_secure_sns_email_events";
@@ -565,6 +576,7 @@ async fn test_migration_down() -> anyhow::Result<()> {
 
     // Start TimescaleDB container
     let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -581,6 +593,7 @@ async fn test_migration_down() -> anyhow::Result<()> {
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -593,27 +606,7 @@ async fn test_migration_down() -> anyhow::Result<()> {
     // Create database connection string
     let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
-    // Wait a bit for the database to be ready, then connect with retries
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-    let mut retries = 5;
-    let db = loop {
-        match Database::connect(&db_url).await {
-            Ok(db) => break db,
-            Err(e) if retries > 0 => {
-                retries -= 1;
-                println!(
-                    "Database connection failed, retrying in 2s... ({} retries left)",
-                    retries
-                );
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                if retries == 0 {
-                    panic!("Failed to connect to database after retries: {}", e);
-                }
-            }
-            Err(e) => panic!("Failed to connect to database: {}", e),
-        }
-    };
+    let db = connect_with_retries(&db_url).await?;
 
     // First apply migrations
     Migrator::up(&db, None)
@@ -651,6 +644,7 @@ async fn test_migration_status() -> anyhow::Result<()> {
 
     // Start TimescaleDB container
     let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -667,6 +661,7 @@ async fn test_migration_status() -> anyhow::Result<()> {
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -679,27 +674,7 @@ async fn test_migration_status() -> anyhow::Result<()> {
     // Create database connection string
     let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
-    // Wait a bit for the database to be ready, then connect with retries
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-    let mut retries = 5;
-    let db = loop {
-        match Database::connect(&db_url).await {
-            Ok(db) => break db,
-            Err(e) if retries > 0 => {
-                retries -= 1;
-                println!(
-                    "Database connection failed, retrying in 2s... ({} retries left)",
-                    retries
-                );
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                if retries == 0 {
-                    panic!("Failed to connect to database after retries: {}", e);
-                }
-            }
-            Err(e) => panic!("Failed to connect to database: {}", e),
-        }
-    };
+    let db = connect_with_retries(&db_url).await?;
 
     // Check status before migrations
     let status_before = Migrator::get_pending_migrations(&db).await?;
@@ -727,6 +702,7 @@ async fn test_migration_status() -> anyhow::Result<()> {
 async fn test_pgvector_extension() -> anyhow::Result<()> {
     // Start TimescaleDB container
     let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -743,6 +719,7 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -755,27 +732,7 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
     // Create database connection string
     let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
-    // Wait a bit for the database to be ready, then connect with retries
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-    let mut retries = 5;
-    let db = loop {
-        match Database::connect(&db_url).await {
-            Ok(db) => break db,
-            Err(e) if retries > 0 => {
-                retries -= 1;
-                println!(
-                    "Database connection failed, retrying in 2s... ({} retries left)",
-                    retries
-                );
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                if retries == 0 {
-                    panic!("Failed to connect to database after retries: {}", e);
-                }
-            }
-            Err(e) => panic!("Failed to connect to database: {}", e),
-        }
-    };
+    let db = connect_with_retries(&db_url).await?;
 
     // Apply migrations (this should handle pgvector gracefully)
     Migrator::up(&db, None).await?;
@@ -849,6 +806,7 @@ async fn test_table_constraints() -> anyhow::Result<()> {
 
     // Start TimescaleDB container
     let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -865,6 +823,7 @@ async fn test_table_constraints() -> anyhow::Result<()> {
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -877,27 +836,7 @@ async fn test_table_constraints() -> anyhow::Result<()> {
     // Create database connection string
     let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
-    // Wait a bit for the database to be ready, then connect with retries
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-    let mut retries = 5;
-    let db = loop {
-        match Database::connect(&db_url).await {
-            Ok(db) => break db,
-            Err(e) if retries > 0 => {
-                retries -= 1;
-                println!(
-                    "Database connection failed, retrying in 2s... ({} retries left)",
-                    retries
-                );
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                if retries == 0 {
-                    panic!("Failed to connect to database after retries: {}", e);
-                }
-            }
-            Err(e) => panic!("Failed to connect to database: {}", e),
-        }
-    };
+    let db = connect_with_retries(&db_url).await?;
 
     // Apply migrations
     Migrator::up(&db, None).await?;
@@ -1097,6 +1036,7 @@ async fn test_compute_network_migration() -> anyhow::Result<()> {
     }
 
     let container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -1113,13 +1053,13 @@ async fn test_compute_network_migration() -> anyhow::Result<()> {
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
     Migrator::up(&db, None).await?;
 
@@ -1241,6 +1181,7 @@ async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
     }
 
     let container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -1257,13 +1198,13 @@ async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
     Migrator::up(&db, None).await?;
 
@@ -1518,6 +1459,7 @@ async fn test_visitor_dedup_migration_repoints_session_replay_sessions() -> anyh
     }
 
     let container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -1534,13 +1476,13 @@ async fn test_visitor_dedup_migration_repoints_session_replay_sessions() -> anyh
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
 
     // ── 1. Apply every migration up to but not including the target. ──────
@@ -1768,21 +1710,36 @@ async fn test_visitor_dedup_migration_repoints_session_replay_sessions() -> anyh
     Ok(())
 }
 
+/// Number of connection attempts made by [`connect_with_retries`].
+///
+/// [`postgres_ready_wait_for`] is what actually removes the startup race; this
+/// retry is only a backstop for the brief window between the server logging
+/// "ready to accept connections" and the listener accepting on the mapped
+/// port. It is deliberately generous because the cost is paid only when the
+/// database is genuinely unreachable — the happy path returns on attempt 1.
+const DB_CONNECT_ATTEMPTS: u32 = 15;
+const DB_CONNECT_RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(2);
+
 async fn connect_with_retries(db_url: &str) -> anyhow::Result<DatabaseConnection> {
-    let mut retries = 5;
-    loop {
+    let mut last_err = None;
+    for attempt in 1..=DB_CONNECT_ATTEMPTS {
         match Database::connect(db_url).await {
             Ok(db) => return Ok(db),
-            Err(e) if retries > 0 => {
-                retries -= 1;
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                if retries == 0 {
-                    return Err(anyhow::Error::from(e));
-                }
+            Err(e) => {
+                println!(
+                    "Database connection attempt {attempt}/{DB_CONNECT_ATTEMPTS} failed ({e}), \
+                     retrying in {}s...",
+                    DB_CONNECT_RETRY_DELAY.as_secs()
+                );
+                last_err = Some(e);
+                tokio::time::sleep(DB_CONNECT_RETRY_DELAY).await;
             }
-            Err(e) => return Err(anyhow::Error::from(e)),
         }
     }
+    Err(anyhow::anyhow!(
+        "Failed to connect to database after {DB_CONNECT_ATTEMPTS} attempts: {}",
+        last_err.expect("at least one attempt was made")
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1814,6 +1771,7 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
     }
 
     let container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -1830,12 +1788,12 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
 
     // ── 1. Apply every migration EXCEPT our target so we land on the same
@@ -2038,6 +1996,7 @@ async fn test_observe_correlation_migration_is_idempotent() -> anyhow::Result<()
     }
 
     let container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -2054,12 +2013,12 @@ async fn test_observe_correlation_migration_is_idempotent() -> anyhow::Result<()
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
 
     Migrator::up(&db, None).await?;
@@ -2104,6 +2063,7 @@ async fn test_observe_correlation_migration_survives_concurrent_retention() -> a
     }
 
     let container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -2120,12 +2080,12 @@ async fn test_observe_correlation_migration_survives_concurrent_retention() -> a
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
 
     // Bring schema up to but not including the target migration.
@@ -2286,6 +2246,7 @@ async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_clos
     }
 
     let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -2302,6 +2263,7 @@ async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_clos
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
     {
@@ -2313,7 +2275,6 @@ async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_clos
     };
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
 
     let target = "m20260713_000001_add_mfa_pending_to_sessions";
@@ -2416,6 +2377,7 @@ async fn test_feature_flags_migration_is_reversible() -> anyhow::Result<()> {
     }
 
     let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -2425,6 +2387,7 @@ async fn test_feature_flags_migration_is_reversible() -> anyhow::Result<()> {
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
     {
@@ -2437,7 +2400,6 @@ async fn test_feature_flags_migration_is_reversible() -> anyhow::Result<()> {
 
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
 
     Migrator::up(&db, None).await?;
@@ -2532,6 +2494,7 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
     }
 
     let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -2541,6 +2504,7 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
             "-c",
             "timescaledb.max_background_workers=0",
         ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
         .start()
         .await
     {
@@ -2553,7 +2517,6 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
 
     let port = container.get_host_port_ipv4(5432).await?;
     let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
     Migrator::up(&db, None).await?;
 
