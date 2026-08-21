@@ -102,6 +102,20 @@ export function resolveExplicitNamedProjectDestination(
   )
 }
 
+/**
+ * Enter must open the row the list highlights. When an explicit resolver picks
+ * a destination that outranks the fuzzy order, that destination has to become
+ * the visible first row too — otherwise the palette navigates somewhere the
+ * user never saw selected.
+ */
+export function hoistResultFirst<T extends { key: string }>(
+  results: T[],
+  first: T | undefined
+): T[] {
+  if (!first) return results
+  return [first, ...results.filter((result) => result.key !== first.key)]
+}
+
 export function toCommandExtendedQuery(query: string): string {
   const stopWords = new Set([
     'a',
