@@ -97,6 +97,25 @@ pub struct Project {
     pub image_retention_hours: Option<i32>,
 }
 
+/// Outcome of a project settings update.
+///
+/// Carries what the service actually *did* rather than leaving the caller to
+/// infer it by reading the row before and after. A caller comparing its own
+/// pre-read against the result would be racing any concurrent update: two
+/// overlapping renames could pair one request's stale pre-read with the other's
+/// persisted name and report a transition that never happened.
+#[derive(Serialize)]
+pub struct ProjectSettingsUpdate {
+    /// The project as it stands after the update.
+    pub project: Project,
+    /// The display name immediately before this update, set only when this
+    /// update actually renamed the project. `None` when no name was supplied,
+    /// or when the supplied name matched what was already stored. Captured
+    /// under the same row lock as the write, so it always describes a real
+    /// transition.
+    pub renamed_from: Option<String>,
+}
+
 /// One environment variable supplied while creating a project.
 ///
 /// Deserializes from either shape so clients written before `is_secret`

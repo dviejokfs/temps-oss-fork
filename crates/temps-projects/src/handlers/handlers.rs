@@ -1117,28 +1117,6 @@ pub async fn delete_project(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Decide what the settings audit should record in its `name` field.
-///
-/// Records the *persisted* name rather than the request, because the service
-/// trims the incoming value — auditing the raw request could write a name that
-/// never reached the database. Records nothing when the request re-submitted
-/// the name the project already had (directly, or via a value that trims to
-/// it), because no rename happened and a rename in the audit history would be a
-/// lie.
-///
-/// `previous` is `None` when the pre-update read failed. That case cannot prove
-/// the update was a no-op, so it records the name: over-reporting a rename is
-/// recoverable during an incident review, silently dropping a real one is not.
-fn audited_rename(name_requested: bool, previous: Option<&str>, persisted: &str) -> Option<String> {
-    if !name_requested {
-        return None;
-    }
-    match previous {
-        Some(previous) if previous == persisted => None,
-        _ => Some(persisted.to_string()),
-    }
-}
-
 /// Update project settings
 #[utoipa::path(
     post,
@@ -1172,12 +1150,12 @@ pub async fn update_project_settings(
 
     // Capture the pre-update state only when a field that audits its previous
     // value is actually changing, so an unrelated settings save (attack mode,
-    // preview envs, ...) doesn't pay for an extra read. One read serves both
-    // the retention window and the display name.
-    let audits_previous_value = settings.image_retention_hours.is_some() || settings.name.is_some();
-    let prior_project = if audits_previous_value {
+    // preview envs, ...) doesn't pay for an extra read. The rename's previous
+    // value deliberately does *not* come from here — the service reports it
+    // from under the row lock, where it cannot race a concurrent rename.
+    let previous_image_retention_hours = if settings.image_retention_hours.is_some() {
         match state.project_service.get_project(project_id).await {
-            Ok(project) => Some(project),
+            Ok(project) => project.image_retention_hours,
             Err(e) => {
                 // A failed read and a genuinely-unset prior value both end up
                 // `None` in the audit record below — that's an accepted gap
@@ -1188,8 +1166,8 @@ pub async fn update_project_settings(
                 warn!(
                     error = %e,
                     project_id,
-                    "Could not read prior project state before update; audit log \
-                     will record previous values as unset rather than unknown"
+                    "Could not read prior image_retention_hours before update; \
+                     audit log will record it as unset rather than unknown"
                 );
                 None
             }
@@ -1198,21 +1176,7 @@ pub async fn update_project_settings(
         None
     };
 
-    let previous_image_retention_hours = if settings.image_retention_hours.is_some() {
-        prior_project
-            .as_ref()
-            .and_then(|project| project.image_retention_hours)
-    } else {
-        None
-    };
-
-    let previous_name = settings
-        .name
-        .as_ref()
-        .and(prior_project.as_ref())
-        .map(|project| project.name.clone());
-
-    let updated_project = state
+    let update = state
         .project_service
         .update_project_settings(
             project_id,
@@ -1249,23 +1213,22 @@ pub async fn update_project_settings(
         user_agent: metadata.user_agent,
     };
 
-    let audited_name = audited_rename(
-        settings.name.is_some(),
-        previous_name.as_deref(),
-        &updated_project.name,
-    );
-
+    // The service reports the rename it actually performed, under the row lock
+    // that carried the write. Deriving this here from a pre-read instead would
+    // race a concurrent rename and could pair one request's stale "before" with
+    // another's persisted "after" — a transition that never happened. `name`
+    // and `previous_name` are therefore set together or not at all.
     let updated_settings = ProjectSettingsUpdatedFields {
         cpu_request: None,
         cpu_limit: None,
         memory_request: None,
         memory_limit: None,
         performance_metrics_enabled: None,
-        // `previous_name` is only meaningful next to a recorded rename. Keeping
-        // it when the rename was a no-op would render as an old name with no
-        // new one, reading like a half-finished rename that never happened.
-        name: audited_name.clone(),
-        previous_name: audited_name.and(previous_name),
+        name: update
+            .renamed_from
+            .as_ref()
+            .map(|_| update.project.name.clone()),
+        previous_name: update.renamed_from,
         slug: settings.slug,
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
         image_retention_hours: settings.image_retention_hours,
@@ -1274,9 +1237,9 @@ pub async fn update_project_settings(
 
     let audit_event = ProjectSettingsUpdatedAudit {
         context: audit_context,
-        project_id: updated_project.id,
-        project_name: updated_project.name.clone(),
-        project_slug: updated_project.slug.clone(),
+        project_id: update.project.id,
+        project_name: update.project.name.clone(),
+        project_slug: update.project.slug.clone(),
         updated_settings,
     };
 
@@ -1285,7 +1248,7 @@ pub async fn update_project_settings(
         // Continue with the operation even if audit logging fails
     }
 
-    Ok(Json(ProjectResponse::map_from_project(updated_project)))
+    Ok(Json(ProjectResponse::map_from_project(update.project)))
 }
 
 /// Update automatic deployment setting for a project
@@ -2446,7 +2409,7 @@ pub async fn create_project_from_template(
 #[cfg(test)]
 mod tests {
     use super::{
-        audited_rename, compose_path_for_candidate, parse_owner_repo_from_git_url,
+        compose_path_for_candidate, parse_owner_repo_from_git_url,
         project_created_from_template_telemetry_event, require_git_settings_permissions,
     };
     use chrono::Utc;
@@ -2637,54 +2600,5 @@ mod tests {
         let (owner, repo) = parse_owner_repo_from_git_url("not-a-url");
         assert!(!owner.is_empty());
         assert!(!repo.is_empty());
-    }
-
-    #[test]
-    fn audited_rename_records_nothing_when_no_name_was_requested() {
-        assert_eq!(audited_rename(false, Some("Old"), "Old"), None);
-        // Even if the persisted name differs for unrelated reasons, a request
-        // that did not ask to rename must not record one.
-        assert_eq!(audited_rename(false, Some("Old"), "New"), None);
-    }
-
-    #[test]
-    fn audited_rename_records_nothing_for_a_no_op_rename() {
-        // Re-submitting the current name, or a value that trims to it, performs
-        // no rename — the audit must not claim otherwise.
-        assert_eq!(audited_rename(true, Some("Same Name"), "Same Name"), None);
-    }
-
-    #[test]
-    fn audited_rename_records_the_persisted_name_on_a_real_rename() {
-        assert_eq!(
-            audited_rename(true, Some("Old Name"), "New Name"),
-            Some("New Name".to_string())
-        );
-    }
-
-    /// `name` and `previous_name` are recorded as a pair. A no-op rename must
-    /// clear both, or the audit renders an old name with no new one and reads
-    /// like a rename that half-happened.
-    #[test]
-    fn audited_rename_and_previous_name_are_recorded_as_a_pair() {
-        let previous_name = Some("Same Name".to_string());
-
-        let audited = audited_rename(true, previous_name.as_deref(), "Same Name");
-        assert_eq!(audited, None);
-        assert_eq!(audited.and(previous_name.clone()), None);
-
-        let audited = audited_rename(true, previous_name.as_deref(), "New Name");
-        assert_eq!(audited, Some("New Name".to_string()));
-        assert_eq!(audited.and(previous_name), Some("Same Name".to_string()));
-    }
-
-    #[test]
-    fn audited_rename_records_the_name_when_the_previous_value_is_unknown() {
-        // The pre-update read failed. We cannot prove this was a no-op, and
-        // dropping a real rename from the audit trail is the worse error.
-        assert_eq!(
-            audited_rename(true, None, "New Name"),
-            Some("New Name".to_string())
-        );
     }
 }

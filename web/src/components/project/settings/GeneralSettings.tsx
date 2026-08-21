@@ -38,7 +38,7 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
@@ -82,10 +82,18 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   // when the route switches between two projects' settings pages. Without this
   // reset the form would still hold the previous project's identity, and Save
   // would rename the newly-selected project to the old one's name and slug.
+  //
+  // Keyed on the project *identity*, not its values: a plain refetch of the
+  // same project must not overwrite whatever the user is currently typing.
+  const syncedProjectId = useRef<number | undefined>(undefined)
   useEffect(() => {
+    if (project?.id === undefined || syncedProjectId.current === project.id) {
+      return
+    }
+    syncedProjectId.current = project.id
     projectForm.reset({
-      name: project?.name || '',
-      slug: project?.slug || '',
+      name: project.name || '',
+      slug: project.slug || '',
     })
   }, [project?.id, project?.name, project?.slug, projectForm])
 

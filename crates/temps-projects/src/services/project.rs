@@ -16,8 +16,8 @@ use temps_git::services::public_repo::PublicRepoProviderFactory;
 use serde::Serialize;
 
 use super::types::{
-    CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectStatistics,
-    UpdateDeploymentSettingsRequest,
+    CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectSettingsUpdate,
+    ProjectStatistics, UpdateDeploymentSettingsRequest,
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::UpdateDeploymentConfigRequest;
@@ -1324,7 +1324,7 @@ impl ProjectService {
         error_source_root: Option<String>,
         ai_api_traffic_summary_enabled: Option<bool>,
         image_retention_hours: Option<Option<i32>>,
-    ) -> Result<Project, ProjectError> {
+    ) -> Result<ProjectSettingsUpdate, ProjectError> {
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
         // never out of range.
@@ -1739,11 +1739,11 @@ impl ProjectService {
                 active_project.directory = Set(normalize_project_directory(&dir)?);
             }
             // Fold the rename into this same write so a name change submitted
-            // alongside git settings commits atomically with them.
-            if let Some(ref name_value) = new_name {
-                active_project.name = Set(name_value.clone());
-            }
-
+            // alongside git settings commits atomically with them. Read the
+            // name back under the row lock rather than trusting the copy loaded
+            // before the transaction: that copy predates the lock and a
+            // concurrent rename could have landed in between, which would make
+            // the reported transition fiction.
             // Carry the write and the route-reload signal on one transaction.
             // If the signal cannot be published, returning an error while the
             // rename and the preset/directory changes stayed persisted would
@@ -1751,6 +1751,23 @@ impl ProjectService {
             // port removal, leave a withdrawn route reachable. Dropping the
             // transaction on the error path rolls all of it back together.
             let txn = self.db.begin().await?;
+
+            let mut renamed_from = None;
+            if let Some(ref name_value) = new_name {
+                let locked = projects::Entity::find_by_id(project_id)
+                    .lock_exclusive()
+                    .one(&txn)
+                    .await?
+                    .ok_or(ProjectError::NotFound(format!(
+                        "Project {} not found",
+                        project_id
+                    )))?;
+                if locked.name != *name_value {
+                    renamed_from = Some(locked.name);
+                }
+                active_project.name = Set(name_value.clone());
+            }
+
             let updated_project = active_project.update(&txn).await?;
             let ports_changed = initial_public_ports
                 != compose_public_ports(updated_project.preset_config.as_ref());
@@ -1776,14 +1793,24 @@ impl ProjectService {
                 );
             }
 
-            return Ok(project_found);
+            return Ok(ProjectSettingsUpdate {
+                project: project_found,
+                renamed_from,
+            });
         }
 
         // Persist the rename last, once every other fallible step has
         // succeeded, so a failed request never leaves a renamed project behind.
+        // Read and write under one transaction holding the row lock, so the
+        // previous name reported back describes the transition this update
+        // actually performed rather than whatever a concurrent rename left
+        // behind between the read and the write.
+        let mut renamed_from = None;
         if let Some(name_value) = new_name {
+            let txn = self.db.begin().await?;
             let current = projects::Entity::find_by_id(project_id)
-                .one(self.db.as_ref())
+                .lock_exclusive()
+                .one(&txn)
                 .await?
                 .ok_or(ProjectError::NotFound(format!(
                     "Project {} not found",
@@ -1791,11 +1818,13 @@ impl ProjectService {
                 )))?;
 
             if current.name != name_value {
+                renamed_from = Some(current.name.clone());
                 let mut active_project: projects::ActiveModel = current.into();
                 active_project.name = Set(name_value);
                 active_project.updated_at = Set(chrono::Utc::now());
-                active_project.update(self.db.as_ref()).await?;
+                active_project.update(&txn).await?;
             }
+            txn.commit().await?;
         }
 
         // Always reload the final project state before returning
@@ -1822,7 +1851,10 @@ impl ProjectService {
             );
         }
 
-        Ok(project_found)
+        Ok(ProjectSettingsUpdate {
+            project: project_found,
+            renamed_from,
+        })
     }
 
     pub async fn update_automatic_deploy(
@@ -4457,6 +4489,12 @@ mod tests {
             .await
             .expect("rename should succeed");
 
+        // The service reports the transition it actually performed, so the
+        // audit never has to infer it from a racy read-before-write.
+        assert_eq!(updated.renamed_from.as_deref(), Some("Old Name"));
+
+        let updated = updated.project;
+
         // Trimmed, persisted, and the slug is exactly as it was.
         assert_eq!(updated.name, "New Display Name");
         assert_eq!(updated.slug, "rename-keeps-slug");
@@ -4468,6 +4506,66 @@ mod tests {
             .expect("project should still exist");
         assert_eq!(reloaded.name, "New Display Name");
         assert_eq!(reloaded.slug, "rename-keeps-slug");
+    }
+
+    /// Re-submitting the name a project already has performs no write, so the
+    /// service must report no rename — otherwise the audit records a transition
+    /// that never happened.
+    #[tokio::test]
+    async fn test_update_project_settings_reports_no_rename_for_a_no_op() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Unchanged Name".to_string()),
+            slug: Set("rename-noop".to_string()),
+            repo_name: Set("noop-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("noop-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        // Whitespace that trims back to the stored name is still a no-op.
+        let updated = project_service
+            .update_project_settings(
+                inserted_project.id,
+                Some("  Unchanged Name  ".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("no-op rename should succeed");
+
+        assert_eq!(
+            updated.renamed_from, None,
+            "a no-op rename must not report a transition"
+        );
+        assert_eq!(updated.project.name, "Unchanged Name");
     }
 
     /// A request that renames *and* fails on something else must not leave the
@@ -5134,7 +5232,8 @@ mod tests {
                 None, // image_retention_hours
             )
             .await
-            .expect("partial preset_config patch");
+            .expect("partial preset_config patch")
+            .project;
 
         assert_eq!(updated.preset.as_deref(), Some("nixpacks-node"));
 
@@ -5208,7 +5307,8 @@ mod tests {
                 None, // image_retention_hours
             )
             .await
-            .expect("partial excludedServices patch");
+            .expect("partial excludedServices patch")
+            .project;
 
         assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
 
@@ -5258,7 +5358,8 @@ mod tests {
                 None, // image_retention_hours
             )
             .await
-            .expect("partial relaxedCapabilityServices patch");
+            .expect("partial relaxedCapabilityServices patch")
+            .project;
         assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
 
         let row = projects::Entity::find_by_id(created.id)
@@ -5316,7 +5417,8 @@ mod tests {
                 None, // image_retention_hours
             )
             .await
-            .expect("explicit composeServices patch, even though it strands relaxedCapabilityServices");
+            .expect("explicit composeServices patch, even though it strands relaxedCapabilityServices")
+            .project;
         assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
 
         let row = projects::Entity::find_by_id(created.id)
@@ -5370,7 +5472,8 @@ mod tests {
                 None, // image_retention_hours
             )
             .await
-            .expect("unrelated excludedServices patch");
+            .expect("unrelated excludedServices patch")
+            .project;
         assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
 
         let row = projects::Entity::find_by_id(created.id)
@@ -5445,7 +5548,8 @@ mod tests {
                 None, // image_retention_hours
             )
             .await
-            .expect("relaxedCapabilityServices patch for a real non-database service");
+            .expect("relaxedCapabilityServices patch for a real non-database service")
+            .project;
         assert_eq!(result.preset.as_deref(), Some("docker-compose"));
 
         let row = projects::Entity::find_by_id(created.id)
@@ -5576,7 +5680,8 @@ mod tests {
                 None, // image_retention_hours
             )
             .await
-            .expect("explicit empty providers");
+            .expect("explicit empty providers")
+            .project;
 
         assert_eq!(updated.preset.as_deref(), Some("nixpacks"));
 
@@ -6139,7 +6244,8 @@ mod tests {
                 None, // image_retention_hours
             )
             .await
-            .expect("update preset and config together");
+            .expect("update preset and config together")
+            .project;
 
         assert_eq!(updated.preset.as_deref(), Some("nixpacks-node"));
         let row = projects::Entity::find_by_id(created.id)
