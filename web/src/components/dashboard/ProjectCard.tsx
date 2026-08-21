@@ -1,6 +1,7 @@
 import type {
   ProjectDashboardAnalytics,
   ProjectHealthSummary,
+  ProjectMonitorHealth,
   ProjectResponse,
 } from '@/api/client'
 import { PresetIcon } from '@/components/presets/PresetIcon'
@@ -43,6 +44,8 @@ interface ProjectCardProps {
   healthLoading?: boolean
   healthError?: boolean
   health?: ProjectHealthSummary
+  /** Latest production uptime-monitor status; outranks traffic health. */
+  monitorHealth?: ProjectMonitorHealth
   latestDeploymentMedia?: {
     url?: string | null
     screenshot_location?: string | null
@@ -127,6 +130,7 @@ export function ProjectCard({
   healthLoading = false,
   healthError = false,
   health,
+  monitorHealth,
   latestDeploymentMedia,
 }: ProjectCardProps) {
   const repository = projectRepository(project)
@@ -135,6 +139,7 @@ export function ProjectCard({
   const apiRequests = health?.total_requests ?? 0
   const healthIndicator = projectHealthIndicator({
     health,
+    monitor: monitorHealth,
     loading: healthLoading,
     error: healthError,
   })

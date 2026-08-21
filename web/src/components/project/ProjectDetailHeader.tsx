@@ -4,6 +4,11 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
+import { useProjectsMonitorHealth } from '@/hooks/useProjectsMonitorHealth'
+import {
+  projectHealthIndicator,
+  type ProjectHealthTone,
+} from '@/components/dashboard/project-card-health'
 import {
   gitProviderKind,
   repositoryWebUrl,
@@ -16,18 +21,17 @@ import GithubIcon from '@/icons/Github'
 import GitlabIcon from '@/icons/Gitlab'
 import { Link, useNavigate } from 'react-router'
 
-const healthDotColors: Record<string, string> = {
-  operational: 'bg-emerald-500',
+/**
+ * Tones for the header health badge. Mirrors the projects-list card so the same
+ * project reads the same in both places.
+ */
+const healthToneStyles: Record<ProjectHealthTone, string> = {
   healthy: 'bg-emerald-500',
   degraded: 'bg-amber-500',
   down: 'bg-red-500',
-}
-
-const healthLabels: Record<string, string> = {
-  operational: 'Operational',
-  healthy: 'Healthy',
-  degraded: 'Degraded',
-  down: 'Down',
+  idle: 'bg-zinc-300',
+  unavailable: 'bg-zinc-400',
+  pending: 'bg-zinc-300 animate-pulse',
 }
 
 interface ProjectDetailHeaderProps {
@@ -67,7 +71,18 @@ export function ProjectDetailHeader({
 }: ProjectDetailHeaderProps) {
   const navigate = useNavigate()
   const healthQuery = useDashboardHealth([project.id])
-  const health = healthQuery.data?.projects?.[String(project.id)]
+  const monitorQuery = useProjectsMonitorHealth([project.id])
+  // This badge links to Monitors, so it had better report what the monitors
+  // say. Traffic health alone reports "unknown" for a project nobody visited
+  // in the last hour — including one whose monitor is green — because the
+  // proxy query excludes Temps' own checks (is_system_request = FALSE).
+  const healthIndicator = projectHealthIndicator({
+    health: healthQuery.data?.projects?.[String(project.id)],
+    monitor: monitorQuery.data?.projects?.[String(project.id)],
+    loading: healthQuery.isLoading,
+    error: healthQuery.isError,
+    windowHours: 1,
+  })
   const screenshotLocation = lastDeployment?.screenshot_location
   const repositoryUrl = repositoryCloneUrl
     ? repositoryWebUrl(repositoryCloneUrl)
@@ -114,19 +129,21 @@ export function ProjectDetailHeader({
             >
               {project.last_deployment ? 'Deployed' : 'Not deployed'}
             </Badge>
-            {health && health.status !== 'no_monitors' && (
-              <Link to={`/projects/${project.slug}/monitors`}>
-                <Badge
-                  variant="outline"
-                  className="hidden sm:inline-flex shrink-0 gap-1.5"
-                >
-                  <span
-                    className={`inline-block h-2 w-2 rounded-full ${healthDotColors[health.status] || 'bg-zinc-400'}`}
-                  />
-                  {healthLabels[health.status] || health.status}
-                </Badge>
-              </Link>
-            )}
+            <Link
+              to={`/projects/${project.slug}/monitors`}
+              title={healthIndicator.detail}
+            >
+              <Badge
+                variant="outline"
+                className="hidden sm:inline-flex shrink-0 gap-1.5"
+              >
+                <span
+                  className={`inline-block h-2 w-2 rounded-full ${healthToneStyles[healthIndicator.tone]}`}
+                />
+                {healthIndicator.label}
+                <span className="sr-only">. {healthIndicator.detail}</span>
+              </Badge>
+            </Link>
           </div>
         </div>
         <div className="flex items-center gap-2">

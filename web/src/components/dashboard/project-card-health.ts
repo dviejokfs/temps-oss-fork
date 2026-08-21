@@ -1,12 +1,25 @@
 /**
- * Health indicator shown on every project card.
+ * Health indicator shown on every project card and in the project header.
  *
- * The backend derives `status` from the proxy's error rate over the requested
- * window, and reports `"unknown"` for a project that received no requests at
- * all. Those are two very different things to a user — "we measured it and it
- * is fine" versus "nothing reached it, so there is nothing to measure" — and
- * neither of them may render as *nothing*. A card that silently drops its
- * indicator teaches the operator that Temps has no health signal.
+ * Two independent signals feed this, and the order matters:
+ *
+ * 1. **Uptime monitors** (`/monitors-health/projects`) — the latest production
+ *    status check. This is what "is the project healthy" actually means, and
+ *    it has an answer even when nobody visited the site.
+ * 2. **User traffic** (`/proxy-logs/stats/projects-health`) — the proxy error
+ *    rate over the window. It measures *real user requests* and deliberately
+ *    excludes Temps' own monitor checks (`is_system_request = FALSE`), so a
+ *    perfectly healthy but quiet project produces zero requests and the
+ *    backend reports `"unknown"` because it cannot divide by zero.
+ *
+ * Reading only (2) is why a project with a monitor sitting at 100% uptime used
+ * to be labelled "unknown": its uptime checks were filtered out of the very
+ * query being asked, and no human happened to visit in the last hour. Monitors
+ * therefore win whenever one exists; traffic is the fallback for projects that
+ * have no monitor configured.
+ *
+ * Whatever the inputs, this never resolves to "render nothing" — "we could not
+ * measure it" is itself a state the operator needs to see.
  */
 
 export type ProjectHealthTone =
@@ -29,10 +42,18 @@ export interface ProjectHealthInput {
   avg_response_time_ms: number
 }
 
+/** The slice of `ProjectMonitorHealth` this indicator reads. */
+export interface ProjectMonitorHealthInput {
+  /** `operational` | `degraded` | `down` | `no_monitors` */
+  status: string
+}
+
 export interface ProjectHealthIndicatorOptions {
   health?: ProjectHealthInput
   loading?: boolean
   error?: boolean
+  /** Latest production uptime-monitor status, when monitors are readable. */
+  monitor?: ProjectMonitorHealthInput
   /** Hours the summary covers, for the explanatory detail text. */
   windowHours?: number
 }
@@ -57,12 +78,57 @@ function measuredDetail(
   )
 }
 
+/**
+ * A configured production monitor is the direct answer to "is this healthy",
+ * so it outranks traffic — including when traffic is silent. `no_monitors`
+ * means the project opted out, not that it is unhealthy, so it declines to
+ * answer and lets the traffic signal decide.
+ */
+function monitorIndicator(
+  monitor: ProjectMonitorHealthInput
+): ProjectHealthIndicator | null {
+  switch (monitor.status) {
+    case 'operational':
+      return {
+        tone: 'healthy',
+        label: 'Healthy',
+        detail:
+          'The production uptime monitor reports every check operational.',
+      }
+    case 'degraded':
+      return {
+        tone: 'degraded',
+        label: 'Degraded',
+        detail:
+          'Some production uptime monitors are failing their checks. Open Monitors to see which.',
+      }
+    case 'down':
+      return {
+        tone: 'down',
+        label: 'Down',
+        detail:
+          'Every production uptime monitor is failing its checks, or has not reported in over a day.',
+      }
+    default:
+      // 'no_monitors', or a status this build does not know about.
+      return null
+  }
+}
+
 export function projectHealthIndicator({
   health,
   loading = false,
   error = false,
+  monitor,
   windowHours = 24,
 }: ProjectHealthIndicatorOptions): ProjectHealthIndicator {
+  // Checked before the traffic branches — a monitor answers even when the
+  // traffic query failed or came back empty, which is the whole point of it.
+  if (monitor) {
+    const fromMonitor = monitorIndicator(monitor)
+    if (fromMonitor) return fromMonitor
+  }
+
   // An outright failure is reported as a failure. Falling back to a grey dot
   // would read as "this project is quiet" when we simply could not ask.
   if (error) {
@@ -99,7 +165,9 @@ export function projectHealthIndicator({
     return {
       tone: 'idle',
       label: 'No traffic',
-      detail: `No requests reached this project in ${windowLabel(windowHours)}, so there is no health signal to report yet.`,
+      detail:
+        `No user requests reached this project in ${windowLabel(windowHours)}, so there is no traffic to measure. ` +
+        'Add an uptime monitor to get a health signal that does not depend on visitors.',
     }
   }
 

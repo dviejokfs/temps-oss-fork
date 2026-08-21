@@ -64,7 +64,7 @@ describe('projectHealthIndicator', () => {
 
     expect(indicator.tone).toBe('idle')
     expect(indicator.label).toBe('No traffic')
-    expect(indicator.detail).toContain('No requests reached this project')
+    expect(indicator.detail).toContain('No user requests reached this project')
   })
 
   test('never reports an unreachable health service as idle', () => {
@@ -103,6 +103,81 @@ describe('projectHealthIndicator', () => {
     expect(indicator.label).toBe('Unknown')
     expect(indicator.detail).toContain('partial_outage')
     expect(indicator.detail).toContain('1,200 requests')
+  })
+
+  test('reports a healthy monitor for a project with no traffic', () => {
+    // The reported bug: bridge-relayer had a production monitor sitting at 100%
+    // uptime and still showed "unknown", because proxy health excludes Temps'
+    // own monitor checks (is_system_request = FALSE) and no human had visited
+    // in the default 1-hour window.
+    const indicator = projectHealthIndicator({
+      health: summary({
+        status: 'unknown',
+        total_requests: 0,
+        total_errors: 0,
+        error_rate: 0,
+        avg_response_time_ms: 0,
+      }),
+      monitor: { status: 'operational' },
+    })
+
+    expect(indicator.tone).toBe('healthy')
+    expect(indicator.label).toBe('Healthy')
+    expect(indicator.detail).toContain('uptime monitor')
+  })
+
+  test('lets the monitor answer when the traffic query failed entirely', () => {
+    expect(
+      projectHealthIndicator({ error: true, monitor: { status: 'down' } })
+    ).toMatchObject({ tone: 'down', label: 'Down' })
+
+    expect(
+      projectHealthIndicator({
+        loading: true,
+        monitor: { status: 'degraded' },
+      })
+    ).toMatchObject({ tone: 'degraded', label: 'Degraded' })
+  })
+
+  test('a failing monitor outranks quiet-but-clean traffic', () => {
+    expect(
+      projectHealthIndicator({
+        health: summary({ status: 'healthy' }),
+        monitor: { status: 'down' },
+      })
+    ).toMatchObject({ tone: 'down', label: 'Down' })
+  })
+
+  test('falls back to traffic when the project has no monitors', () => {
+    expect(
+      projectHealthIndicator({
+        health: summary({ status: 'degraded', error_rate: 22.5 }),
+        monitor: { status: 'no_monitors' },
+      })
+    ).toMatchObject({ tone: 'degraded', label: 'Degraded' })
+
+    // No monitor and no traffic: still not "unknown", and it says what to do.
+    const idle = projectHealthIndicator({
+      health: summary({
+        status: 'unknown',
+        total_requests: 0,
+        total_errors: 0,
+        error_rate: 0,
+        avg_response_time_ms: 0,
+      }),
+      monitor: { status: 'no_monitors' },
+    })
+    expect(idle).toMatchObject({ tone: 'idle', label: 'No traffic' })
+    expect(idle.detail).toContain('Add an uptime monitor')
+  })
+
+  test('ignores a monitor status it does not recognise', () => {
+    expect(
+      projectHealthIndicator({
+        health: summary({ status: 'healthy' }),
+        monitor: { status: 'maintenance' },
+      })
+    ).toMatchObject({ tone: 'healthy', label: 'Healthy' })
   })
 
   test('describes a non-default window in the detail text', () => {
