@@ -2,17 +2,70 @@ import type { ProjectResponse } from '@/api/client'
 
 type RepositoryProject = Pick<
   ProjectResponse,
-  'git_url' | 'repo_name' | 'repo_owner'
+  'git_url' | 'repo_name' | 'repo_owner' | 'git_provider_type'
 >
+
+export type GitProvider = 'github' | 'gitlab' | 'gitea' | 'bitbucket' | 'git'
 
 export type RepositoryInfo = {
   label: string
-  provider: 'github' | 'gitlab' | 'git'
+  provider: GitProvider
 }
 
 export type ProjectBuildSource = {
   label: string
-  kind: 'github' | 'gitlab' | 'git' | 'docker' | 'source'
+  kind: GitProvider | 'docker' | 'source'
+}
+
+const PROVIDER_LABELS: Record<GitProvider, string> = {
+  github: 'GitHub',
+  gitlab: 'GitLab',
+  gitea: 'Gitea',
+  bitbucket: 'Bitbucket',
+  git: 'Git repository',
+}
+
+/**
+ * The provider type stored on the project's Git connection, normalized to what
+ * the UI draws. `github_app` is the GitHub App flavour of GitHub; `generic`
+ * (self-hosted plain Git) has no brand mark of its own.
+ */
+function providerFromConnection(
+  providerType: string | null | undefined
+): GitProvider | null {
+  switch (providerType?.toLowerCase()) {
+    case 'github':
+    case 'github_app':
+      return 'github'
+    case 'gitlab':
+      return 'gitlab'
+    case 'gitea':
+      return 'gitea'
+    case 'bitbucket':
+      return 'bitbucket'
+    case 'generic':
+      return 'git'
+    default:
+      return null
+  }
+}
+
+/**
+ * Last-resort hostname sniffing, for public repositories that have a clone URL
+ * but no connection to read the provider from.
+ *
+ * This can only ever recognize vendors that name themselves in the hostname, so
+ * it must never be used when `git_provider_type` is available, and an
+ * unrecognized host must stay generic — a self-hosted instance on a custom
+ * domain is not GitHub just because we failed to identify it.
+ */
+function providerFromUrl(gitUrl: string | undefined): GitProvider {
+  const url = gitUrl?.toLowerCase() ?? ''
+  if (url.includes('github')) return 'github'
+  if (url.includes('gitlab')) return 'gitlab'
+  if (url.includes('bitbucket')) return 'bitbucket'
+  if (url.includes('gitea')) return 'gitea'
+  return 'git'
 }
 
 export function projectPresetLabel(preset?: string | null): string {
@@ -43,12 +96,10 @@ export function projectRepository(
 
   if (!owner || !name) return null
 
-  const lowerUrl = gitUrl?.toLowerCase() ?? ''
-  const provider = lowerUrl.includes('gitlab')
-    ? 'gitlab'
-    : lowerUrl.includes('github') || !gitUrl
-      ? 'github'
-      : 'git'
+  // The connected provider is authoritative; the clone URL is only a fallback
+  // for public repositories, which have no connection to read it from.
+  const provider =
+    providerFromConnection(project.git_provider_type) ?? providerFromUrl(gitUrl)
 
   return { label: `${owner}/${name}`, provider }
 }
@@ -56,20 +107,15 @@ export function projectRepository(
 export function projectBuildSource(
   project: Pick<
     ProjectResponse,
-    'source_type' | 'git_url' | 'repo_name' | 'repo_owner'
+    'source_type' | 'git_url' | 'repo_name' | 'repo_owner' | 'git_provider_type'
   >
 ): ProjectBuildSource {
   if (project.source_type === 'git') {
-    const provider = projectRepository(project)?.provider ?? 'git'
-    return {
-      kind: provider,
-      label:
-        provider === 'github'
-          ? 'GitHub'
-          : provider === 'gitlab'
-            ? 'GitLab'
-            : 'Git repository',
-    }
+    const provider =
+      providerFromConnection(project.git_provider_type) ??
+      projectRepository(project)?.provider ??
+      'git'
+    return { kind: provider, label: PROVIDER_LABELS[provider] }
   }
 
   if (project.source_type === 'docker_image') {

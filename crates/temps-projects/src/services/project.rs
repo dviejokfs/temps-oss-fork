@@ -5,12 +5,13 @@ use tracing::{info, warn};
 
 use sea_orm::{
     prelude::Uuid, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, Statement,
+    TransactionTrait,
 };
 use temps_core::{
     ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
 };
-use temps_entities::projects;
+use temps_entities::{git_provider_connections, git_providers, projects};
 use temps_git::services::public_repo::PublicRepoProviderFactory;
 
 use serde::Serialize;
@@ -22,6 +23,32 @@ use super::types::{
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::UpdateDeploymentConfigRequest;
 // Placeholder functions - these should be implemented properly or imported from other services
+
+/// A project row plus the provider type of the Git connection it is linked to.
+///
+/// The provider type lives two hops away (`projects` →
+/// `git_provider_connections` → `git_providers`), so the read queries LEFT JOIN
+/// it in as one extra column rather than paying a second round trip. `LEFT` and
+/// `Option` because most projects have no connection at all — a Docker-image or
+/// uploaded-source project must still come back from the same query.
+#[derive(Debug)]
+struct ProjectWithGitProviderType {
+    project: projects::Model,
+    git_provider_type: Option<String>,
+}
+
+impl sea_orm::FromQueryResult for ProjectWithGitProviderType {
+    fn from_query_result(result: &sea_orm::QueryResult, pre: &str) -> Result<Self, sea_orm::DbErr> {
+        Ok(Self {
+            project: projects::Model::from_query_result(result, pre)?,
+            git_provider_type: result.try_get(pre, GIT_PROVIDER_TYPE_ALIAS)?,
+        })
+    }
+}
+
+/// Alias for the joined-in `git_providers.provider_type` column. Named rather
+/// than bare so it can never collide with a `projects` column.
+const GIT_PROVIDER_TYPE_ALIAS: &str = "git_provider_type";
 
 /// Whether changing `repo_owner`/`repo_name` would leave `git_url` pointing at
 /// a different repository.
@@ -906,7 +933,7 @@ impl ProjectService {
             project_found_db
         };
 
-        Ok(Self::map_db_project_to_project(project_found_db))
+        Ok(self.map_written_project(project_found_db).await)
     }
 
     /// Post-insert steps for `create_project`. Returns the default environment
@@ -987,7 +1014,7 @@ impl ProjectService {
     }
 
     pub async fn get_projects(&self) -> Result<Vec<Project>, ProjectError> {
-        let results = projects::Entity::find()
+        let results = Self::with_git_provider_type(projects::Entity::find())
             // Most-recently-deployed first; never-deployed projects (NULL
             // last_deployment) sort last, not first — a NULL under DESC would
             // otherwise be treated as "deployed infinitely recently".
@@ -997,24 +1024,27 @@ impl ProjectService {
                 sea_orm::sea_query::NullOrdering::Last,
             )
             .order_by_desc(projects::Column::CreatedAt)
+            .into_model::<ProjectWithGitProviderType>()
             .all(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))?;
 
         Ok(results
             .into_iter()
-            .map(Self::map_db_project_to_project)
+            .map(Self::map_db_project_row_to_project)
             .collect())
     }
 
     pub async fn get_project(&self, project_id: i32) -> Result<Project, ProjectError> {
-        let project_found_db = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await
-            .map_err(|e| ProjectError::Other(e.to_string()))?;
+        let project_found_db =
+            Self::with_git_provider_type(projects::Entity::find_by_id(project_id))
+                .into_model::<ProjectWithGitProviderType>()
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| ProjectError::Other(e.to_string()))?;
 
         project_found_db
-            .map(Self::map_db_project_to_project)
+            .map(Self::map_db_project_row_to_project)
             .ok_or(ProjectError::NotFound(format!(
                 "project {} not found",
                 project_id
@@ -1022,8 +1052,9 @@ impl ProjectService {
     }
 
     pub async fn get_project_by_slug(&self, slug: &str) -> Result<Project, ProjectError> {
-        let project_found_db = projects::Entity::find()
+        let project_found_db = Self::with_git_provider_type(projects::Entity::find())
             .filter(projects::Column::Slug.eq(slug))
+            .into_model::<ProjectWithGitProviderType>()
             .one(self.db.as_ref())
             .await?
             .ok_or(ProjectError::NotFound(format!(
@@ -1031,7 +1062,9 @@ impl ProjectService {
                 slug
             )))?;
 
-        Ok(Self::map_db_project_to_project(project_found_db))
+        let project_found = Self::map_db_project_row_to_project(project_found_db);
+
+        Ok(project_found)
     }
 
     pub async fn get_projects_by_repo_owner_and_name(
@@ -1039,16 +1072,17 @@ impl ProjectService {
         repo_owner: &str,
         repo_name: &str,
     ) -> Result<Vec<Project>, ProjectError> {
-        let projects_found_db = projects::Entity::find()
+        let projects_found_db = Self::with_git_provider_type(projects::Entity::find())
             .filter(projects::Column::RepoOwner.eq(repo_owner))
             .filter(projects::Column::RepoName.eq(repo_name))
+            .into_model::<ProjectWithGitProviderType>()
             .all(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))?;
 
         let projects_found: Vec<Project> = projects_found_db
             .into_iter()
-            .map(Self::map_db_project_to_project)
+            .map(Self::map_db_project_row_to_project)
             .collect();
         Ok(projects_found)
     }
@@ -1058,15 +1092,16 @@ impl ProjectService {
         owner: &str,
         repo: &str,
     ) -> Result<Project, ProjectError> {
-        let project_found = projects::Entity::find()
+        let project_found = Self::with_git_provider_type(projects::Entity::find())
             .filter(projects::Column::RepoOwner.eq(owner))
             .filter(projects::Column::RepoName.eq(repo))
+            .into_model::<ProjectWithGitProviderType>()
             .one(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::Other(format!("Database error: {}", e)))?;
 
         match project_found {
-            Some(project) => Ok(Self::map_db_project_to_project(project)),
+            Some(project) => Ok(Self::map_db_project_row_to_project(project)),
             None => Err(ProjectError::NotFound(format!(
                 "Project not found for repository {}/{}",
                 owner, repo
@@ -1108,9 +1143,11 @@ impl ProjectService {
         active_project.updated_at = Set(chrono::Utc::now());
 
         let project_found = active_project.update(self.db.as_ref()).await?;
-        let project_found = Self::map_db_project_to_project(project_found);
 
-        // Emit ProjectUpdated job
+        // Emit ProjectUpdated before reading anything else. Everything after
+        // the commit is a fresh await point, and a cancelled request (client
+        // disconnect, timeout) drops the task there — so the notification goes
+        // out first, and only the response can be lost.
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
             project_id: project_found.id,
             project_name: project_found.name.clone(),
@@ -1128,7 +1165,7 @@ impl ProjectService {
             );
         }
 
-        Ok(project_found)
+        Ok(self.map_written_project(project_found).await)
     }
 
     /// Change a project's source type to a Git-less type (docker_image /
@@ -1171,9 +1208,10 @@ impl ProjectService {
         active_project.source_type = Set(source_type);
         active_project.updated_at = Set(chrono::Utc::now());
         let updated = active_project.update(self.db.as_ref()).await?;
-        let updated = Self::map_db_project_to_project(updated);
 
-        // Deploy routing / behavior keys off source_type — notify consumers.
+        // Deploy routing / behavior keys off source_type — notify consumers
+        // before anything else awaits, so a cancelled request can only cost
+        // the response, never the notification.
         if let Err(e) = self
             .queue_service
             .send(Job::ProjectUpdated(ProjectUpdatedJob {
@@ -1187,7 +1225,7 @@ impl ProjectService {
                 updated.id, e
             );
         }
-        Ok(updated)
+        Ok(self.map_written_project(updated).await)
     }
 
     /// Toggle whether the project accepts deployments from a source other than
@@ -1212,7 +1250,7 @@ impl ProjectService {
         active_project.allow_alternate_sources = Set(Some(allow));
         active_project.updated_at = Set(chrono::Utc::now());
         let updated = active_project.update(self.db.as_ref()).await?;
-        Ok(Self::map_db_project_to_project(updated))
+        Ok(self.map_written_project(updated).await)
     }
 
     /// Persist deletion intent before cancelling workflows or touching Docker.
@@ -1728,22 +1766,22 @@ impl ProjectService {
                 self.reload_routes_after_compose_port_change(project_id)
                     .await?;
             }
-            let project_found = Self::map_db_project_to_project(updated_project);
-
-            // Emit ProjectUpdated job
+            // Notify before the provider lookup: past the commit, every await
+            // is a point the task can be cancelled at, and losing the response
+            // is recoverable where losing the notification is not.
             let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
-                project_id: project_found.id,
-                project_name: project_found.name.clone(),
+                project_id: updated_project.id,
+                project_name: updated_project.name.clone(),
             });
 
             if let Err(e) = self.queue_service.send(project_updated_job).await {
                 warn!(
                     "Failed to emit ProjectUpdated job for project {}: {}",
-                    project_found.id, e
+                    updated_project.id, e
                 );
             }
 
-            return Ok(project_found);
+            return Ok(self.map_written_project(updated_project).await);
         }
 
         // Always reload the final project state before returning
@@ -1755,22 +1793,19 @@ impl ProjectService {
                 project_id
             )))?;
 
-        let project_found = Self::map_db_project_to_project(final_project);
-
-        // Emit ProjectUpdated job
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
-            project_id: project_found.id,
-            project_name: project_found.name.clone(),
+            project_id: final_project.id,
+            project_name: final_project.name.clone(),
         });
 
         if let Err(e) = self.queue_service.send(project_updated_job).await {
             warn!(
                 "Failed to emit ProjectUpdated job for project {}: {}",
-                project_found.id, e
+                final_project.id, e
             );
         }
 
-        Ok(project_found)
+        Ok(self.map_written_project(final_project).await)
     }
 
     pub async fn update_automatic_deploy(
@@ -1797,7 +1832,7 @@ impl ProjectService {
 
         let updated_project = active_project.update(self.db.as_ref()).await?;
 
-        Ok(Self::map_db_project_to_project(updated_project))
+        Ok(self.map_written_project(updated_project).await)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2159,7 +2194,7 @@ impl ProjectService {
                 .await?;
         }
 
-        Ok(Self::map_db_project_to_project(updated_project))
+        Ok(self.map_written_project(updated_project).await)
     }
 
     /// Public Compose ports are read directly from `projects.preset_config`
@@ -2872,15 +2907,24 @@ impl ProjectService {
             }
             if let Some(search) = search {
                 let pattern = format!("%{}%", escape_like_literal(search));
+                // Table-qualified: the page query joins `git_providers`, which
+                // has a `name` column of its own, and an unqualified `name`
+                // here is rejected by Postgres as ambiguous.
                 query = query.filter(
                     Condition::any()
                         .add(
-                            sea_orm::sea_query::Expr::col(projects::Column::Name)
-                                .ilike(LikeExpr::new(pattern.clone())),
+                            sea_orm::sea_query::Expr::col((
+                                projects::Entity,
+                                projects::Column::Name,
+                            ))
+                            .ilike(LikeExpr::new(pattern.clone())),
                         )
                         .add(
-                            sea_orm::sea_query::Expr::col(projects::Column::Slug)
-                                .ilike(LikeExpr::new(pattern.clone())),
+                            sea_orm::sea_query::Expr::col((
+                                projects::Entity,
+                                projects::Column::Slug,
+                            ))
+                            .ilike(LikeExpr::new(pattern.clone())),
                         ),
                 );
             }
@@ -2897,7 +2941,9 @@ impl ProjectService {
         // Get paginated projects. Never-deployed projects (NULL last_deployment)
         // sort last rather than first (a NULL under DESC would otherwise appear
         // as the most-recently-deployed project).
-        let projects = filtered()
+        // The count query above stays join-free: it counts projects, and the
+        // provider join exists only to carry an extra column.
+        let projects = Self::with_git_provider_type(filtered())
             .order_by_with_nulls(
                 projects::Column::LastDeployment,
                 sea_orm::Order::Desc,
@@ -2906,14 +2952,16 @@ impl ProjectService {
             .order_by_desc(projects::Column::CreatedAt)
             .offset(offset)
             .limit(per_page as u64)
+            .into_model::<ProjectWithGitProviderType>()
             .all(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?;
 
         let projects_found: Vec<Project> = projects
             .into_iter()
-            .map(Self::map_db_project_to_project)
+            .map(Self::map_db_project_row_to_project)
             .collect();
+
         Ok((projects_found, total))
     }
 
@@ -3053,7 +3101,7 @@ impl ProjectService {
             );
         }
 
-        Ok(Self::map_db_project_to_project(updated_project))
+        Ok(self.map_written_project(updated_project).await)
     }
 
     /// Update a project's deployment config.
@@ -3171,7 +3219,7 @@ impl ProjectService {
             );
         }
 
-        Ok(Self::map_db_project_to_project(updated_project))
+        Ok(self.map_written_project(updated_project).await)
     }
 
     /// Generate a unique project slug by checking for collisions and appending a short UUID if needed.
@@ -3229,7 +3277,87 @@ impl ProjectService {
         }
     }
 
-    pub fn map_db_project_to_project(db_project: projects::Model) -> Project {
+    /// LEFT JOIN each project to the provider behind its Git connection and
+    /// select that provider's type as one extra column.
+    ///
+    /// Neither hop can fan a project out into several rows (both are
+    /// many-to-one), so this changes the row count of no query it is applied
+    /// to, and it never needs a second round trip to fill the field in.
+    fn with_git_provider_type(
+        select: sea_orm::Select<projects::Entity>,
+    ) -> sea_orm::Select<projects::Entity> {
+        select
+            .join(
+                sea_orm::JoinType::LeftJoin,
+                projects::Relation::GitProviderConnection.def(),
+            )
+            .join(
+                sea_orm::JoinType::LeftJoin,
+                git_provider_connections::Relation::Provider.def(),
+            )
+            .column_as(git_providers::Column::ProviderType, GIT_PROVIDER_TYPE_ALIAS)
+    }
+
+    fn map_db_project_row_to_project(row: ProjectWithGitProviderType) -> Project {
+        let mut project = Self::map_db_project_to_project(row.project);
+        project.git_provider_type = row.git_provider_type;
+        project
+    }
+
+    /// Build the client-facing `Project` for a row a mutation just wrote.
+    ///
+    /// Writes return an updated `projects::Model` rather than going back
+    /// through the joined read query, so the provider type is fetched here —
+    /// one primary-key lookup, and none at all for a project with no
+    /// connection. Answering a successful update with `git_provider_type:
+    /// null` would tell a client that a connected project has no provider, and
+    /// any client that trusts its own mutation response would downgrade a
+    /// GitLab project back to a guess until its next read.
+    ///
+    /// Deliberately infallible. This runs *after* the write has committed, and
+    /// it reads a display label — failing here would report a change the
+    /// database has already accepted as a failed request, and would skip the
+    /// `ProjectUpdated` job that several callers emit straight after this call,
+    /// leaving routes and notifications unaware of a change that did happen. A
+    /// lookup that fails is logged and leaves the field empty; the next read
+    /// fills it in.
+    async fn map_written_project(&self, db_project: projects::Model) -> Project {
+        let git_provider_type = match db_project.git_provider_connection_id {
+            None => None,
+            Some(connection_id) => {
+                match git_provider_connections::Entity::find_by_id(connection_id)
+                    .select_only()
+                    .column(git_providers::Column::ProviderType)
+                    .inner_join(git_providers::Entity)
+                    .into_tuple::<String>()
+                    .one(self.db.as_ref())
+                    .await
+                {
+                    Ok(provider_type) => provider_type,
+                    Err(e) => {
+                        warn!(
+                            "Failed to read the git provider type for connection {} of project {} \
+                             after a successful write; responding without it: {}",
+                            connection_id, db_project.id, e
+                        );
+                        None
+                    }
+                }
+            }
+        };
+
+        let mut project = Self::map_db_project_to_project(db_project);
+        project.git_provider_type = git_provider_type;
+        project
+    }
+
+    /// Maps the project row alone, leaving `git_provider_type` empty.
+    ///
+    /// Private on purpose: every client-facing path must go through
+    /// `map_db_project_row_to_project` (joined read) or `map_written_project`
+    /// (mutation), so a new endpoint cannot quietly answer with "no provider"
+    /// for a connected project.
+    fn map_db_project_to_project(db_project: projects::Model) -> Project {
         // Extract deployment config fields
         let deployment_config = db_project.deployment_config.clone();
 
@@ -3290,6 +3418,11 @@ impl ProjectService {
             is_public_repo: db_project.is_public_repo,
             git_url: db_project.git_url,
             git_provider_connection_id: db_project.git_provider_connection_id,
+            // Lives on the connection's provider row, not on the project row,
+            // so it is filled in by the caller: `map_db_project_row_to_project`
+            // from the joined read query, or `map_written_project` after a
+            // mutation. Both are the only ways a `Project` reaches a client.
+            git_provider_type: None,
             is_on_demand: false, // Deprecated field, default to false
             deployment_config: deployment_config.clone(),
             attack_mode: db_project.attack_mode,
@@ -4250,6 +4383,142 @@ mod tests {
             temps_entities::source_type::SourceType::Git
         );
         assert_eq!(opted_out.repo_owner.as_deref(), Some("owner"));
+    }
+
+    /// The console draws a provider logo for each project. Before this, it had
+    /// nothing authoritative to draw it from and guessed from the clone URL —
+    /// which reports GitHub for every project whose URL is missing, and for
+    /// self-hosted instances whose hostname doesn't happen to spell out the
+    /// vendor. A GitLab-connected project must report GitLab.
+    #[tokio::test]
+    async fn connected_projects_report_the_provider_they_are_linked_to() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            eprintln!("Test database unavailable, skipping");
+            return;
+        };
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        // Self-hosted GitLab on a hostname that says nothing about the vendor,
+        // and a project connected to it that stores no clone URL at all.
+        let provider = temps_entities::git_providers::ActiveModel {
+            name: Set("Internal Git".to_string()),
+            provider_type: Set("gitlab".to_string()),
+            base_url: Set(Some("https://code.example.internal".to_string())),
+            api_url: Set(None),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let connection = temps_entities::git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None),
+            account_name: Set("platform-team".to_string()),
+            account_type: Set("Organization".to_string()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let connected = temps_entities::projects::ActiveModel {
+            name: Set("Connected Project".to_string()),
+            slug: Set("connected-project".to_string()),
+            repo_name: Set("api".to_string()),
+            repo_owner: Set("platform-team".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            git_url: Set(None),
+            git_provider_connection_id: Set(Some(connection.id)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let standalone = temps_entities::projects::ActiveModel {
+            name: Set("Image Project".to_string()),
+            slug: Set("image-project".to_string()),
+            repo_name: Set("image".to_string()),
+            repo_owner: Set("owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            git_provider_connection_id: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let fetched = service.get_project(connected.id).await.unwrap();
+        assert_eq!(fetched.git_provider_type.as_deref(), Some("gitlab"));
+
+        let by_slug = service
+            .get_project_by_slug("connected-project")
+            .await
+            .unwrap();
+        assert_eq!(by_slug.git_provider_type.as_deref(), Some("gitlab"));
+
+        // A project with no connection has no provider to report — it must stay
+        // empty rather than fall back to a guess.
+        let unconnected = service.get_project(standalone.id).await.unwrap();
+        assert_eq!(unconnected.git_provider_type, None);
+
+        // The dashboard list carries the provider in the same query.
+        let (listed, total) = service
+            .get_projects_paginated_excluding_search(1, 100, &[], None)
+            .await
+            .unwrap();
+        let matching = |id: i32| listed.iter().filter(move |project| project.id == id);
+        let listed_connected = matching(connected.id)
+            .next()
+            .expect("connected project is listed");
+        let listed_standalone = matching(standalone.id)
+            .next()
+            .expect("standalone project is listed");
+        assert_eq!(
+            listed_connected.git_provider_type.as_deref(),
+            Some("gitlab")
+        );
+        assert_eq!(listed_standalone.git_provider_type, None);
+
+        // The provider join must not fan a project out into several rows, and
+        // must not drift from the count query, which stays join-free.
+        assert_eq!(matching(connected.id).count(), 1, "no duplicate rows");
+        assert_eq!(
+            total,
+            listed.len() as i64,
+            "count query and page agree once the provider join is in the page query"
+        );
+
+        // A write answers with the provider too. A client that trusts its own
+        // mutation response would otherwise downgrade a connected project to
+        // "no provider" until its next read.
+        let after_write = service
+            .set_allow_alternate_sources(connected.id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_write.git_provider_type.as_deref(),
+            Some("gitlab"),
+            "an update response must not drop the connected provider"
+        );
+
+        let after_write_unconnected = service
+            .set_allow_alternate_sources(standalone.id, true)
+            .await
+            .unwrap();
+        assert_eq!(after_write_unconnected.git_provider_type, None);
     }
 
     #[tokio::test]

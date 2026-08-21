@@ -322,6 +322,16 @@ pub struct ProjectResponse {
     pub updated_at: i64,
     pub last_deployment: Option<i64>,
     pub git_provider_connection_id: Option<i32>,
+    /// Git provider behind `git_provider_connection_id`: `github`,
+    /// `github_app`, `gitlab`, `gitea`, `bitbucket` or `generic`. `null` when
+    /// the project has no connection (public repository, Docker image or
+    /// uploaded source).
+    ///
+    /// Clients must use this rather than guessing the host from `git_url`: a
+    /// self-hosted GitLab/Gitea/Bitbucket instance can live on any domain, and
+    /// a connected project may have no clone URL stored at all.
+    #[schema(example = "gitlab")]
+    pub git_provider_type: Option<String>,
     /// Authoritative repository visibility. A missing connection alone does
     /// not imply that an incompletely configured repository is public.
     pub is_public_repo: bool,
@@ -404,6 +414,7 @@ impl ProjectResponse {
             updated_at: project.updated_at.timestamp_millis(),
             last_deployment: project.last_deployment.map(|d| d.timestamp_millis()),
             git_provider_connection_id: project.git_provider_connection_id,
+            git_provider_type: project.git_provider_type,
             is_public_repo: project.is_public_repo,
             git_url: project.git_url,
             attack_mode: project.attack_mode,

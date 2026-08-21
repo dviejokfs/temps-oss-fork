@@ -7,8 +7,7 @@ import { PresetIcon } from '@/components/presets/PresetIcon'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
-import GithubIcon from '@/icons/Github'
-import GitlabIcon from '@/icons/Gitlab'
+import { ProviderLogo } from '@/components/git/ProviderLogo'
 import {
   AlertCircle,
   Container,
@@ -69,8 +68,14 @@ function HealthStatusDot({ status }: { status: string }) {
 }
 
 function BuildSourceIcon({ kind }: { kind: ProjectBuildSource['kind'] }) {
-  if (kind === 'github') return <GithubIcon className="size-4 shrink-0" />
-  if (kind === 'gitlab') return <GitlabIcon className="size-4 shrink-0" />
+  if (
+    kind === 'github' ||
+    kind === 'gitlab' ||
+    kind === 'gitea' ||
+    kind === 'bitbucket'
+  ) {
+    return <ProviderLogo providerType={kind} className="size-4 shrink-0" />
+  }
   if (kind === 'git') {
     return <GitFork className="size-4 shrink-0 text-muted-foreground" />
   }
