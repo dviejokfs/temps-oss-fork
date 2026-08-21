@@ -5290,6 +5290,71 @@ mod tests {
     /// `ExternalServiceManager`. When Docker isn't available locally
     /// (CI without docker-in-docker, dev machines without daemon) skip
     /// rather than failing — matches the `cargo test` discipline in CLAUDE.md.
+    /// Pins an assumption the git-settings path depends on: it builds its
+    /// `ActiveModel` from a project snapshot loaded *before* the transaction's
+    /// row lock, so if `update()` wrote back every column of that snapshot, an
+    /// unrelated concurrent change would be silently lost.
+    ///
+    /// It does not: `Model -> ActiveModel` marks columns `Unchanged`, and
+    /// `update()` emits a SET clause containing only the columns explicitly
+    /// `Set`. This test exists because that is a Sea-ORM behaviour rather than
+    /// something visible in our code — if it ever changed, the git-settings path
+    /// would start clobbering concurrent writes with no other signal.
+    #[tokio::test]
+    async fn test_partial_update_does_not_clobber_concurrent_columns() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+
+        let inserted = temps_entities::projects::ActiveModel {
+            name: Set("Probe Original".to_string()),
+            slug: Set("probe-stale-snapshot".to_string()),
+            repo_name: Set("probe-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("probe-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // A stale snapshot, taken before the "concurrent" write below.
+        let stale = projects::Entity::find_by_id(inserted.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Concurrent, unrelated update: someone else changes attack_mode.
+        let mut other: projects::ActiveModel = projects::Entity::find_by_id(inserted.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        other.attack_mode = Set(true);
+        other.update(db.as_ref()).await.unwrap();
+
+        // Now write the stale snapshot back, setting only `directory`.
+        let mut from_stale: projects::ActiveModel = stale.into();
+        from_stale.directory = Set("probe-dir-changed".to_string());
+        from_stale.update(db.as_ref()).await.unwrap();
+
+        let final_row = projects::Entity::find_by_id(inserted.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(final_row.directory, "probe-dir-changed");
+        assert!(
+            final_row.attack_mode,
+            "LOST UPDATE: the stale snapshot clobbered the concurrent attack_mode change"
+        );
+    }
+
     async fn docker_available() -> bool {
         match bollard::Docker::connect_with_local_defaults() {
             Ok(d) => d.ping().await.is_ok(),
