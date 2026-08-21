@@ -10,6 +10,7 @@ import {
   DollarSign,
 } from 'lucide-react'
 import * as React from 'react'
+import { formatFunnelDuration } from './funnel-duration'
 
 interface FunnelVisualizationProps {
   totalEntries: number
@@ -263,14 +264,15 @@ function FunnelView({
           </div>
           <div>
             <div className="text-sm text-muted-foreground mb-1">
-              Completion Time
+              Avg. Completion Time
             </div>
             <div className="text-xl font-bold">
-              {averageCompletionTime >= 3600
-                ? `${Math.round(averageCompletionTime / 3600)}h`
-                : averageCompletionTime >= 60
-                  ? `${Math.round(averageCompletionTime / 60)}m`
-                  : `${Math.round(averageCompletionTime)}s`}
+              {formatFunnelDuration(averageCompletionTime).primary}
+            </div>
+            {/* The exact figure, because "1h" alone hides half an hour of
+                difference between two funnels. */}
+            <div className="text-xs text-muted-foreground tabular-nums">
+              {formatFunnelDuration(averageCompletionTime).exact}
             </div>
           </div>
         </div>
