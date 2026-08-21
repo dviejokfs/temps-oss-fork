@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   buildCommandSampleQueries,
   dedupeCommandDestinations,
+  hoistResultFirst,
   resolveExplicitProjectEnvironment,
   resolveExplicitNamedProjectDestination,
   toCommandExtendedQuery,
@@ -19,6 +20,28 @@ const destination = (
   description: title,
   category: 'Test',
   keywords: [],
+})
+
+describe('hoistResultFirst', () => {
+  const row = (key: string) => ({ key })
+
+  test('returns the ranked list untouched when nothing is hoisted', () => {
+    const results = [row('/a'), row('/b')]
+    expect(hoistResultFirst(results, undefined)).toBe(results)
+  })
+
+  test('moves an already ranked row to the top without duplicating it', () => {
+    expect(
+      hoistResultFirst([row('/a'), row('/b'), row('/c')], row('/b'))
+    ).toEqual([row('/b'), row('/a'), row('/c')])
+  })
+
+  test('prepends a row that the ranked list did not contain', () => {
+    expect(hoistResultFirst([row('/a')], row('/z'))).toEqual([
+      row('/z'),
+      row('/a'),
+    ])
+  })
 })
 
 describe('command destination catalog', () => {
