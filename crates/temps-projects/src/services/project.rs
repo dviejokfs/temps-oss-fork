@@ -19,6 +19,7 @@ use serde::Serialize;
 use super::types::{
     CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectRename,
     ProjectSettingsUpdate, ProjectStatistics, UpdateDeploymentSettingsRequest,
+    UpdateProjectSettingsParams,
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::UpdateDeploymentConfigRequest;
@@ -1336,33 +1337,36 @@ impl ProjectService {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn update_project_settings(
         &self,
         project_id: i32,
-        new_name: Option<String>,
-        new_slug: Option<String>,
-        git_provider_connection_id: Option<i32>,
-        main_branch: Option<String>,
-        repo_owner: Option<String>,
-        repo_name: Option<String>,
-        preset: Option<String>,
-        directory: Option<String>,
-        attack_mode: Option<bool>,
-        enable_preview_environments: Option<bool>,
-        preview_envs_on_demand: Option<bool>,
-        preview_envs_idle_timeout_seconds: Option<i32>,
-        preview_envs_wake_timeout_seconds: Option<i32>,
-        preset_config: Option<serde_json::Value>,
-        ai_alert_summaries_enabled: Option<bool>,
-        ai_debug_chat_enabled: Option<bool>,
-        ai_write_actions_enabled: Option<bool>,
-        cross_project_trace_sharing: Option<bool>,
-        error_source_context_enabled: Option<bool>,
-        error_source_root: Option<String>,
-        ai_api_traffic_summary_enabled: Option<bool>,
-        image_retention_hours: Option<Option<i32>>,
+        params: UpdateProjectSettingsParams,
     ) -> Result<ProjectSettingsUpdate, ProjectError> {
+        let UpdateProjectSettingsParams {
+            name: new_name,
+            slug: new_slug,
+            git_provider_connection_id,
+            main_branch,
+            repo_owner,
+            repo_name,
+            preset,
+            directory,
+            attack_mode,
+            enable_preview_environments,
+            preview_envs_on_demand,
+            preview_envs_idle_timeout_seconds,
+            preview_envs_wake_timeout_seconds,
+            preset_config,
+            ai_alert_summaries_enabled,
+            ai_debug_chat_enabled,
+            ai_write_actions_enabled,
+            cross_project_trace_sharing,
+            error_source_context_enabled,
+            error_source_root,
+            ai_api_traffic_summary_enabled,
+            image_retention_hours,
+        } = params;
+
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
         // never out of range.
@@ -1400,6 +1404,16 @@ impl ProjectService {
                 if trimmed.is_empty() || trimmed.chars().count() > 100 {
                     return Err(ProjectError::InvalidInput(
                         "Project name must contain 1-100 characters".to_string(),
+                    ));
+                }
+                // The name becomes OTEL_SERVICE_NAME on the next deployment, and
+                // the Compose env-file renderer rejects control characters. Catch
+                // them here so the operator gets a 400 naming the project name,
+                // rather than a 200 followed by every later deploy failing with
+                // an error about an environment variable they never set.
+                if trimmed.chars().any(char::is_control) {
+                    return Err(ProjectError::InvalidInput(
+                        "Project name cannot contain control characters".to_string(),
                     ));
                 }
                 Some(trimmed)
@@ -1785,27 +1799,11 @@ impl ProjectService {
             let txn = self.db.begin().await?;
 
             // Fold the rename into this same write so a name change submitted
-            // alongside git settings commits atomically with them. Read the
-            // name back under the row lock rather than trusting the copy loaded
-            // before the transaction: that copy predates the lock and a
-            // concurrent rename could have landed in between, which would make
-            // the reported transition fiction.
+            // alongside git settings commits atomically with them. The write
+            // itself rides `active_project` below rather than a separate update.
             let mut rename = None;
             if let Some(ref name_value) = new_name {
-                let locked = projects::Entity::find_by_id(project_id)
-                    .lock_exclusive()
-                    .one(&txn)
-                    .await?
-                    .ok_or(ProjectError::NotFound(format!(
-                        "Project {} not found",
-                        project_id
-                    )))?;
-                if locked.name != *name_value {
-                    rename = Some(ProjectRename {
-                        from: locked.name,
-                        to: name_value.clone(),
-                    });
-                }
+                rename = self.locked_rename(&txn, project_id, name_value).await?;
                 active_project.name = Set(name_value.clone());
             }
 
@@ -1813,7 +1811,17 @@ impl ProjectService {
             let ports_changed = initial_public_ports
                 != compose_public_ports(updated_project.preset_config.as_ref());
             if ports_changed {
-                self.publish_route_reload(&txn, project_id).await?;
+                // Only this transaction rolls back. Earlier steps of this same
+                // request (slug, attack mode, AI toggles, preview envs) were
+                // committed independently and survive, so do not tell the
+                // operator the whole request was discarded.
+                self.publish_route_reload(
+                    &txn,
+                    project_id,
+                    "The preset, directory and name portion of this update was rolled back; \
+                     other settings sent in the same request may already be saved.",
+                )
+                .await?;
             }
             txn.commit().await?;
             if ports_changed {
@@ -1842,6 +1850,13 @@ impl ProjectService {
 
         // Persist the rename last, once every other fallible step has
         // succeeded, so a failed request never leaves a renamed project behind.
+        //
+        // Note the guarantee is one-directional and this endpoint is *not*
+        // all-or-nothing: everything above committed independently, so a failure
+        // in this block still leaves those earlier steps persisted. Ordering the
+        // rename last only ensures it is never the survivor of someone else's
+        // failure. Making the whole endpoint atomic belongs with the parked
+        // optimistic-concurrency work, not here.
         // The locked read, the write, and the read-back of the final state all
         // ride one transaction: committing before the read-back would let a
         // failure there report an error over an already-persisted rename, and
@@ -1850,23 +1865,13 @@ impl ProjectService {
         let mut rename = None;
         let final_project = if let Some(name_value) = new_name {
             let txn = self.db.begin().await?;
-            let current = projects::Entity::find_by_id(project_id)
-                .lock_exclusive()
-                .one(&txn)
-                .await?
-                .ok_or(ProjectError::NotFound(format!(
-                    "Project {} not found",
-                    project_id
-                )))?;
-
-            if current.name != name_value {
-                rename = Some(ProjectRename {
-                    from: current.name.clone(),
-                    to: name_value.clone(),
-                });
-                let mut active_project: projects::ActiveModel = current.into();
+            rename = self.locked_rename(&txn, project_id, &name_value).await?;
+            if rename.is_some() {
+                let mut active_project = projects::ActiveModel {
+                    id: Set(project_id),
+                    ..Default::default()
+                };
                 active_project.name = Set(name_value);
-                active_project.updated_at = Set(chrono::Utc::now());
                 active_project.update(&txn).await?;
             }
 
@@ -2296,7 +2301,9 @@ impl ProjectService {
         let ports_changed =
             previous_public_ports != compose_public_ports(updated_project.preset_config.as_ref());
         if ports_changed {
-            self.publish_route_reload(&txn, project_id).await?;
+            // Every write in this method rides `txn`, so the rollback is total.
+            self.publish_route_reload(&txn, project_id, "No changes were saved.")
+                .await?;
         }
         txn.commit().await?;
         if ports_changed {
@@ -2304,6 +2311,40 @@ impl ProjectService {
         }
 
         Ok(self.map_written_project(updated_project).await)
+    }
+
+    /// Take the row lock and report the rename `new_name` would perform against
+    /// the currently-stored name, or `None` when it matches and no write is
+    /// needed.
+    ///
+    /// Both ends of the transition come from the locked read, so the pair always
+    /// describes one real change. Callers must perform the write on the same
+    /// `conn`: reading here and writing outside this transaction would let a
+    /// concurrent rename land in between and make the reported transition
+    /// fiction.
+    async fn locked_rename<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        project_id: i32,
+        new_name: &str,
+    ) -> Result<Option<ProjectRename>, ProjectError> {
+        let locked = projects::Entity::find_by_id(project_id)
+            .lock_exclusive()
+            .one(conn)
+            .await?
+            .ok_or(ProjectError::NotFound(format!(
+                "Project {} not found",
+                project_id
+            )))?;
+
+        Ok(if locked.name == new_name {
+            None
+        } else {
+            Some(ProjectRename {
+                from: locked.name,
+                to: new_name.to_string(),
+            })
+        })
     }
 
     /// Public Compose ports are read directly from `projects.preset_config`
@@ -2332,6 +2373,7 @@ impl ProjectService {
         &self,
         conn: &C,
         project_id: i32,
+        rolled_back_scope: &str,
     ) -> Result<(), ProjectError> {
         let payload = serde_json::json!({
             "action": "UPDATE",
@@ -2348,6 +2390,7 @@ impl ProjectService {
         .map_err(|database_error| ProjectError::RouteReloadFailed {
             project_id,
             database_reason: database_error.to_string(),
+            rolled_back_scope: rolled_back_scope.to_string(),
         })?;
 
         Ok(())
@@ -2355,9 +2398,14 @@ impl ProjectService {
 
     /// Send the in-process route-reload job. Call only *after* the transaction
     /// carrying the port change has committed, so the subscriber cannot read
-    /// pre-commit state. Best-effort: the NOTIFY published on the transaction
-    /// has already been delivered by this point, so a queue failure degrades
-    /// this process's reload latency rather than losing the signal.
+    /// pre-commit state.
+    ///
+    /// Best-effort. NOTIFY is not durable — it reaches only sessions holding a
+    /// `LISTEN` at commit time — so a queue failure here is not automatically
+    /// harmless. What makes it recoverable is the listener itself: a dropped
+    /// connection surfaces as an error and its reconnect path runs a full route
+    /// reload, so a signal missed while the listener was down is picked up then.
+    /// Do not weaken that reconnect-reload while trusting this comment.
     async fn enqueue_route_reload(&self, project_id: i32) {
         if let Err(e) = self
             .queue_service
@@ -4748,28 +4796,10 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 inserted_project.id,
-                Some("  New Display Name  ".to_string()),
-                None, // slug deliberately untouched
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                UpdateProjectSettingsParams {
+                    name: Some("  New Display Name  ".to_string()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("rename should succeed");
@@ -4794,6 +4824,111 @@ mod tests {
             .expect("project should still exist");
         assert_eq!(reloaded.name, "New Display Name");
         assert_eq!(reloaded.slug, "rename-keeps-slug");
+    }
+
+    /// The rename can also travel inside the git-settings transaction, which is
+    /// a separate implementation from the tail path above: it mutates a
+    /// pre-lock ActiveModel and takes the row lock afterwards. Cover it, and
+    /// assert the accompanying git change commits alongside the rename.
+    #[tokio::test]
+    async fn test_update_project_settings_renames_alongside_git_settings() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Before Git Rename".to_string()),
+            slug: Set("rename-with-git".to_string()),
+            repo_name: Set("git-rename-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("git-rename-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        // `main_branch` makes `needs_git_update` true, routing the rename
+        // through the git-settings transaction rather than the tail path.
+        let updated = project_service
+            .update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    name: Some("  After Git Rename  ".to_string()),
+                    main_branch: Some("develop".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rename alongside git settings should succeed");
+
+        let rename = updated
+            .rename
+            .as_ref()
+            .expect("the git path must report the rename it performed");
+        assert_eq!(rename.from, "Before Git Rename");
+        assert_eq!(rename.to, "After Git Rename");
+        assert_eq!(updated.project.name, "After Git Rename");
+
+        // Both halves of the transaction committed together.
+        let stored = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(stored.name, "After Git Rename");
+        assert_eq!(stored.main_branch, "develop");
+        assert_eq!(stored.slug, "rename-with-git");
+    }
+
+    /// Validation of the accompanying git settings happens before the rename is
+    /// staged, so a request that renames *and* sends an unusable preset leaves
+    /// the name untouched. (Failures after the rename is staged are covered by
+    /// the slug-conflict test, which exercises the rollback itself.)
+    #[tokio::test]
+    async fn test_update_project_settings_rename_not_applied_when_preset_is_invalid() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Keep This Name".to_string()),
+            slug: Set("rename-git-rollback".to_string()),
+            repo_name: Set("git-rollback-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("git-rollback-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        let result = project_service
+            .update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    name: Some("Renamed Before Failure".to_string()),
+                    preset: Some("definitely-not-a-real-preset".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err(), "an unknown preset should fail the request");
+
+        let stored = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(
+            stored.name, "Keep This Name",
+            "a request rejected during validation must not have renamed anything"
+        );
     }
 
     /// Re-submitting the name a project already has performs no write, so the
@@ -4823,28 +4958,10 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 inserted_project.id,
-                Some("  Unchanged Name  ".to_string()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                UpdateProjectSettingsParams {
+                    name: Some("  Unchanged Name  ".to_string()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("no-op rename should succeed");
@@ -4898,28 +5015,11 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 target.id,
-                Some("Renamed Before Failure".to_string()),
-                Some("rename-rollback-taken".to_string()), // conflicts
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                UpdateProjectSettingsParams {
+                    name: Some("Renamed Before Failure".to_string()),
+                    slug: Some("rename-rollback-taken".to_string()),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -4964,28 +5064,10 @@ mod tests {
             let result = project_service
                 .update_project_settings(
                     inserted_project.id,
-                    Some(candidate.clone()),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    UpdateProjectSettingsParams {
+                        name: Some(candidate.clone()),
+                        ..Default::default()
+                    },
                 )
                 .await;
 
@@ -5036,28 +5118,12 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 inserted_project.id,
-                None,
-                Some("new-slug".to_string()),
-                None,
-                Some("develop".to_string()),
-                None,
-                None,
-                Some(Preset::Nixpacks.to_string()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // cross_project_trace_sharing
-                None, // error_source_context_enabled
-                None, // error_source_root
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    slug: Some("new-slug".to_string()),
+                    main_branch: Some("develop".to_string()),
+                    preset: Some(Preset::Nixpacks.to_string()),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -5496,28 +5562,10 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "nixpacksConfig": toml })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "nixpacksConfig": toml })),
+                    ..Default::default()
+                },
             )
             .await
             .expect("partial preset_config patch")
@@ -5571,28 +5619,10 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "excludedServices": ["postgres"] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "excludedServices": ["postgres"] })),
+                    ..Default::default()
+                },
             )
             .await
             .expect("partial excludedServices patch")
@@ -5622,28 +5652,12 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "relaxedCapabilityServices": ["postgres"] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(
+                        serde_json::json!({ "relaxedCapabilityServices": ["postgres"] }),
+                    ),
+                    ..Default::default()
+                },
             )
             .await
             .expect("partial relaxedCapabilityServices patch")
@@ -5677,32 +5691,14 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({
                     "composeServices": [
                         {"name": "hub", "image": "ghcr.io/getpaseo/hub:latest", "looksLikeDatabase": false}
                     ]
                 })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                    ..Default::default()
+                },
             )
             .await
             .expect("explicit composeServices patch, even though it strands relaxedCapabilityServices")
@@ -5736,28 +5732,10 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "excludedServices": [] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "excludedServices": [] })),
+                    ..Default::default()
+                },
             )
             .await
             .expect("unrelated excludedServices patch")
@@ -5812,28 +5790,12 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "relaxedCapabilityServices": ["gitea"] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(
+                        serde_json::json!({ "relaxedCapabilityServices": ["gitea"] }),
+                    ),
+                    ..Default::default()
+                },
             )
             .await
             .expect("relaxedCapabilityServices patch for a real non-database service")
@@ -5883,28 +5845,12 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "relaxedCapabilityServices": ["does-not-exist"] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(
+                        serde_json::json!({ "relaxedCapabilityServices": ["does-not-exist"] }),
+                    ),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -5944,28 +5890,10 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "providers": [] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "providers": [] })),
+                    ..Default::default()
+                },
             )
             .await
             .expect("explicit empty providers")
@@ -6047,28 +5975,10 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "providers": ["not-real"] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "providers": ["not-real"] })),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -6148,28 +6058,10 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -6269,30 +6161,12 @@ mod tests {
         project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({
-                    "dockerfilePath": "Dockerfile.updated"
-                })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({
+                        "dockerfilePath": "Dockerfile.updated"
+                    })),
+                    ..Default::default()
+                },
             )
             .await
             .expect("update custom Dockerfile config");
@@ -6508,28 +6382,11 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("nixpacks-node".to_string()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "nixpacksConfig": toml })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset: Some("nixpacks-node".to_string()),
+                    preset_config: Some(serde_json::json!({ "nixpacksConfig": toml })),
+                    ..Default::default()
+                },
             )
             .await
             .expect("update preset and config together")
@@ -6842,28 +6699,11 @@ mod tests {
         project_service
             .update_project_settings(
                 inserted_project.id,
-                None,
-                None,
-                None,
-                Some("main".to_string()),
-                None,
-                None,
-                None,
-                Some(String::new()), // directory: blank field from the settings form
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // cross_project_trace_sharing
-                None, // error_source_context_enabled
-                None, // error_source_root
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    main_branch: Some("main".to_string()),
+                    directory: Some(String::new()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("update_project_settings should succeed");
@@ -6915,28 +6755,10 @@ mod tests {
         let update_with_hours = |hours: i32| {
             project_service.update_project_settings(
                 inserted_project.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,              // cross_project_trace_sharing
-                None,              // error_source_context_enabled
-                None,              // error_source_root
-                None,              // ai_api_traffic_summary_enabled
-                Some(Some(hours)), // image_retention_hours
+                UpdateProjectSettingsParams {
+                    image_retention_hours: Some(Some(hours)),
+                    ..Default::default()
+                },
             )
         };
 

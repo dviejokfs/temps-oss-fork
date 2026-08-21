@@ -238,8 +238,11 @@ export async function updateSettingsAction(
   }
 
   success('Project settings updated successfully')
-  keyValue('Name', name ?? project.name)
-  keyValue('Slug', slug ?? project.slug)
+  // Report what the server persisted, not what was submitted: it trims the name
+  // and slugifies the slug, so echoing the request can show a value that was
+  // never stored.
+  keyValue('Name', updated?.name ?? name ?? project.name)
+  keyValue('Slug', updated?.slug ?? slug ?? project.slug)
   keyValue('Attack Mode', attackMode ? colors.success('Enabled') : colors.muted('Disabled'))
   keyValue('Preview Environments', previewEnvs ? colors.success('Enabled') : colors.muted('Disabled'))
 

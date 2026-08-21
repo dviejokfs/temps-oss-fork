@@ -767,6 +767,35 @@ pub struct UpdateProjectSettingsRequest {
     pub cross_project_trace_sharing: Option<bool>,
 }
 
+impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjectSettingsParams {
+    fn from(request: UpdateProjectSettingsRequest) -> Self {
+        Self {
+            name: request.name,
+            slug: request.slug,
+            git_provider_connection_id: request.git_provider_connection_id,
+            main_branch: request.main_branch,
+            repo_owner: request.repo_owner,
+            repo_name: request.repo_name,
+            preset: request.preset,
+            directory: request.directory,
+            attack_mode: request.attack_mode,
+            enable_preview_environments: request.enable_preview_environments,
+            preview_envs_on_demand: request.preview_envs_on_demand,
+            preview_envs_idle_timeout_seconds: request.preview_envs_idle_timeout_seconds,
+            preview_envs_wake_timeout_seconds: request.preview_envs_wake_timeout_seconds,
+            preset_config: request.preset_config,
+            ai_alert_summaries_enabled: request.ai_alert_summaries_enabled,
+            ai_debug_chat_enabled: request.ai_debug_chat_enabled,
+            ai_write_actions_enabled: request.ai_write_actions_enabled,
+            cross_project_trace_sharing: request.cross_project_trace_sharing,
+            error_source_context_enabled: request.error_source_context_enabled,
+            error_source_root: request.error_source_root,
+            ai_api_traffic_summary_enabled: request.ai_api_traffic_summary_enabled,
+            image_retention_hours: request.image_retention_hours,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateEnvironmentVariableRequest {
     pub key: String,

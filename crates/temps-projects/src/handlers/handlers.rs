@@ -1178,31 +1178,7 @@ pub async fn update_project_settings(
 
     let update = state
         .project_service
-        .update_project_settings(
-            project_id,
-            settings.name.clone(),
-            settings.slug.clone(),
-            settings.git_provider_connection_id,
-            settings.main_branch.clone(),
-            settings.repo_owner.clone(),
-            settings.repo_name.clone(),
-            settings.preset.clone(),
-            settings.directory.clone(),
-            settings.attack_mode,
-            settings.enable_preview_environments,
-            settings.preview_envs_on_demand,
-            settings.preview_envs_idle_timeout_seconds,
-            settings.preview_envs_wake_timeout_seconds,
-            settings.preset_config.clone(),
-            settings.ai_alert_summaries_enabled,
-            settings.ai_debug_chat_enabled,
-            settings.ai_write_actions_enabled,
-            settings.cross_project_trace_sharing,
-            settings.error_source_context_enabled,
-            settings.error_source_root.clone(),
-            settings.ai_api_traffic_summary_enabled,
-            settings.image_retention_hours,
-        )
+        .update_project_settings(project_id, settings.clone().into())
         .await
         .map_err(Problem::from)?;
 

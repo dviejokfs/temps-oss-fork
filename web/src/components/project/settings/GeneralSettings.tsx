@@ -55,7 +55,15 @@ const projectSchema = z.object({
     .trim()
     .min(1, 'Project name is required')
     .max(100, 'Project name must be 100 characters or fewer'),
-  slug: z.string().min(1, 'Project slug is required'),
+  slug: z
+    .string()
+    .trim()
+    .min(1, 'Project slug is required')
+    .max(63, 'Project slug must be 63 characters or fewer')
+    .regex(
+      /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
+      'Use lowercase letters, numbers and single hyphens (no leading or trailing hyphen)'
+    ),
 })
 
 type ProjectFormValues = z.infer<typeof projectSchema>
@@ -100,23 +108,32 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const handleSaveProject = async (values: ProjectFormValues) => {
     if (!project?.id) return
 
-    await toast.promise(
-      updateProjectSettings.mutateAsync({
-        path: { project_id: project.id! },
-        body: {
-          name: values.name,
-          slug: values.slug,
-        },
-      }),
-      {
-        loading: 'Updating project...',
-        success: 'Project updated successfully',
-        error: 'Failed to update project',
-      }
-    )
+    const request = updateProjectSettings.mutateAsync({
+      path: { project_id: project.id! },
+      body: {
+        name: values.name,
+        slug: values.slug,
+      },
+    })
+    toast.promise(request, {
+      loading: 'Updating project...',
+      success: 'Project updated successfully',
+      error: 'Failed to update project',
+    })
+    // The toast surfaces the failure; bail out here so a rejected save never
+    // falls through to refetch/navigate, and never escapes as an unhandled
+    // rejection.
+    let updated
+    try {
+      updated = await request
+    } catch {
+      return
+    }
     refetch()
-    // The slug is the URL identifier, so only it determines where we land.
-    navigate(`/projects/${values.slug}/settings/general`)
+    // Navigate to the slug the server persisted, not the one submitted: the
+    // server normalizes it, so routing on the raw input can land on a URL that
+    // does not exist.
+    navigate(`/projects/${updated?.slug ?? values.slug}/settings/general`)
   }
 
   const handleToggleCrossProjectTraceSharing = async (enabled: boolean) => {
