@@ -1026,7 +1026,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             .client
             .clone()
             .with_setting("max_execution_time", "15")
-            .with_setting("max_rows_to_group_by", "100000")
+            .with_setting("max_rows_to_group_by", CH_MAX_ROWS_TO_GROUP_BY.to_string())
             .with_setting("group_by_overflow_mode", "throw")
             .with_setting("max_bytes_before_external_group_by", "67108864")
             // Four concurrent endpoint queries therefore reserve at most
@@ -1035,10 +1035,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         let rows = apply_binds(query_client.query(&sql), binds)
             .fetch_all::<ChTrafficAggregationRow>()
             .await
-            .map_err(|error| ProxyLogServiceError::ClickHouse {
-                operation: "aggregate_traffic".to_string(),
-                reason: error.to_string(),
-            })?;
+            .map_err(|error| classify_traffic_query_error(&request, error))?;
         let empty_page_total = if rows.is_empty() {
             Some(
                 apply_binds(query_client.query(&count_sql), count_binds)
@@ -2182,6 +2179,44 @@ fn build_traffic_query(
         )
     };
     Ok((sql, binds, count_sql))
+}
+
+/// Group-count ceiling applied to every traffic aggregation. Kept next to the
+/// classifier so the number reported to the caller cannot drift from the number
+/// actually enforced in [`ClickHouseProxyLogStorage::aggregate_traffic`].
+const CH_MAX_ROWS_TO_GROUP_BY: u64 = 100_000;
+
+/// Turn a ClickHouse failure into the most specific error we can justify.
+///
+/// A `GROUP BY` overflow is the caller asking for too much, not the server
+/// breaking — the difference decides whether the user gets a 400 naming the
+/// dimensions to drop or a 500 saying "Storage error". ClickHouse signals it as
+/// `TOO_MANY_ROWS` (code 158) under `group_by_overflow_mode = throw`; match on
+/// the code and the name, since the client stringifies these differently across
+/// versions.
+fn classify_traffic_query_error(
+    request: &TrafficAggregationRequest,
+    error: clickhouse::error::Error,
+) -> ProxyLogServiceError {
+    let reason = error.to_string();
+    let overflowed = reason.contains("TOO_MANY_ROWS")
+        || reason.contains("Code: 158")
+        || reason.contains("max_rows_to_group_by");
+    if overflowed && !request.dimensions.is_empty() {
+        return ProxyLogServiceError::TrafficAggregationTooManyGroups {
+            dimensions: request
+                .dimensions
+                .iter()
+                .map(|dimension| dimension.api_name())
+                .collect::<Vec<_>>()
+                .join(" + "),
+            max_groups: CH_MAX_ROWS_TO_GROUP_BY,
+        };
+    }
+    ProxyLogServiceError::ClickHouse {
+        operation: "aggregate_traffic".to_string(),
+        reason,
+    }
 }
 
 fn ch_count(value: Option<u64>, metric: &str) -> Result<Option<i64>, ProxyLogServiceError> {
