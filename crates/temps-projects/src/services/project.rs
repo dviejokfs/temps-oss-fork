@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use sea_orm::{
-    prelude::Uuid, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, Statement,
-    TransactionTrait,
+    prelude::Uuid, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
+    Statement, TransactionTrait,
 };
 use temps_core::{
     ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
@@ -89,6 +89,40 @@ fn would_desync_git_url(
     let url_pair = format!("{}/{}", tail[1], tail[0]);
 
     (url_pair.eq_ignore_ascii_case(&old_pair)).then_some((url_pair, new_pair))
+}
+
+/// Normalize and validate a project display name.
+///
+/// The name is not just a label: it becomes `OTEL_SERVICE_NAME` on the next
+/// deployment, and the Compose env-file renderer rejects control characters —
+/// so a name accepted here but refused there turns one bad save into every
+/// later deploy failing with an error naming a variable the operator never set.
+/// Format characters (bidi overrides, zero-width spaces) are rejected too:
+/// names are not unique and are rendered next to each other in the dashboard,
+/// alerts, and audit records, where an override can make one project display as
+/// another.
+///
+/// Shared by every path that writes `projects.name` so the three cannot drift.
+fn validate_project_name(raw: &str) -> Result<String, ProjectError> {
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() || trimmed.chars().count() > 100 {
+        return Err(ProjectError::InvalidInput(
+            "Project name must contain 1-100 characters".to_string(),
+        ));
+    }
+    if trimmed.chars().any(|c| {
+        c.is_control()
+            || matches!(c,
+                '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}')
+    }) {
+        return Err(ProjectError::InvalidInput(
+            "Project name cannot contain control or text-direction characters".to_string(),
+        ));
+    }
+    Ok(trimmed)
 }
 
 fn slugify(name: &str) -> String {
@@ -587,7 +621,8 @@ impl ProjectService {
 
         let normalized_directory = normalize_project_directory(&request.directory)?;
 
-        let project_slug = self.generate_unique_project_slug(&request.name).await?;
+        let validated_name = validate_project_name(&request.name)?;
+        let project_slug = self.generate_unique_project_slug(&validated_name).await?;
         let resolved = resolve_preset_selection(
             request.preset.as_str(),
             request.preset_config.as_ref(),
@@ -620,7 +655,7 @@ impl ProjectService {
         }
 
         let project = projects::ActiveModel {
-            name: Set(request.name),
+            name: Set(validated_name),
             repo_name: Set(request.repo_name.unwrap_or_default()),
             repo_owner: Set(request.repo_owner.unwrap_or_default()),
             directory: Set(normalized_directory),
@@ -1134,7 +1169,7 @@ impl ProjectService {
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
-        active_project.name = Set(request.name);
+        active_project.name = Set(validate_project_name(&request.name)?);
         active_project.repo_name = Set(request.repo_name.unwrap_or_else(|| "unknown".to_string()));
         active_project.repo_owner =
             Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string()));
@@ -1399,25 +1434,7 @@ impl ProjectService {
         // only at the end (see below) — a rename must not survive a request that
         // goes on to fail on a conflicting slug or a git desync.
         let new_name = match new_name {
-            Some(raw) => {
-                let trimmed = raw.trim().to_string();
-                if trimmed.is_empty() || trimmed.chars().count() > 100 {
-                    return Err(ProjectError::InvalidInput(
-                        "Project name must contain 1-100 characters".to_string(),
-                    ));
-                }
-                // The name becomes OTEL_SERVICE_NAME on the next deployment, and
-                // the Compose env-file renderer rejects control characters. Catch
-                // them here so the operator gets a 400 naming the project name,
-                // rather than a 200 followed by every later deploy failing with
-                // an error about an environment variable they never set.
-                if trimmed.chars().any(char::is_control) {
-                    return Err(ProjectError::InvalidInput(
-                        "Project name cannot contain control characters".to_string(),
-                    ));
-                }
-                Some(trimmed)
-            }
+            Some(raw) => Some(validate_project_name(&raw)?),
             None => None,
         };
 
@@ -1818,8 +1835,10 @@ impl ProjectService {
                 self.publish_route_reload(
                     &txn,
                     project_id,
-                    "The preset, directory and name portion of this update was rolled back; \
-                     other settings sent in the same request may already be saved.",
+                    "The git settings, preset, directory and name portion of this update was \
+                     rolled back; other settings sent in the same request (slug, attack mode, \
+                     AI toggles, preview environments) commit independently and may already be \
+                     saved.",
                 )
                 .await?;
             }
@@ -2301,9 +2320,16 @@ impl ProjectService {
         let ports_changed =
             previous_public_ports != compose_public_ports(updated_project.preset_config.as_ref());
         if ports_changed {
-            // Every write in this method rides `txn`, so the rollback is total.
-            self.publish_route_reload(&txn, project_id, "No changes were saved.")
-                .await?;
+            // Every *database* write in this method rides `txn`. The provider-side
+            // webhook install/removal above does not, and nothing here undoes
+            // it — so do not claim a total rollback.
+            self.publish_route_reload(
+                &txn,
+                project_id,
+                "No database changes were saved, but any git-provider webhook this request \
+                 installed or removed has already been applied at the provider.",
+            )
+            .await?;
         }
         txn.commit().await?;
         if ports_changed {
@@ -2322,15 +2348,18 @@ impl ProjectService {
     /// `conn`: reading here and writing outside this transaction would let a
     /// concurrent rename land in between and make the reported transition
     /// fiction.
-    async fn locked_rename<C: ConnectionTrait>(
+    /// Takes a transaction rather than a generic connection on purpose: passing
+    /// an autocommit handle would compile and silently discard the `FOR UPDATE`
+    /// guarantee this whole design rests on, so the type makes that unrepresentable.
+    async fn locked_rename(
         &self,
-        conn: &C,
+        txn: &DatabaseTransaction,
         project_id: i32,
         new_name: &str,
     ) -> Result<Option<ProjectRename>, ProjectError> {
         let locked = projects::Entity::find_by_id(project_id)
             .lock_exclusive()
-            .one(conn)
+            .one(txn)
             .await?
             .ok_or(ProjectError::NotFound(format!(
                 "Project {} not found",
@@ -2387,10 +2416,18 @@ impl ProjectService {
             [payload.into()],
         ))
         .await
-        .map_err(|database_error| ProjectError::RouteReloadFailed {
-            project_id,
-            database_reason: database_error.to_string(),
-            rolled_back_scope: rolled_back_scope.to_string(),
+        .map_err(|database_error| {
+            // The driver text can name the connection target or a constraint, so
+            // it stays in the operator's logs rather than the HTTP response.
+            error!(
+                project_id,
+                error = %database_error,
+                "Failed to publish project route-reload NOTIFY"
+            );
+            ProjectError::RouteReloadFailed {
+                project_id,
+                rolled_back_scope: rolled_back_scope.to_string(),
+            }
         })?;
 
         Ok(())
@@ -4775,6 +4812,12 @@ mod tests {
     /// every domain already pointing at it.
     #[tokio::test]
     async fn test_update_project_settings_renames_without_touching_slug() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.db.clone();
         let mock_queue = Arc::new(MockJobQueue::new());
@@ -4832,6 +4875,12 @@ mod tests {
     /// assert the accompanying git change commits alongside the rename.
     #[tokio::test]
     async fn test_update_project_settings_renames_alongside_git_settings() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.db.clone();
         let mock_queue = Arc::new(MockJobQueue::new());
@@ -4889,6 +4938,12 @@ mod tests {
     /// the slug-conflict test, which exercises the rollback itself.)
     #[tokio::test]
     async fn test_update_project_settings_rename_not_applied_when_preset_is_invalid() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.db.clone();
         let mock_queue = Arc::new(MockJobQueue::new());
@@ -4918,7 +4973,10 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_err(), "an unknown preset should fail the request");
+        assert!(
+            matches!(result, Err(ProjectError::InvalidInput(_))),
+            "an unknown preset should fail validation, not something unrelated"
+        );
 
         let stored = projects::Entity::find_by_id(inserted_project.id)
             .one(db.as_ref())
@@ -4936,6 +4994,12 @@ mod tests {
     /// that never happened.
     #[tokio::test]
     async fn test_update_project_settings_reports_no_rename_for_a_no_op() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.db.clone();
         let mock_queue = Arc::new(MockJobQueue::new());
@@ -4979,6 +5043,12 @@ mod tests {
     /// operator has no way to diagnose.
     #[tokio::test]
     async fn test_update_project_settings_rename_does_not_persist_when_slug_conflicts() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.db.clone();
         let mock_queue = Arc::new(MockJobQueue::new());
@@ -5042,6 +5112,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_project_settings_rejects_blank_and_overlong_names() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.db.clone();
         let mock_queue = Arc::new(MockJobQueue::new());

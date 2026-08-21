@@ -349,13 +349,11 @@ pub enum ProjectError {
     /// steps in the same request may already be persisted. Claiming "nothing was
     /// saved" there would be false.
     #[error(
-        "Project {project_id}'s proxy routes could not be signalled for reload (database \
-         notification: {database_reason}). {rolled_back_scope} Retry once the database is \
-         reachable."
+        "Project {project_id}'s proxy routes could not be signalled for reload. \
+         {rolled_back_scope} Retry once the database is reachable."
     )]
     RouteReloadFailed {
         project_id: i32,
-        database_reason: String,
         rolled_back_scope: String,
     },
 
