@@ -96,6 +96,37 @@ pub fn dns_with_fallback(primary: Vec<String>) -> Vec<String> {
     merge_dns_with_fallback(primary, &host_default_dns_servers())
 }
 
+fn build_redaction_values(request: &BuildRequest) -> Vec<String> {
+    let mut values = request
+        .build_args
+        .values()
+        .chain(request.build_args_buildkit.values())
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    values
+}
+
+fn redact_build_diagnostic(diagnostic: &str, values: &[String]) -> String {
+    values
+        .iter()
+        .fold(diagnostic.to_string(), |sanitized, value| {
+            sanitized.replace(value, "<redacted>")
+        })
+}
+
+fn build_network_mode(use_buildkit: bool, application_network: &str) -> String {
+    if use_buildkit {
+        // BuildKit's default sandbox permits normal outbound dependency
+        // fetches without exposing the host network namespace.
+        "default".to_string()
+    } else {
+        application_network.to_string()
+    }
+}
+
 pub struct DockerRuntime {
     docker: Arc<Docker>,
     use_buildkit: bool,
@@ -1055,6 +1086,213 @@ impl DockerRuntime {
         Ok(Full::new(Bytes::from(tar_data)))
     }
 
+    /// Runs a BuildKit build by talking to the Docker daemon directly,
+    /// bypassing Bollard's `Docker::build_image`.
+    ///
+    /// Bollard is compiled with `buildkit_providerless` in this workspace
+    /// (forced on transitively by `testcontainers`' own `bollard` dependency,
+    /// which requires it unconditionally -- Cargo unifies features across
+    /// the one shared `bollard` instance, so our own feature list can't opt
+    /// out). With that feature active, `build_image` requires a
+    /// client-supplied `session` id whenever `version` is
+    /// `BuilderBuildKit`, and sets up a real BuildKit gRPC session for it --
+    /// but that session only serves Auth/FileSend(Packet), never the
+    /// filesync service BuildKit uses to pull the build context. With a
+    /// session present, BuildKit waits on that (missing) context filesync
+    /// call forever instead of reading the uploaded tar, hanging every
+    /// build at "load remote build context". Talking to the daemon directly
+    /// with no `session` avoids the broken path entirely.
+    ///
+    /// This shells out to `curl` rather than issuing the request with
+    /// `hyper`/`hyper-util` directly. A hand-rolled `hyper::client::conn`
+    /// connection (both a manually-driven one and a pooled
+    /// `hyper_util::client::legacy::Client`) was tried first and reliably
+    /// works for small requests, but hangs forever after the daemon's first
+    /// response line specifically when the request has BOTH a large body
+    /// (a real build context, typically hundreds of KB+) AND a long query
+    /// string (real builds always have one -- `buildargs` carries every
+    /// build-time secret/env var as URL-encoded JSON, often 1-2KB alone).
+    /// Neither condition alone reproduces it, and reducing the body's
+    /// chunk size didn't change the outcome, which rules out a simple
+    /// buffer-boundary explanation. `curl` (libcurl, a different HTTP
+    /// implementation) was verified via dozens of direct reproductions to
+    /// never hit this, including with the exact request `hyper` hangs on,
+    /// so it's used here instead of continuing to chase what is most
+    /// likely a `hyper`/`tokio` unix-socket write-path issue with no
+    /// upstream fix available.
+    ///
+    /// Supports the two `DOCKER_HOST` schemes this codebase actually uses:
+    /// `unix://` (the default local daemon) and `tcp://`/`http://` (the
+    /// cross-architecture `docker:dind` case documented elsewhere in this
+    /// file). `RemoteNodeDeployer`'s mTLS transport is a separate
+    /// `ImageBuilder` implementation and doesn't go through this method.
+    async fn build_image_buildkit_stream(
+        &self,
+        options: &bollard::query_parameters::BuildImageOptions,
+        tar_bytes: bytes::Bytes,
+    ) -> Result<
+        std::pin::Pin<
+            Box<dyn Stream<Item = Result<bollard::models::BuildInfo, BuilderError>> + Send>,
+        >,
+        BuilderError,
+    > {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        use tokio::process::Command;
+
+        let host = std::env::var("DOCKER_HOST")
+            .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
+        let api_version = self.docker.client_version();
+        let query = serde_urlencoded::to_string(options).map_err(|e| {
+            BuilderError::Other(format!("Failed to encode BuildKit request query: {e}"))
+        })?;
+        let path = format!(
+            "/v{}.{}/build?{}",
+            api_version.major_version, api_version.minor_version, query
+        );
+
+        // Write the tar to a temp file and hand curl the path (`@<path>`)
+        // rather than piping it over stdin (`@-`). A piped-stdin version of
+        // this (write the body via a `tokio::process::Child`'s stdin handle,
+        // concurrently with reading stdout) reliably hung with the child
+        // alive but idle at 0% CPU and zero daemon-side build-cache
+        // activity -- true both for a `tokio::spawn`-detached writer task
+        // and for one polled in the same `select!` as the stdout read, so
+        // it wasn't a scheduling issue either time. The same request shape
+        // run by hand in a shell (`cat file | curl ... --data-binary @-`)
+        // does NOT reproduce it, which points at something specific to how
+        // `tokio::process` manages a piped child stdin here rather than at
+        // curl or the request itself. Since curl reading its own file
+        // never exhibited any of this, that's what's used.
+        let tmp_file = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
+        let tmp_path = tmp_file.path().to_path_buf();
+        tokio::fs::write(&tmp_path, &tar_bytes)
+            .await
+            .map_err(BuilderError::IoError)?;
+
+        let mut cmd = Command::new("curl");
+        cmd.arg("--silent").arg("--show-error");
+        if let Some(socket_path) = host.strip_prefix("unix://") {
+            cmd.arg("--unix-socket")
+                .arg(socket_path)
+                .arg(format!("http://localhost{path}"));
+        } else if let Some(rest) = host
+            .strip_prefix("tcp://")
+            .or_else(|| host.strip_prefix("http://"))
+        {
+            cmd.arg(format!("http://{rest}{path}"));
+        } else {
+            return Err(BuilderError::Other(format!(
+                "BuildKit builds require a unix:// or tcp://\\http:// DOCKER_HOST (got '{host}')"
+            )));
+        }
+        cmd.arg("-X")
+            .arg("POST")
+            .arg("-H")
+            .arg("Content-Type: application/x-tar")
+            .arg("--data-binary")
+            .arg(format!("@{}", tmp_path.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            BuilderError::Other(format!("Failed to spawn curl for BuildKit request: {e}"))
+        })?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| BuilderError::Other("curl child has no stdout pipe".to_string()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| BuilderError::Other("curl child has no stderr pipe".to_string()))?;
+
+        let stream = async_stream::stream! {
+            // Keep the temp file alive for curl's whole run; it's removed
+            // when this drops at the end of the stream.
+            let _tmp_file = tmp_file;
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<bollard::models::BuildInfo>(line) {
+                            Ok(info) => yield Ok(info),
+                            Err(e) => yield Err(BuilderError::Other(format!(
+                                "Failed to parse BuildKit response line: {e} (line: {line})"
+                            ))),
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        yield Err(BuilderError::Other(format!("Failed to read curl stdout: {e}")));
+                        break;
+                    }
+                }
+            }
+
+            let mut stderr_output = String::new();
+            let _ = stderr.read_to_string(&mut stderr_output).await;
+            match child.wait().await {
+                Ok(status) if !status.success() => {
+                    yield Err(BuilderError::Other(format!(
+                        "curl exited with {status} sending BuildKit request: {}",
+                        stderr_output.trim()
+                    )));
+                }
+                Err(e) => {
+                    yield Err(BuilderError::Other(format!("Failed to wait for curl: {e}")));
+                }
+                Ok(_) => {}
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+
+    /// Picks the build transport: the direct BuildKit request when
+    /// `use_buildkit` is set (see `build_image_buildkit_stream`), otherwise
+    /// Bollard's own `build_image` for the classic (non-BuildKit) builder,
+    /// which has no session requirement and works as-is.
+    async fn build_stream_for(
+        &self,
+        build_options: bollard::query_parameters::BuildImageOptions,
+        tar_body: http_body_util::Full<bytes::Bytes>,
+    ) -> Result<
+        std::pin::Pin<
+            Box<dyn Stream<Item = Result<bollard::models::BuildInfo, BuilderError>> + Send + '_>,
+        >,
+        BuilderError,
+    > {
+        use http_body_util::BodyExt;
+
+        if self.use_buildkit {
+            let tar_bytes = tar_body
+                .collect()
+                .await
+                .map_err(|e| BuilderError::Other(format!("Failed to read build context: {e}")))?
+                .to_bytes();
+            self.build_image_buildkit_stream(&build_options, tar_bytes)
+                .await
+        } else {
+            let stream = self
+                .docker
+                .build_image(
+                    build_options,
+                    None,
+                    Some(http_body_util::Either::Left(tar_body)),
+                )
+                .map(|r| r.map_err(|e| BuilderError::Other(e.to_string())));
+            Ok(Box::pin(stream))
+        }
+    }
+
     fn get_resource_limits() -> (usize, u64) {
         let cpu_num = num_cpus::get();
         let mut sys = System::new_all();
@@ -1229,6 +1467,7 @@ impl ImageBuilder for DockerRuntime {
         };
 
         let start_time = Instant::now();
+        let redact_values = build_redaction_values(&request);
 
         self.ensure_network_exists()
             .await
@@ -1275,13 +1514,9 @@ impl ImageBuilder for DockerRuntime {
             t: Some(request.image_name.clone()),
             buildargs: build_args,
             labels: Some(labels),
-            networkmode: if self.use_buildkit {
-                // BuildKit only supports "default", "host", or "none"
-                Some("host".to_string())
-            } else {
-                // Legacy builder supports custom networks
-                Some(self.network_name.clone())
-            },
+            // Never give an untrusted Dockerfile the host network namespace:
+            // that would expose loopback-only services and cloud metadata.
+            networkmode: Some(build_network_mode(self.use_buildkit, &self.network_name)),
             platform: request
                 .platform
                 .clone()
@@ -1294,12 +1529,12 @@ impl ImageBuilder for DockerRuntime {
             } else {
                 BuilderVersion::BuilderV1
             },
-            session: if self.use_buildkit {
-                // Generate unique session ID for BuildKit to avoid conflicts
-                Some(uuid::Uuid::new_v4().to_string())
-            } else {
-                None
-            },
+            // No `session` field: Bollard's `build_image` only uploads a flat
+            // tar body over HTTP, it never opens a BuildKit gRPC session. A
+            // client-supplied session ID tells the daemon a live session is
+            // available for context filesync, so BuildKit waits on it instead
+            // of reading the uploaded tar -- and since nothing ever answers,
+            // the build hangs forever at "load remote build context".
             ..Default::default()
         };
 
@@ -1311,17 +1546,14 @@ impl ImageBuilder for DockerRuntime {
             .await
             .map_err(BuilderError::IoError)?;
 
-        let mut build_stream = self.docker.build_image(
-            build_options,
-            None,
-            Some(http_body_util::Either::Left(tar_body)),
-        );
+        let mut build_stream = self.build_stream_for(build_options, tar_body).await?;
 
         // Stream build output and write to log
         while let Some(build_info) = build_stream.next().await {
             match build_info {
                 Ok(info) => {
                     if let Some(stream) = info.stream {
+                        let stream = redact_build_diagnostic(&stream, &redact_values);
                         let _ = log_file.write_all(stream.as_bytes()).await;
                         debug!("Build: {}", stream.trim());
                     }
@@ -1329,6 +1561,7 @@ impl ImageBuilder for DockerRuntime {
                         let error = error_detail
                             .message
                             .unwrap_or_else(|| "Unknown build error".to_string());
+                        let error = redact_build_diagnostic(&error, &redact_values);
                         error!("Build error: {}", error);
                         let _ = log_file
                             .write_all(format!("ERROR: {}\n", error).as_bytes())
@@ -1337,7 +1570,8 @@ impl ImageBuilder for DockerRuntime {
                     }
                 }
                 Err(e) => {
-                    let error_msg = format!("Build failed: {}", e);
+                    let error_msg =
+                        redact_build_diagnostic(&format!("Build failed: {}", e), &redact_values);
                     error!("{}", error_msg);
                     let _ = log_file
                         .write_all(format!("ERROR: {}\n", error_msg).as_bytes())
@@ -1423,6 +1657,7 @@ impl ImageBuilder for DockerRuntime {
         };
 
         let start_time = Instant::now();
+        let redact_values = build_redaction_values(&request);
 
         self.ensure_network_exists()
             .await
@@ -1460,13 +1695,7 @@ impl ImageBuilder for DockerRuntime {
             t: Some(request.image_name.clone()),
             buildargs: Some(build_args),
             labels: Some(labels),
-            networkmode: if self.use_buildkit {
-                // BuildKit only supports "default", "host", or "none"
-                Some("default".to_string())
-            } else {
-                // Legacy builder supports custom networks
-                Some(self.network_name.clone())
-            },
+            networkmode: Some(build_network_mode(self.use_buildkit, &self.network_name)),
             platform: request
                 .platform
                 .clone()
@@ -1479,12 +1708,12 @@ impl ImageBuilder for DockerRuntime {
             } else {
                 BuilderVersion::BuilderV1
             },
-            session: if self.use_buildkit {
-                // Generate unique session ID for BuildKit to avoid conflicts
-                Some(uuid::Uuid::new_v4().to_string())
-            } else {
-                None
-            },
+            // No `session` field: Bollard's `build_image` only uploads a flat
+            // tar body over HTTP, it never opens a BuildKit gRPC session. A
+            // client-supplied session ID tells the daemon a live session is
+            // available for context filesync, so BuildKit waits on it instead
+            // of reading the uploaded tar -- and since nothing ever answers,
+            // the build hangs forever at "load remote build context".
             ..Default::default()
         };
 
@@ -1497,17 +1726,14 @@ impl ImageBuilder for DockerRuntime {
             .map_err(BuilderError::IoError)?;
 
         // Execute build using Bollard
-        let mut build_stream = self.docker.build_image(
-            build_options,
-            None,
-            Some(http_body_util::Either::Left(tar_body)),
-        );
+        let mut build_stream = self.build_stream_for(build_options, tar_body).await?;
 
         // Stream build output and write to log and callback
         while let Some(build_info) = build_stream.next().await {
             match build_info {
                 Ok(info) => {
                     if let Some(stream) = info.stream {
+                        let stream = redact_build_diagnostic(&stream, &redact_values);
                         // Write to file
                         let _ = log_file.write_all(stream.as_bytes()).await;
                         debug!("Build: {}", stream.trim());
@@ -1521,6 +1747,7 @@ impl ImageBuilder for DockerRuntime {
                         let error = error_detail
                             .message
                             .unwrap_or_else(|| "Unknown build error".to_string());
+                        let error = redact_build_diagnostic(&error, &redact_values);
                         error!("Build error: {}", error);
                         let error_line = format!("ERROR: {}\n", error);
                         let _ = log_file.write_all(error_line.as_bytes()).await;
@@ -1556,7 +1783,10 @@ impl ImageBuilder for DockerRuntime {
                             } else {
                                 "ERROR"
                             };
-                            let line = format!("[{}] {}\n", status, vertex.name);
+                            let line = redact_build_diagnostic(
+                                &format!("[{}] {}\n", status, vertex.name),
+                                &redact_values,
+                            );
                             let _ = log_file.write_all(line.as_bytes()).await;
                             debug!("BuildKit vertex: {}", line.trim());
 
@@ -1567,17 +1797,22 @@ impl ImageBuilder for DockerRuntime {
 
                         // Emit actual command output from build steps
                         for log in res.logs {
-                            let _ = log_file.write_all(&log.msg[..]).await;
-                            debug!("BuildKit: {}", String::from_utf8_lossy(&log.msg));
+                            let output = redact_build_diagnostic(
+                                &String::from_utf8_lossy(&log.msg),
+                                &redact_values,
+                            );
+                            let _ = log_file.write_all(output.as_bytes()).await;
+                            debug!("BuildKit: {}", output);
 
                             if let Some(ref callback) = log_callback {
-                                callback(String::from_utf8_lossy(&log.msg[..]).to_string()).await;
+                                callback(output).await;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    let error_msg = format!("Build failed: {}", e);
+                    let error_msg =
+                        redact_build_diagnostic(&format!("Build failed: {}", e), &redact_values);
                     error!("{}", error_msg);
                     let error_line = format!("ERROR: {}\n", error_msg);
                     let _ = log_file.write_all(error_line.as_bytes()).await;
@@ -2960,6 +3195,37 @@ mod docker_tests {
         let docker = Docker::connect_with_local_defaults()
             .expect("bollard client construction (no connection made)");
         DockerRuntime::new(Arc::new(docker), false, "test-network".to_string())
+    }
+
+    #[test]
+    fn buildkit_builds_use_sandboxed_default_network() {
+        assert_eq!(build_network_mode(true, "temps-app"), "default");
+        assert_ne!(build_network_mode(true, "temps-app"), "host");
+        assert_eq!(build_network_mode(false, "temps-app"), "temps-app");
+    }
+
+    #[test]
+    fn build_diagnostics_redact_all_build_argument_values() {
+        let request = BuildRequest {
+            image_name: "example:test".to_string(),
+            context_path: PathBuf::from("/tmp/context"),
+            dockerfile_path: None,
+            build_args: HashMap::from([("TOKEN".to_string(), "secret-value".to_string())]),
+            build_args_buildkit: HashMap::from([(
+                "PRIVATE_KEY".to_string(),
+                "longer-secret-value".to_string(),
+            )]),
+            platform: None,
+            log_path: PathBuf::from("/tmp/build.log"),
+        };
+        let values = build_redaction_values(&request);
+
+        let diagnostic = redact_build_diagnostic(
+            "command echoed secret-value and longer-secret-value",
+            &values,
+        );
+
+        assert_eq!(diagnostic, "command echoed <redacted> and <redacted>");
     }
 
     #[test]
@@ -4586,5 +4852,121 @@ CMD ["cat", "/hello.txt"]
             }),
         );
         assert!(rt.build_resource_override.is_none());
+    }
+
+    /// Regression test for the BuildKit session hang: a `BuildImageOptions`
+    /// built the way `build_stream_for` builds it must never carry a
+    /// `session` id, since Bollard's `buildkit_providerless` feature (forced
+    /// on transitively by `testcontainers`) makes a present session hang
+    /// every build forever waiting on a filesync service it never
+    /// implements. Pure/fast -- no Docker daemon needed.
+    #[test]
+    fn buildkit_options_never_set_session() {
+        let options = bollard::query_parameters::BuildImageOptions {
+            dockerfile: "Dockerfile".to_string(),
+            t: Some("regression-test:latest".to_string()),
+            networkmode: Some("default".to_string()),
+            version: BuilderVersion::BuilderBuildKit,
+            ..Default::default()
+        };
+        let query = serde_urlencoded::to_string(&options).unwrap();
+        assert!(
+            !query.contains("session"),
+            "BuildImageOptions must never set `session` for BuildKit builds -- \
+             a session forces the daemon to wait on a filesync service Bollard \
+             never implements, hanging every build forever (query: {query})"
+        );
+    }
+
+    /// End-to-end proof that the raw BuildKit request path actually builds
+    /// an image, including the BuildKit-only features this codebase's
+    /// generated Dockerfiles rely on (`# syntax=` directive,
+    /// `--mount=type=cache`) that the classic (non-BuildKit) builder
+    /// rejects outright. Skips gracefully when Docker is unavailable.
+    #[tokio::test]
+    async fn build_image_buildkit_stream_builds_a_real_image() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let rt = DockerRuntime::new(Arc::new(docker), true, "temps-app".to_string());
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Dockerfile"),
+            "# syntax=docker/dockerfile:1.4\n\
+             FROM alpine:latest\n\
+             RUN --mount=type=cache,target=/var/cache/apk true\n\
+             RUN echo hello > /hello.txt\n",
+        )
+        .await
+        .unwrap();
+
+        let tar_body = rt
+            .create_tar_context_body(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let tar_bytes = {
+            use http_body_util::BodyExt;
+            tar_body.collect().await.unwrap().to_bytes()
+        };
+
+        let image_tag = format!(
+            "temps-buildkit-regression-test-{}:latest",
+            uuid::Uuid::new_v4()
+        );
+        let options = bollard::query_parameters::BuildImageOptions {
+            dockerfile: "Dockerfile".to_string(),
+            t: Some(image_tag.clone()),
+            networkmode: Some("default".to_string()),
+            version: BuilderVersion::BuilderBuildKit,
+            ..Default::default()
+        };
+
+        let mut stream = timeout(
+            Duration::from_secs(30),
+            rt.build_image_buildkit_stream(&options, tar_bytes),
+        )
+        .await
+        .expect("build_image_buildkit_stream must not hang establishing the request")
+        .expect("build_image_buildkit_stream request failed");
+
+        let mut saw_image_id = false;
+        loop {
+            let next = timeout(Duration::from_secs(60), stream.next())
+                .await
+                .expect("BuildKit stream must not hang mid-build");
+            match next {
+                Some(Ok(info)) => {
+                    assert!(
+                        info.error_detail.is_none(),
+                        "build failed: {:?}",
+                        info.error_detail
+                    );
+                    if let Some(bollard::models::BuildInfoAux::BuildKit(_)) = info.aux {
+                        saw_image_id = true;
+                    }
+                }
+                Some(Err(e)) => panic!("BuildKit stream item error: {e}"),
+                None => break,
+            }
+        }
+        assert!(saw_image_id, "expected at least one BuildKit vertex/result");
+
+        let _ = rt
+            .docker
+            .remove_image(
+                &image_tag,
+                None::<bollard::query_parameters::RemoveImageOptions>,
+                None,
+            )
+            .await;
     }
 }
