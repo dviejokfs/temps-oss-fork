@@ -38,9 +38,9 @@ use tracing::{error, info, warn};
 
 use crate::commands::upgrade::{
     check_write_permission, current_version_tag, download_asset, download_asset_text,
-    extract_binary_from_tarball, fetch_latest_release_in_channel, fetch_specific_release,
-    is_newer_version, platform_target, replace_binary, verify_checksum, GitHubRelease,
-    UpgradeChannel,
+    extract_binary_from_tarball, extract_libs_from_tarball, fetch_latest_release_in_channel,
+    fetch_specific_release, install_libs, is_newer_version, platform_target, replace_binary,
+    rollback_libs, verify_checksum, GitHubRelease, UpgradeChannel,
 };
 
 /// Grace period between accepting the update and exiting the process. Long
@@ -901,7 +901,21 @@ impl UpdateJob {
         verify_checksum(&tarball, &expected)?;
 
         let new_binary = extract_binary_from_tarball(&tarball)?;
-        preflight_binary(&self.binary_path, &new_binary)?;
+        let new_libs = extract_libs_from_tarball(&tarball)?;
+
+        // Install any bundled shared libraries (no-op for OSS -- empty)
+        // BEFORE preflighting: the probe binary preflight_binary execs
+        // lives in the same directory as the real one and resolves its
+        // dependencies via the same lib/ dir, so it needs them in place
+        // first, not after. If preflight then fails, roll the libraries
+        // back too, so a still-running old binary that also depends on a
+        // bundled lib/ dir (a prior library-bundling release) is never
+        // left pointed at an untested library set.
+        let libs_had_backup = install_libs(&self.binary_path, &new_libs)?;
+        if let Err(e) = preflight_binary(&self.binary_path, &new_binary) {
+            rollback_libs(&self.binary_path, libs_had_backup);
+            return Err(e);
+        }
 
         self.set_phase(SelfUpdatePhase::Installing, None);
         // Keep the outgoing binary next to the new one so a release that boots

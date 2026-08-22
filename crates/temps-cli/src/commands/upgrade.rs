@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::env::consts::{ARCH, OS};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -374,6 +374,12 @@ impl UpgradeCommand {
         // Extract the binary from the tarball
         println!("  Extracting binary...");
         let new_binary = extract_binary_from_tarball(&tarball_bytes)?;
+        let new_libs = extract_libs_from_tarball(&tarball_bytes)?;
+
+        // Install any bundled shared libraries before swapping the binary
+        // in, so there is never a window where the new binary is in place
+        // but its dependencies (if any -- empty/no-op for OSS) are not.
+        install_libs(&binary_path, &new_libs)?;
 
         // Replace the binary atomically
         println!("  Replacing binary at {}...", binary_path.display());
@@ -515,6 +521,15 @@ impl UpgradeCommand {
 
         println!("  Extracting binary...");
         let new_binary = extract_binary_from_tarball(&tarball)?;
+        let new_libs = extract_libs_from_tarball(&tarball)?;
+
+        if !new_libs.is_empty() {
+            println!(
+                "  Installing {} bundled shared library file(s)...",
+                new_libs.len()
+            );
+        }
+        install_libs(&binary_path, &new_libs)?;
 
         println!("  Replacing binary at {}...", binary_path.display());
         replace_binary(&binary_path, &new_binary)?;
@@ -1153,6 +1168,130 @@ pub(crate) fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Resul
     ))
 }
 
+/// Extract any bundled shared libraries from a `lib/` directory in the
+/// downloaded tarball, keyed by bare filename (e.g. `libxml2.so.2`).
+///
+/// OSS releases never have a `lib/` entry -- this returns an empty `Vec`
+/// for them, which makes `install_libs`/`rollback_libs` below complete
+/// no-ops downstream. A build that links against a shared library the
+/// host doesn't ship (e.g. libxmlsec1/libxml2 via FFI) bundles it here
+/// instead of requiring the operator to install OS packages.
+pub(crate) fn extract_libs_from_tarball(
+    tarball_bytes: &[u8],
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let decoder = GzDecoder::new(tarball_bytes);
+    let mut archive = tar::Archive::new(decoder);
+    let mut libs = Vec::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let in_lib_dir = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n == "lib")
+            .unwrap_or(false);
+        if !in_lib_dir {
+            continue;
+        }
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf)?;
+        libs.push((name, buf));
+    }
+
+    Ok(libs)
+}
+
+/// Install bundled libraries (if any) into a `lib/` directory next to the
+/// binary. A complete no-op when `libs` is empty (every OSS install).
+///
+/// Backs up any pre-existing `lib/` dir to `lib.bak` first (mirroring
+/// `backup_current_binary`'s pattern) so a caller whose preflight check
+/// then fails can call `rollback_libs` to restore it -- otherwise a failed
+/// upgrade between two library-bundling releases could leave the
+/// still-running old binary pointed at the new (untested) library set, if
+/// it also resolves its dependencies via this same `lib/` directory.
+/// Returns whether a backup was made.
+pub(crate) fn install_libs(binary_path: &Path, libs: &[(String, Vec<u8>)]) -> anyhow::Result<bool> {
+    if libs.is_empty() {
+        return Ok(false);
+    }
+    let parent = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine the binary's directory"))?;
+    let lib_dir = parent.join("lib");
+    let backup_dir = parent.join("lib.bak");
+
+    let mut backed_up = false;
+    if lib_dir.exists() {
+        let _ = fs::remove_dir_all(&backup_dir);
+        match copy_dir_all(&lib_dir, &backup_dir) {
+            Ok(()) => backed_up = true,
+            Err(e) => tracing::warn!(
+                "Could not back up {} before installing new libraries: {}",
+                lib_dir.display(),
+                e
+            ),
+        }
+    }
+
+    fs::create_dir_all(&lib_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", lib_dir.display(), e))?;
+    for (name, bytes) in libs {
+        let dest = lib_dir.join(name);
+        fs::write(&dest, bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", dest.display(), e))?;
+    }
+    Ok(backed_up)
+}
+
+/// Undo `install_libs` after its caller's preflight check on the new
+/// binary failed. `had_backup` is exactly what `install_libs` returned.
+pub(crate) fn rollback_libs(binary_path: &Path, had_backup: bool) {
+    let Some(parent) = binary_path.parent() else {
+        return;
+    };
+    let lib_dir = parent.join("lib");
+    let backup_dir = parent.join("lib.bak");
+
+    if had_backup {
+        let _ = fs::remove_dir_all(&lib_dir);
+        if let Err(e) = copy_dir_all(&backup_dir, &lib_dir) {
+            tracing::warn!(
+                "Could not restore {} from {}: {}",
+                lib_dir.display(),
+                backup_dir.display(),
+                e
+            );
+        }
+    } else {
+        // No prior lib/ dir existed -- this was a first-time install that
+        // failed preflight, so remove what was just written rather than
+        // leaving an empty or mismatched directory behind.
+        let _ = fs::remove_dir_all(&lib_dir);
+    }
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let dest_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &dest_path)?;
+        } else {
+            fs::copy(entry.path(), &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Check we have write permission to the binary path.
 pub(crate) fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()> {
     // Check the parent directory is writable (for atomic rename)
@@ -1724,6 +1863,159 @@ mod tests {
         let result = extract_binary_from_tarball(&tarball);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    /// Builds a gzipped tarball with a `temps` binary entry and, optionally,
+    /// `lib/<name>` entries -- mirrors the real release layout closely enough
+    /// for `extract_binary_from_tarball`/`extract_libs_from_tarball` to be
+    /// exercised the same way they'd see a real download.
+    fn build_test_tarball(binary_content: &[u8], libs: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+
+            let mut header = tar::Header::new_gnu();
+            header.set_size(binary_content.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "temps", binary_content)
+                .unwrap();
+
+            for (name, content) in libs {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, format!("lib/{name}"), *content)
+                    .unwrap();
+            }
+
+            builder.finish().unwrap();
+        }
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn test_extract_libs_from_tarball_empty_for_oss_shaped_tarball() {
+        // No lib/ entries at all -- the shape every existing OSS release has.
+        let tarball = build_test_tarball(b"fake-binary", &[]);
+        let libs = extract_libs_from_tarball(&tarball).unwrap();
+        assert!(
+            libs.is_empty(),
+            "a tarball with no lib/ entries must yield no libs"
+        );
+    }
+
+    #[test]
+    fn test_extract_libs_from_tarball_finds_bundled_libs() {
+        let tarball = build_test_tarball(
+            b"fake-binary",
+            &[
+                ("libxml2.so.2", b"xml2-bytes" as &[u8]),
+                ("libxmlsec1.so.1", b"xmlsec1-bytes"),
+            ],
+        );
+        let mut libs = extract_libs_from_tarball(&tarball).unwrap();
+        libs.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            libs,
+            vec![
+                ("libxml2.so.2".to_string(), b"xml2-bytes".to_vec()),
+                ("libxmlsec1.so.1".to_string(), b"xmlsec1-bytes".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_install_libs_is_noop_for_empty_libs() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary_path = dir.path().join("temps");
+        std::fs::write(&binary_path, b"binary").unwrap();
+
+        let had_backup = install_libs(&binary_path, &[]).unwrap();
+
+        assert!(!had_backup);
+        assert!(
+            !dir.path().join("lib").exists(),
+            "install_libs must not create a lib/ dir when there is nothing to install \
+             -- this is the OSS-compatibility guarantee"
+        );
+    }
+
+    #[test]
+    fn test_install_libs_writes_files_next_to_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary_path = dir.path().join("temps");
+        std::fs::write(&binary_path, b"binary").unwrap();
+
+        let libs = vec![("libxml2.so.2".to_string(), b"xml2-bytes".to_vec())];
+        let had_backup = install_libs(&binary_path, &libs).unwrap();
+
+        assert!(
+            !had_backup,
+            "no prior lib/ dir existed, so nothing to back up"
+        );
+        let installed = dir.path().join("lib").join("libxml2.so.2");
+        assert_eq!(std::fs::read(&installed).unwrap(), b"xml2-bytes");
+    }
+
+    #[test]
+    fn test_install_libs_then_rollback_restores_previous_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary_path = dir.path().join("temps");
+        std::fs::write(&binary_path, b"binary").unwrap();
+
+        // Simulate a prior install that already has a lib/ dir.
+        let old_libs = vec![("libxml2.so.2".to_string(), b"old-version".to_vec())];
+        install_libs(&binary_path, &old_libs).unwrap();
+
+        // A new install replaces it with a different version...
+        let new_libs = vec![("libxml2.so.2".to_string(), b"new-version".to_vec())];
+        let had_backup = install_libs(&binary_path, &new_libs).unwrap();
+        assert!(
+            had_backup,
+            "a prior lib/ dir existed and must have been backed up"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("lib").join("libxml2.so.2")).unwrap(),
+            b"new-version"
+        );
+
+        // ...but preflight on the new binary fails, so the caller rolls back.
+        rollback_libs(&binary_path, had_backup);
+
+        assert_eq!(
+            std::fs::read(dir.path().join("lib").join("libxml2.so.2")).unwrap(),
+            b"old-version",
+            "rollback must restore the pre-upgrade library contents"
+        );
+    }
+
+    #[test]
+    fn test_rollback_libs_without_backup_removes_first_time_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary_path = dir.path().join("temps");
+        std::fs::write(&binary_path, b"binary").unwrap();
+
+        // First-ever install of bundled libs (no prior lib/ dir) whose
+        // preflight then fails.
+        let libs = vec![("libxml2.so.2".to_string(), b"new-version".to_vec())];
+        let had_backup = install_libs(&binary_path, &libs).unwrap();
+        assert!(!had_backup);
+        assert!(dir.path().join("lib").exists());
+
+        rollback_libs(&binary_path, had_backup);
+
+        assert!(
+            !dir.path().join("lib").exists(),
+            "rollback of a first-time install (no backup) must remove the lib/ dir \
+             entirely, not leave an empty or partially-written one behind"
+        );
     }
 
     /// Helper to parse version tag from a TEMPS_VERSION-like string,
