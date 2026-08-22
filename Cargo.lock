@@ -10861,6 +10861,7 @@ dependencies = [
  "temps-kv",
  "temps-log-aggregator",
  "temps-logs",
+ "temps-mcp-server",
  "temps-metrics",
  "temps-migrations",
  "temps-monitoring",
@@ -12008,6 +12009,28 @@ dependencies = [
  "tokio",
  "tracing",
  "utoipa",
+]
+
+[[package]]
+name = "temps-mcp-server"
+version = "0.1.0-beta.56"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "temps-auth",
+ "temps-config",
+ "temps-core",
+ "temps-deployments",
+ "temps-projects",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]

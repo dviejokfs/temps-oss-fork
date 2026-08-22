@@ -91,6 +91,7 @@ members = [
     "crates/temps-observability",
     "crates/temps-metrics",
     "crates/temps-ai-api-tools",
+    "crates/temps-mcp-server",
     "examples/example-plugin",
     "examples/lighthouse-plugin",
     "examples/indexnow-plugin",
