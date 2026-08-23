@@ -81,9 +81,10 @@ The wizard will:
 2. Ask which tool groups to enable (default: all).
 3. Ask whether to enable write tools (default: **no** -- read-only). Write tools
    still require human confirmation per call even when enabled (see below).
-4. Offer to create a dedicated, scoped API key for MCP access (recommended over
-   reusing an admin key) -- `role_type: 'reader'` when write mode is off, `'user'`
-   when it's on (the `user` role carries `DeploymentsWrite`; `reader` does not).
+4. Offer to create a dedicated, scoped API key for MCP access, recommended over
+   reusing a broader existing credential. The new key's role is `role_type:
+   'reader'` when write mode is off, `'user'` when it's on (the `user` role
+   carries `DeploymentsWrite`; `reader` does not).
 5. Write the client's config file (or, for Claude Code/Codex, shell out to their
    own `claude mcp add` / `codex mcp add` so their config format is never
    hand-maintained here).
