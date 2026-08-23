@@ -1,14 +1,51 @@
 import type { Command } from 'commander'
-import { createApiKey } from '../../api/sdk.gen.js'
-import { getApiUrl, requireAuth } from '../../config/store.js'
-import { client, getErrorMessage, setupClient } from '../../lib/api-client.js'
+import { createApiKey, getSettings, updateSettings } from '../../api/sdk.gen.js'
+import type { AppSettings } from '../../api/types.gen.js'
+import { loginWithDevice } from '../auth/login.js'
+import { credentials, getApiUrl, requireAuth } from '../../config/store.js'
+import { client, getErrorMessage, getWebUrl, setupClient } from '../../lib/api-client.js'
 import { header, icons, info, keyValue, newline, success, warning } from '../../ui/output.js'
-import { promptCheckbox, promptConfirm, promptSelect } from '../../ui/prompts.js'
+import { promptCheckbox, promptConfirm, promptSelect, promptText } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { CLIENT_ADAPTERS, getClientAdapter, listClientIds } from './clients/index.js'
 import { buildMcpUrl, isValidGroupKey, TOOL_GROUPS } from './groups.js'
 import { probeMcpEndpoint } from './probe.js'
+
+/**
+ * Auth gate for the mcp command family. Unlike the plain `requireAuth()` used
+ * by every other command (which just errors out with "run `temps login`"),
+ * this offers to run the device-flow login right here -- the mcp wizard is
+ * commonly someone's first CLI interaction on a machine, so making them stop,
+ * remember the separate `login` command, and re-run `mcp add` is unnecessary
+ * friction. Skipped entirely in `--yes` (non-interactive) mode, where the
+ * caller must already have a valid context or pass `--api-key`.
+ */
+async function ensureMcpAuth(opts: { yes?: boolean } = {}): Promise<string> {
+  if (await credentials.isAuthenticated()) {
+    return requireAuth()
+  }
+  if (opts.yes) {
+    return requireAuth() // prints "Not authenticated..." and exits, same as before
+  }
+
+  warning('Not logged in to the Temps CLI yet.')
+  const wantsLogin = await promptConfirm({
+    message: 'Log in now?',
+    default: true,
+  })
+  if (!wantsLogin) {
+    return requireAuth() // reuses the standard "run `temps login`" exit
+  }
+
+  const url = await promptText({
+    message: 'Temps server URL (leave blank to use the default)',
+    default: getApiUrl(),
+  })
+
+  await loginWithDevice({ url: url || undefined })
+  return requireAuth()
+}
 
 interface AddOptions {
   groups?: string
@@ -21,6 +58,16 @@ export function registerMcpCommands(program: Command): void {
   const mcp = program
     .command('mcp')
     .description('Configure this Temps instance as an MCP server for AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Zed)')
+
+  mcp
+    .command('enable')
+    .description('Enable the Temps MCP server on this instance (admin, one-time per instance)')
+    .action(enableAction)
+
+  mcp
+    .command('disable')
+    .description('Disable the Temps MCP server on this instance (admin)')
+    .action(disableAction)
 
   mcp
     .command('add [client]')
@@ -38,12 +85,43 @@ export function registerMcpCommands(program: Command): void {
 
   mcp
     .command('status')
-    .description('Show which AI clients have the Temps MCP server configured')
+    .description('Show whether this instance has MCP enabled and which AI clients are configured')
     .action(statusAction)
 }
 
+async function setMcpServerEnabled(enabled: boolean): Promise<void> {
+  await ensureMcpAuth()
+  await setupClient()
+
+  await withSpinner(enabled ? 'Enabling the Temps MCP server...' : 'Disabling the Temps MCP server...', async () => {
+    // PUT /settings replaces every field not present in the body with its
+    // Rust default, so this must send the full current settings with only
+    // mcp_server changed -- same rule as apps/temps-cli/src/commands/settings/index.ts.
+    const { data: currentSettings, error: getError } = await getSettings({ client })
+    if (getError) throw new Error(getErrorMessage(getError))
+
+    const { error } = await updateSettings({
+      client,
+      body: { ...currentSettings, mcp_server: { enabled } } as AppSettings,
+    })
+    if (error) throw new Error(getErrorMessage(error))
+  })
+}
+
+async function enableAction(): Promise<void> {
+  await setMcpServerEnabled(true)
+  success('MCP server enabled.')
+  info('Run `bunx @temps-sdk/cli mcp add <client>` to connect an AI client (Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Zed).')
+}
+
+async function disableAction(): Promise<void> {
+  await setMcpServerEnabled(false)
+  success('MCP server disabled.')
+  info('AI clients configured with `mcp add` will stop working until this is enabled again.')
+}
+
 async function addAction(clientArg: string | undefined, options: AddOptions): Promise<void> {
-  await requireAuth()
+  await ensureMcpAuth({ yes: options.yes })
   await setupClient()
 
   const clientId =
@@ -59,12 +137,15 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
     return
   }
 
-  const apiUrl = getApiUrl()
+  // MCP endpoints (/mcp, /mcp/tools) are mounted at the server root, not under
+  // /api like the REST API -- getApiUrl() (used by the generated client) would
+  // build a URL that always 404s here. getWebUrl() strips the /api suffix.
+  const mcpBaseUrl = getWebUrl()
 
-  const probe = await withSpinner('Checking for Temps MCP support...', () => probeMcpEndpoint(apiUrl))
+  const probe = await withSpinner('Checking for Temps MCP support...', () => probeMcpEndpoint(mcpBaseUrl))
   if (!probe.supported) {
     warning(`This Temps instance does not expose an MCP endpoint (${probe.reason}).`)
-    info('MCP support ships behind a feature flag -- ask an admin to enable it, or upgrade this instance.')
+    info('Run `bunx @temps-sdk/cli mcp enable` as an admin to turn it on (or this instance may predate MCP support).')
     return
   }
 
@@ -140,7 +221,7 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
     }
   }
 
-  const url = buildMcpUrl(apiUrl, groups, write)
+  const url = buildMcpUrl(mcpBaseUrl, groups, write)
 
   newline()
   header(`Configure ${adapter.label}`)
@@ -206,7 +287,15 @@ interface StatusRow {
 }
 
 async function statusAction(): Promise<void> {
-  header('Temps MCP client status')
+  const mcpBaseUrl = getWebUrl()
+  const probe = await withSpinner('Checking this instance...', () => probeMcpEndpoint(mcpBaseUrl))
+
+  header('Temps MCP status')
+  newline()
+  keyValue('This instance', probe.supported ? `${icons.success} enabled (${mcpBaseUrl})` : `${icons.bullet} disabled (${mcpBaseUrl})`)
+  if (!probe.supported) {
+    info('Run `bunx @temps-sdk/cli mcp enable` as an admin to turn it on.')
+  }
   newline()
 
   const rows: StatusRow[] = await Promise.all(

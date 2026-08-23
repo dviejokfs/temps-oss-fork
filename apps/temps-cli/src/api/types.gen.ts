@@ -1428,6 +1428,11 @@ export type AppSettings = {
     internal_url?: string | null;
     letsencrypt?: LetsEncryptSettings;
     /**
+     * MCP server settings (ADR-039). Off by default — enable via the Settings
+     * UI to expose the MCP endpoint to the Temps CLI wizard.
+     */
+    mcp_server?: McpServerSettings;
+    /**
      * Metrics observability settings. Controls the MetricsStore backend,
      * scrape interval, and tiered retention windows.
      */
@@ -1552,6 +1557,11 @@ export type AppSettingsResponse = {
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
+    /**
+     * MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
+     * content — passed through as-is so the settings UI can show and edit it.
+     */
+    mcp_server: McpServerSettings;
     /**
      * Number of enabled, running services the MetricsScraper currently
      * includes. Used for the lightweight storage estimate in the UI.
@@ -4043,7 +4053,8 @@ export type CreateIpAccessControlRequest = {
      */
     action: string;
     /**
-     * IP address in CIDR notation (e.g., "192.168.1.1" or "10.0.0.0/24")
+     * IPv4 or IPv6 address, in CIDR notation for ranges (e.g., "192.168.1.1",
+     * "10.0.0.0/24", "2001:db8::1", or "2001:db8::/32")
      */
     ip_address: string;
     /**
@@ -10413,6 +10424,26 @@ export type McpDefinitionResponse = {
     project_id?: number | null;
     slug: string;
     updated_at: string;
+};
+
+/**
+ * MCP server settings (ADR-039).
+ *
+ * The MCP endpoint lets AI tools (e.g. the Temps CLI wizard) interact with
+ * this Temps instance through the Model Context Protocol.  Disabled by
+ * default so new installs do not expose the endpoint until the operator
+ * explicitly opts in.
+ *
+ * `bool` defaults to `false` in Rust and JSON (`#[serde(default)]`), so the
+ * safe-off behaviour is automatic for new installs and legacy settings rows.
+ */
+export type McpServerSettings = {
+    /**
+     * Master switch. When `false` (default), `GET /mcp/tools` returns `404`
+     * and all other MCP endpoints return `404` too.  Set to `true` via the
+     * Settings UI to activate the MCP server.
+     */
+    enabled?: boolean;
 };
 
 export type MessageContent = string | Array<ContentPart>;
