@@ -217,6 +217,11 @@ export type AddEnvironmentDomainRequest = {
 };
 
 export type AddEventsRequest = {
+    /**
+     * Client-generated id, stable across retries of the same batch. When
+     * present the append is idempotent; omitted, delivery is at-least-once.
+     */
+    batchId?: string | null;
     events: string;
 };
 
@@ -4038,7 +4043,8 @@ export type CreateIpAccessControlRequest = {
      */
     action: string;
     /**
-     * IP address in CIDR notation (e.g., "192.168.1.1" or "10.0.0.0/24")
+     * IPv4 or IPv6 address, in CIDR notation for ranges (e.g., "192.168.1.1",
+     * "10.0.0.0/24", "2001:db8::1", or "2001:db8::/32")
      */
     ip_address: string;
     /**
@@ -6345,6 +6351,14 @@ export type DropPresetCandidate = {
     composePath?: string | null;
     confidence: string;
     directory: string;
+    /**
+     * Repository-root-relative path to the Dockerfile, when it does not
+     * live directly under `{directory}/Dockerfile` (e.g. `docker/Dockerfile`
+     * rolled up to a `directory` of `"."`). `None` for a Dockerfile located
+     * directly at `{directory}/Dockerfile` and for every non-Dockerfile
+     * preset.
+     */
+    dockerfilePath?: string | null;
     isStatic: boolean;
     label: string;
     preset: string;
@@ -12887,6 +12901,13 @@ export type PresetInfo = {
      */
     compose_files?: Array<string> | null;
     /**
+     * Repository-root-relative path to the Dockerfile, when it does not
+     * live directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`
+     * rolled up to a `path` of `"./"`). `None` for a Dockerfile located
+     * directly at `{path}/Dockerfile` and for every non-Dockerfile preset.
+     */
+    dockerfile_path?: string | null;
+    /**
      * Default exposed port for this preset
      */
     exposed_port?: number | null;
@@ -13244,6 +13265,13 @@ export type ProjectPresetResponse = {
      * Compose file paths found in the repository (only for docker-compose preset)
      */
     composeFiles?: Array<string> | null;
+    /**
+     * Repository-root-relative path to the Dockerfile, when it does not
+     * live directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`
+     * rolled up to a `path` of `"./"`). `None` for a Dockerfile located
+     * directly at `{path}/Dockerfile` and for every non-Dockerfile preset.
+     */
+    dockerfilePath?: string | null;
     /**
      * Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
      */
@@ -16726,6 +16754,11 @@ export type SessionLogsResponse = {
 };
 
 export type SessionReplayEventsRequest = {
+    /**
+     * Client-generated id, stable across retries of the same batch. When
+     * present the append is idempotent; omitted, delivery is at-least-once.
+     */
+    batchId?: string | null;
     events: string;
     sessionId: string;
 };

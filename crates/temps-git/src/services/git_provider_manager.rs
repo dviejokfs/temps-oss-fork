@@ -37,6 +37,12 @@ pub struct ProjectPresetDomain {
     /// Compose file paths found in the repository (only for docker-compose preset)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_files: Option<Vec<String>>,
+    /// Repository-root-relative path to the Dockerfile, when it does not
+    /// live directly under `{path}/Dockerfile`. See
+    /// [`temps_presets::DetectedPreset::dockerfile_path`] for the full
+    /// explanation.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dockerfile_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3457,6 +3463,7 @@ impl GitProviderManager {
                 icon_url: p.icon_url.clone(),
                 project_type: p.project_type.clone(),
                 compose_files: p.compose_files.clone(),
+                dockerfile_path: p.dockerfile_path.clone(),
             })
             .collect();
 
@@ -3739,6 +3746,7 @@ impl GitProviderManager {
                     icon_url,
                     project_type,
                     compose_files: preset.compose_files,
+                    dockerfile_path: preset.dockerfile_path,
                 }
             })
             .collect()

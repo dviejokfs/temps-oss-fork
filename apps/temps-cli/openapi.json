@@ -8286,7 +8286,7 @@
             "type": "string"
           },
           "ip_address": {
-            "description": "IP address in CIDR notation (e.g., \"192.168.1.1\" or \"10.0.0.0/24\")",
+            "description": "IPv4 or IPv6 address, in CIDR notation for ranges (e.g., \"192.168.1.1\",\n\"10.0.0.0/24\", \"2001:db8::1\", or \"2001:db8::/32\")",
             "example": "192.168.1.100",
             "type": "string"
           },
@@ -13159,6 +13159,13 @@
           },
           "directory": {
             "type": "string"
+          },
+          "dockerfilePath": {
+            "description": "Repository-root-relative path to the Dockerfile, when it does not\nlive directly under `{directory}/Dockerfile` (e.g. `docker/Dockerfile`\nrolled up to a `directory` of `\".\"`). `None` for a Dockerfile located\ndirectly at `{directory}/Dockerfile` and for every non-Dockerfile\npreset.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "isStatic": {
             "type": "boolean"
@@ -28167,6 +28174,13 @@
               "null"
             ]
           },
+          "dockerfile_path": {
+            "description": "Repository-root-relative path to the Dockerfile, when it does not\nlive directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`\nrolled up to a `path` of `\"./\"`). `None` for a Dockerfile located\ndirectly at `{path}/Dockerfile` and for every non-Dockerfile preset.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "exposed_port": {
             "description": "Default exposed port for this preset",
             "format": "int32",
@@ -28768,6 +28782,13 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "dockerfilePath": {
+            "description": "Repository-root-relative path to the Dockerfile, when it does not\nlive directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`\nrolled up to a `path` of `\"./\"`). `None` for a Dockerfile located\ndirectly at `{path}/Dockerfile` and for every non-Dockerfile preset.",
+            "type": [
+              "string",
               "null"
             ]
           },

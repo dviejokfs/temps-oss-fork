@@ -442,6 +442,7 @@ export function GitImportClone({
         projectType: p.project_type,
         path: p.path,
         composeFiles: (p as any).compose_files as string[] | undefined,
+        dockerfilePath: p.dockerfile_path,
       }))
     : authenticatedPresetData?.presets
 
