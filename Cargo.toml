@@ -284,19 +284,7 @@ octocrab = "0.54.1"
 # ============================================================================
 # Container Management (Docker)
 # ============================================================================
-# `buildkit_providerless` is forced on transitively (testcontainers' own
-# bollard dependency requires it unconditionally, and Cargo unifies features
-# across the one shared `bollard` instance) even though we don't want it: it
-# makes `build_image` require a client-supplied `session` id and spin up a
-# real BuildKit gRPC session that only serves Auth/FileSend(Packet) -- it
-# never implements the filesync service BuildKit needs to pull the build
-# context, so with a session present BuildKit waits on that (missing) call
-# forever instead of reading the uploaded tar, hanging every build at "load
-# remote build context". temps-deployer talks to the daemon directly (via
-# `curl`, not this workspace's `hyper`/`hyper-util`) and never sets
-# `session` -- see `DockerRuntime::build_image_buildkit_stream`.
 bollard = { version = "0.20.1", features = ["buildkit", "buildkit_providerless", "chrono", "json_data_content"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 
 # ============================================================================
 # Scheduling & Background Jobs

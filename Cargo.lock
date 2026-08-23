@@ -10994,7 +10994,6 @@ name = "temps-deployer"
 version = "0.1.0-beta.56"
 dependencies = [
  "anyhow",
- "async-stream",
  "async-trait",
  "bollard",
  "bytes",
@@ -11011,7 +11010,6 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "serde_urlencoded",
  "serde_yaml",
  "serial_test",
  "sysinfo",
@@ -11029,7 +11027,6 @@ dependencies = [
  "urlencoding",
  "utoipa",
  "uuid",
- "zstd",
 ]
 
 [[package]]
