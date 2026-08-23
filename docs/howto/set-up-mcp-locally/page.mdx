@@ -41,39 +41,29 @@ MCP is off by default on every instance, so a fresh install never exposes it unc
 
 <CodeGroup title="Enable MCP">
 
-```bash {{ title: 'curl' }}
-API=http://localhost:8080
-
-# 1. Fetch current settings (requires an authenticated admin session or API key)
-curl -s -b cookies.txt "$API/api/settings" -o /tmp/settings.json
-
-# 2. Flip the one field
-python3 -c "
-import json
-d = json.load(open('/tmp/settings.json'))
-d['mcp_server']['enabled'] = True
-json.dump(d, open('/tmp/settings.json', 'w'))
-"
-
-# 3. Write the whole object back
-curl -s -b cookies.txt -X PUT "$API/api/settings" \
-  -H "Content-Type: application/json" \
-  --data-binary @/tmp/settings.json
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli mcp enable
 ```
 
 </CodeGroup>
 
 <Note>
-  `PUT /api/settings` takes the full settings object, not a partial patch — always
-  fetch it, change the one field you care about, and write the whole thing back.
-  Masked secrets (like a configured DNS provider key) round-trip safely; the
-  server restores them from the database rather than accepting the masked
-  placeholder value.
+  Under the hood this fetches the full settings object, flips `mcp_server.enabled`,
+  and writes the whole thing back — `PUT /api/settings` takes the full object, not
+  a partial patch. Masked secrets (like a configured DNS provider key) round-trip
+  safely; the server restores them from the database rather than accepting the
+  masked placeholder value. Run `bunx @temps-sdk/cli mcp disable` to turn it back off.
+  If you're not logged into the CLI yet, this command notices and offers to log
+  you in right there — see [Step 2](#step-2-log-in-to-the-cli).
 </Note>
 
-Confirm it took effect — this probe needs no auth:
+Confirm it took effect:
 
 <CodeGroup title="Verify">
+
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli mcp status
+```
 
 ```bash {{ title: 'curl' }}
 curl -s http://localhost:8080/mcp/tools
@@ -87,7 +77,9 @@ A `200` with a list of tool groups means MCP is live. A `404` means the flag is 
 
 ## Step 2: Log in to the CLI {{ anchor: true, id: 'step-2-log-in-to-the-cli' }}
 
-The installer wizard needs an authenticated CLI session to mint an API key on your behalf. If you're not already logged in:
+`mcp enable`, `mcp add`, and `mcp disable` all need an authenticated CLI session to act on your behalf. You don't have to do this as a separate step — if you run one of those commands while logged out, it detects that and offers to log you in right there (prompting "Log in now?" and then for a server URL, defaulting to the one already configured), rather than erroring out.
+
+If you'd rather log in explicitly first (for example, to pick a specific `--context` name, or before running `mcp add --yes` non-interactively):
 
 <CodeGroup title="Log in">
 
@@ -97,7 +89,13 @@ bunx @temps-sdk/cli login http://localhost:8080
 
 </CodeGroup>
 
-This opens the same browser-based device flow used everywhere else in the CLI — see [Log in to the Temps CLI](/docs/cli-login) for the full walkthrough, MFA/SSO notes, and how to switch between several Temps instances. This step only authenticates *you*; it has nothing to do with how the AI client itself will authenticate later (that's a separate, long-lived API key — see below).
+Either way, this is the same browser-based device flow used everywhere else in the CLI — see [Log in to the Temps CLI](/docs/cli-login) for the full walkthrough, MFA/SSO notes, and how to switch between several Temps instances. This step only authenticates *you*; it has nothing to do with how the AI client itself will authenticate later (that's a separate, long-lived API key — see below).
+
+<Note>
+  The inline login offer only appears in interactive use. `mcp add --yes` skips
+  it entirely and expects `--api-key` or an existing logged-in context — it
+  never blocks on a prompt, which matters for scripted or CI use.
+</Note>
 
 ---
 

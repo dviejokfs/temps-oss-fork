@@ -19,34 +19,32 @@ Installer wizard lives in `apps/temps-cli/src/commands/mcp/`
 ## 1. Enable the MCP server (operator, one-time per instance)
 
 Off by default (`AppSettings.mcp_server.enabled = false`), so a fresh install never
-exposes it unconfigured. There is no dedicated `temps settings mcp` toggle yet --
-until there is, flip it with a direct settings round-trip using an admin session
-(cookie or API key):
+exposes it unconfigured. Turn it on as an admin:
 
 ```bash
-API=http://localhost:8080     # your instance's API URL
-
-curl -s -b cookies.txt "$API/api/settings" -o /tmp/settings.json
-python3 -c "
-import json
-d = json.load(open('/tmp/settings.json'))
-d['mcp_server']['enabled'] = True
-json.dump(d, open('/tmp/settings.json', 'w'))
-"
-curl -s -b cookies.txt -X PUT "$API/api/settings" \
-  -H "Content-Type: application/json" \
-  --data-binary @/tmp/settings.json
+bunx @temps-sdk/cli mcp enable
 ```
 
-`GET /api/settings` requires an authenticated admin session -- `PUT` takes the
-**full** `AppSettings` object, not a partial patch, so always GET, modify one
-field, then PUT the whole thing back (the handler restores masked secret fields
-like the DNS API key from the DB, so round-tripping the GET response is safe).
+If you're not logged in yet, `mcp enable` offers to run the device-flow login
+inline (see [Auth model, precisely](#2-configure-your-ai-client-per-user-per-client)
+below) -- no separate `temps login` step required first.
 
-Verify it took effect (no auth needed for this probe):
+`mcp enable` does the same GET-modify-PUT round-trip against `/api/settings` the
+handler requires (it takes the **full** `AppSettings` object, not a partial patch),
+merging onto whatever is already fetched so it can never clobber another admin's
+settings. `mcp disable` reverses it.
+
+Verify it took effect, or check status any time without re-running enable:
 
 ```bash
-curl -s "$API/mcp/tools"
+bunx @temps-sdk/cli mcp status
+# "This instance: <check> enabled (http://localhost:8080)" or "<bullet> disabled (...)"
+```
+
+Or probe the endpoint directly (no auth needed for this one):
+
+```bash
+curl -s http://localhost:8080/mcp/tools
 # {"groups":[{"key":"deployments","label":"Deployments & Projects"}, ...]}
 # A 404 here means the flag is still off (or this instance predates MCP support).
 ```
@@ -54,23 +52,28 @@ curl -s "$API/mcp/tools"
 ## 2. Configure your AI client (per user, per client)
 
 ```bash
-bunx @temps-sdk/cli login                    # device-flow browser login, one-time
 bunx @temps-sdk/cli mcp add <client>
 ```
 
 `<client>` is one of: `claude-code`, `claude-desktop`, `codex`, `cursor`, `vscode`,
 `windsurf`, `zed`.
 
-**Auth model, precisely:** `mcp add` requires you to already be logged into the CLI
-(`temps login`'s existing OAuth-style device-authorization flow -- `/auth/cli/device/start`
-+ `/auth/cli/device/poll`, server-authoritative polling, no code to type). That
-login is only used to authenticate *you* so the wizard can mint an API key on your
-behalf; it has nothing to do with MCP itself. What actually gets written into the
-AI client's config is a plain, long-lived `Authorization: Bearer <api-key>` header
--- the same static-bearer-token pattern PostHog's own MCP wizard uses, and one of
-the two auth patterns the MCP HTTP transport spec supports (the other being full
-OAuth 2.1 + dynamic client registration, which most of these 7 clients don't yet
-implement for remote MCP servers anyway).
+**Auth model, precisely:** `mcp add`/`mcp enable`/`mcp disable` need you logged
+into the CLI so the wizard can mint an API key on your behalf -- that login has
+nothing to do with MCP itself. If you're not already logged in, these commands
+detect that and offer to run the device-authorization flow right there (prompts
+"Log in now?", then "Temps server URL", defaulting to your current config) rather
+than erroring out and making you run `temps login` as a separate step first. Under
+the hood it's the same flow `temps login` uses (`/auth/cli/device/start` +
+`/auth/cli/device/poll`, server-authoritative polling, no code to type, browser
+approval). In `--yes` (non-interactive) mode this inline offer is skipped --
+pass `--api-key` or ensure a context is already logged in. What actually gets
+written into the AI client's config either way is a plain, long-lived
+`Authorization: Bearer <api-key>` header -- the same static-bearer-token pattern
+PostHog's own MCP wizard uses, and one of the two auth patterns the MCP HTTP
+transport spec supports (the other being full OAuth 2.1 + dynamic client
+registration, which most of these 7 clients don't yet implement for remote MCP
+servers anyway).
 
 The wizard will:
 1. Probe `/mcp/tools` to confirm the instance has MCP enabled (see step 1). If it
