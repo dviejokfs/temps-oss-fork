@@ -4587,4 +4587,93 @@ CMD ["cat", "/hello.txt"]
         );
         assert!(rt.build_resource_override.is_none());
     }
+
+    /// Guardrail for a reported "Build Container Image" stage stuck In
+    /// Progress indefinitely at the BuildKit vertex "load remote build
+    /// context", with zero log output. This was reproduced locally against
+    /// Docker Desktop for macOS with a context in the hundreds-of-KB range,
+    /// and traced to BuildKit calling back over Bollard's `session` for
+    /// context (`moby.filesync.v1.FileSync`), a service Bollard's own
+    /// session implementation never registers a handler for -- so the RPC
+    /// never gets a response. The same request against a native Linux
+    /// `dockerd` (this crate's actual deployment target) did not reproduce
+    /// it across dozens of runs from 0 bytes up to 2MB, so this is most
+    /// likely specific to Docker Desktop's macOS VM socket-forwarding
+    /// layer rather than a cross-platform Bollard/BuildKit issue. Kept as
+    /// a CI guardrail (5MB context, past the size where the Mac-only hang
+    /// reproduced) in case it turns out to affect Linux too under
+    /// conditions this investigation didn't cover -- if this stays green
+    /// in CI over time, the underlying "load remote build context" issue
+    /// is confirmed to not affect the platforms this codebase actually
+    /// runs on.
+    #[tokio::test]
+    #[serial]
+    async fn build_image_buildkit_large_context_does_not_hang() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let rt = DockerRuntime::new(Arc::new(docker), true, "temps-app".to_string());
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Dockerfile"),
+            "FROM alpine:latest\nRUN echo hello > /hello.txt\n",
+        )
+        .await
+        .unwrap();
+
+        const FILLER_BYTES: usize = 5_000_000;
+        let mut filler = Vec::with_capacity(FILLER_BYTES);
+        while filler.len() < FILLER_BYTES {
+            filler.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        }
+        fs::write(tmp.path().join("filler.bin"), &filler)
+            .await
+            .unwrap();
+
+        let mut build_args = HashMap::new();
+        for i in 0..40 {
+            build_args.insert(
+                format!("BUILD_ARG_{i}"),
+                format!("value-{}-{}", i, uuid::Uuid::new_v4()),
+            );
+        }
+
+        let image_tag = format!("temps-buildkit-repro-{}:latest", uuid::Uuid::new_v4());
+        let request = BuildRequest {
+            image_name: image_tag.clone(),
+            context_path: tmp.path().to_path_buf(),
+            dockerfile_path: Some(tmp.path().join("Dockerfile")),
+            build_args,
+            build_args_buildkit: HashMap::new(),
+            platform: None,
+            log_path: tmp.path().join("build.log"),
+        };
+
+        let result = timeout(Duration::from_secs(90), rt.build_image(request)).await;
+
+        let _ = rt
+            .docker
+            .remove_image(
+                &image_tag,
+                Some(bollard::query_parameters::RemoveImageOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await;
+
+        result
+            .expect("build_image must not hang on a large build context")
+            .expect("build_image must succeed");
+    }
 }
