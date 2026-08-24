@@ -144,10 +144,9 @@ export function EnvironmentDashboard({
               </p>
             </div>
           ) : activeView === 'metrics' ? (
-            <MetricsPanel
-              project={project}
-              environment={environment}
-              environmentId={environmentId.toString()}
+            <EnvironmentMetricsCharts
+              projectId={project.id}
+              environmentId={environmentId}
             />
           ) : (
             <ContainerPanel
@@ -198,46 +197,5 @@ function ContainerPanel({ project, environmentId }: ContainerPanelProps) {
         }}
       />
     </>
-  )
-}
-
-interface MetricsPanelProps {
-  project: ProjectResponse
-  environment: EnvironmentResponse
-  environmentId: string
-}
-
-function MetricsPanel({
-  project,
-  environment,
-  environmentId,
-}: MetricsPanelProps) {
-  // Same query key ContainerList uses, so this shares its cache/network
-  // request via TanStack Query rather than double-fetching when both tabs
-  // have been visited.
-  const { data: containers } = useQuery({
-    ...listContainersOptions({
-      path: {
-        project_id: project.id,
-        environment_id: parseInt(environmentId),
-      },
-    }),
-    staleTime: 5000,
-  })
-
-  if (!containers || containers.containers.length === 0) {
-    return (
-      <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
-        No running containers
-      </div>
-    )
-  }
-
-  return (
-    <EnvironmentMetricsCharts
-      projectId={project.id}
-      environment={environment}
-      containers={containers.containers}
-    />
   )
 }
