@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use headless_chrome::{Browser, LaunchOptions};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info};
@@ -20,7 +20,12 @@ use crate::provider::ScreenshotProvider;
 /// `check_provider_availability()`/`capture_screenshot()` around the same
 /// time. Serialize every real Chrome launch process-wide so concurrent
 /// callers can't race on it.
-static CHROME_LAUNCH_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+///
+/// `Arc`-wrapped (rather than a bare `&'static AsyncMutex`) so a guard can be
+/// moved into a detached task and held for as long as the actual launch is
+/// running -- see `check_availability`'s use of `lock_owned()`.
+static CHROME_LAUNCH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
+    LazyLock::new(|| Arc::new(AsyncMutex::new(())));
 
 /// Local screenshot provider using headless Chrome
 pub struct LocalScreenshotProvider {
@@ -197,37 +202,55 @@ impl ScreenshotProvider for LocalScreenshotProvider {
     async fn check_availability(&self) -> ScreenshotResult<()> {
         // See CHROME_LAUNCH_LOCK: serialize this probe launch against any
         // concurrent real capture (or another probe) on this provider.
-        let _launch_guard = CHROME_LAUNCH_LOCK.lock().await;
+        //
+        // An owned guard, not a plain `.lock().await`: `spawn_blocking`
+        // tasks are NOT cancelled when the `JoinHandle` future stops being
+        // polled/is dropped (e.g. by the 10s `timeout` below elapsing) --
+        // the launch keeps running on its blocking thread regardless. If the
+        // guard lived on this function's stack, it would be dropped the
+        // moment we give up waiting, letting a second caller start a second
+        // launch while the first is still executing -- the exact race this
+        // lock exists to prevent. Instead, hand the owned guard to a
+        // detached supervisor that releases it only once the real launch
+        // attempt truly finishes; `timeout` below races the supervisor's
+        // *report* of that outcome, not the launch itself.
+        let launch_guard = CHROME_LAUNCH_LOCK.clone().lock_owned().await;
+        let handle = tokio::task::spawn_blocking(|| {
+            let options = LaunchOptions::default_builder()
+                .headless(true)
+                .sandbox(false)
+                .idle_browser_timeout(Duration::from_secs(5))
+                .build();
 
-        // Try to launch browser to check if Chrome is available
+            match options {
+                Ok(opts) => match Browser::new(opts) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(format!("Failed to launch Chrome browser: {}", e)),
+                },
+                Err(e) => Err(format!("Failed to build launch options: {}", e)),
+            }
+        });
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let outcome = handle.await;
+            drop(launch_guard);
+            let _ = done_tx.send(outcome);
+        });
+
         // Use a 10-second timeout to prevent hanging on VPS/servers without Chrome
-        let check_result = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::task::spawn_blocking(|| {
-                let options = LaunchOptions::default_builder()
-                    .headless(true)
-                    .sandbox(false)
-                    .idle_browser_timeout(Duration::from_secs(5))
-                    .build();
-
-                match options {
-                    Ok(opts) => match Browser::new(opts) {
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(format!("Failed to launch Chrome browser: {}", e)),
-                    },
-                    Err(e) => Err(format!("Failed to build launch options: {}", e)),
-                }
-            }),
-        )
-        .await;
+        let check_result = tokio::time::timeout(Duration::from_secs(10), done_rx).await;
 
         let reason = match check_result {
-            Ok(Ok(Ok(()))) => {
+            Ok(Ok(Ok(Ok(())))) => {
                 debug!("Chrome browser is available");
                 return Ok(());
             }
-            Ok(Ok(Err(e))) => e,
-            Ok(Err(e)) => format!("Chrome availability check task failed: {}", e),
+            Ok(Ok(Ok(Err(e)))) => e,
+            Ok(Ok(Err(e))) => format!("Chrome availability check task failed: {}", e),
+            Ok(Err(_)) => "Chrome availability check task failed: supervisor task dropped before \
+                 reporting an outcome"
+                .to_string(),
             Err(_) => {
                 "Chrome availability check timed out after 10 seconds; Chrome is most likely \
                  installed but missing shared libraries (check `ldd <chrome-binary> | grep \
