@@ -89,6 +89,27 @@ function formatNetworkRate(kbs: number): string {
   return `${(kbs * 1024).toFixed(0)} B/s`
 }
 
+function metricTooltipRow(
+  label: React.ReactNode,
+  value: string,
+  color?: string
+) {
+  return (
+    <div className="flex w-full items-center justify-between gap-4">
+      <div className="flex items-center gap-1.5">
+        <span
+          className="h-2.5 w-2.5 shrink-0 rounded-[2px]"
+          style={{ backgroundColor: color }}
+        />
+        <span className="text-muted-foreground">{label}</span>
+      </div>
+      <span className="font-mono font-medium tabular-nums text-foreground">
+        {value}
+      </span>
+    </div>
+  )
+}
+
 /** `@hey-api/client-fetch` throws the parsed RFC 7807 Problem body
  *  ({ detail, title, status }) on a failed request — same convention
  *  MonitoringCard.tsx uses for its "not enabled" detection. */
@@ -375,10 +396,13 @@ export function EnvironmentMetricsCharts({
                   }
                   content={
                     <ChartTooltipContent
-                      formatter={(value, name) => [
-                        `${Number(value).toFixed(2)}%`,
-                        cpuChartConfig[name as string]?.label ?? name,
-                      ]}
+                      formatter={(value, name, item) =>
+                        metricTooltipRow(
+                          cpuChartConfig[name as string]?.label ?? name,
+                          `${Number(value).toFixed(2)}%`,
+                          item?.color
+                        )
+                      }
                     />
                   }
                 />
@@ -448,10 +472,13 @@ export function EnvironmentMetricsCharts({
                   }
                   content={
                     <ChartTooltipContent
-                      formatter={(value, name) => [
-                        `${Number(value).toFixed(1)} MB`,
-                        memChartConfig[name as string]?.label ?? name,
-                      ]}
+                      formatter={(value, name, item) =>
+                        metricTooltipRow(
+                          memChartConfig[name as string]?.label ?? name,
+                          `${Number(value).toFixed(1)} MB`,
+                          item?.color
+                        )
+                      }
                     />
                   }
                 />
@@ -521,10 +548,13 @@ export function EnvironmentMetricsCharts({
                   }
                   content={
                     <ChartTooltipContent
-                      formatter={(value, name) => [
-                        formatNetworkRate(Number(value)),
-                        netChartConfig[name as string]?.label ?? name,
-                      ]}
+                      formatter={(value, name, item) =>
+                        metricTooltipRow(
+                          netChartConfig[name as string]?.label ?? name,
+                          formatNetworkRate(Number(value)),
+                          item?.color
+                        )
+                      }
                     />
                   }
                 />
