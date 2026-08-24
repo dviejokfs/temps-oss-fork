@@ -22,8 +22,11 @@ use futures::SinkExt;
 use temps_auth::RequireAuth;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
+    require_sensitive_action,
 };
-use temps_core::{AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata};
+use temps_core::{
+    AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata, SensitiveAction,
+};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
@@ -992,6 +995,15 @@ pub async fn teardown_environment(
         project_id,
         state.project_access_checker
     );
+    require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DeleteEnvironment {
+            project_id,
+            environment_id: env_id,
+        },
+    )
+    .await?;
 
     info!(
         "Tearing down environment {} for project: {}",
@@ -2575,6 +2587,25 @@ mod tests {
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
+    /// Test double for handlers unrelated to sensitive-action gating --
+    /// always allows, so existing tests built before that gate was added
+    /// don't need to know about it.
+    struct AllowAllSensitiveActions;
+
+    #[async_trait]
+    impl temps_core::SensitiveActionAuthorizer for AllowAllSensitiveActions {
+        async fn authorize(
+            &self,
+            _action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            Ok(temps_core::SensitiveActionDecision::Allow)
+        }
+    }
+
     struct MediaWithoutDeploymentsRead;
 
     #[async_trait]
@@ -3077,6 +3108,35 @@ mod tests {
     /// Helper to create a mock AuthContext for testing
     fn create_test_auth_context() -> temps_auth::AuthContext {
         create_test_auth_context_for_role(temps_auth::Role::Admin)
+    }
+
+    /// Helper to create a mock AuthContext with a persisted session (non-None
+    /// session_id). Required for handlers that call `require_sensitive_action`,
+    /// because a bare `new_session()` with `session_id: None` yields a `None`
+    /// principal and causes an immediate 401 before the authorizer is consulted.
+    fn create_test_auth_context_persisted_session() -> temps_auth::AuthContext {
+        use temps_entities::users;
+        let user = users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: Some("hashed_password".to_string()),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        temps_auth::AuthContext::new_persisted_session(user, temps_auth::Role::Admin, 1)
     }
 
     #[test]
@@ -4229,6 +4289,7 @@ mod tests {
                 as Arc<dyn temps_core::PublicHostnameResolver>,
             metrics_store: None,
             failure_report_service,
+            sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
         })
     }
 
@@ -5434,9 +5495,13 @@ mod tests {
         .await
         .expect("Failed to create test environment");
 
+        // teardown_environment calls require_sensitive_action, so the auth
+        // context must have a non-None session_id to produce a principal.
+        // Use new_persisted_session here; the AllowAllSensitiveActions
+        // authorizer in the test AppState will permit the action.
         let auth_middleware = middleware::from_fn(
             |mut req: Request, next: axum::middleware::Next| async move {
-                let auth_context = create_test_auth_context();
+                let auth_context = create_test_auth_context_persisted_session();
                 req.extensions_mut().insert(auth_context);
                 req.extensions_mut().insert(create_test_request_metadata());
                 next.run(req).await

@@ -7,6 +7,7 @@ use temps_providers::postgres_upgrade_service::PostgresUpgradeService;
 use crate::services::{BackupService, RestoreService};
 
 /// Application state shared across all backup HTTP handlers.
+#[derive(Clone)]
 pub struct BackupAppState {
     pub backup_service: Arc<BackupService>,
     pub restore_service: Arc<RestoreService>,
@@ -25,6 +26,10 @@ pub struct BackupAppState {
     /// `BackupsWrite` + `ExternalServicesWrite` permissions that the default
     /// `Role::User` already carries.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// MFA / step-up authorizer for security-sensitive mutations. `None` in
+    /// installations that have not registered an authorizer (step-up checks
+    /// become a no-op).
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 // Field-for-field constructor for a public struct: every argument is a
@@ -40,6 +45,7 @@ pub fn create_backup_app_state(
     backup_executor: Arc<BackupExecutor>,
     telemetry: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
     project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 ) -> Arc<BackupAppState> {
     Arc::new(BackupAppState {
         backup_service,
@@ -50,5 +56,6 @@ pub fn create_backup_app_state(
         backup_executor,
         telemetry,
         project_access_checker,
+        sensitive_action_authorizer,
     })
 }
