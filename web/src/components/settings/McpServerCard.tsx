@@ -38,12 +38,20 @@ const MCP_CLIENTS: { id: string; label: string }[] = [
   { id: 'zed', label: 'Zed' },
 ]
 
-const CONNECT_EXAMPLES: CodeExample[] = MCP_CLIENTS.map((c) => ({
-  id: c.id,
-  label: c.label,
-  language: 'bash',
-  code: `bunx @temps-sdk/cli mcp add ${c.id}`,
-}))
+/**
+ * Pins --url to this instance so the copied command is self-contained --
+ * without it, `mcp add` falls back to whatever CLI context happens to be
+ * active on the operator's machine, which silently may not be this instance
+ * at all (e.g. they're also logged into a production server elsewhere).
+ */
+function connectExamples(baseUrl: string): CodeExample[] {
+  return MCP_CLIENTS.map((c) => ({
+    id: c.id,
+    label: c.label,
+    language: 'bash',
+    code: `bunx @temps-sdk/cli mcp add ${c.id} --url ${baseUrl}`,
+  }))
+}
 
 export function McpServerCard() {
   const { data: settings, isLoading, error } = useSettings()
@@ -160,14 +168,16 @@ export function McpServerCard() {
               <CodeTabs
                 value={connectClientId}
                 onValueChange={setConnectClientId}
-                examples={CONNECT_EXAMPLES}
+                examples={connectExamples(baseUrl)}
                 showLineNumbers={false}
               />
               <p className="text-xs text-muted-foreground">
                 Runs an installer wizard that mints a scoped API key and
                 writes the right config for {
                   MCP_CLIENTS.find((c) => c.id === connectClientId)?.label
-                }.
+                }. <code className="px-1 py-0.5 bg-muted rounded text-xs">--url</code>{' '}
+                targets this instance directly, regardless of which CLI
+                context is currently active on your machine.
               </p>
             </div>
             <a
@@ -187,7 +197,7 @@ export function McpServerCard() {
             <AlertDescription>
               Turn it on above, then run{' '}
               <code className="px-1 py-0.5 bg-muted rounded text-xs">
-                bunx @temps-sdk/cli mcp add
+                bunx @temps-sdk/cli mcp add --url {baseUrl}
               </code>{' '}
               to connect an AI client.
             </AlertDescription>
