@@ -246,6 +246,9 @@ export async function updatePlatformSettings(
     // Same reasoning: omitting this would silently reset cluster DNS back to
     // disabled on every unrelated settings save.
     cluster_dns: updated.cluster_dns,
+    // Same reasoning: omitting this would silently disable the MCP server on
+    // every unrelated settings save.
+    mcp_server: updated.mcp_server,
   }
   const result = await updateSettings({ body })
   if (result.error) {
