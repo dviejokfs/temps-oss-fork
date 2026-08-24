@@ -21,7 +21,7 @@ import { probeMcpEndpoint } from './probe.js'
  * friction. Skipped entirely in `--yes` (non-interactive) mode, where the
  * caller must already have a valid context or pass `--api-key`.
  */
-async function ensureMcpAuth(opts: { yes?: boolean } = {}): Promise<string> {
+async function ensureMcpAuth(opts: { yes?: boolean; urlOverride?: string } = {}): Promise<string> {
   if (await credentials.isAuthenticated()) {
     return requireAuth()
   }
@@ -38,20 +38,37 @@ async function ensureMcpAuth(opts: { yes?: boolean } = {}): Promise<string> {
     return requireAuth() // reuses the standard "run `temps login`" exit
   }
 
+  // Defaults to --url when the caller pinned one (e.g. a command copied from
+  // the Settings UI, which names this instance explicitly) -- otherwise the
+  // ambient context/legacy default, same as before.
   const url = await promptText({
     message: 'Temps server URL (leave blank to use the default)',
-    default: getApiUrl(),
+    default: opts.urlOverride ?? getApiUrl(),
   })
 
   await loginWithDevice({ url: url || undefined })
   return requireAuth()
 }
 
+/**
+ * Normalizes an explicit --url override to the same "web root, no /api
+ * suffix" shape getWebUrl() returns, so callers can pass either form.
+ * Undefined falls through to the existing context/env-resolved default.
+ */
+function resolveWebUrl(urlOverride: string | undefined): string {
+  if (!urlOverride) return getWebUrl()
+  return urlOverride.replace(/\/+$/, '').replace(/\/api$/, '')
+}
+
+const URL_OPTION_DESCRIPTION =
+  'Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted.'
+
 interface AddOptions {
   groups?: string
   write?: boolean
   yes?: boolean
   apiKey?: string
+  url?: string
 }
 
 export function registerMcpCommands(program: Command): void {
@@ -62,11 +79,13 @@ export function registerMcpCommands(program: Command): void {
   mcp
     .command('enable')
     .description('Enable the Temps MCP server on this instance (admin, one-time per instance)')
+    .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
     .action(enableAction)
 
   mcp
     .command('disable')
     .description('Disable the Temps MCP server on this instance (admin)')
+    .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
     .action(disableAction)
 
   mcp
@@ -75,6 +94,7 @@ export function registerMcpCommands(program: Command): void {
     .option('-g, --groups <groups>', 'Comma-separated tool groups to enable (default: all)')
     .option('-w, --write', 'Enable write tools (deploy, delete, restart, etc). Default: read-only')
     .option('-k, --api-key <key>', 'Use this API key instead of creating or prompting for one')
+    .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
     .option('-y, --yes', 'Skip prompts and confirmation (uses defaults; requires --api-key or an existing login)')
     .action(addAction)
 
@@ -86,12 +106,13 @@ export function registerMcpCommands(program: Command): void {
   mcp
     .command('status')
     .description('Show whether this instance has MCP enabled and which AI clients are configured')
+    .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
     .action(statusAction)
 }
 
-async function setMcpServerEnabled(enabled: boolean): Promise<void> {
-  await ensureMcpAuth()
-  await setupClient()
+async function setMcpServerEnabled(enabled: boolean, urlOverride?: string): Promise<void> {
+  await ensureMcpAuth({ urlOverride })
+  await setupClient(urlOverride)
 
   await withSpinner(enabled ? 'Enabling the Temps MCP server...' : 'Disabling the Temps MCP server...', async () => {
     // PUT /settings replaces every field not present in the body with its
@@ -108,21 +129,21 @@ async function setMcpServerEnabled(enabled: boolean): Promise<void> {
   })
 }
 
-async function enableAction(): Promise<void> {
-  await setMcpServerEnabled(true)
+async function enableAction(options: { url?: string }): Promise<void> {
+  await setMcpServerEnabled(true, options.url)
   success('MCP server enabled.')
   info('Run `bunx @temps-sdk/cli mcp add <client>` to connect an AI client (Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Zed).')
 }
 
-async function disableAction(): Promise<void> {
-  await setMcpServerEnabled(false)
+async function disableAction(options: { url?: string }): Promise<void> {
+  await setMcpServerEnabled(false, options.url)
   success('MCP server disabled.')
   info('AI clients configured with `mcp add` will stop working until this is enabled again.')
 }
 
 async function addAction(clientArg: string | undefined, options: AddOptions): Promise<void> {
-  await ensureMcpAuth({ yes: options.yes })
-  await setupClient()
+  await ensureMcpAuth({ yes: options.yes, urlOverride: options.url })
+  await setupClient(options.url)
 
   const clientId =
     clientArg ||
@@ -139,8 +160,9 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
 
   // MCP endpoints (/mcp, /mcp/tools) are mounted at the server root, not under
   // /api like the REST API -- getApiUrl() (used by the generated client) would
-  // build a URL that always 404s here. getWebUrl() strips the /api suffix.
-  const mcpBaseUrl = getWebUrl()
+  // build a URL that always 404s here. resolveWebUrl() strips the /api suffix
+  // (and honors --url when the caller pinned a specific instance).
+  const mcpBaseUrl = resolveWebUrl(options.url)
 
   const probe = await withSpinner('Checking for Temps MCP support...', () => probeMcpEndpoint(mcpBaseUrl))
   if (!probe.supported) {
@@ -302,8 +324,8 @@ function formatGroups(url: string | null): string {
   return parsed.write ? `${label} (write)` : label
 }
 
-async function statusAction(): Promise<void> {
-  const mcpBaseUrl = getWebUrl()
+async function statusAction(options: { url?: string }): Promise<void> {
+  const mcpBaseUrl = resolveWebUrl(options.url)
   const probe = await withSpinner('Checking this instance...', () => probeMcpEndpoint(mcpBaseUrl))
 
   header('Temps MCP status')
