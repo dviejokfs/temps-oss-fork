@@ -1,10 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ChartConfig,
   ChartContainer,
@@ -44,34 +38,34 @@ export interface AggregatedMetrics {
 export interface ChartDataPoint {
   time: string
   timestamp: number
-  cpu: number
-  memory: number
-  memoryPercent: number
   networkRx: number
   networkTx: number
+  [seriesKey: string]: number | string
 }
 
 const MAX_DATA_POINTS = 120
+
+// Theme only defines 5 chart colors (web/src/globals.css); beyond 5 replicas
+// colors repeat but the legend label (container name) still disambiguates.
+const CHART_COLORS = [
+  'var(--chart-1)',
+  'var(--chart-2)',
+  'var(--chart-3)',
+  'var(--chart-4)',
+  'var(--chart-5)',
+]
+
+interface ContainerSeries {
+  key: string
+  label: string
+  color: string
+}
 
 function formatNetworkRate(kbs: number): string {
   if (kbs >= 1024) return `${(kbs / 1024).toFixed(1)} MB/s`
   if (kbs >= 1) return `${kbs.toFixed(1)} KB/s`
   return `${(kbs * 1024).toFixed(0)} B/s`
 }
-
-const cpuChartConfig = {
-  cpu: {
-    label: 'CPU %',
-    color: 'var(--chart-1)',
-  },
-} satisfies ChartConfig
-
-const memoryChartConfig = {
-  memory: {
-    label: 'Memory',
-    color: 'var(--chart-2)',
-  },
-} satisfies ChartConfig
 
 const networkChartConfig = {
   networkRx: {
@@ -105,9 +99,7 @@ export function EnvironmentMetricsCharts({
   const [connectedCount, setConnectedCount] = useState(0)
   const hasDataRef = useRef(false)
   const [hasData, setHasData] = useState(false)
-  const [liveMetrics, setLiveMetrics] = useState<AggregatedMetrics | null>(
-    null
-  )
+  const [liveMetrics, setLiveMetrics] = useState<AggregatedMetrics | null>(null)
   const eventSourcesRef = useRef<Map<string, EventSource>>(new Map())
 
   const activeContainers = useMemo(
@@ -115,9 +107,50 @@ export function EnvironmentMetricsCharts({
     [containers]
   )
 
-  // Store onMetricsUpdate in a ref so callbacks don't depend on it
+  // Stable per-container series identity (color + legend label), keyed by a
+  // short positional id rather than the container id itself so it stays a
+  // safe CSS-custom-property / recharts dataKey suffix.
+  const containerSeries = useMemo(() => {
+    const sorted = [...activeContainers].sort((a, b) =>
+      a.container_id.localeCompare(b.container_id)
+    )
+    const map = new Map<string, ContainerSeries>()
+    sorted.forEach((container, index) => {
+      map.set(container.container_id, {
+        key: `c${index}`,
+        label: (container.container_name || container.container_id).replace(
+          /^\//,
+          ''
+        ),
+        color: CHART_COLORS[index % CHART_COLORS.length],
+      })
+    })
+    return map
+  }, [activeContainers])
+
+  const cpuChartConfig = useMemo(() => {
+    const config: ChartConfig = {}
+    for (const series of containerSeries.values()) {
+      config[`cpu_${series.key}`] = { label: series.label, color: series.color }
+    }
+    return config
+  }, [containerSeries])
+
+  const memoryChartConfig = useMemo(() => {
+    const config: ChartConfig = {}
+    for (const series of containerSeries.values()) {
+      config[`mem_${series.key}`] = { label: series.label, color: series.color }
+    }
+    return config
+  }, [containerSeries])
+
+  // Store onMetricsUpdate in a ref so callbacks don't depend on it. Updated
+  // in an effect, not during render, since refs aren't meant to be written
+  // while rendering.
   const onMetricsUpdateRef = useRef(onMetricsUpdate)
-  onMetricsUpdateRef.current = onMetricsUpdate
+  useEffect(() => {
+    onMetricsUpdateRef.current = onMetricsUpdate
+  })
 
   const aggregateMetrics = useCallback((): AggregatedMetrics | null => {
     const allMetrics = Array.from(metricsMapRef.current.values())
@@ -170,6 +203,25 @@ export function EnvironmentMetricsCharts({
     }
   }, [])
 
+  // Per-replica CPU/memory values for the current tick, keyed by each
+  // container's series id so each replica renders as its own labeled line
+  // instead of being folded into a single summed line.
+  const buildPerContainerPoint = useCallback((): Record<
+    string,
+    number
+  > | null => {
+    if (containerSeries.size === 0) return null
+    const point: Record<string, number> = {}
+    for (const [containerId, series] of containerSeries) {
+      const m = metricsMapRef.current.get(containerId)
+      if (!m) continue
+      point[`cpu_${series.key}`] = Math.round((m.cpu_percent ?? 0) * 100) / 100
+      point[`mem_${series.key}`] =
+        Math.round(((m.memory_bytes ?? 0) / (1024 * 1024)) * 100) / 100
+    }
+    return point
+  }, [containerSeries])
+
   const connectToStream = useCallback(
     (container: ContainerInfoResponse) => {
       const existing = eventSourcesRef.current.get(container.container_id)
@@ -219,11 +271,12 @@ export function EnvironmentMetricsCharts({
     for (const container of activeContainers) {
       connectToStream(container)
     }
+    const sources = eventSourcesRef.current
     return () => {
-      for (const es of eventSourcesRef.current.values()) {
+      for (const es of sources.values()) {
         es.close()
       }
-      eventSourcesRef.current.clear()
+      sources.clear()
     }
   }, [activeContainers, connectToStream])
 
@@ -238,6 +291,8 @@ export function EnvironmentMetricsCharts({
       setLiveMetrics(agg)
       onMetricsUpdateRef.current?.(agg)
 
+      const perContainer = buildPerContainerPoint()
+
       const now = Date.now()
       setChartHistory((prev) => {
         const next = [
@@ -245,11 +300,9 @@ export function EnvironmentMetricsCharts({
           {
             time: format(now, 'HH:mm:ss'),
             timestamp: now,
-            cpu: agg.cpu,
-            memory: agg.memoryMb,
-            memoryPercent: agg.memoryPercent,
             networkRx: agg.networkRxKBs,
             networkTx: agg.networkTxKBs,
+            ...perContainer,
           },
         ]
         return next.length > MAX_DATA_POINTS
@@ -259,7 +312,7 @@ export function EnvironmentMetricsCharts({
     }, 2000)
 
     return () => clearInterval(interval)
-  }, [hasData, aggregateMetrics])
+  }, [hasData, aggregateMetrics, buildPerContainerPoint])
 
   const isConnected = connectedCount > 0
 
@@ -278,7 +331,13 @@ export function EnvironmentMetricsCharts({
       {/* CPU Line Chart */}
       <div>
         <div className="flex items-center justify-between mb-2">
-          <p className="text-sm font-medium">CPU Usage</p>
+          <div className="flex items-center gap-2">
+            <p className="text-sm font-medium">CPU Usage</p>
+            <span className="text-xs text-muted-foreground">
+              {activeContainers.length}{' '}
+              {activeContainers.length === 1 ? 'replica' : 'replicas'}
+            </span>
+          </div>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             {isConnected && (
               <span className="flex items-center gap-1">
@@ -287,7 +346,7 @@ export function EnvironmentMetricsCharts({
               </span>
             )}
             {liveMetrics ? (
-              <span>{liveMetrics.cpu.toFixed(1)}%</span>
+              <span>Total {liveMetrics.cpu.toFixed(1)}%</span>
             ) : (
               <span className="flex items-center gap-1">
                 <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground animate-pulse" />
@@ -297,10 +356,7 @@ export function EnvironmentMetricsCharts({
           </div>
         </div>
         {chartsReady ? (
-          <ChartContainer
-            config={cpuChartConfig}
-            className="h-[200px] w-full"
-          >
+          <ChartContainer config={cpuChartConfig} className="h-[200px] w-full">
             <LineChart
               data={chartHistory}
               margin={{ left: 12, right: 12, top: 8, bottom: 0 }}
@@ -330,21 +386,26 @@ export function EnvironmentMetricsCharts({
               <ChartTooltip
                 content={
                   <ChartTooltipContent
-                    formatter={(value) => [
+                    formatter={(value, name) => [
                       `${Number(value).toFixed(2)}%`,
-                      'CPU',
+                      cpuChartConfig[name as string]?.label ?? name,
                     ]}
                   />
                 }
               />
-              <Line
-                dataKey="cpu"
-                type="monotone"
-                stroke="var(--color-cpu)"
-                strokeWidth={2}
-                dot={false}
-                activeDot={{ r: 4 }}
-              />
+              <ChartLegend content={<ChartLegendContent />} />
+              {Array.from(containerSeries.values()).map((series) => (
+                <Line
+                  key={series.key}
+                  dataKey={`cpu_${series.key}`}
+                  name={`cpu_${series.key}`}
+                  type="monotone"
+                  stroke={`var(--color-cpu_${series.key})`}
+                  strokeWidth={2}
+                  dot={false}
+                  activeDot={{ r: 4 }}
+                />
+              ))}
             </LineChart>
           </ChartContainer>
         ) : (
@@ -355,11 +416,17 @@ export function EnvironmentMetricsCharts({
       {/* Memory Line Chart */}
       <div>
         <div className="flex items-center justify-between mb-2">
-          <p className="text-sm font-medium">Memory Usage</p>
+          <div className="flex items-center gap-2">
+            <p className="text-sm font-medium">Memory Usage</p>
+            <span className="text-xs text-muted-foreground">
+              {activeContainers.length}{' '}
+              {activeContainers.length === 1 ? 'replica' : 'replicas'}
+            </span>
+          </div>
           <span className="text-xs text-muted-foreground">
             {liveMetrics ? (
               <>
-                {liveMetrics.memoryMb.toFixed(0)} MB (
+                Total {liveMetrics.memoryMb.toFixed(0)} MB (
                 {liveMetrics.memoryPercent.toFixed(1)}%)
               </>
             ) : (
@@ -404,21 +471,26 @@ export function EnvironmentMetricsCharts({
               <ChartTooltip
                 content={
                   <ChartTooltipContent
-                    formatter={(value) => [
+                    formatter={(value, name) => [
                       `${Number(value).toFixed(1)} MB`,
-                      'Memory',
+                      memoryChartConfig[name as string]?.label ?? name,
                     ]}
                   />
                 }
               />
-              <Line
-                dataKey="memory"
-                type="monotone"
-                stroke="var(--color-memory)"
-                strokeWidth={2}
-                dot={false}
-                activeDot={{ r: 4 }}
-              />
+              <ChartLegend content={<ChartLegendContent />} />
+              {Array.from(containerSeries.values()).map((series) => (
+                <Line
+                  key={series.key}
+                  dataKey={`mem_${series.key}`}
+                  name={`mem_${series.key}`}
+                  type="monotone"
+                  stroke={`var(--color-mem_${series.key})`}
+                  strokeWidth={2}
+                  dot={false}
+                  activeDot={{ r: 4 }}
+                />
+              ))}
             </LineChart>
           </ChartContainer>
         ) : (

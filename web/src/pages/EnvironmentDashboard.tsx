@@ -8,6 +8,7 @@ import { ContainerList } from '@/components/containers/ContainerList'
 import { ContainerActionDialog } from '@/components/containers/ContainerActionDialog'
 import { EnvironmentSettingsContent } from '@/components/environments/EnvironmentSettingsContent'
 import { EnvironmentHeaderBar } from '@/components/environments/EnvironmentHeaderBar'
+import { EnvironmentMetricsCharts } from '@/components/monitoring/EnvironmentMetricsCard'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router'
 import { EnvironmentResponse, ProjectResponse } from '@/api/client'
@@ -145,6 +146,7 @@ export function EnvironmentDashboard({
           ) : (
             <ContainerPanel
               project={project}
+              environment={environment}
               environmentId={environmentId.toString()}
             />
           )}
@@ -156,18 +158,44 @@ export function EnvironmentDashboard({
 
 interface ContainerPanelProps {
   project: ProjectResponse
+  environment: EnvironmentResponse
   environmentId: string
 }
 
-function ContainerPanel({ project, environmentId }: ContainerPanelProps) {
+function ContainerPanel({
+  project,
+  environment,
+  environmentId,
+}: ContainerPanelProps) {
   const queryClient = useQueryClient()
   const [action, setAction] = useState<{
     containerId: string
     type: 'start' | 'stop' | 'restart'
   } | null>(null)
 
+  // Same query key as ContainerList below, so this shares its cache/network
+  // request via TanStack Query rather than double-fetching.
+  const { data: containers } = useQuery({
+    ...listContainersOptions({
+      path: {
+        project_id: project.id,
+        environment_id: parseInt(environmentId),
+      },
+    }),
+    staleTime: 5000,
+  })
+
   return (
     <>
+      {containers && containers.containers.length > 0 && (
+        <div className="mb-6">
+          <EnvironmentMetricsCharts
+            projectId={project.id}
+            environment={environment}
+            containers={containers.containers}
+          />
+        </div>
+      )}
       <ContainerList
         project={project}
         environmentId={environmentId}
