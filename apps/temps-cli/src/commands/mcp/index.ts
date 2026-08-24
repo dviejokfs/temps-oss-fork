@@ -2,6 +2,7 @@ import type { Command } from 'commander'
 import { createApiKey, getSettings, updateSettings } from '../../api/sdk.gen.js'
 import type { AppSettings } from '../../api/types.gen.js'
 import { loginWithDevice } from '../auth/login.js'
+import { getActiveContext, getContext, listContexts } from '../../config/contexts.js'
 import { credentials, getApiUrl, requireAuth } from '../../config/store.js'
 import { client, getErrorMessage, getWebUrl, setupClient } from '../../lib/api-client.js'
 import { header, icons, info, keyValue, newline, success, warning } from '../../ui/output.js'
@@ -62,6 +63,55 @@ function resolveWebUrl(urlOverride: string | undefined): string {
 
 const URL_OPTION_DESCRIPTION =
   'Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted.'
+
+/** Sentinel choice value for "type a URL instead of picking a saved context". */
+const CUSTOM_TARGET = '__custom_url__'
+
+interface McpTarget {
+  url?: string
+  apiKey?: string
+}
+
+/**
+ * The wizard's first step: which Temps instance to configure. Defaults to
+ * the active context (Enter reproduces today's behavior) so this never adds
+ * friction for the common case, but makes the choice explicit instead of
+ * silently trusting whatever happens to be active -- especially important
+ * for `mcp add`, which can end up embedding the wrong server's API key into
+ * an AI client's config if the wrong instance is picked (see addAction).
+ *
+ * Skipped (returns { url: options.url }) when --url was already passed
+ * explicitly, in --yes mode (must stay non-interactive), or when there are
+ * no saved contexts at all -- ensureMcpAuth's own "log in now?" prompt
+ * covers that last case instead.
+ */
+async function selectMcpTarget(options: { url?: string; yes?: boolean }): Promise<McpTarget> {
+  if (options.url || options.yes) return { url: options.url }
+
+  const contexts = await listContexts()
+  if (contexts.length === 0) return {}
+
+  const active = await getActiveContext()
+  const selected = await promptSelect({
+    message: 'Which Temps instance do you want to configure?',
+    choices: [
+      ...contexts.map((c) => ({
+        name: `${c.name}  (${c.url})${active?.name === c.name ? '  [current]' : ''}`,
+        value: c.name,
+      })),
+      { name: 'Enter a different URL...', value: CUSTOM_TARGET },
+    ],
+    default: active?.name,
+  })
+
+  if (selected === CUSTOM_TARGET) {
+    const url = await promptText({ message: 'Temps server URL' })
+    return { url: url || undefined }
+  }
+
+  const ctx = await getContext(selected)
+  return ctx ? { url: ctx.url, apiKey: ctx.apiKey } : {}
+}
 
 interface AddOptions {
   groups?: string
@@ -142,8 +192,9 @@ async function disableAction(options: { url?: string }): Promise<void> {
 }
 
 async function addAction(clientArg: string | undefined, options: AddOptions): Promise<void> {
-  await ensureMcpAuth({ yes: options.yes, urlOverride: options.url })
-  await setupClient(options.url)
+  const target = await selectMcpTarget({ url: options.url, yes: options.yes })
+  await ensureMcpAuth({ yes: options.yes, urlOverride: target.url })
+  await setupClient(target.url, target.apiKey)
 
   const clientId =
     clientArg ||
@@ -161,8 +212,8 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   // MCP endpoints (/mcp, /mcp/tools) are mounted at the server root, not under
   // /api like the REST API -- getApiUrl() (used by the generated client) would
   // build a URL that always 404s here. resolveWebUrl() strips the /api suffix
-  // (and honors --url when the caller pinned a specific instance).
-  const mcpBaseUrl = resolveWebUrl(options.url)
+  // (and honors the instance chosen above, whether via --url or the picker).
+  const mcpBaseUrl = resolveWebUrl(target.url)
 
   const probe = await withSpinner('Checking for Temps MCP support...', () => probeMcpEndpoint(mcpBaseUrl))
   if (!probe.supported) {
@@ -239,7 +290,12 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
       newline()
       success(`Created API key "${created.name}" (${created.key_prefix}...)`)
     } else {
-      apiKey = await requireAuth()
+      // Prefer the key resolved for the chosen instance (from the picker
+      // above or --url) over requireAuth()'s ambient resolution, which
+      // reflects whatever context is globally active -- possibly a
+      // *different* server than the one just chosen, which would otherwise
+      // embed the wrong credentials into this client's config.
+      apiKey = target.apiKey ?? (await requireAuth())
     }
   }
 
