@@ -6,12 +6,14 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { CodeTabs, type CodeExample } from '@/components/ui/code-tabs'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
 import { AlertTriangle, Bot, ExternalLink } from 'lucide-react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 
 /**
@@ -25,9 +27,28 @@ function mcpBaseUrl(externalUrl: string | null | undefined): string {
   return externalUrl || window.location.origin
 }
 
+/** Mirrors CLIENT_ADAPTERS in apps/temps-cli/src/commands/mcp/clients/index.ts. */
+const MCP_CLIENTS: { id: string; label: string }[] = [
+  { id: 'claude-code', label: 'Claude Code' },
+  { id: 'claude-desktop', label: 'Claude Desktop' },
+  { id: 'codex', label: 'Codex' },
+  { id: 'cursor', label: 'Cursor' },
+  { id: 'vscode', label: 'VS Code' },
+  { id: 'windsurf', label: 'Windsurf' },
+  { id: 'zed', label: 'Zed' },
+]
+
+const CONNECT_EXAMPLES: CodeExample[] = MCP_CLIENTS.map((c) => ({
+  id: c.id,
+  label: c.label,
+  language: 'bash',
+  code: `bunx @temps-sdk/cli mcp add ${c.id}`,
+}))
+
 export function McpServerCard() {
   const { data: settings, isLoading, error } = useSettings()
   const updateSettings = useUpdateSettings()
+  const [connectClientId, setConnectClientId] = useState(MCP_CLIENTS[0].id)
 
   if (isLoading) {
     return (
@@ -136,20 +157,17 @@ export function McpServerCard() {
             </div>
             <div className="space-y-1">
               <Label className="text-sm">Connect a client</Label>
-              <div className="flex items-center gap-2">
-                <code className="flex-1 truncate rounded bg-muted px-2 py-1 text-xs">
-                  bunx @temps-sdk/cli mcp add
-                </code>
-                <CopyButton
-                  value="bunx @temps-sdk/cli mcp add"
-                  minimal
-                  label="Copy command"
-                  className="shrink-0"
-                />
-              </div>
+              <CodeTabs
+                value={connectClientId}
+                onValueChange={setConnectClientId}
+                examples={CONNECT_EXAMPLES}
+                showLineNumbers={false}
+              />
               <p className="text-xs text-muted-foreground">
                 Runs an installer wizard that mints a scoped API key and
-                writes the right config for whichever AI client you pick.
+                writes the right config for {
+                  MCP_CLIENTS.find((c) => c.id === connectClientId)?.label
+                }.
               </p>
             </div>
             <a
