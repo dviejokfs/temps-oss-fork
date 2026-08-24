@@ -111,7 +111,7 @@ export function EnvironmentDashboard({
     )
   }
 
-  const isStatic = project?.preset === 'custom'
+  const isStatic = project?.source_type === 'static_files'
 
   return (
     <div className="flex flex-col h-full bg-white dark:bg-neutral-950">
