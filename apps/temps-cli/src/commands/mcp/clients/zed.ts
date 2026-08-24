@@ -23,6 +23,10 @@ export class ZedAdapter extends JsonConfigMcpClientAdapter {
     return { enabled: true, url: entry.url, headers: { Authorization: `Bearer ${entry.apiKey}` } }
   }
 
+  protected extractUrl(serverConfig: Record<string, unknown>): string | null {
+    return typeof serverConfig.url === 'string' ? serverConfig.url : null
+  }
+
   // Zed does not ship an official Windows build.
   override async isClientSupported(): Promise<boolean> {
     return process.platform === 'darwin' || process.platform === 'linux'

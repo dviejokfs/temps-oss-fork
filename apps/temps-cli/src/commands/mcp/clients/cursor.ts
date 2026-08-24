@@ -18,6 +18,10 @@ export class CursorAdapter extends JsonConfigMcpClientAdapter {
     return { url: entry.url, headers: { Authorization: `Bearer ${entry.apiKey}` } }
   }
 
+  protected extractUrl(serverConfig: Record<string, unknown>): string | null {
+    return typeof serverConfig.url === 'string' ? serverConfig.url : null
+  }
+
   override async isClientSupported(): Promise<boolean> {
     return process.platform === 'darwin' || process.platform === 'win32' || process.platform === 'linux'
   }

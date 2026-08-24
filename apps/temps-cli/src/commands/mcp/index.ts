@@ -9,7 +9,7 @@ import { promptCheckbox, promptConfirm, promptSelect, promptText } from '../../u
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { CLIENT_ADAPTERS, getClientAdapter, listClientIds } from './clients/index.js'
-import { buildMcpUrl, isValidGroupKey, TOOL_GROUPS } from './groups.js'
+import { buildMcpUrl, isValidGroupKey, parseMcpUrl, TOOL_GROUPS } from './groups.js'
 import { probeMcpEndpoint } from './probe.js'
 
 /**
@@ -284,6 +284,22 @@ interface StatusRow {
   label: string
   detected: string
   installed: string
+  groups: string
+}
+
+/**
+ * Summarizes which tool groups + write mode a client's configured URL grants,
+ * for the "Tool groups" status column. Returns "-" when the client isn't
+ * configured, or when its URL wasn't built by this CLI (an entry hand-edited
+ * or written by another tool -- e.g. the legacy @temps-sdk/mcp package --
+ * doesn't carry the groups/write query params this parses).
+ */
+function formatGroups(url: string | null): string {
+  if (!url) return '-'
+  const parsed = parseMcpUrl(url)
+  if (!parsed) return '-'
+  const label = parsed.groups.length === TOOL_GROUPS.length ? 'All' : `${parsed.groups.length}/${TOOL_GROUPS.length}`
+  return parsed.write ? `${label} (write)` : label
 }
 
 async function statusAction(): Promise<void> {
@@ -301,10 +317,12 @@ async function statusAction(): Promise<void> {
   const rows: StatusRow[] = await Promise.all(
     CLIENT_ADAPTERS.map(async (adapter) => {
       const [detected, installed] = await Promise.all([adapter.isClientSupported(), adapter.isServerInstalled()])
+      const url = installed ? await adapter.getServerUrl() : null
       return {
         label: adapter.label,
         detected: detected ? `${icons.success} detected` : `${icons.bullet} not detected`,
         installed: installed ? `${icons.success} configured` : `${icons.bullet} not configured`,
+        groups: formatGroups(url),
       }
     }),
   )
@@ -313,6 +331,7 @@ async function statusAction(): Promise<void> {
     { header: 'Client', key: 'label' },
     { header: 'On this machine', key: 'detected' },
     { header: 'Temps MCP server', key: 'installed' },
+    { header: 'Tool groups', key: 'groups' },
   ]
 
   printTable(rows, columns)

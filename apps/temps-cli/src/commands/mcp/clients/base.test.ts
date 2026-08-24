@@ -20,6 +20,9 @@ class TestAdapter extends JsonConfigMcpClientAdapter {
   protected buildServerConfig(entry: McpServerEntry): Record<string, unknown> {
     return { url: entry.url, headers: { Authorization: `Bearer ${entry.apiKey}` } }
   }
+  protected extractUrl(serverConfig: Record<string, unknown>): string | null {
+    return typeof serverConfig.url === 'string' ? serverConfig.url : null
+  }
 }
 
 describe('JsonConfigMcpClientAdapter', () => {
@@ -103,5 +106,11 @@ describe('JsonConfigMcpClientAdapter', () => {
     const result = await adapter.removeServer()
     expect(result).toEqual({ success: true })
     expect(await adapter.isServerInstalled()).toBe(false)
+  })
+
+  test('getServerUrl returns null when not installed, the URL when it is', async () => {
+    expect(await adapter.getServerUrl()).toBeNull()
+    await adapter.addServer(entry)
+    expect(await adapter.getServerUrl()).toBe(entry.url)
   })
 })

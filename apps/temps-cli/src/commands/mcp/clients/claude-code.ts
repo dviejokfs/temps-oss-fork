@@ -34,17 +34,31 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
     return this.findBinary() !== null
   }
 
+  // `mcp get <name>` exits non-zero when the name isn't configured, unlike
+  // grepping `mcp list` output for MCP_SERVER_NAME -- a substring match
+  // there false-positives on any unrelated server whose URL merely contains
+  // "temps" (e.g. a server hosted at some-app.temps.example.com).
+  private getServerEntry(binary: string): string | null {
+    try {
+      return execFileSync(binary, ['mcp', 'get', MCP_SERVER_NAME], { stdio: ['ignore', 'pipe', 'pipe'] }).toString()
+    } catch {
+      return null
+    }
+  }
+
   async isServerInstalled(): Promise<boolean> {
     const binary = this.findBinary()
     if (!binary) return false
-    try {
-      const out = execFileSync(binary, ['mcp', 'list'], { stdio: ['ignore', 'pipe', 'pipe'] })
-        .toString()
-        .toLowerCase()
-      return out.includes(MCP_SERVER_NAME)
-    } catch {
-      return false
-    }
+    return this.getServerEntry(binary) !== null
+  }
+
+  async getServerUrl(): Promise<string | null> {
+    const binary = this.findBinary()
+    if (!binary) return null
+    const entry = this.getServerEntry(binary)
+    if (!entry) return null
+    const match = entry.match(/^\s*URL:\s*(\S+)/m)
+    return match?.[1] ?? null
   }
 
   async addServer(entry: McpServerEntry): Promise<InstallResult> {

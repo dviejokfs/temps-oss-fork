@@ -27,6 +27,13 @@ export interface McpClientAdapter {
   /** Best-effort detection of whether this client is installed on the machine. Advisory only -- add proceeds either way. */
   isClientSupported(): Promise<boolean>
   isServerInstalled(): Promise<boolean>
+  /**
+   * Best-effort: the connection URL this client currently has configured for
+   * the Temps server, or null if not installed / not determinable. `mcp
+   * status` parses this to show which tool groups and write mode are active
+   * -- see parseMcpUrl in ../groups.ts.
+   */
+  getServerUrl(): Promise<string | null>
   addServer(entry: McpServerEntry): Promise<InstallResult>
   removeServer(): Promise<InstallResult>
   /** Human-readable description of what `addServer`/`removeServer` will change, for the pre-write confirmation prompt. */
@@ -47,22 +54,33 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
   protected abstract getConfigPath(): string
   protected abstract getServerPropertyName(): string
   protected abstract buildServerConfig(entry: McpServerEntry): Record<string, unknown>
+  /** Pulls the connection URL back out of a config entry previously built by buildServerConfig. */
+  protected abstract extractUrl(serverConfig: Record<string, unknown>): string | null
 
   async isClientSupported(): Promise<boolean> {
     return true
   }
 
-  async isServerInstalled(): Promise<boolean> {
+  private async readServerConfig(): Promise<Record<string, unknown> | null> {
     const configPath = this.getConfigPath()
-    if (!fs.existsSync(configPath)) return false
+    if (!fs.existsSync(configPath)) return null
     try {
       const content = await fs.promises.readFile(configPath, 'utf8')
       const config = jsonc.parse(content) as Record<string, any> | undefined
       const prop = this.getServerPropertyName()
-      return !!config?.[prop]?.[MCP_SERVER_NAME]
+      return config?.[prop]?.[MCP_SERVER_NAME] ?? null
     } catch {
-      return false
+      return null
     }
+  }
+
+  async isServerInstalled(): Promise<boolean> {
+    return (await this.readServerConfig()) !== null
+  }
+
+  async getServerUrl(): Promise<string | null> {
+    const serverConfig = await this.readServerConfig()
+    return serverConfig ? this.extractUrl(serverConfig) : null
   }
 
   async addServer(entry: McpServerEntry): Promise<InstallResult> {

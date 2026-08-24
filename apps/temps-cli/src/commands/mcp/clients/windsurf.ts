@@ -23,6 +23,10 @@ export class WindsurfAdapter extends JsonConfigMcpClientAdapter {
     return { serverUrl: entry.url, headers: { Authorization: `Bearer ${entry.apiKey}` } }
   }
 
+  protected extractUrl(serverConfig: Record<string, unknown>): string | null {
+    return typeof serverConfig.serverUrl === 'string' ? serverConfig.serverUrl : null
+  }
+
   override async isClientSupported(): Promise<boolean> {
     return process.platform === 'darwin' || process.platform === 'win32' || process.platform === 'linux'
   }

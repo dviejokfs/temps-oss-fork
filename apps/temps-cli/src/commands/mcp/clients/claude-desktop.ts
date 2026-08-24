@@ -31,6 +31,17 @@ export class ClaudeDesktopAdapter extends JsonConfigMcpClientAdapter {
     }
   }
 
+  // Only recognizes an entry this adapter itself wrote (the URL is a bare
+  // arg to mcp-remote). An entry from the old @temps-sdk/mcp package encodes
+  // the connection via env vars and --tools instead -- returns null there,
+  // same as any other config this adapter doesn't understand.
+  protected extractUrl(serverConfig: Record<string, unknown>): string | null {
+    const args = serverConfig.args
+    if (!Array.isArray(args)) return null
+    const url = args.find((arg) => typeof arg === 'string' && /^https?:\/\//.test(arg))
+    return typeof url === 'string' ? url : null
+  }
+
   override async isClientSupported(): Promise<boolean> {
     return process.platform === 'darwin' || process.platform === 'win32'
   }

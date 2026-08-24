@@ -67,3 +67,29 @@ export function buildMcpUrl(apiUrl: string, groups: string[], write: boolean): s
   }
   return url.toString()
 }
+
+export interface ParsedMcpUrl {
+  groups: string[]
+  write: boolean
+}
+
+/**
+ * Inverse of buildMcpUrl, for `mcp status` to summarize what a client is
+ * already connected with. Returns null for a URL this app didn't build
+ * (unparsable, or missing the `groups`/`write` query shape entirely) --
+ * that includes a client configured through some other tool, or the legacy
+ * `@temps-sdk/mcp` package, which encoded tool selection differently.
+ */
+export function parseMcpUrl(url: string): ParsedMcpUrl | null {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return null
+  }
+  const groupsParam = parsed.searchParams.get('groups')
+  const groups = groupsParam
+    ? groupsParam.split(',').filter(isValidGroupKey)
+    : TOOL_GROUPS.map((g) => g.key)
+  return { groups, write: parsed.searchParams.get('write') === '1' }
+}
