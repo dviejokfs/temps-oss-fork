@@ -143,10 +143,15 @@ export function EnvironmentDashboard({
                 This project does not have running containers to manage.
               </p>
             </div>
+          ) : activeView === 'metrics' ? (
+            <MetricsPanel
+              project={project}
+              environment={environment}
+              environmentId={environmentId.toString()}
+            />
           ) : (
             <ContainerPanel
               project={project}
-              environment={environment}
               environmentId={environmentId.toString()}
             />
           )}
@@ -158,44 +163,18 @@ export function EnvironmentDashboard({
 
 interface ContainerPanelProps {
   project: ProjectResponse
-  environment: EnvironmentResponse
   environmentId: string
 }
 
-function ContainerPanel({
-  project,
-  environment,
-  environmentId,
-}: ContainerPanelProps) {
+function ContainerPanel({ project, environmentId }: ContainerPanelProps) {
   const queryClient = useQueryClient()
   const [action, setAction] = useState<{
     containerId: string
     type: 'start' | 'stop' | 'restart'
   } | null>(null)
 
-  // Same query key as ContainerList below, so this shares its cache/network
-  // request via TanStack Query rather than double-fetching.
-  const { data: containers } = useQuery({
-    ...listContainersOptions({
-      path: {
-        project_id: project.id,
-        environment_id: parseInt(environmentId),
-      },
-    }),
-    staleTime: 5000,
-  })
-
   return (
     <>
-      {containers && containers.containers.length > 0 && (
-        <div className="mb-6">
-          <EnvironmentMetricsCharts
-            projectId={project.id}
-            environment={environment}
-            containers={containers.containers}
-          />
-        </div>
-      )}
       <ContainerList
         project={project}
         environmentId={environmentId}
@@ -219,5 +198,46 @@ function ContainerPanel({
         }}
       />
     </>
+  )
+}
+
+interface MetricsPanelProps {
+  project: ProjectResponse
+  environment: EnvironmentResponse
+  environmentId: string
+}
+
+function MetricsPanel({
+  project,
+  environment,
+  environmentId,
+}: MetricsPanelProps) {
+  // Same query key ContainerList uses, so this shares its cache/network
+  // request via TanStack Query rather than double-fetching when both tabs
+  // have been visited.
+  const { data: containers } = useQuery({
+    ...listContainersOptions({
+      path: {
+        project_id: project.id,
+        environment_id: parseInt(environmentId),
+      },
+    }),
+    staleTime: 5000,
+  })
+
+  if (!containers || containers.containers.length === 0) {
+    return (
+      <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
+        No running containers
+      </div>
+    )
+  }
+
+  return (
+    <EnvironmentMetricsCharts
+      projectId={project.id}
+      environment={environment}
+      containers={containers.containers}
+    />
   )
 }
