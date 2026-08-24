@@ -92,7 +92,9 @@ pub struct SetupCommand {
     pub admin_password: Option<String>,
 
     /// Wildcard domain pattern for SSL certificate (e.g., "*.app.example.com")
-    /// Auto-generated from public IP via sslip.io when --auto is used
+    /// When omitted, defaults to a sslip.io domain generated from the
+    /// detected server IP (e.g. "*.203-0-113-42.sslip.io"), with on-demand
+    /// Let's Encrypt TLS and no DNS provider required.
     #[arg(long)]
     pub wildcard_domain: Option<String>,
 
@@ -227,9 +229,10 @@ pub struct SetupCommand {
     #[arg(long, default_value = "false")]
     pub skip_geolite2_download: bool,
 
-    /// Fully automatic setup: auto-detect public IP, use sslip.io for instant DNS,
-    /// skip SSL/DNS, generate admin credentials. Zero prompts required.
-    /// Use this for quick setup without a custom domain — add a real domain later.
+    /// Fully automatic setup: skip all prompts, generate admin credentials,
+    /// and (like the sslip.io domain default above) skip SSL/DNS-provider
+    /// setup even if --wildcard-domain is explicitly given. Zero prompts
+    /// required. Use this for unattended/scripted installs.
     #[arg(long, default_value = "false")]
     pub auto: bool,
 }
@@ -1474,46 +1477,61 @@ impl SetupCommand {
             print_success("Auto mode enabled - detecting configuration...");
 
             // Auto implies non-interactive, skip-ssl, skip-dns-records, skip-git
+            // regardless of domain — even `--auto --wildcard-domain
+            // example.com` should skip the DNS-provider/manual-cert flow, since
+            // the whole point of --auto is a zero-prompt install.
             self.non_interactive = true;
             self.skip_ssl = true;
             self.skip_dns_records = true;
             self.skip_git = true;
 
-            // Auto-detect public IP and generate sslip.io domain
-            if self.wildcard_domain.is_none() {
-                let rt_tmp = tokio::runtime::Runtime::new()?;
-                let ip = match rt_tmp.block_on(detect_public_ip()) {
-                    Ok(ip) => {
-                        print_success(&format!("Detected public IP: {}", ip.bright_cyan()));
-                        ip
-                    }
-                    Err(_) => {
-                        // Fallback to private IP or localhost
-                        let ip = detect_private_ip().unwrap_or_else(|| "127.0.0.1".to_string());
-                        print_success(&format!(
-                            "Using IP: {} (public IP detection failed)",
-                            ip.bright_cyan()
-                        ));
-                        ip
-                    }
-                };
-                let sslip_domain = sslip_domain_for(&ip);
-                print_success(&format!(
-                    "Using sslip.io domain: {}",
-                    format!("*.{}", sslip_domain).bright_cyan()
-                ));
-                self.wildcard_domain = Some(format!("*.{}", sslip_domain));
-                self.server_ip = Some(ip.clone());
-
-                // Set external URL for HTTP access
-                if self.external_url.is_none() {
-                    self.external_url = Some(format!("http://{}", sslip_domain));
-                }
-            }
-
             // Default admin email
             if self.admin_email.is_none() {
                 self.admin_email = Some("admin@localhost".to_string());
+            }
+
+            println!();
+        }
+
+        // sslip.io is the universal fallback whenever no wildcard domain was
+        // given, independent of --auto: a bare `temps setup --database-url ...
+        // --admin-email ...` with no domain flags used to hard-fail demanding
+        // --wildcard-domain. It now gets a real, publicly resolvable domain
+        // and working on-demand TLS instead. sslip.io needs no DNS provider
+        // and no manual cert ordering, so both are skipped for exactly this
+        // derived domain — an explicitly-provided --wildcard-domain still
+        // goes through the normal DNS-provider / cert flow below.
+        if self.wildcard_domain.is_none() {
+            print_section("Domain");
+            let rt_tmp = tokio::runtime::Runtime::new()?;
+            let ip = match rt_tmp.block_on(detect_public_ip()) {
+                Ok(ip) => {
+                    print_success(&format!("Detected public IP: {}", ip.bright_cyan()));
+                    ip
+                }
+                Err(_) => {
+                    // Fallback to private IP or localhost
+                    let ip = detect_private_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+                    print_success(&format!(
+                        "Using IP: {} (public IP detection failed)",
+                        ip.bright_cyan()
+                    ));
+                    ip
+                }
+            };
+            let sslip_domain = sslip_domain_for(&ip);
+            print_success(&format!(
+                "No --wildcard-domain given — defaulting to sslip.io: {}",
+                format!("*.{}", sslip_domain).bright_cyan()
+            ));
+            self.wildcard_domain = Some(format!("*.{}", sslip_domain));
+            self.server_ip = Some(ip.clone());
+            self.skip_ssl = true;
+            self.skip_dns_records = true;
+
+            // Set external URL for HTTP access
+            if self.external_url.is_none() {
+                self.external_url = Some(format!("http://{}", sslip_domain));
             }
 
             println!();
@@ -1527,7 +1545,7 @@ impl SetupCommand {
         })?;
         let wildcard_domain = self.wildcard_domain.clone().ok_or_else(|| {
             anyhow::anyhow!(
-                "--wildcard-domain is required. Use --auto to auto-generate from public IP via sslip.io."
+                "internal error: wildcard_domain must be set explicitly or defaulted to sslip.io above"
             )
         })?;
 
