@@ -6,7 +6,7 @@ import { getActiveContext, getContext, listContexts } from '../../config/context
 import { credentials, getApiUrl, requireAuth } from '../../config/store.js'
 import { client, getErrorMessage, getWebUrl, setupClient } from '../../lib/api-client.js'
 import { header, icons, info, keyValue, newline, success, warning } from '../../ui/output.js'
-import { promptCheckbox, promptConfirm, promptSelect, promptText } from '../../ui/prompts.js'
+import { promptCheckbox, promptConfirm, promptSearch, promptSelect, promptText } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { CLIENT_ADAPTERS, getClientAdapter, listClientIds } from './clients/index.js'
@@ -92,16 +92,23 @@ async function selectMcpTarget(options: { url?: string; yes?: boolean }): Promis
   if (contexts.length === 0) return {}
 
   const active = await getActiveContext()
-  const selected = await promptSelect({
-    message: 'Which Temps instance do you want to configure?',
+  // Active context first so it's always in view on the initial (unfiltered)
+  // page, regardless of how many contexts are configured -- this is the
+  // "just press Enter" fast path. Typing filters by name OR url (the search
+  // term is matched against `description` too), which matters once there
+  // are more contexts than fit on one page.
+  const ordered = active ? [active, ...contexts.filter((c) => c.name !== active.name)] : contexts
+
+  const selected = await promptSearch({
+    message: 'Which Temps instance do you want to configure? (type to search)',
     choices: [
-      ...contexts.map((c) => ({
-        name: `${c.name}  (${c.url})${active?.name === c.name ? '  [current]' : ''}`,
+      ...ordered.map((c) => ({
+        name: `${c.name}${active?.name === c.name ? '  [current]' : ''}`,
         value: c.name,
+        description: c.url,
       })),
-      { name: 'Enter a different URL...', value: CUSTOM_TARGET },
+      { name: 'Enter a different URL...', value: CUSTOM_TARGET, alwaysShow: true },
     ],
-    default: active?.name,
   })
 
   if (selected === CUSTOM_TARGET) {
