@@ -2324,10 +2324,14 @@ pub async fn stream_container_metrics(
         .and_then(|i| i.parse::<u64>().ok())
         .unwrap_or(1000); // Default: 1 second
 
-    // Verify container exists and get initial stats
-    let _stats = state
+    // Verify container exists and is accessible before opening the stream.
+    // A DB-only lookup, not `get_container_metrics` — that would pay for a
+    // full Docker two-sample CPU read (~1s, see `sample_container_stats_twice`)
+    // just to discard the result, adding needless latency before the first
+    // real tick.
+    let _detail = state
         .deployment_service
-        .get_container_metrics(project_id, environment_id, container_id.clone())
+        .get_container_detail(project_id, environment_id, container_id.clone())
         .await?;
 
     let service = state.deployment_service.clone();
