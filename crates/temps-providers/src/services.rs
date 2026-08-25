@@ -107,6 +107,22 @@ fn select_member_dns_endpoint(
     underlay_endpoint
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProvisioningRoute {
+    Local,
+    Remote(i32),
+}
+
+/// `external_services.node_id` is the ownership boundary: NULL means the
+/// control plane's Docker daemon, while a concrete ID means that worker's
+/// private daemon and network namespace.
+fn runtime_provisioning_route(node_id: Option<i32>) -> RuntimeProvisioningRoute {
+    match node_id {
+        Some(node_id) => RuntimeProvisioningRoute::Remote(node_id),
+        None => RuntimeProvisioningRoute::Local,
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum ExternalServiceError {
     #[error("Service {id} not found")]
@@ -1479,7 +1495,7 @@ impl ExternalServiceManager {
 
         let container_name = self
             .create_service_instance(service_name.to_string(), backend_service_type)
-            .get_name();
+            .get_docker_container_name();
         let container_name_for_volume = format!("{}-{}", backend_service_type, service_name);
         let volume_name = format!("{}_data", container_name_for_volume);
 
@@ -4864,6 +4880,10 @@ echo "[restore] Pre-seed complete"
         let mut inferred = HashMap::new();
         inferred.insert("port".to_string(), response.host_port.to_string());
         inferred.insert("container_id".to_string(), response.container_id.clone());
+        inferred.insert(
+            "container_name".to_string(),
+            response.container_name.clone(),
+        );
 
         // Persist inferred parameters
         let mut current_params = self.get_service_parameters(service_id).await?;
@@ -8326,12 +8346,6 @@ echo "[restore] Pre-seed complete"
             return Ok(cluster_vars);
         }
 
-        // Standalone: delegate to the service instance's get_runtime_env_vars
-        let service_instance = self.create_service_instance_for_parameters(
-            service.name.clone(),
-            service_type,
-            &parameters,
-        )?;
         let service_config = ServiceConfig {
             name: service.name.clone(),
             service_type,
@@ -8342,6 +8356,38 @@ echo "[restore] Pre-seed complete"
                 }
             })?,
         };
+
+        if let RuntimeProvisioningRoute::Remote(node_id) =
+            runtime_provisioning_route(service.node_id)
+        {
+            info!(
+                service_id = service_id_val,
+                node_id, "Dispatching external-service runtime provisioning to owning node"
+            );
+            let client = self.get_remote_client(node_id).await?;
+            return client
+                .get_runtime_env_vars(crate::remote_service_client::RemoteRuntimeEnvRequest {
+                    service_config,
+                    project_slug: project.slug,
+                    environment_slug: environment.slug,
+                })
+                .await
+                .map(|response| response.environment)
+                .map_err(|error| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to provision runtime environment for service {} on node {}: {}",
+                        service_id_val, node_id, error
+                    ),
+                });
+        }
+
+        // Local standalone service: preserve the existing in-process provider
+        // path against the control plane's Docker daemon.
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
 
         // Initialize the service to populate its internal config
         service_instance
@@ -10905,6 +10951,24 @@ mod tests {
             "monitor remote and new member remote (possibly different \
              nodes) -> still the monitor's own node address"
         );
+    }
+
+    #[test]
+    fn remote_create_uses_provider_canonical_container_names() {
+        let manager = mock_service_manager(vec![]);
+
+        for (service_type, expected) in [
+            (ServiceType::Postgres, "postgres-orders"),
+            (ServiceType::Mariadb, "mariadb-orders"),
+            (ServiceType::Mongodb, "temps-mongodb-orders"),
+            (ServiceType::Redis, "redis-orders"),
+            (ServiceType::Rustfs, "rustfs-orders"),
+        ] {
+            let params = manager
+                .build_remote_create_params("orders", &service_type, &HashMap::new())
+                .expect("default remote service parameters should be valid");
+            assert_eq!(params.name, expected, "wrong name for {service_type}");
+        }
     }
 
     /// Regression for the `ExternalServiceManager::Clone` fix: background
@@ -14976,5 +15040,21 @@ mod tests {
             5432,
         );
         assert_eq!(underlay, Some(("10.52.0.11".to_string(), 6012)));
+    }
+
+    #[test]
+    fn runtime_provisioning_without_node_id_stays_local() {
+        assert_eq!(
+            runtime_provisioning_route(None),
+            RuntimeProvisioningRoute::Local
+        );
+    }
+
+    #[test]
+    fn runtime_provisioning_with_node_id_targets_owning_worker() {
+        assert_eq!(
+            runtime_provisioning_route(Some(17)),
+            RuntimeProvisioningRoute::Remote(17)
+        );
     }
 }

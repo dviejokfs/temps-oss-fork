@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use utoipa::ToSchema;
 
 pub mod cluster_role;
@@ -27,6 +28,29 @@ pub mod s3_util;
 #[cfg(test)]
 pub mod test_utils;
 
+#[cfg(test)]
+mod runtime_provisioning_tests {
+    use super::is_container_not_found;
+
+    #[test]
+    fn only_docker_404_means_container_absent() {
+        let not_found = bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "No such container".to_string(),
+        };
+        let daemon_failure = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "daemon unavailable".to_string(),
+        };
+
+        assert!(is_container_not_found(&not_found));
+        assert!(!is_container_not_found(&daemon_failure));
+        assert!(!is_container_not_found(
+            &bollard::errors::Error::RequestTimeoutError
+        ));
+    }
+}
+
 // Integration tests for service clusters
 #[cfg(test)]
 mod cluster_integration_tests;
@@ -48,6 +72,193 @@ pub use postgres_cluster::PostgresClusterService;
 pub use redis::RedisService;
 pub use rustfs::RustfsService;
 pub use s3::S3Service;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeProvisioningError {
+    #[error("Failed to inspect external-service container '{container}': {source}")]
+    ContainerInspection {
+        container: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+
+    #[error("Failed to rename legacy container '{legacy}' to '{canonical}': {source}")]
+    LegacyContainerRename {
+        legacy: String,
+        canonical: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+
+    #[error("External-service provider provisioning failed: {0}")]
+    Provider(#[source] anyhow::Error),
+}
+
+fn is_container_not_found(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
+async fn runtime_container_exists(
+    docker: &bollard::Docker,
+    container: &str,
+) -> std::result::Result<bool, RuntimeProvisioningError> {
+    match docker
+        .inspect_container(
+            container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) if is_container_not_found(&error) => Ok(false),
+        Err(source) => Err(RuntimeProvisioningError::ContainerInspection {
+            container: container.to_string(),
+            source,
+        }),
+    }
+}
+
+/// Provision one project's logical resource on the worker that owns the
+/// service container.
+///
+/// Older control planes created remote containers using the raw service name,
+/// while providers use a type-prefixed canonical name. Before initializing the
+/// provider, adopt that legacy container by renaming it in place. Docker keeps
+/// the container ID, volumes, network attachments, and published ports intact.
+/// This avoids creating a second container during the first deployment after
+/// upgrading while making subsequent provider operations use one canonical
+/// identity.
+#[allow(deprecated)]
+pub async fn provision_runtime_environment(
+    name: String,
+    service_type: ServiceType,
+    config: ServiceConfig,
+    project_slug: &str,
+    environment_slug: &str,
+    docker: Arc<bollard::Docker>,
+) -> std::result::Result<HashMap<String, String>, RuntimeProvisioningError> {
+    let parameters = &config.parameters;
+    let instance_name = match service_type {
+        ServiceType::Kv | ServiceType::Blob => managed_instance_name(&name, service_type),
+        _ => name.clone(),
+    };
+
+    let instance: Box<dyn ExternalService> = match service_type {
+        ServiceType::Mariadb => Box::new(MariaDbService::new(instance_name, docker.clone())),
+        ServiceType::Mongodb => Box::new(MongodbService::new(instance_name, docker.clone())),
+        ServiceType::Postgres => Box::new(PostgresService::new(instance_name, docker.clone())),
+        ServiceType::Redis | ServiceType::Kv => {
+            Box::new(RedisService::new(instance_name, docker.clone()))
+        }
+        ServiceType::S3 | ServiceType::Blob => {
+            let selection = ManagedS3BackendSelection::from_parameters(parameters)
+                .map_err(RuntimeProvisioningError::Provider)?;
+            selection
+                .validate_for_service_create()
+                .map_err(RuntimeProvisioningError::Provider)?;
+
+            // Runtime provisioning does not use the backup encryption APIs,
+            // but these providers require the dependency at construction.
+            // Use a fresh request-local key so this narrow function cannot
+            // expose a provider carrying a fixed or reusable key.
+            let encryption = Arc::new(
+                temps_core::EncryptionService::new(
+                    &temps_core::EncryptionService::generate_raw_key()
+                        .map_err(RuntimeProvisioningError::Provider)?,
+                )
+                .map_err(RuntimeProvisioningError::Provider)?,
+            );
+            match selection.backend {
+                ManagedS3BackendKind::Rustfs => Box::new(RustfsService::new(
+                    instance_name,
+                    docker.clone(),
+                    encryption,
+                )),
+                ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
+                    Box::new(S3Service::new(instance_name, docker.clone(), encryption))
+                }
+                ManagedS3BackendKind::Minio => {
+                    return Err(RuntimeProvisioningError::Provider(anyhow::anyhow!(
+                        "managed S3 backend 'minio' is only supported for S3 services"
+                    )));
+                }
+                ManagedS3BackendKind::Garage => {
+                    return Err(RuntimeProvisioningError::Provider(anyhow::anyhow!(
+                        "managed S3 backend 'garage' is not supported for runtime provisioning"
+                    )));
+                }
+            }
+        }
+        ServiceType::Rustfs => {
+            let encryption = Arc::new(
+                temps_core::EncryptionService::new(
+                    &temps_core::EncryptionService::generate_raw_key()
+                        .map_err(RuntimeProvisioningError::Provider)?,
+                )
+                .map_err(RuntimeProvisioningError::Provider)?,
+            );
+            Box::new(RustfsService::new(
+                instance_name,
+                docker.clone(),
+                encryption,
+            ))
+        }
+        ServiceType::Minio => {
+            let encryption = Arc::new(
+                temps_core::EncryptionService::new(
+                    &temps_core::EncryptionService::generate_raw_key()
+                        .map_err(RuntimeProvisioningError::Provider)?,
+                )
+                .map_err(RuntimeProvisioningError::Provider)?,
+            );
+            Box::new(S3Service::new(instance_name, docker.clone(), encryption))
+        }
+    };
+
+    let legacy_name = instance.get_name();
+    let canonical_name = instance.get_docker_container_name();
+    let canonical_exists = runtime_container_exists(&docker, &canonical_name).await?;
+    let legacy_exists = if legacy_name == canonical_name {
+        false
+    } else {
+        runtime_container_exists(&docker, &legacy_name).await?
+    };
+    if !canonical_exists && legacy_exists {
+        tracing::info!(
+            legacy_container = %legacy_name,
+            canonical_container = %canonical_name,
+            "Adopting legacy remote external-service container name"
+        );
+        docker
+            .rename_container(
+                &legacy_name,
+                bollard::query_parameters::RenameContainerOptions {
+                    name: canonical_name.clone(),
+                },
+            )
+            .await
+            .map_err(|source| RuntimeProvisioningError::LegacyContainerRename {
+                legacy: legacy_name,
+                canonical: canonical_name,
+                source,
+            })?;
+    }
+
+    instance
+        .init(config.clone())
+        .await
+        .map_err(RuntimeProvisioningError::Provider)?;
+    instance
+        .get_runtime_env_vars(config, project_slug, environment_slug)
+        .await
+        .map_err(RuntimeProvisioningError::Provider)
+}
 
 /// Result of a successful `backup_to_s3` call.
 ///
@@ -262,7 +473,7 @@ impl S3Credentials {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ServiceConfig {
     pub name: String,
     pub service_type: ServiceType,

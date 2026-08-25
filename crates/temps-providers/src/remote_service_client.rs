@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info};
 
+use crate::externalsvc::ServiceConfig;
 use crate::services::ExternalServiceError;
 
 /// Response envelope from the agent API (mirrors `AgentResponse` in temps-agent).
@@ -96,6 +97,21 @@ pub struct RemoteExecResult {
     pub exit_code: i64,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Request to initialize a service and provision one project's logical
+/// resource on the node that owns the service container.
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RemoteRuntimeEnvRequest {
+    pub service_config: ServiceConfig,
+    pub project_slug: String,
+    pub environment_slug: String,
+}
+
+/// Runtime environment returned after the logical resource is provisioned.
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RemoteRuntimeEnvResponse {
+    pub environment: HashMap<String, String>,
 }
 
 impl RemoteServiceClient {
@@ -197,6 +213,22 @@ impl RemoteServiceClient {
             params.container_name, self.node_name, params.command
         );
         self.agent_post("/agent/services/exec", &params).await
+    }
+
+    /// Initialize the provider and provision its per-project resource on the
+    /// remote node. This keeps Docker and node-local TCP access inside the
+    /// worker agent instead of accidentally using the control plane host.
+    pub async fn get_runtime_env_vars(
+        &self,
+        request: RemoteRuntimeEnvRequest,
+    ) -> Result<RemoteRuntimeEnvResponse, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            node = %self.node_name,
+            "Provisioning external-service runtime environment on remote node"
+        );
+        self.agent_post("/agent/services/runtime-env", &request)
+            .await
     }
 
     // -----------------------------------------------------------------------
@@ -403,6 +435,13 @@ impl RemoteServiceClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::externalsvc::ServiceType;
+    use axum::{
+        extract::Json,
+        http::{header::AUTHORIZATION, HeaderMap},
+        routing::post,
+        Router,
+    };
 
     #[test]
     fn test_remote_service_create_params_serialization() {
@@ -432,5 +471,94 @@ mod tests {
         assert!(json.contains("30001"));
         assert!(!json.contains("command")); // None fields skipped
         assert!(!json.contains("resource_limits")); // None field skipped
+    }
+
+    #[test]
+    fn runtime_env_request_preserves_provider_config_and_tenant_identity() {
+        let request = RemoteRuntimeEnvRequest {
+            service_config: ServiceConfig {
+                name: "orders-db".to_string(),
+                service_type: ServiceType::Postgres,
+                version: Some("18".to_string()),
+                parameters: serde_json::json!({
+                    "host": "localhost",
+                    "port": "5432",
+                    "password": "secret"
+                }),
+            },
+            project_slug: "storefront".to_string(),
+            environment_slug: "production".to_string(),
+        };
+
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["service_config"]["name"], "orders-db");
+        assert_eq!(encoded["service_config"]["service_type"], "postgres");
+        assert_eq!(encoded["service_config"]["parameters"]["port"], "5432");
+        assert_eq!(encoded["project_slug"], "storefront");
+        assert_eq!(encoded["environment_slug"], "production");
+    }
+
+    #[tokio::test]
+    async fn runtime_env_posts_to_agent_and_returns_typed_environment() {
+        async fn handler(
+            headers: HeaderMap,
+            Json(request): Json<RemoteRuntimeEnvRequest>,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(
+                headers
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer node-token")
+            );
+            assert_eq!(request.service_config.name, "orders-db");
+            assert_eq!(request.project_slug, "storefront");
+            assert_eq!(request.environment_slug, "production");
+            Json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "environment": {
+                        "DATABASE_URL": "postgres://app:secret@postgres-orders-db:5432/storefront_production"
+                    }
+                },
+                "error": null
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/runtime-env", post(handler)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap();
+        let response = client
+            .get_runtime_env_vars(RemoteRuntimeEnvRequest {
+                service_config: ServiceConfig {
+                    name: "orders-db".to_string(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: serde_json::json!({"host": "localhost"}),
+                },
+                project_slug: "storefront".to_string(),
+                environment_slug: "production".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.environment.get("DATABASE_URL").map(String::as_str),
+            Some("postgres://app:secret@postgres-orders-db:5432/storefront_production")
+        );
+        server.abort();
     }
 }

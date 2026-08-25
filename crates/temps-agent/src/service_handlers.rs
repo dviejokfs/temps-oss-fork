@@ -21,6 +21,7 @@ use crate::{
     ServiceBackupRequest, ServiceBackupResponse, ServiceCreateRequest, ServiceCreateResponse,
     ServiceExecRequest, ServiceExecResponse, ServiceRestoreRequest, ServiceStatus,
 };
+use temps_providers::remote_service_client::{RemoteRuntimeEnvRequest, RemoteRuntimeEnvResponse};
 
 fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
     (
@@ -792,6 +793,70 @@ pub async fn service_exec(
         stderr: output.1,
     })
     .into_response()
+}
+
+/// Provision a project's logical database, bucket, or Redis allocation on
+/// the worker that owns the external-service container.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/runtime-env",
+    request_body = RemoteRuntimeEnvRequest,
+    responses(
+        (status = 200, description = "Runtime resource provisioned", body = AgentResponse<RemoteRuntimeEnvResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Provisioning failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn runtime_env(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<RemoteRuntimeEnvRequest>,
+) -> impl IntoResponse {
+    let service_name = request.service_config.name.clone();
+    let service_type = request.service_config.service_type;
+    tracing::info!(
+        service = %service_name,
+        service_type = %service_type,
+        project = %request.project_slug,
+        environment = %request.environment_slug,
+        "Provisioning external-service runtime environment"
+    );
+
+    let docker = match state.docker.as_ref() {
+        Some(docker) => Arc::new(docker.clone()),
+        None => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Docker client is unavailable while provisioning service '{}'",
+                    service_name
+                ),
+            )
+            .into_response();
+        }
+    };
+
+    match temps_providers::externalsvc::provision_runtime_environment(
+        service_name.clone(),
+        service_type,
+        request.service_config,
+        &request.project_slug,
+        &request.environment_slug,
+        docker,
+    )
+    .await
+    {
+        Ok(environment) => ok_response(RemoteRuntimeEnvResponse { environment }).into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Failed to provision runtime resource for service '{}': {}",
+                service_name, error
+            ),
+        )
+        .into_response(),
+    }
 }
 
 /// List all service containers on this node.

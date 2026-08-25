@@ -10233,6 +10233,7 @@ dependencies = [
  "temps-deployer",
  "temps-dns-resolver",
  "temps-network",
+ "temps-providers",
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
