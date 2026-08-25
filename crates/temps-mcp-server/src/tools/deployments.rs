@@ -11,7 +11,7 @@ use crate::access::check_project_access;
 use crate::audit::{AuditContext, McpDeploymentTriggeredAudit};
 use crate::error::McpError;
 use crate::proposal::ProposalStore;
-use crate::protocol::McpTool;
+use crate::protocol::{McpTool, McpToolResult};
 
 /// Actor + request context needed to attribute an audit log entry to the MCP
 /// caller. Constructed by the handler layer from `AuthContext` +
@@ -131,6 +131,11 @@ pub struct DeploymentExecCtx<'a> {
 
 /// Execute a deployments-group tool call.
 ///
+/// `arguments` is `serde_json::Value` because tool call arguments are defined
+/// per-tool by `inputSchema` and dispatched generically.  Typed values are
+/// extracted at the point of use with helpers such as `require_i32` and
+/// `.get().as_str()`.
+///
 /// # Errors
 ///
 /// - [`McpError::UnknownTool`] when `name` is not in [`tools()`].
@@ -146,7 +151,7 @@ pub async fn execute(
     arguments: &serde_json::Value,
     write_enabled: bool,
     ctx: &DeploymentExecCtx<'_>,
-) -> Result<serde_json::Value, McpError> {
+) -> Result<McpToolResult, McpError> {
     let deployment_service = ctx.deployment_service;
     let proposals = ctx.proposals;
     let audit_service = ctx.audit_service;
@@ -183,9 +188,7 @@ pub async fn execute(
 
             let text = serde_json::to_string_pretty(&response).map_err(McpError::Serialization)?;
 
-            Ok(json!({
-                "content": [{ "type": "text", "text": text }]
-            }))
+            Ok(McpToolResult::text(text))
         }
 
         "trigger_deployment" => {
@@ -217,20 +220,18 @@ pub async fn execute(
                 }),
             );
 
-            Ok(json!({
-                "content": [{
-                    "type": "text",
-                    "text": format!(
-                        "Deployment proposed for project {project_id} / environment \
-                         {environment_id}{}.\n\nCall confirm_action with token: {token}\n\
-                         Token expires in 5 minutes.",
-                        branch.as_deref()
-                            .map(|b| format!(" (branch: {b})"))
-                            .unwrap_or_default()
-                    )
-                }],
-                "_proposal_token": token
-            }))
+            Ok(McpToolResult::text_with_proposal_token(
+                format!(
+                    "Deployment proposed for project {project_id} / environment \
+                     {environment_id}{}.\n\nCall confirm_action with token: {token}\n\
+                     Token expires in 5 minutes.",
+                    branch
+                        .as_deref()
+                        .map(|b| format!(" (branch: {b})"))
+                        .unwrap_or_default()
+                ),
+                token,
+            ))
         }
 
         "confirm_action" => {
@@ -306,16 +307,11 @@ pub async fn execute(
                             other => McpError::DeploymentService(other.to_string()),
                         })?;
 
-                    Ok(json!({
-                        "content": [{
-                            "type": "text",
-                            "text": format!(
-                                "Deployment triggered for project {project_id} / \
-                                 environment {environment_id}. Check the Temps console \
-                                 for build progress."
-                            )
-                        }]
-                    }))
+                    Ok(McpToolResult::text(format!(
+                        "Deployment triggered for project {project_id} / \
+                         environment {environment_id}. Check the Temps console \
+                         for build progress."
+                    )))
                 }
 
                 other => Err(McpError::UnknownTool {

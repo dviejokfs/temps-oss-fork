@@ -4,7 +4,6 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use serde_json::json;
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -15,7 +14,10 @@ use temps_core::RequestMetadata;
 use crate::tools::deployments::{AuditActor, DeploymentExecCtx};
 
 use crate::error::McpError;
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpQuery, ToolsProbeResponse};
+use crate::protocol::{
+    JsonRpcRequest, JsonRpcResponse, McpCapabilities, McpInitializeResult, McpQuery, McpServerInfo,
+    McpToolResult, McpToolsCapability, McpToolsListResult, ToolsProbeResponse,
+};
 use crate::registry::{collect_tools, ALL_GROUP_INFOS};
 use crate::McpHandlerState;
 use temps_core::problemdetails::Problem;
@@ -186,10 +188,19 @@ async fn dispatch(
     let requested_groups = query.parsed_groups();
     let write_enabled = query.write_enabled();
 
+    // Each handler returns a typed result; the single legitimate boundary
+    // conversion to `serde_json::Value` happens here, once per arm, before the
+    // value enters the JSON-RPC envelope's generic `result` field.
     match request.method.as_str() {
-        "initialize" => handle_initialize(),
+        "initialize" => {
+            let r = handle_initialize()?;
+            serde_json::to_value(r).map_err(McpError::Serialization)
+        }
 
-        "tools/list" => handle_tools_list(&requested_groups, write_enabled),
+        "tools/list" => {
+            let r = handle_tools_list(&requested_groups, write_enabled)?;
+            serde_json::to_value(r).map_err(McpError::Serialization)
+        }
 
         "tools/call" => {
             let params = request
@@ -213,7 +224,7 @@ async fn dispatch(
                 .cloned()
                 .unwrap_or(serde_json::Value::Object(Default::default()));
 
-            handle_tool_call(
+            let r = handle_tool_call(
                 auth,
                 metadata,
                 state,
@@ -222,7 +233,8 @@ async fn dispatch(
                 tool_name,
                 &args,
             )
-            .await
+            .await?;
+            serde_json::to_value(r).map_err(McpError::Serialization)
         }
 
         other => {
@@ -234,25 +246,25 @@ async fn dispatch(
     }
 }
 
-fn handle_initialize() -> Result<serde_json::Value, McpError> {
-    Ok(json!({
-        "protocolVersion": "2025-03-26",
-        "capabilities": {
-            "tools": {}
+fn handle_initialize() -> Result<McpInitializeResult, McpError> {
+    Ok(McpInitializeResult {
+        protocol_version: "2025-03-26",
+        capabilities: McpCapabilities {
+            tools: McpToolsCapability {},
         },
-        "serverInfo": {
-            "name": "temps-mcp-server",
-            "version": env!("CARGO_PKG_VERSION")
-        }
-    }))
+        server_info: McpServerInfo {
+            name: "temps-mcp-server",
+            version: env!("CARGO_PKG_VERSION"),
+        },
+    })
 }
 
 fn handle_tools_list(
     requested_groups: &[String],
     write_enabled: bool,
-) -> Result<serde_json::Value, McpError> {
+) -> Result<McpToolsListResult, McpError> {
     let tools = collect_tools(requested_groups, write_enabled);
-    Ok(json!({ "tools": tools }))
+    Ok(McpToolsListResult { tools })
 }
 
 async fn handle_tool_call(
@@ -263,7 +275,7 @@ async fn handle_tool_call(
     write_enabled: bool,
     tool_name: &str,
     args: &serde_json::Value,
-) -> Result<serde_json::Value, McpError> {
+) -> Result<McpToolResult, McpError> {
     // Verify the tool belongs to one of the requested (active) groups.
     let available_tools = collect_tools(requested_groups, write_enabled);
     let tool_known = available_tools.iter().any(|t| t.name == tool_name);
@@ -343,18 +355,31 @@ mod tests {
     #[test]
     fn initialize_response_has_required_fields() {
         let result = handle_initialize().expect("initialize must succeed");
-        assert_eq!(result["protocolVersion"], "2025-03-26");
-        assert!(result["serverInfo"]["name"].as_str().is_some());
-        assert!(result["capabilities"]["tools"].is_object());
+        assert_eq!(result.protocol_version, "2025-03-26");
+        assert!(!result.server_info.name.is_empty());
+        // McpToolsCapability is a marker struct; its presence on capabilities
+        // confirms tool support — serializes as `{}` per the MCP spec.
+        let _ = &result.capabilities.tools;
+    }
+
+    #[test]
+    fn initialize_serializes_correctly() {
+        // Verify the wire shape so a future rename doesn't silently break the
+        // protocol handshake.
+        let result = handle_initialize().expect("initialize must succeed");
+        let v = serde_json::to_value(result).expect("must serialize");
+        assert_eq!(v["protocolVersion"], "2025-03-26");
+        assert!(v["serverInfo"]["name"].as_str().is_some());
+        assert!(v["capabilities"]["tools"].is_object());
     }
 
     #[test]
     fn tools_list_all_groups_read_only() {
         let result = handle_tools_list(&[], false).expect("tools/list must succeed");
-        let tools = result["tools"].as_array().expect("must be an array");
+        let tools = &result.tools;
         assert!(!tools.is_empty());
         // Write tools must not appear in read-only mode.
-        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(!names.contains(&"trigger_deployment"));
         assert!(!names.contains(&"confirm_action"));
     }
@@ -362,8 +387,8 @@ mod tests {
     #[test]
     fn tools_list_write_mode_includes_write_tools() {
         let result = handle_tools_list(&[], true).expect("tools/list must succeed");
-        let tools = result["tools"].as_array().expect("must be an array");
-        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        let tools = &result.tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"trigger_deployment"));
         assert!(names.contains(&"confirm_action"));
     }
@@ -372,9 +397,17 @@ mod tests {
     fn tools_list_group_filter() {
         let result =
             handle_tools_list(&["platform".to_string()], false).expect("tools/list must succeed");
-        let tools = result["tools"].as_array().expect("must be an array");
-        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        let tools = &result.tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"list_projects"));
         assert!(!names.contains(&"list_deployments"));
+    }
+
+    #[test]
+    fn tools_list_serializes_correctly() {
+        // Verify the wire shape is preserved end-to-end.
+        let result = handle_tools_list(&[], false).expect("tools/list must succeed");
+        let v = serde_json::to_value(result).expect("must serialize");
+        assert!(v["tools"].as_array().is_some(), "must have a 'tools' array");
     }
 }

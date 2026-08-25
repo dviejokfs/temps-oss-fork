@@ -9,7 +9,7 @@ use tracing::error;
 
 use crate::access::check_project_access;
 use crate::error::McpError;
-use crate::protocol::McpTool;
+use crate::protocol::{McpTool, McpToolResult};
 
 /// Tool definitions for the **platform** group.
 ///
@@ -64,13 +64,16 @@ pub fn tools() -> Vec<McpTool> {
 ///   requested project.
 /// - [`McpError::ProjectNotFound`] / [`McpError::ProjectService`] on backend
 ///   errors.
+// `arguments` is `serde_json::Value` because tool call arguments are defined
+// per-tool by `inputSchema` and dispatched generically.  Typed values are
+// extracted at the point of use with helpers such as `.get().as_i64()`.
 pub async fn execute(
     name: &str,
     arguments: &serde_json::Value,
     auth: &AuthContext,
     project_service: &Arc<ProjectService>,
     checker: Option<&dyn ProjectAccessChecker>,
-) -> Result<serde_json::Value, McpError> {
+) -> Result<McpToolResult, McpError> {
     match name {
         "list_projects" => {
             let projects = project_service
@@ -116,9 +119,7 @@ pub async fn execute(
 
             let text = serde_json::to_string_pretty(&projects).map_err(McpError::Serialization)?;
 
-            Ok(json!({
-                "content": [{ "type": "text", "text": text }]
-            }))
+            Ok(McpToolResult::text(text))
         }
 
         "get_project" => {
@@ -147,9 +148,7 @@ pub async fn execute(
 
             let text = serde_json::to_string_pretty(&project).map_err(McpError::Serialization)?;
 
-            Ok(json!({
-                "content": [{ "type": "text", "text": text }]
-            }))
+            Ok(McpToolResult::text(text))
         }
 
         other => Err(McpError::UnknownTool {

@@ -20,6 +20,9 @@ pub struct JsonRpcRequest {
     #[serde(default)]
     pub id: Option<serde_json::Value>,
     pub method: String,
+    /// Intentionally `serde_json::Value`: JSON-RPC defines `params` as "any
+    /// JSON value" — its shape is per-method and unknown to the generic
+    /// dispatcher.
     #[serde(default)]
     pub params: Option<serde_json::Value>,
 }
@@ -85,7 +88,10 @@ impl JsonRpcResponse {
 pub struct McpTool {
     pub name: String,
     pub description: String,
-    /// JSON Schema describing the tool's input arguments.
+    /// Intentionally `serde_json::Value`: `inputSchema` is a JSON Schema
+    /// document — an inherently arbitrary JSON structure with no meaningful
+    /// static Rust representation.  Every real MCP server SDK represents it
+    /// this way.
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
 }
@@ -101,6 +107,95 @@ pub struct ToolGroupInfo {
 #[derive(Debug, Serialize)]
 pub struct ToolsProbeResponse {
     pub groups: Vec<ToolGroupInfo>,
+}
+
+// ─── MCP result types ────────────────────────────────────────────────────────
+
+/// A single content block inside an MCP tool result (e.g. a text paragraph).
+#[derive(Debug, Clone, Serialize)]
+pub struct McpContentBlock {
+    /// Always `"text"` for text blocks; kept as a field for MCP spec compliance.
+    #[serde(rename = "type")]
+    pub block_type: &'static str,
+    pub text: String,
+}
+
+impl McpContentBlock {
+    /// Create a text content block.
+    pub fn text(text: String) -> Self {
+        Self {
+            block_type: "text",
+            text,
+        }
+    }
+}
+
+/// Typed result returned by every MCP tool-executing function.
+///
+/// Serializes to `{"content": [...]}`, with `_proposal_token` included only
+/// when present (propose-step write tool results).
+#[derive(Debug, Clone, Serialize)]
+pub struct McpToolResult {
+    pub content: Vec<McpContentBlock>,
+    /// Proposal token attached to propose-step write tool results only.
+    #[serde(rename = "_proposal_token", skip_serializing_if = "Option::is_none")]
+    pub proposal_token: Option<String>,
+}
+
+impl McpToolResult {
+    /// Create a result with a single text block and no proposal token.
+    pub fn text(text: String) -> Self {
+        Self {
+            content: vec![McpContentBlock::text(text)],
+            proposal_token: None,
+        }
+    }
+
+    /// Create a result with a single text block and an attached proposal token.
+    ///
+    /// Used by `trigger_deployment`, which requires a subsequent
+    /// `confirm_action` call before the action is executed.
+    pub fn text_with_proposal_token(text: String, token: String) -> Self {
+        Self {
+            content: vec![McpContentBlock::text(text)],
+            proposal_token: Some(token),
+        }
+    }
+}
+
+/// Typed result for the MCP `initialize` handshake.
+#[derive(Debug, Serialize)]
+pub struct McpInitializeResult {
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: &'static str,
+    pub capabilities: McpCapabilities,
+    #[serde(rename = "serverInfo")]
+    pub server_info: McpServerInfo,
+}
+
+/// MCP capability advertisement sent in the `initialize` response.
+#[derive(Debug, Serialize)]
+pub struct McpCapabilities {
+    /// An empty object (`{}`) signals to the client that this server supports
+    /// tool calls.
+    pub tools: McpToolsCapability,
+}
+
+/// Marker struct — serializes to `{}` per the MCP spec's tool-support signal.
+#[derive(Debug, Serialize)]
+pub struct McpToolsCapability {}
+
+/// Server identity block returned in the `initialize` response.
+#[derive(Debug, Serialize)]
+pub struct McpServerInfo {
+    pub name: &'static str,
+    pub version: &'static str,
+}
+
+/// Typed result for the `tools/list` response.
+#[derive(Debug, Serialize)]
+pub struct McpToolsListResult {
+    pub tools: Vec<McpTool>,
 }
 
 // ─── Query parameters ────────────────────────────────────────────────────────
