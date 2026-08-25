@@ -106,10 +106,14 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
         formattingOptions: { tabSize: 2, insertSpaces: true },
       })
       const updated = jsonc.applyEdits(content, edits)
-      // mode: 0o600 -- the file embeds an API key (in an Authorization header
-      // value); the default umask-derived mode (typically 0o644) would leave
-      // it readable by any other local user on a shared machine.
-      await fs.promises.writeFile(configPath, updated, { encoding: 'utf8', mode: 0o600 })
+      // The file embeds an API key (in an Authorization header value), so it
+      // must never be world-readable. `mode` on writeFile only applies when
+      // the file is newly created (via the open() syscall's O_CREAT path) --
+      // it does NOT chmod an already-existing file on overwrite, so a config
+      // that predates this fix (or was created by some other tool at 0o644)
+      // would stay world-readable forever. chmod explicitly, every write.
+      await fs.promises.writeFile(configPath, updated, 'utf8')
+      await fs.promises.chmod(configPath, 0o600)
       return { success: true }
     } catch (error) {
       return { success: false, reason: redactSecrets(error instanceof Error ? error.message : String(error)) }
@@ -132,7 +136,10 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
         formattingOptions: { tabSize: 2, insertSpaces: true },
       })
       const updated = jsonc.applyEdits(content, edits)
-      await fs.promises.writeFile(configPath, updated, { encoding: 'utf8', mode: 0o600 })
+      // Other MCP servers' credentials may remain in this file after removing
+      // ours -- keep it locked down the same way addServer does.
+      await fs.promises.writeFile(configPath, updated, 'utf8')
+      await fs.promises.chmod(configPath, 0o600)
       return { success: true }
     } catch (error) {
       return { success: false, reason: redactSecrets(error instanceof Error ? error.message : String(error)) }

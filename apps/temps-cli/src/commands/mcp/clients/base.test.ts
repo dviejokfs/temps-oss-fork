@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as jsonc from 'jsonc-parser'
@@ -112,5 +112,36 @@ describe('JsonConfigMcpClientAdapter', () => {
     expect(await adapter.getServerUrl()).toBeNull()
     await adapter.addServer(entry)
     expect(await adapter.getServerUrl()).toBe(entry.url)
+  })
+
+  // On Windows, chmod is a no-op for these bits, so this check would be
+  // meaningless there -- restrict to platforms where file mode is real.
+  const modeMatchers = process.platform === 'win32' ? test.skip : test
+
+  modeMatchers('writes a freshly created config file with mode 0o600', async () => {
+    await adapter.addServer(entry)
+    const mode = statSync(configPath).mode & 0o777
+    expect(mode).toBe(0o600)
+  })
+
+  modeMatchers('tightens an existing world-readable config file to 0o600 on overwrite', async () => {
+    mkdirSync(join(dir, 'nested'), { recursive: true })
+    writeFileSync(configPath, '{ "mcpServers": {} }', { mode: 0o644 })
+    chmodSync(configPath, 0o644) // writeFileSync's mode is only honored on create; be explicit.
+    expect(statSync(configPath).mode & 0o777).toBe(0o644)
+
+    await adapter.addServer(entry)
+
+    expect(statSync(configPath).mode & 0o777).toBe(0o600)
+  })
+
+  modeMatchers('tightens permissions on removeServer as well', async () => {
+    await adapter.addServer(entry)
+    chmodSync(configPath, 0o644)
+    expect(statSync(configPath).mode & 0o777).toBe(0o644)
+
+    await adapter.removeServer()
+
+    expect(statSync(configPath).mode & 0o777).toBe(0o600)
   })
 })
