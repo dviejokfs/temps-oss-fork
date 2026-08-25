@@ -28,6 +28,7 @@ import { registerTeamsCommands } from './commands/teams/index.js'
 import { registerMonitorsCommands } from './commands/monitors/index.js'
 import { registerWebhooksCommands } from './commands/webhooks/index.js'
 import { registerContainersCommands } from './commands/containers/index.js'
+import { registerClusterCommands } from './commands/cluster/index.js'
 import { registerDocsCommand } from './commands/docs.js'
 import { registerTokensCommands } from './commands/tokens/index.js'
 import { registerErrorsCommands } from './commands/errors/index.js'
@@ -178,6 +179,7 @@ export function createProgram(): Command {
   registerMonitorsCommands(program)
   registerWebhooksCommands(program)
   registerContainersCommands(program)
+  registerClusterCommands(program)
   registerTokensCommands(program)
   registerErrorsCommands(program)
   registerMetricsCommands(program)
