@@ -40,6 +40,7 @@ use axum::{
     Router,
 };
 use temps_config::ConfigService;
+use temps_core::project_access::ProjectAccessChecker;
 use temps_deployments::DeploymentService;
 use temps_projects::ProjectService;
 
@@ -57,6 +58,11 @@ pub struct McpHandlerState {
     /// Audit sink for MCP-executed write actions (e.g. `confirm_action` ->
     /// `trigger_deployment`). CLAUDE.md requires audit logging on every write.
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
+    /// Optional project-scoped access checker.  `None` on instances without
+    /// RBAC/team-based access configured — the absence means "allow all",
+    /// matching the OSS default.  Retrieved via `get_service` (not
+    /// `require_service`) because this dependency is legitimately optional.
+    pub project_access_checker: Option<Arc<dyn ProjectAccessChecker>>,
 }
 
 /// The two sub-routers returned by [`build_mcp_routers`].

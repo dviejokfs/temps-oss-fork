@@ -9,14 +9,13 @@ pub const PROPOSAL_TTL: Duration = Duration::from_secs(5 * 60);
 /// A pending write action awaiting human confirmation.
 ///
 /// Created by a write tool (e.g. `trigger_deployment`); consumed exactly once
-/// by `confirm_action`.  Expired or already-consumed tokens are rejected.
+/// by `confirm_action`.  Expired tokens are rejected.
 #[derive(Debug)]
 pub struct Proposal {
     pub token: String,
     pub tool_name: String,
     pub arguments: serde_json::Value,
     pub created_at: Instant,
-    pub used: bool,
 }
 
 /// In-memory store for pending proposals.  Shared across all MCP connections
@@ -48,6 +47,11 @@ impl ProposalStore {
     }
 
     /// Store a new proposal and return its token.
+    ///
+    /// Opportunistically sweeps expired proposals on every `create()` call.
+    /// This is a human-facing, low-volume flow (propose-then-confirm), so an
+    /// O(n) scan per call is acceptable and avoids unbounded memory growth
+    /// from proposals that were created but never confirmed.
     pub fn create(&self, tool_name: String, arguments: serde_json::Value) -> String {
         let token = Uuid::new_v4().to_string();
         let proposal = Proposal {
@@ -55,42 +59,41 @@ impl ProposalStore {
             tool_name,
             arguments,
             created_at: Instant::now(),
-            used: false,
         };
-        self.lock_store().insert(token.clone(), proposal);
+        let mut store = self.lock_store();
+        // Sweep expired entries before inserting so stale proposals don't
+        // accumulate indefinitely.
+        store.retain(|_, p| p.created_at.elapsed() <= PROPOSAL_TTL);
+        store.insert(token.clone(), proposal);
         token
     }
 
     /// Consume the proposal identified by `token`.
     ///
-    /// Returns `Err(ProposalTakeError::NotFound)` when the token is unknown or
-    /// already used, and `Err(ProposalTakeError::Expired)` when the TTL has
-    /// elapsed.  On success the proposal is marked as used and returned.
+    /// Returns `Err(ProposalTakeError::NotFound)` when the token is unknown,
+    /// and `Err(ProposalTakeError::Expired)` when the TTL has elapsed.
+    /// On success the proposal is removed from the store (single-use).
     pub fn take(&self, token: &str) -> Result<TakenProposal, ProposalTakeError> {
         let mut store = self.lock_store();
 
         let proposal = store.get(token).ok_or(ProposalTakeError::NotFound)?;
-
-        if proposal.used {
-            return Err(ProposalTakeError::NotFound);
-        }
 
         if proposal.created_at.elapsed() > PROPOSAL_TTL {
             store.remove(token);
             return Err(ProposalTakeError::Expired);
         }
 
-        // Clone what we need before mutably borrowing.
-        let taken = TakenProposal {
-            tool_name: proposal.tool_name.clone(),
-            arguments: proposal.arguments.clone(),
-        };
+        // Remove on success — proposals are single-use.  A subsequent call
+        // with the same token returns NotFound, identical to an unknown token,
+        // which is correct: after consumption the token has no further meaning.
+        let proposal = store
+            .remove(token)
+            .expect("token was confirmed present two lines above");
 
-        if let Some(p) = store.get_mut(token) {
-            p.used = true;
-        }
-
-        Ok(taken)
+        Ok(TakenProposal {
+            tool_name: proposal.tool_name,
+            arguments: proposal.arguments,
+        })
     }
 }
 
@@ -124,6 +127,32 @@ impl From<ProposalTakeError> for crate::error::McpError {
 }
 
 #[cfg(test)]
+impl ProposalStore {
+    /// Backdates the `created_at` field of the named proposal by `age`.
+    ///
+    /// This is test scaffolding only: it allows tests to simulate TTL
+    /// expiry without actually sleeping.  The `created_at` field is set
+    /// with `Instant::now()` in production and has no injectable clock —
+    /// this helper is the ONLY way a test can reach the `Expired` branch.
+    pub(crate) fn backdate(&self, token: &str, age: Duration) {
+        let mut store = self.lock_store();
+        if let Some(p) = store.get_mut(token) {
+            // `Instant` arithmetic: subtract `age` from `created_at` by
+            // computing a new `Instant` that is `age` before `now()` and
+            // then adjusting for the elapsed time since creation.
+            let elapsed = p.created_at.elapsed();
+            // We want the new created_at to be `now - age`, i.e. elapsed
+            // will read as `age` when take() calls `.elapsed()`.  Since we
+            // can't set an Instant directly, subtract from now minus the
+            // requested age plus any time already on the clock.
+            if let Some(new_created_at) = Instant::now().checked_sub(age + elapsed) {
+                p.created_at = new_created_at;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -139,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn take_used_proposal_returns_not_found() {
+    fn take_consumed_proposal_returns_not_found() {
         let store = ProposalStore::new();
         let token = store.create("trigger_deployment".to_string(), serde_json::json!({}));
 
@@ -154,6 +183,53 @@ mod tests {
         let err = store
             .take("no-such-token")
             .expect_err("unknown token must fail");
+        assert!(matches!(err, ProposalTakeError::NotFound));
+    }
+
+    #[test]
+    fn take_expired_proposal_returns_expired() {
+        let store = ProposalStore::new();
+        let token = store.create("trigger_deployment".to_string(), serde_json::json!({}));
+
+        // Backdate by more than the TTL so take() sees it as expired.
+        store.backdate(&token, PROPOSAL_TTL + Duration::from_secs(1));
+
+        let err = store.take(&token).expect_err("expired token must fail");
+        assert!(matches!(err, ProposalTakeError::Expired));
+    }
+
+    #[test]
+    fn create_sweeps_expired_proposals() {
+        let store = ProposalStore::new();
+
+        // Create a proposal and expire it.
+        let old_token = store.create("trigger_deployment".to_string(), serde_json::json!({}));
+        store.backdate(&old_token, PROPOSAL_TTL + Duration::from_secs(1));
+
+        // A fresh create() must sweep the expired entry.
+        let _new_token = store.create("trigger_deployment".to_string(), serde_json::json!({}));
+
+        // The expired token is no longer in the store (swept by the second
+        // create) — so take() returns NotFound, not Expired.
+        let err = store.take(&old_token).expect_err("swept token must fail");
+        assert!(matches!(err, ProposalTakeError::NotFound));
+    }
+
+    #[test]
+    fn consumed_proposal_is_removed_from_store() {
+        let store = ProposalStore::new();
+        let token = store.create("trigger_deployment".to_string(), serde_json::json!({}));
+
+        // Consume it.
+        let _ = store.take(&token).expect("first take must succeed");
+
+        // Trigger a create() to flush any retained entries.
+        let _other = store.create("trigger_deployment".to_string(), serde_json::json!({}));
+
+        // The original token is gone (removed on consumption, not just flagged).
+        let err = store
+            .take(&token)
+            .expect_err("consumed token must not be found");
         assert!(matches!(err, ProposalTakeError::NotFound));
     }
 }

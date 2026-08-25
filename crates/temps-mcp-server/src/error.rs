@@ -33,6 +33,21 @@ pub enum McpError {
     )]
     WriteNotEnabled,
 
+    /// The caller holds a token but lacks a required permission for the
+    /// operation.  Distinct from `WriteNotEnabled` (which is an opt-in
+    /// gate), this indicates the token's role does not carry the capability.
+    #[error("This operation requires the {permission} permission")]
+    InsufficientPermission { permission: String },
+
+    /// The caller's token is valid but they are not allowed to access the
+    /// given project (per the registered `ProjectAccessChecker`).
+    #[error("Access to project {project_id} is denied for this token")]
+    ProjectAccessDenied { project_id: i32 },
+
+    /// The `jsonrpc` field in the request was not the required value `"2.0"`.
+    #[error("Invalid JSON-RPC version '{received}'; this server requires jsonrpc == \"2.0\"")]
+    InvalidJsonRpcVersion { received: String },
+
     /// The tool name supplied in tools/call does not exist.
     #[error("Unknown tool '{name}'")]
     UnknownTool { name: String },
@@ -70,6 +85,9 @@ impl McpError {
             Self::ProjectNotFound { .. } | Self::DeploymentNotFound { .. } => -32002,
             Self::ProposalNotFound | Self::ProposalExpired => -32003,
             Self::WriteNotEnabled => -32004,
+            Self::ProjectAccessDenied { .. } => -32005,
+            Self::InsufficientPermission { .. } => -32006,
+            Self::InvalidJsonRpcVersion { .. } => crate::protocol::INVALID_REQUEST,
             Self::UnknownTool { .. } => crate::protocol::METHOD_NOT_FOUND,
             Self::MissingArgument { .. } | Self::InvalidArgument { .. } => {
                 crate::protocol::INVALID_PARAMS
@@ -103,6 +121,18 @@ impl From<McpError> for Problem {
 
             McpError::WriteNotEnabled => problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("Write Mode Disabled")
+                .with_detail(error.to_string()),
+
+            McpError::InsufficientPermission { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Insufficient Permission")
+                .with_detail(error.to_string()),
+
+            McpError::ProjectAccessDenied { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Project Access Denied")
+                .with_detail(error.to_string()),
+
+            McpError::InvalidJsonRpcVersion { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid JSON-RPC Version")
                 .with_detail(error.to_string()),
 
             McpError::UnknownTool { .. } => problemdetails::new(StatusCode::NOT_FOUND)

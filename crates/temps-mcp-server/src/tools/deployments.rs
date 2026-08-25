@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use serde_json::json;
+use temps_core::project_access::ProjectAccessChecker;
 use temps_core::AuditLogger;
 use temps_deployments::DeploymentService;
 use tracing::error;
@@ -108,6 +109,50 @@ pub fn tools(write_enabled: bool) -> Vec<McpTool> {
     result
 }
 
+/// Check whether `user_id` may access `project_id` via the optional checker.
+///
+/// - `None` checker → no RBAC configured → allow (OSS default).
+/// - `Ok(true)` → explicitly allowed.
+/// - `Ok(false)` → denied.
+/// - `Err(_)` → infrastructure failure → fail closed (deny).
+async fn check_project_access(
+    checker: Option<&dyn ProjectAccessChecker>,
+    user_id: i32,
+    project_id: i32,
+) -> Result<(), McpError> {
+    let Some(checker) = checker else {
+        // No checker registered → OSS default: allow everything.
+        return Ok(());
+    };
+
+    match checker.user_can_access_project(user_id, project_id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(McpError::ProjectAccessDenied { project_id }),
+        Err(e) => {
+            // Fail closed: infrastructure failure must not silently widen access.
+            error!(
+                user_id,
+                project_id, "MCP project access check failed (infra error): {}", e
+            );
+            Err(McpError::ProjectAccessDenied { project_id })
+        }
+    }
+}
+
+/// Shared services and auth context threaded into [`execute`].
+///
+/// Bundled as a single struct so the function stays below clippy's
+/// `too_many_arguments` limit (7) while keeping all dependencies explicit.
+pub struct DeploymentExecCtx<'a> {
+    pub deployment_service: &'a Arc<DeploymentService>,
+    pub proposals: &'a Arc<ProposalStore>,
+    pub audit_service: &'a Arc<dyn AuditLogger>,
+    pub actor: &'a AuditActor,
+    /// Optional per-project access checker (absent on instances without
+    /// team-based RBAC configured).
+    pub checker: Option<&'a dyn ProjectAccessChecker>,
+}
+
 /// Execute a deployments-group tool call.
 ///
 /// # Errors
@@ -115,6 +160,8 @@ pub fn tools(write_enabled: bool) -> Vec<McpTool> {
 /// - [`McpError::UnknownTool`] when `name` is not in [`tools()`].
 /// - [`McpError::WriteNotEnabled`] when a write tool is called without
 ///   `write_enabled`.
+/// - [`McpError::ProjectAccessDenied`] when the caller lacks per-project
+///   access (at both propose and confirm steps, independently).
 /// - [`McpError::MissingArgument`] / [`McpError::InvalidArgument`] on bad
 ///   input.
 /// - [`McpError::DeploymentService`] on backend errors.
@@ -122,14 +169,22 @@ pub async fn execute(
     name: &str,
     arguments: &serde_json::Value,
     write_enabled: bool,
-    deployment_service: &Arc<DeploymentService>,
-    proposals: &Arc<ProposalStore>,
-    audit_service: &Arc<dyn AuditLogger>,
-    actor: &AuditActor,
+    ctx: &DeploymentExecCtx<'_>,
 ) -> Result<serde_json::Value, McpError> {
+    let deployment_service = ctx.deployment_service;
+    let proposals = ctx.proposals;
+    let audit_service = ctx.audit_service;
+    let actor = ctx.actor;
+    let checker = ctx.checker;
     match name {
         "list_deployments" => {
             let project_id = require_i32(arguments, "project_id", name)?;
+
+            // Per-project access check — a single `user_can_access_project`
+            // call is correct here (not the hidden-list pattern) because this
+            // is a direct, project-scoped read.
+            check_project_access(checker, actor.user_id, project_id).await?;
+
             let environment_id = arguments
                 .get("environment_id")
                 .and_then(serde_json::Value::as_i64)
@@ -167,6 +222,13 @@ pub async fn execute(
                 .get("branch")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
+
+            // Project access check at the propose step.  The check is
+            // repeated at confirm time as well, because the two steps are
+            // separate HTTP requests and either could be replayed or misused
+            // independently (e.g. a propose token passed to a different
+            // session that has lost the project access).
+            check_project_access(checker, actor.user_id, project_id).await?;
 
             // Propose rather than execute immediately.  The human confirms
             // via confirm_action.
@@ -221,6 +283,13 @@ pub async fn execute(
                         .get("branch")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_string);
+
+                    // Re-check project access at the confirm step.  The propose
+                    // and confirm steps are separate HTTP requests: the token
+                    // holder at confirm time may differ from the one who proposed
+                    // (e.g. a replayed or forwarded token).  Fail-closed on any
+                    // access denial or infra error.
+                    check_project_access(checker, actor.user_id, project_id).await?;
 
                     let audit_event = McpDeploymentTriggeredAudit {
                         context: AuditContext {
@@ -286,6 +355,7 @@ fn require_i32(arguments: &serde_json::Value, arg: &str, tool: &str) -> Result<i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
 
     #[test]
     fn tools_read_only_excludes_write_tools() {
@@ -336,5 +406,84 @@ mod tests {
         let taken = store.take(&token).expect("first take must succeed");
         assert_eq!(taken.tool_name, "trigger_deployment");
         store.take(&token).expect_err("second take must fail");
+    }
+
+    // ── ProjectAccessChecker mocks ────────────────────────────────────────────
+
+    /// A checker that denies access to a specific project_id.
+    struct DenyingChecker {
+        denied_project_id: i32,
+    }
+
+    #[async_trait]
+    impl ProjectAccessChecker for DenyingChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(project_id != self.denied_project_id)
+        }
+    }
+
+    /// A checker that always returns an infra error.
+    struct FailingChecker;
+
+    #[async_trait]
+    impl ProjectAccessChecker for FailingChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Err("infra failure".into())
+        }
+    }
+
+    // ── check_project_access unit tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn check_project_access_none_checker_allows() {
+        // No checker registered → OSS default → allow.
+        let result = check_project_access(None, 1, 42).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_project_access_allows_permitted_project() {
+        let checker = DenyingChecker {
+            denied_project_id: 99,
+        };
+        let result = check_project_access(Some(&checker), 1, 42).await;
+        assert!(result.is_ok(), "project 42 must be allowed");
+    }
+
+    #[tokio::test]
+    async fn check_project_access_denies_forbidden_project() {
+        let checker = DenyingChecker {
+            denied_project_id: 42,
+        };
+        let result = check_project_access(Some(&checker), 1, 42).await;
+        assert!(
+            matches!(
+                result,
+                Err(McpError::ProjectAccessDenied { project_id: 42 })
+            ),
+            "project 42 must be denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_project_access_infra_failure_fails_closed() {
+        // Infrastructure failure must produce ProjectAccessDenied, not a silent allow.
+        let checker = FailingChecker;
+        let result = check_project_access(Some(&checker), 1, 42).await;
+        assert!(
+            matches!(
+                result,
+                Err(McpError::ProjectAccessDenied { project_id: 42 })
+            ),
+            "infra failure must fail closed as ProjectAccessDenied"
+        );
     }
 }

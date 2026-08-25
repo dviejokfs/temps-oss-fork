@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use temps_config::ConfigService;
 use temps_core::plugin::{PluginError, ServiceRegistrationContext, TempsPlugin};
+use temps_core::project_access::ProjectAccessChecker;
 use temps_deployments::DeploymentService;
 use temps_projects::ProjectService;
 
@@ -43,6 +44,9 @@ impl TempsPlugin for McpServerPlugin {
             let deployment_service = context.require_service::<DeploymentService>();
             let config_service = context.require_service::<ConfigService>();
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+            // Optional — not all instances have team-based project access configured.
+            // `get_service` (not `require_service`) so startup succeeds on plain OSS.
+            let project_access_checker = context.get_service::<dyn ProjectAccessChecker>();
 
             let state = Arc::new(McpHandlerState {
                 project_service,
@@ -50,6 +54,7 @@ impl TempsPlugin for McpServerPlugin {
                 config_service,
                 proposals: Arc::new(ProposalStore::new()),
                 audit_service,
+                project_access_checker,
             });
 
             // Register as Arc<McpHandlerState> so console.rs can retrieve it

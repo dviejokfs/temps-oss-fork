@@ -12,7 +12,7 @@ use temps_auth::permissions::Permission;
 use temps_auth::{permission_guard, AuthContext, RequireAuth};
 use temps_core::RequestMetadata;
 
-use crate::tools::deployments::AuditActor;
+use crate::tools::deployments::{AuditActor, DeploymentExecCtx};
 
 use crate::error::McpError;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpQuery, ToolsProbeResponse};
@@ -126,6 +126,10 @@ pub async fn mcp_get_handler(
     // Return an empty SSE stream that terminates immediately.
     // TODO(mcp): implement persistent SSE for server-initiated notifications.
     let body = ": keep-alive\n\n";
+    // Safety: all builder inputs are static string literals — this call
+    // cannot produce a builder error, so the `unwrap_or_else` fallback is
+    // unreachable in practice.  It is kept here (rather than `.unwrap()`)
+    // purely to satisfy CLAUDE.md's "no unwrap in production paths" rule.
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -172,6 +176,13 @@ async fn dispatch(
     query: &McpQuery,
     request: JsonRpcRequest,
 ) -> Result<serde_json::Value, McpError> {
+    // MINOR #12 — validate protocol version before routing.
+    if request.jsonrpc != "2.0" {
+        return Err(McpError::InvalidJsonRpcVersion {
+            received: request.jsonrpc.clone(),
+        });
+    }
+
     let requested_groups = query.parsed_groups();
     let write_enabled = query.write_enabled();
 
@@ -262,14 +273,22 @@ async fn handle_tool_call(
         });
     }
 
-    // Write tools additionally require DeploymentsWrite permission.
+    // Write tools additionally require write mode opt-in AND DeploymentsCreate
+    // permission.  These are two distinct, orthogonal checks:
+    // - `write_enabled`: operator/user explicitly passed `?write=1` in the MCP
+    //   URL — the session was opened with intent to mutate.
+    // - `DeploymentsCreate` permission: the token's role actually carries the
+    //   capability to trigger deployments (matches the REST endpoint check in
+    //   remote_deployments.rs).
     let write_tools = ["trigger_deployment", "confirm_action"];
     if write_tools.contains(&tool_name) {
         if !write_enabled {
             return Err(McpError::WriteNotEnabled);
         }
-        if !auth.has_permission(&Permission::DeploymentsWrite) {
-            return Err(McpError::WriteNotEnabled); // surfaced as 403
+        if !auth.has_permission(&Permission::DeploymentsCreate) {
+            return Err(McpError::InsufficientPermission {
+                permission: Permission::DeploymentsCreate.to_string(),
+            });
         }
         info!(
             user_id = auth.user_id(),
@@ -281,7 +300,14 @@ async fn handle_tool_call(
     // Route to the correct group handler.
     // Platform tools.
     if matches!(tool_name, "list_projects" | "get_project") {
-        return crate::tools::platform::execute(tool_name, args, &state.project_service).await;
+        return crate::tools::platform::execute(
+            tool_name,
+            args,
+            auth.user_id(),
+            &state.project_service,
+            state.project_access_checker.as_deref(),
+        )
+        .await;
     }
 
     // Deployments tools.
@@ -294,16 +320,14 @@ async fn handle_tool_call(
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         };
-        return crate::tools::deployments::execute(
-            tool_name,
-            args,
-            write_enabled,
-            &state.deployment_service,
-            &state.proposals,
-            &state.audit_service,
-            &actor,
-        )
-        .await;
+        let exec_ctx = DeploymentExecCtx {
+            deployment_service: &state.deployment_service,
+            proposals: &state.proposals,
+            audit_service: &state.audit_service,
+            actor: &actor,
+            checker: state.project_access_checker.as_deref(),
+        };
+        return crate::tools::deployments::execute(tool_name, args, write_enabled, &exec_ctx).await;
     }
 
     Err(McpError::UnknownTool {
