@@ -7,7 +7,7 @@ use sea_orm::{
 use std::sync::Arc;
 use std::time::Duration;
 use temps_core::UtcDateTime;
-use temps_entities::{status_incident_updates, status_incidents};
+use temps_entities::{environments, status_incident_updates, status_incidents, status_monitors};
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
@@ -113,6 +113,46 @@ impl IncidentService {
             return Err(StatusPageError::Validation(
                 "Invalid severity. Must be one of: minor, major, critical".to_string(),
             ));
+        }
+
+        if let Some(environment_id) = request.environment_id {
+            let environment_project_id = environments::Entity::find_by_id(environment_id)
+                .select_only()
+                .column(environments::Column::ProjectId)
+                .into_tuple::<i32>()
+                .one(self.db.as_ref())
+                .await
+                .map_err(|source| StatusPageError::EnvironmentOwnershipLookup {
+                    environment_id,
+                    project_id,
+                    source,
+                })?;
+            if environment_project_id != Some(project_id) {
+                return Err(StatusPageError::EnvironmentNotInProject {
+                    environment_id,
+                    project_id,
+                });
+            }
+        }
+
+        if let Some(monitor_id) = request.monitor_id {
+            let monitor_project_id = status_monitors::Entity::find_by_id(monitor_id)
+                .select_only()
+                .column(status_monitors::Column::ProjectId)
+                .into_tuple::<i32>()
+                .one(self.db.as_ref())
+                .await
+                .map_err(|source| StatusPageError::MonitorOwnershipLookup {
+                    monitor_id,
+                    project_id,
+                    source,
+                })?;
+            if monitor_project_id != Some(project_id) {
+                return Err(StatusPageError::MonitorNotInProject {
+                    monitor_id,
+                    project_id,
+                });
+            }
         }
 
         let incident = status_incidents::ActiveModel {
@@ -460,7 +500,7 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::projects;
+    use temps_entities::{environments, projects, status_monitors, upstream_config::UpstreamList};
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
         // Use nanoseconds for better uniqueness in parallel tests
@@ -479,6 +519,45 @@ mod tests {
         project.insert(db.as_ref()).await.unwrap()
     }
 
+    async fn create_test_environment(
+        db: &Arc<DatabaseConnection>,
+        project_id: i32,
+    ) -> environments::Model {
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let slug = format!("incident-env-{nanos}");
+        environments::ActiveModel {
+            project_id: Set(project_id),
+            name: Set(slug.clone()),
+            slug: Set(slug.clone()),
+            subdomain: Set(slug.clone()),
+            host: Set(format!("{slug}.local")),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+    }
+
+    async fn create_test_monitor(
+        db: &Arc<DatabaseConnection>,
+        project_id: i32,
+        environment_id: i32,
+    ) -> status_monitors::Model {
+        status_monitors::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(Some(environment_id)),
+            name: Set("Incident monitor".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+    }
+
     fn sample_incident_request() -> CreateIncidentRequest {
         CreateIncidentRequest {
             title: "Test Incident".to_string(),
@@ -487,6 +566,142 @@ mod tests {
             environment_id: None,
             monitor_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn create_incident_rejects_environment_from_another_project() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+        let target_project = create_test_project(&db).await;
+        let other_project = create_test_project(&db).await;
+        let foreign_environment = create_test_environment(&db, other_project.id).await;
+        let mut request = sample_incident_request();
+        request.environment_id = Some(foreign_environment.id);
+
+        let result = service.create_incident(target_project.id, request).await;
+
+        assert!(matches!(
+            result,
+            Err(StatusPageError::EnvironmentNotInProject {
+                environment_id,
+                project_id,
+            }) if environment_id == foreign_environment.id && project_id == target_project.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_incident_rejects_missing_environment() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+        let project = create_test_project(&db).await;
+        let mut request = sample_incident_request();
+        request.environment_id = Some(i32::MAX);
+
+        let result = service.create_incident(project.id, request).await;
+
+        assert!(matches!(
+            result,
+            Err(StatusPageError::EnvironmentNotInProject {
+                environment_id: i32::MAX,
+                project_id,
+            }) if project_id == project.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_incident_rejects_monitor_from_another_project() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+        let target_project = create_test_project(&db).await;
+        let other_project = create_test_project(&db).await;
+        let foreign_environment = create_test_environment(&db, other_project.id).await;
+        let foreign_monitor =
+            create_test_monitor(&db, other_project.id, foreign_environment.id).await;
+        let mut request = sample_incident_request();
+        request.monitor_id = Some(foreign_monitor.id);
+
+        let result = service.create_incident(target_project.id, request).await;
+
+        assert!(matches!(
+            result,
+            Err(StatusPageError::MonitorNotInProject {
+                monitor_id,
+                project_id,
+            }) if monitor_id == foreign_monitor.id && project_id == target_project.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_incident_rejects_missing_monitor() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+        let project = create_test_project(&db).await;
+        let mut request = sample_incident_request();
+        request.monitor_id = Some(i32::MAX);
+
+        let result = service.create_incident(project.id, request).await;
+
+        assert!(matches!(
+            result,
+            Err(StatusPageError::MonitorNotInProject {
+                monitor_id: i32::MAX,
+                project_id,
+            }) if project_id == project.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_incident_fails_closed_when_environment_lookup_fails() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom(
+                    "environment lookup unavailable".to_string(),
+                )])
+                .into_connection(),
+        );
+        let service = IncidentService::new(db);
+        let mut request = sample_incident_request();
+        request.environment_id = Some(11);
+
+        let result = service.create_incident(7, request).await;
+
+        assert!(matches!(
+            result,
+            Err(StatusPageError::EnvironmentOwnershipLookup {
+                environment_id: 11,
+                project_id: 7,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_incident_fails_closed_when_monitor_lookup_fails() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom(
+                    "monitor lookup unavailable".to_string(),
+                )])
+                .into_connection(),
+        );
+        let service = IncidentService::new(db);
+        let mut request = sample_incident_request();
+        request.monitor_id = Some(13);
+
+        let result = service.create_incident(7, request).await;
+
+        assert!(matches!(
+            result,
+            Err(StatusPageError::MonitorOwnershipLookup {
+                monitor_id: 13,
+                project_id: 7,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

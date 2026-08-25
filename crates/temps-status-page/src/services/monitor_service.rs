@@ -248,6 +248,24 @@ impl MonitorService {
             validate_check_path(path)?;
         }
 
+        let environment_project_id = environments::Entity::find_by_id(request.environment_id)
+            .select_only()
+            .column(environments::Column::ProjectId)
+            .into_tuple::<i32>()
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| StatusPageError::EnvironmentOwnershipLookup {
+                environment_id: request.environment_id,
+                project_id,
+                source,
+            })?;
+        if environment_project_id != Some(project_id) {
+            return Err(StatusPageError::EnvironmentNotInProject {
+                environment_id: request.environment_id,
+                project_id,
+            });
+        }
+
         let monitor = status_monitors::ActiveModel {
             project_id: Set(project_id),
             environment_id: Set(Some(request.environment_id)),
@@ -1133,6 +1151,106 @@ mod tests {
         assert_eq!(monitor.environment_id, Some(environment.id));
         assert_eq!(monitor.check_interval_seconds, 60);
         assert!(monitor.is_active);
+    }
+
+    #[tokio::test]
+    async fn create_monitor_rejects_environment_from_another_project_without_writing() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let target_project = create_test_project(&db).await;
+        let other_project = create_test_project(&db).await;
+        let foreign_environment = create_test_environment(&db, other_project.id).await;
+
+        let result = service
+            .create_monitor(
+                target_project.id,
+                CreateMonitorRequest {
+                    name: "Cross-project monitor".to_string(),
+                    monitor_type: "web".to_string(),
+                    environment_id: foreign_environment.id,
+                    check_interval_seconds: Some(60),
+                    check_path: None,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(StatusPageError::EnvironmentNotInProject {
+                environment_id,
+                project_id,
+            }) if environment_id == foreign_environment.id && project_id == target_project.id
+        ));
+        let persisted = status_monitors::Entity::find()
+            .filter(status_monitors::Column::ProjectId.eq(target_project.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(persisted.is_empty(), "validation must happen before insert");
+    }
+
+    #[tokio::test]
+    async fn create_monitor_rejects_missing_environment() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let project = create_test_project(&db).await;
+
+        let result = service
+            .create_monitor(
+                project.id,
+                CreateMonitorRequest {
+                    name: "Missing environment".to_string(),
+                    monitor_type: "web".to_string(),
+                    environment_id: i32::MAX,
+                    check_interval_seconds: Some(60),
+                    check_path: None,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(StatusPageError::EnvironmentNotInProject {
+                environment_id: i32::MAX,
+                project_id,
+            }) if project_id == project.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_monitor_fails_closed_when_environment_lookup_fails() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom(
+                    "environment lookup unavailable".to_string(),
+                )])
+                .into_connection(),
+        );
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+
+        let result = service
+            .create_monitor(
+                7,
+                CreateMonitorRequest {
+                    name: "Lookup failure".to_string(),
+                    monitor_type: "web".to_string(),
+                    environment_id: 11,
+                    check_interval_seconds: Some(60),
+                    check_path: None,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(StatusPageError::EnvironmentOwnershipLookup {
+                environment_id: 11,
+                project_id: 7,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
