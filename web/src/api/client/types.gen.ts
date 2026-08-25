@@ -17069,6 +17069,14 @@ export type SetupDnsResponse = {
     total_records: number;
 };
 
+export type SetupMfaRequest = {
+    /**
+     * Required to enroll MFA on an account that has a password set.
+     * Omit (or leave empty) for SSO-only accounts with no local password.
+     */
+    current_password?: string | null;
+};
+
 /**
  * A sibling project that shares the same `trace_id` and has opted in to
  * cross-project trace sharing (`cross_project_trace_sharing = TRUE`).
@@ -52299,7 +52307,7 @@ export type DisableMfaResponses = {
 export type DisableMfaResponse = DisableMfaResponses[keyof DisableMfaResponses];
 
 export type SetupMfaData = {
-    body?: never;
+    body: SetupMfaRequest;
     path?: never;
     query?: never;
     url: '/users/me/mfa/setup';
@@ -52307,7 +52315,11 @@ export type SetupMfaData = {
 
 export type SetupMfaErrors = {
     /**
-     * Unauthorized
+     * Current password is required but was not provided
+     */
+    400: unknown;
+    /**
+     * Unauthorized or current password is incorrect
      */
     401: unknown;
     /**
