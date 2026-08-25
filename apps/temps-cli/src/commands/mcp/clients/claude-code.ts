@@ -5,6 +5,16 @@ import { execFileSync } from 'node:child_process'
 import { MCP_SERVER_NAME, redactSecrets, type InstallResult, type McpClientAdapter, type McpServerEntry } from './base.js'
 import { execErrorMessage, resolveOnPath } from './exec-utils.js'
 
+/**
+ * Pulls the connection URL out of `claude mcp get <name>` stdout. Pure and
+ * exported so the parsing logic is unit-testable without shelling out to a
+ * real `claude` binary or mocking `execFileSync`.
+ */
+export function parseClaudeCodeMcpGetOutput(output: string): string | null {
+  const match = output.match(/^\s*URL:\s*(\S+)/m)
+  return match?.[1] ?? null
+}
+
 // Claude Code owns its own config format/location, so this shells out to the
 // `claude` CLI (same as PostHog's installer) instead of hand-writing a JSON
 // file -- that survives Claude Code changing its config shape underneath us.
@@ -57,14 +67,20 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
     if (!binary) return null
     const entry = this.getServerEntry(binary)
     if (!entry) return null
-    const match = entry.match(/^\s*URL:\s*(\S+)/m)
-    return match?.[1] ?? null
+    return parseClaudeCodeMcpGetOutput(entry)
   }
 
   async addServer(entry: McpServerEntry): Promise<InstallResult> {
     const binary = this.findBinary()
     if (!binary) return { success: false, reason: 'The claude CLI was not found on PATH.' }
     try {
+      // The claude CLI's HTTP transport only accepts headers as a literal
+      // --header value (no env-var-substitution flag, unlike Codex's
+      // --bearer-token-env-var below) -- confirmed against `claude mcp add
+      // --help`, which offers -e/--env only for stdio servers. This means the
+      // key is briefly visible in this process's argv (e.g. /proc/<pid>/cmdline
+      // on Linux) for the duration of the exec call. Tracked as a known
+      // upstream limitation rather than worked around with a fragile hack.
       execFileSync(
         binary,
         [

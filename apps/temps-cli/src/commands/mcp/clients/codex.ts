@@ -4,6 +4,16 @@ import { execErrorMessage, resolveOnPath } from './exec-utils.js'
 
 const TOKEN_ENV_VAR = 'TEMPS_MCP_AUTH_HEADER'
 
+/**
+ * Pulls the connection URL out of `codex mcp get <name>` stdout. Pure and
+ * exported so the parsing logic is unit-testable without shelling out to a
+ * real `codex` binary or mocking `execFileSync`.
+ */
+export function parseCodexMcpGetOutput(output: string): string | null {
+  const match = output.match(/^\s*url:\s*(\S+)/m)
+  return match?.[1] ?? null
+}
+
 // Same rationale as Claude Code: shell out to the official `codex` CLI so
 // Codex's own config format (config.toml) is never hand-written here.
 export class CodexAdapter implements McpClientAdapter {
@@ -44,8 +54,7 @@ export class CodexAdapter implements McpClientAdapter {
     if (!binary) return null
     const entry = this.getServerEntry(binary)
     if (!entry) return null
-    const match = entry.match(/^\s*url:\s*(\S+)/m)
-    return match?.[1] ?? null
+    return parseCodexMcpGetOutput(entry)
   }
 
   async addServer(entry: McpServerEntry): Promise<InstallResult> {

@@ -106,7 +106,10 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
         formattingOptions: { tabSize: 2, insertSpaces: true },
       })
       const updated = jsonc.applyEdits(content, edits)
-      await fs.promises.writeFile(configPath, updated, 'utf8')
+      // mode: 0o600 -- the file embeds an API key (in an Authorization header
+      // value); the default umask-derived mode (typically 0o644) would leave
+      // it readable by any other local user on a shared machine.
+      await fs.promises.writeFile(configPath, updated, { encoding: 'utf8', mode: 0o600 })
       return { success: true }
     } catch (error) {
       return { success: false, reason: redactSecrets(error instanceof Error ? error.message : String(error)) }
@@ -129,7 +132,7 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
         formattingOptions: { tabSize: 2, insertSpaces: true },
       })
       const updated = jsonc.applyEdits(content, edits)
-      await fs.promises.writeFile(configPath, updated, 'utf8')
+      await fs.promises.writeFile(configPath, updated, { encoding: 'utf8', mode: 0o600 })
       return { success: true }
     } catch (error) {
       return { success: false, reason: redactSecrets(error instanceof Error ? error.message : String(error)) }

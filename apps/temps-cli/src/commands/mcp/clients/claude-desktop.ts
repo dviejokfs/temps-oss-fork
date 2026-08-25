@@ -25,9 +25,14 @@ export class ClaudeDesktopAdapter extends JsonConfigMcpClientAdapter {
   }
 
   protected buildServerConfig(entry: McpServerEntry): Record<string, unknown> {
+    // mcp-remote substitutes ${AUTH_HEADER} from the spawned process's env at
+    // runtime, so the key itself never appears in args (and therefore never
+    // shows up in `ps`/`/proc/<pid>/cmdline` on Linux) -- only the config
+    // file on disk holds it, and that file is now written with mode 0o600.
     return {
       command: 'npx',
-      args: ['-y', 'mcp-remote@latest', entry.url, '--header', `Authorization:Bearer ${entry.apiKey}`],
+      args: ['-y', 'mcp-remote@latest', entry.url, '--header', 'Authorization:${AUTH_HEADER}'],
+      env: { AUTH_HEADER: `Bearer ${entry.apiKey}` },
     }
   }
 
