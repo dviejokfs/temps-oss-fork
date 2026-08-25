@@ -7403,6 +7403,19 @@
         ],
         "type": "object"
       },
+      "CreatableServiceTypeRoute": {
+        "enum": [
+          "mariadb",
+          "mongodb",
+          "postgres",
+          "redis",
+          "s3",
+          "kv",
+          "blob",
+          "rustfs"
+        ],
+        "type": "string"
+      },
       "CreateAlertRuleRequest": {
         "properties": {
           "cooldown_minutes": {
@@ -8063,7 +8076,7 @@
             "type": "object"
           },
           "service_type": {
-            "$ref": "#/components/schemas/ServiceTypeRoute"
+            "$ref": "#/components/schemas/CreatableServiceTypeRoute"
           },
           "topology": {
             "description": "Service topology: \"standalone\" (default) or \"cluster\" (HA multi-member).",

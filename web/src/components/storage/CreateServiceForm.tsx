@@ -2,7 +2,10 @@ import {
   createServiceMutation,
   getServiceTypeParametersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { CreateServiceResponse, ServiceTypeRoute } from '@/api/client/types.gen'
+import {
+  CreatableServiceTypeRoute,
+  CreateServiceResponse,
+} from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -97,7 +100,7 @@ function BackupWarning({
 }
 
 interface CreateServiceFormProps {
-  serviceType: ServiceTypeRoute
+  serviceType: CreatableServiceTypeRoute
   onCancel: () => void
   onSuccess: (data: CreateServiceResponse) => void
 }
@@ -375,7 +378,7 @@ export function CreateServiceForm({
 
     await createServiceMut.mutateAsync({
       body: {
-        service_type: values.service_type as ServiceTypeRoute,
+        service_type: values.service_type as CreatableServiceTypeRoute,
         name: values.name,
         parameters: processedParameters,
       },
