@@ -14,7 +14,7 @@ ARG TEMPS_ARTIFACTS=artifacts-source
 # Stage 1: Toolchain — everything that depends only on the Dockerfile, not on
 # the source tree. Kept as its own stage so CI can cache it as image layers
 # (compiling wasm-pack/wasm-bindgen-cli from source dominates a cold build).
-FROM rust:1.94-alpine AS toolchain
+FROM rust:1.98-alpine AS toolchain
 
 # Install required build dependencies
 RUN apk add --no-cache \
