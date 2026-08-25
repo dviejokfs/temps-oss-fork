@@ -22,7 +22,11 @@ import {
   getServiceEnvironmentVariable,
   getProjectBySlug,
 } from '../../api/sdk.gen.js'
-import type { ExternalServiceInfo, ServiceTypeRoute } from '../../api/types.gen.js'
+import type {
+  CreatableServiceTypeRoute,
+  ExternalServiceInfo,
+  ServiceTypeRoute,
+} from '../../api/types.gen.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
@@ -459,7 +463,7 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
     return
   }
 
-  let serviceType: ServiceTypeRoute
+  let serviceType: CreatableServiceTypeRoute
   let name: string
   let parameters: Record<string, unknown> = {}
 
@@ -475,7 +479,7 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
       warning(`Invalid service type: ${options.type}. Available: ${types.join(', ')}`)
       return
     }
-    serviceType = options.type as ServiceTypeRoute
+    serviceType = options.type as CreatableServiceTypeRoute
     name = options.name!
 
     // Parse --set key=value pairs if provided, otherwise use smart defaults
@@ -497,7 +501,7 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
         warning(`Invalid service type: ${options.type}. Available: ${types.join(', ')}`)
         return
       }
-      serviceType = options.type as ServiceTypeRoute
+      serviceType = options.type as CreatableServiceTypeRoute
       info(`Service type: ${colors.bold(SERVICE_TYPE_LABELS[serviceType] || serviceType)}`)
     } else {
       serviceType = await promptSelect({
@@ -506,7 +510,7 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
           name: SERVICE_TYPE_LABELS[t] || t,
           value: t,
         })),
-      }) as ServiceTypeRoute
+      }) as CreatableServiceTypeRoute
     }
 
     if (options.name) {

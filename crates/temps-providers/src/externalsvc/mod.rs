@@ -30,7 +30,12 @@ pub mod test_utils;
 
 #[cfg(test)]
 mod runtime_provisioning_tests {
-    use super::is_container_not_found;
+    use super::{
+        is_container_not_found, missing_required_probe_credential, sanitize_probe_result,
+        set_runtime_container_name, validate_managed_probe_target, validate_runtime_target,
+        HealthProbeResult, RuntimeProvisioningError, ServiceConfig, ServiceHealthProbeError,
+        ServiceType,
+    };
 
     #[test]
     fn only_docker_404_means_container_absent() {
@@ -48,6 +53,100 @@ mod runtime_provisioning_tests {
         assert!(!is_container_not_found(
             &bollard::errors::Error::RequestTimeoutError
         ));
+    }
+
+    #[test]
+    fn health_probe_rejects_non_loopback_managed_target() {
+        let config = ServiceConfig {
+            name: "orders-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "169.254.169.254", "port": "5432"}),
+        };
+
+        assert!(matches!(
+            validate_managed_probe_target(&config),
+            Err(ServiceHealthProbeError::UnsafeTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_provisioning_rejects_non_loopback_managed_target() {
+        let config = ServiceConfig {
+            name: "orders-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "169.254.169.254", "port": "5432"}),
+        };
+
+        assert!(matches!(
+            validate_runtime_target(&config),
+            Err(RuntimeProvisioningError::UnsafeTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn adopted_container_name_is_injected_before_provider_initialization() {
+        let mut config = ServiceConfig {
+            name: "orders-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "port": "5432"}),
+        };
+
+        set_runtime_container_name(&mut config, "postgres-orders-db")
+            .expect("object parameters should accept the canonical container name");
+
+        assert_eq!(
+            config.parameters["container_name"],
+            serde_json::Value::String("postgres-orders-db".to_string())
+        );
+    }
+
+    #[test]
+    fn health_probe_redacts_secrets_and_bounds_errors() {
+        let secret = "credential-that-must-not-leave-the-agent";
+        let mut result =
+            HealthProbeResult::down(format!("auth failed for {secret} {}", "x".repeat(3_000)));
+
+        sanitize_probe_result(&mut result, &[secret.to_string()]);
+
+        let message = result.error_message.as_deref().unwrap_or_default();
+        assert!(!message.contains(secret));
+        assert!(message.contains("[REDACTED]"));
+        assert!(message.len() <= 2_051);
+    }
+
+    #[test]
+    fn existing_service_probes_never_generate_missing_credentials() {
+        let postgres = ServiceConfig {
+            name: "orders-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "port": "5432"}),
+        };
+        let mariadb = ServiceConfig {
+            name: "orders-maria".to_string(),
+            service_type: ServiceType::Mariadb,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "port": "3306"}),
+        };
+        let redis = ServiceConfig {
+            name: "orders-cache".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "port": "6379"}),
+        };
+
+        assert_eq!(
+            missing_required_probe_credential(&postgres),
+            Some("password")
+        );
+        assert_eq!(
+            missing_required_probe_credential(&mariadb),
+            Some("root_password")
+        );
+        assert_eq!(missing_required_probe_credential(&redis), None);
     }
 }
 
@@ -75,6 +174,14 @@ pub use s3::S3Service;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeProvisioningError {
+    #[error(
+        "External-service runtime provisioning may only target the owning node loopback, got '{host}'"
+    )]
+    UnsafeTarget { host: String },
+
+    #[error("External-service runtime parameters must be a JSON object")]
+    InvalidParameters,
+
     #[error("Failed to inspect external-service container '{container}': {source}")]
     ContainerInspection {
         container: String,
@@ -92,6 +199,199 @@ pub enum RuntimeProvisioningError {
 
     #[error("External-service provider provisioning failed: {0}")]
     Provider(#[source] anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceHealthProbeError {
+    #[error("External-service health probe configuration is invalid: {0}")]
+    Configuration(#[source] anyhow::Error),
+
+    #[error("External-service provider health probe failed: {0}")]
+    Provider(#[source] anyhow::Error),
+
+    #[error(
+        "External-service health probes may only target the owning node loopback, got '{host}'"
+    )]
+    UnsafeTarget { host: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum OwnedContainerTargetError {
+    #[error("managed service port is missing or is not a valid TCP port")]
+    InvalidPort,
+    #[error("managed service container was not found on the owning node")]
+    ContainerNotFound,
+    #[error("failed to inspect managed service container '{container}': {source}")]
+    Inspection {
+        container: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+    #[error(
+        "stored port {stored_port} does not match container '{container}' published port for {internal_port}/tcp"
+    )]
+    PortMismatch {
+        container: String,
+        internal_port: String,
+        stored_port: u16,
+    },
+}
+
+/// Run a provider-authenticated health probe against a service owned by the
+/// Docker daemon supplied by the caller.
+///
+/// This is deliberately a typed provider operation rather than a generic
+/// host/port/command probe. The agent derives all network activity from the
+/// validated provider configuration, which prevents this endpoint from
+/// becoming an arbitrary TCP/HTTP/exec primitive.
+#[allow(deprecated)]
+pub async fn probe_service_health(
+    config: ServiceConfig,
+    docker: Arc<bollard::Docker>,
+) -> std::result::Result<HealthProbeResult, ServiceHealthProbeError> {
+    validate_managed_probe_target(&config)?;
+    let secret_values = probe_secret_values(&config);
+    if let Some(field) = missing_required_probe_credential(&config) {
+        return Ok(HealthProbeResult::down(format!(
+            "stored {} configuration is missing required credential field '{}'",
+            config.service_type, field
+        )));
+    }
+    let service_type = config.service_type;
+    let name = match service_type {
+        ServiceType::Kv | ServiceType::Blob => managed_instance_name(&config.name, service_type),
+        _ => config.name.clone(),
+    };
+
+    let instance: Box<dyn ExternalService> = match service_type {
+        ServiceType::Mariadb => Box::new(MariaDbService::new(name, docker.clone())),
+        ServiceType::Mongodb => Box::new(MongodbService::new(name, docker.clone())),
+        ServiceType::Postgres => Box::new(PostgresService::new(name, docker.clone())),
+        ServiceType::Redis | ServiceType::Kv => Box::new(RedisService::new(name, docker.clone())),
+        ServiceType::S3 | ServiceType::Blob => {
+            let selection = ManagedS3BackendSelection::from_parameters(&config.parameters)
+                .map_err(ServiceHealthProbeError::Configuration)?;
+            let encryption = request_scoped_encryption_service()
+                .map_err(ServiceHealthProbeError::Configuration)?;
+            match selection.backend {
+                ManagedS3BackendKind::Rustfs => {
+                    Box::new(RustfsService::new(name, docker.clone(), encryption))
+                }
+                ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
+                    Box::new(S3Service::new(name, docker.clone(), encryption))
+                }
+                ManagedS3BackendKind::Minio => {
+                    return Err(ServiceHealthProbeError::Configuration(anyhow::anyhow!(
+                        "managed S3 backend 'minio' is only supported for S3 services"
+                    )));
+                }
+                ManagedS3BackendKind::Garage => {
+                    return Err(ServiceHealthProbeError::Configuration(anyhow::anyhow!(
+                        "managed S3 backend 'garage' is not supported for health probes"
+                    )));
+                }
+            }
+        }
+        ServiceType::Rustfs => Box::new(RustfsService::new(
+            name,
+            docker.clone(),
+            request_scoped_encryption_service().map_err(ServiceHealthProbeError::Configuration)?,
+        )),
+        ServiceType::Minio => Box::new(S3Service::new(
+            name,
+            docker.clone(),
+            request_scoped_encryption_service().map_err(ServiceHealthProbeError::Configuration)?,
+        )),
+    };
+
+    validate_owned_container_port(&config, instance.as_ref(), &docker)
+        .await
+        .map_err(|error| ServiceHealthProbeError::Configuration(error.into()))?;
+
+    let mut result = instance
+        .health_probe(config)
+        .await
+        .map_err(ServiceHealthProbeError::Provider)?;
+    sanitize_probe_result(&mut result, &secret_values);
+    Ok(result)
+}
+
+/// Creation-time config parsers may generate credentials for a new service.
+/// A health probe must never do that: generated credentials cannot match an
+/// already-running container. Redis is the exception because no password is
+/// a valid, intentionally unauthenticated configuration.
+fn missing_required_probe_credential(config: &ServiceConfig) -> Option<&'static str> {
+    let present = |key: &str| {
+        config
+            .parameters
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    match config.service_type {
+        ServiceType::Postgres | ServiceType::Mongodb if !present("password") => Some("password"),
+        ServiceType::Mariadb if !present("root_password") => Some("root_password"),
+        _ => None,
+    }
+}
+
+fn validate_managed_probe_target(
+    config: &ServiceConfig,
+) -> std::result::Result<(), ServiceHealthProbeError> {
+    let Some(host) = config
+        .parameters
+        .get("host")
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(());
+    };
+    if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return Ok(());
+    }
+    Err(ServiceHealthProbeError::UnsafeTarget {
+        host: host.to_string(),
+    })
+}
+
+fn probe_secret_values(config: &ServiceConfig) -> Vec<String> {
+    let Some(parameters) = config.parameters.as_object() else {
+        return Vec::new();
+    };
+    parameters
+        .iter()
+        .filter(|(key, _)| {
+            let key = key.to_ascii_lowercase();
+            key.contains("password")
+                || key.contains("secret")
+                || key.contains("token")
+                || key.contains("access_key")
+        })
+        .filter_map(|(_, value)| value.as_str().map(str::to_string))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn sanitize_probe_result(result: &mut HealthProbeResult, secret_values: &[String]) {
+    const MAX_ERROR_BYTES: usize = 2_048;
+    let Some(message) = result.error_message.as_mut() else {
+        return;
+    };
+    for secret in secret_values {
+        *message = message.replace(secret, "[REDACTED]");
+    }
+    if message.len() > MAX_ERROR_BYTES {
+        let mut boundary = MAX_ERROR_BYTES;
+        while !message.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        message.truncate(boundary);
+        message.push('…');
+    }
+}
+
+fn request_scoped_encryption_service() -> anyhow::Result<Arc<temps_core::EncryptionService>> {
+    let key = temps_core::EncryptionService::generate_raw_key()?;
+    Ok(Arc::new(temps_core::EncryptionService::new(&key)?))
 }
 
 fn is_container_not_found(error: &bollard::errors::Error) -> bool {
@@ -138,11 +438,12 @@ async fn runtime_container_exists(
 pub async fn provision_runtime_environment(
     name: String,
     service_type: ServiceType,
-    config: ServiceConfig,
+    mut config: ServiceConfig,
     project_slug: &str,
     environment_slug: &str,
     docker: Arc<bollard::Docker>,
 ) -> std::result::Result<HashMap<String, String>, RuntimeProvisioningError> {
+    validate_runtime_target(&config)?;
     let parameters = &config.parameters;
     let instance_name = match service_type {
         ServiceType::Kv | ServiceType::Blob => managed_instance_name(&name, service_type),
@@ -158,9 +459,6 @@ pub async fn provision_runtime_environment(
         }
         ServiceType::S3 | ServiceType::Blob => {
             let selection = ManagedS3BackendSelection::from_parameters(parameters)
-                .map_err(RuntimeProvisioningError::Provider)?;
-            selection
-                .validate_for_service_create()
                 .map_err(RuntimeProvisioningError::Provider)?;
 
             // Runtime provisioning does not use the backup encryption APIs,
@@ -245,10 +543,18 @@ pub async fn provision_runtime_environment(
             .await
             .map_err(|source| RuntimeProvisioningError::LegacyContainerRename {
                 legacy: legacy_name,
-                canonical: canonical_name,
+                canonical: canonical_name.clone(),
                 source,
             })?;
     }
+
+    if canonical_exists || legacy_exists {
+        set_runtime_container_name(&mut config, &canonical_name)?;
+    }
+
+    validate_owned_container_port(&config, instance.as_ref(), &docker)
+        .await
+        .map_err(|error| RuntimeProvisioningError::Provider(error.into()))?;
 
     instance
         .init(config.clone())
@@ -258,6 +564,117 @@ pub async fn provision_runtime_environment(
         .get_runtime_env_vars(config, project_slug, environment_slug)
         .await
         .map_err(RuntimeProvisioningError::Provider)
+}
+
+fn set_runtime_container_name(
+    config: &mut ServiceConfig,
+    container_name: &str,
+) -> std::result::Result<(), RuntimeProvisioningError> {
+    let parameters = config
+        .parameters
+        .as_object_mut()
+        .ok_or(RuntimeProvisioningError::InvalidParameters)?;
+    parameters.insert(
+        "container_name".to_string(),
+        serde_json::Value::String(container_name.to_string()),
+    );
+    Ok(())
+}
+
+fn validate_runtime_target(
+    config: &ServiceConfig,
+) -> std::result::Result<(), RuntimeProvisioningError> {
+    let Some(host) = config
+        .parameters
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return Ok(());
+    }
+    Err(RuntimeProvisioningError::UnsafeTarget {
+        host: host.to_string(),
+    })
+}
+
+async fn validate_owned_container_port(
+    config: &ServiceConfig,
+    instance: &dyn ExternalService,
+    docker: &bollard::Docker,
+) -> std::result::Result<(), OwnedContainerTargetError> {
+    let stored_port = config
+        .parameters
+        .get("port")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .or_else(|| value.as_str().and_then(|port| port.parse::<u16>().ok()))
+        })
+        .filter(|port| *port > 0)
+        .ok_or(OwnedContainerTargetError::InvalidPort)?;
+
+    let mut candidates = Vec::new();
+    if let Some(container_name) = config
+        .parameters
+        .get("container_name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+    {
+        candidates.push(container_name.to_string());
+    }
+    for candidate in [instance.get_docker_container_name(), instance.get_name()] {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    let mut inspected = None;
+    for candidate in candidates {
+        match docker
+            .inspect_container(
+                &candidate,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(container) => {
+                inspected = Some((candidate, container));
+                break;
+            }
+            Err(error) if is_container_not_found(&error) => {}
+            Err(source) => {
+                return Err(OwnedContainerTargetError::Inspection {
+                    container: candidate,
+                    source,
+                })
+            }
+        }
+    }
+    let (container_name, container) =
+        inspected.ok_or(OwnedContainerTargetError::ContainerNotFound)?;
+    let internal_port = instance.get_docker_internal_port();
+    let key = format!("{internal_port}/tcp");
+    let matches_published_port = container
+        .network_settings
+        .and_then(|settings| settings.ports)
+        .and_then(|ports| ports.get(&key).cloned())
+        .flatten()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|binding| binding.host_port.as_deref())
+        .filter_map(|port| port.parse::<u16>().ok())
+        .any(|port| port == stored_port);
+    if !matches_published_port {
+        return Err(OwnedContainerTargetError::PortMismatch {
+            container: container_name,
+            internal_port,
+            stored_port,
+        });
+    }
+    Ok(())
 }
 
 /// Result of a successful `backup_to_s3` call.
@@ -905,7 +1322,7 @@ pub struct ClusterMemberInfo {
 /// Result of a single probe against a managed external service.
 /// Returned by `ExternalService::health_probe` so the monitor can record
 /// structured health history without the trait having to know about DB rows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthProbeResult {
     pub status: HealthProbeStatus,
     /// Round-trip probe latency, when measurable.
@@ -914,7 +1331,8 @@ pub struct HealthProbeResult {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum HealthProbeStatus {
     Operational,
     Degraded,

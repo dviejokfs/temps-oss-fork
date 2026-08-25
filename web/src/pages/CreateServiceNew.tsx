@@ -7,6 +7,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   ClusterMemberRequest,
+  CreatableServiceTypeRoute,
   NodeInfoResponse,
   ServiceTypeRoute,
 } from '@/api/client/types.gen'
@@ -36,6 +37,16 @@ const generateId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 4)
 
 /** Service types that support HA cluster topology */
 const CLUSTER_SERVICE_TYPES: ServiceTypeRoute[] = ['postgres']
+const CREATABLE_SERVICE_TYPES: CreatableServiceTypeRoute[] = [
+  'mariadb',
+  'mongodb',
+  'postgres',
+  'redis',
+  's3',
+  'kv',
+  'blob',
+  'rustfs',
+]
 
 /** Cluster roles the operator chooses at provisioning time.
  *
@@ -258,7 +269,12 @@ export function CreateService() {
   usePageTitle('Create Service')
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const serviceType = searchParams.get('type') as ServiceTypeRoute | null
+  const requestedServiceType = searchParams.get('type')
+  const serviceType = CREATABLE_SERVICE_TYPES.includes(
+    requestedServiceType as CreatableServiceTypeRoute
+  )
+    ? (requestedServiceType as CreatableServiceTypeRoute)
+    : null
   const { setBreadcrumbs } = useBreadcrumbs()
 
   const defaultName = useMemo(
@@ -374,6 +390,10 @@ export function CreateService() {
       toast.error('Service name is required')
       return
     }
+    if (!serviceType) {
+      toast.error('Select a supported service type')
+      return
+    }
 
     // Keep numbers as numbers, convert null to empty strings
     const cleanedParameters: Record<string, any> = {}
@@ -395,7 +415,7 @@ export function CreateService() {
 
     await createServiceMut.mutateAsync({
       body: {
-        service_type: serviceType as ServiceTypeRoute,
+        service_type: serviceType,
         name: serviceName,
         parameters: cleanedParameters,
         ...(topology === 'standalone' && {

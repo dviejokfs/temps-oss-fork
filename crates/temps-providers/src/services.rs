@@ -108,7 +108,7 @@ fn select_member_dns_endpoint(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeProvisioningRoute {
+enum ServiceExecutionRoute {
     Local,
     Remote(i32),
 }
@@ -116,10 +116,27 @@ enum RuntimeProvisioningRoute {
 /// `external_services.node_id` is the ownership boundary: NULL means the
 /// control plane's Docker daemon, while a concrete ID means that worker's
 /// private daemon and network namespace.
-fn runtime_provisioning_route(node_id: Option<i32>) -> RuntimeProvisioningRoute {
+fn service_execution_route(node_id: Option<i32>) -> ServiceExecutionRoute {
     match node_id {
-        Some(node_id) => RuntimeProvisioningRoute::Remote(node_id),
-        None => RuntimeProvisioningRoute::Local,
+        Some(node_id) => ServiceExecutionRoute::Remote(node_id),
+        None => ServiceExecutionRoute::Local,
+    }
+}
+
+fn select_remote_container_name(
+    persisted_name: Option<&str>,
+    canonical_name: &str,
+    canonical_exists: bool,
+    legacy_name: &str,
+    legacy_exists: bool,
+) -> String {
+    if let Some(name) = persisted_name.filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+    if canonical_exists || canonical_name == legacy_name || !legacy_exists {
+        canonical_name.to_string()
+    } else {
+        legacy_name.to_string()
     }
 }
 
@@ -1212,13 +1229,6 @@ impl ExternalServiceManager {
                     reason: e.to_string(),
                 }
             })?;
-        backend_selection
-            .validate_for_service_create()
-            .map_err(|e| ExternalServiceError::ParameterValidationFailed {
-                service_id: 0,
-                reason: e.to_string(),
-            })?;
-
         match backend_selection.backend {
             ManagedS3BackendKind::Rustfs => Ok(self.create_service_instance(name, service_type)),
             ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
@@ -1233,7 +1243,13 @@ impl ExternalServiceManager {
                 reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services"
                     .to_string(),
             }),
-            ManagedS3BackendKind::Garage => unreachable!("Garage is rejected by validation"),
+            ManagedS3BackendKind::Garage => {
+                Err(ExternalServiceError::ParameterValidationFailed {
+                    service_id: 0,
+                    reason: "managed S3 backend 'garage' is not supported for service operations"
+                        .to_string(),
+                })
+            }
         }
     }
 
@@ -1275,6 +1291,47 @@ impl ExternalServiceManager {
             })?;
 
         RemoteServiceClient::new(node.address.clone(), token, node.name.clone())
+    }
+
+    async fn resolve_remote_container_name(
+        &self,
+        client: &RemoteServiceClient,
+        service_instance: &dyn ExternalService,
+        parameters: &HashMap<String, serde_json::Value>,
+    ) -> Result<String, ExternalServiceError> {
+        let persisted_name = parameters
+            .get("container_name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty());
+        if let Some(container_name) = persisted_name {
+            return Ok(container_name.to_string());
+        }
+
+        let canonical_name = service_instance.get_docker_container_name();
+        let canonical_exists = client
+            .service_status(&canonical_name)
+            .await?
+            .container_id
+            .is_some();
+
+        let legacy_name = service_instance.get_name();
+        let legacy_exists = if legacy_name != canonical_name && !canonical_exists {
+            client
+                .service_status(&legacy_name)
+                .await?
+                .container_id
+                .is_some()
+        } else {
+            false
+        };
+
+        Ok(select_remote_container_name(
+            persisted_name,
+            &canonical_name,
+            canonical_exists,
+            &legacy_name,
+            legacy_exists,
+        ))
     }
 
     /// Build the `RemoteServiceCreateParams` that the agent needs to create a
@@ -1586,6 +1643,17 @@ impl ExternalServiceManager {
         request: CreateExternalServiceRequest,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         info!("Creating new external service");
+
+        #[allow(deprecated)]
+        if request.service_type == ServiceType::Minio {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id: 0,
+                reason:
+                    "MinIO service creation is deprecated; create an S3 or RustFS service instead"
+                        .to_string(),
+            });
+        }
+
         let service_slug = Self::generate_slug(&request.name);
 
         let backend_selection =
@@ -2483,13 +2551,14 @@ impl ExternalServiceManager {
             info!("Removing service {} container", service_id);
             if let Some(node_id) = service.node_id {
                 let client = self.get_remote_client(node_id).await?;
+                let service_instance = self.create_service_instance_for_parameters(
+                    service.name.clone(),
+                    service_type_enum,
+                    &parameters,
+                )?;
                 let container_name = self
-                    .create_service_instance_for_parameters(
-                        service.name.clone(),
-                        service_type_enum,
-                        &parameters,
-                    )?
-                    .get_name();
+                    .resolve_remote_container_name(&client, service_instance.as_ref(), &parameters)
+                    .await?;
                 client.remove_service(&container_name).await.map_err(|e| {
                     ExternalServiceError::DeletionFailed {
                         id: service_id,
@@ -7912,13 +7981,14 @@ echo "[restore] Pre-seed complete"
         // Remote node — delegate to agent
         if let Some(node_id) = service.node_id {
             let client = self.get_remote_client(node_id).await?;
+            let service_instance = self.create_service_instance_for_parameters(
+                service.name.clone(),
+                service_type_enum,
+                &parameters,
+            )?;
             let container_name = self
-                .create_service_instance_for_parameters(
-                    service.name.clone(),
-                    service_type_enum,
-                    &parameters,
-                )?
-                .get_name();
+                .resolve_remote_container_name(&client, service_instance.as_ref(), &parameters)
+                .await?;
 
             match client.start_service(&container_name).await {
                 Ok(()) => {}
@@ -8094,13 +8164,14 @@ echo "[restore] Pre-seed complete"
         // Remote node — delegate to agent
         if let Some(node_id) = service.node_id {
             let client = self.get_remote_client(node_id).await?;
+            let service_instance = self.create_service_instance_for_parameters(
+                service.name.clone(),
+                service_type_enum,
+                &parameters,
+            )?;
             let container_name = self
-                .create_service_instance_for_parameters(
-                    service.name.clone(),
-                    service_type_enum,
-                    &parameters,
-                )?
-                .get_name();
+                .resolve_remote_container_name(&client, service_instance.as_ref(), &parameters)
+                .await?;
 
             client.stop_service(&container_name).await.map_err(|e| {
                 ExternalServiceError::StopFailed {
@@ -8357,9 +8428,7 @@ echo "[restore] Pre-seed complete"
             })?,
         };
 
-        if let RuntimeProvisioningRoute::Remote(node_id) =
-            runtime_provisioning_route(service.node_id)
-        {
+        if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id) {
             info!(
                 service_id = service_id_val,
                 node_id, "Dispatching external-service runtime provisioning to owning node"
@@ -8404,6 +8473,57 @@ echo "[restore] Pre-seed complete"
             .await
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to get runtime environment variables: {}", e),
+            })
+    }
+
+    /// Run a standalone service's provider-authenticated health probe in the
+    /// runtime that owns its container. The control plane retains scheduling,
+    /// history, and alerting; only node-local execution crosses the agent API.
+    pub async fn probe_service_health(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<crate::externalsvc::HealthProbeResult, ExternalServiceError> {
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service.id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let service_config = self.get_service_config(service.id).await?;
+
+        if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id) {
+            info!(
+                service_id = service.id,
+                node_id, "Dispatching external-service health probe to owning node"
+            );
+            let client = self.get_remote_client(node_id).await?;
+            return client
+                .probe_health(crate::remote_service_client::RemoteHealthProbeRequest {
+                    service_config,
+                })
+                .await
+                .map(|response| response.result)
+                .map_err(|error| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to probe service {} on node {}: {}",
+                        service.id, node_id, error
+                    ),
+                });
+        }
+
+        let service_instance = self.create_service_instance_for_parameter_value(
+            service.name.clone(),
+            service_type,
+            &service_config.parameters,
+        )?;
+        service_instance
+            .health_probe(service_config)
+            .await
+            .map_err(|error| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Local health probe failed for service {}: {}",
+                    service.id, error
+                ),
             })
     }
 
@@ -15043,18 +15163,41 @@ mod tests {
     }
 
     #[test]
-    fn runtime_provisioning_without_node_id_stays_local() {
+    fn service_execution_without_node_id_stays_local() {
+        assert_eq!(service_execution_route(None), ServiceExecutionRoute::Local);
+    }
+
+    #[test]
+    fn service_execution_with_node_id_targets_owning_worker() {
         assert_eq!(
-            runtime_provisioning_route(None),
-            RuntimeProvisioningRoute::Local
+            service_execution_route(Some(17)),
+            ServiceExecutionRoute::Remote(17)
         );
     }
 
     #[test]
-    fn runtime_provisioning_with_node_id_targets_owning_worker() {
+    fn remote_container_resolution_supports_persisted_canonical_and_legacy_names() {
         assert_eq!(
-            runtime_provisioning_route(Some(17)),
-            RuntimeProvisioningRoute::Remote(17)
+            select_remote_container_name(
+                Some("persisted-container"),
+                "postgres-orders",
+                true,
+                "orders",
+                true,
+            ),
+            "persisted-container"
+        );
+        assert_eq!(
+            select_remote_container_name(None, "postgres-orders", true, "orders", false),
+            "postgres-orders"
+        );
+        assert_eq!(
+            select_remote_container_name(None, "postgres-orders", false, "orders", true),
+            "orders"
+        );
+        assert_eq!(
+            select_remote_container_name(None, "postgres-orders", false, "orders", false),
+            "postgres-orders"
         );
     }
 }

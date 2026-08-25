@@ -125,6 +125,10 @@ pub fn build_router(
             post(service_handlers::runtime_env),
         )
         .route(
+            "/agent/services/health-probe",
+            post(service_handlers::health_probe),
+        )
+        .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
         )
