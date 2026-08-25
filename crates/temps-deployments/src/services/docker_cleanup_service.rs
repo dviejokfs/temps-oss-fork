@@ -1090,7 +1090,8 @@ impl DockerCleanupService {
                     }
                     Ok(false) => {} // Already gone
                     Err(e) => {
-                        warn!("Failed to delete orphaned blob {}: {}", &hash[..8], e);
+                        let hash_prefix: String = hash.chars().take(8).collect();
+                        warn!("Failed to delete orphaned blob {}: {}", hash_prefix, e);
                     }
                 }
             }

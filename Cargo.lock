@@ -12446,7 +12446,6 @@ dependencies = [
  "clickhouse",
  "cookie",
  "dashmap",
- "flate2",
  "futures",
  "hex",
  "hmac 0.13.0",
