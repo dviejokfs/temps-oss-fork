@@ -11,8 +11,8 @@ import {
   revealServiceEnvironmentVariablesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
+  CreatableServiceTypeRoute,
   RepositoryResponse,
-  ServiceTypeRoute,
   ProjectPresetResponse,
   BranchInfo,
   ExternalServiceInfo,
@@ -624,7 +624,7 @@ export function ProjectConfigurator({
   const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] =
     useState(false)
   const [selectedServiceType, setSelectedServiceType] =
-    useState<ServiceTypeRoute | null>(null)
+    useState<CreatableServiceTypeRoute | null>(null)
   const [showSecrets, setShowSecrets] = useState<{ [key: number]: boolean }>({})
   const [isImportEnvOpen, setIsImportEnvOpen] = useState(false)
   const [newlyCreatedServiceIds, setNewlyCreatedServiceIds] = useState<
