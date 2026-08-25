@@ -14,28 +14,33 @@ import { buildMcpUrl, isValidGroupKey, parseMcpUrl, TOOL_GROUPS } from './groups
 import { probeMcpEndpoint } from './probe.js'
 
 /**
- * The host:port a URL resolves to, for comparing whether two URLs point at
- * the same Temps instance. Returns null for an unparsable URL so callers
- * treat it as "no match" rather than crashing.
+ * The scheme+host+port a URL resolves to, for comparing whether two URLs
+ * point at the same Temps instance. Deliberately includes the scheme, not
+ * just host:port -- a saved https:// context's bearer key must never be
+ * treated as valid for an http:// target sharing the same hostname, which
+ * would bind (and potentially transmit) that credential over plaintext.
+ * Returns null for an unparsable URL so callers treat it as "no match"
+ * rather than crashing.
  */
-export function hostOf(url: string): string | null {
+export function originOf(url: string): string | null {
   try {
-    return new URL(url).host
+    return new URL(url).origin
   } catch {
     return null
   }
 }
 
 /**
- * Finds a saved CLI context whose URL points at the same host as `url`, if
- * any. Used to decide whether a credential is actually bound to a target --
- * see `ensureMcpAuth`'s doc comment for why this matters.
+ * Finds a saved CLI context whose URL points at the same origin (scheme,
+ * host, and port) as `url`, if any. Used to decide whether a credential is
+ * actually bound to a target -- see `ensureMcpAuth`'s doc comment for why
+ * this matters.
  */
 async function findContextByUrl(url: string): Promise<{ url: string; apiKey: string } | null> {
-  const target = hostOf(url)
+  const target = originOf(url)
   if (!target) return null
   const contexts = await listContexts()
-  return contexts.find((c) => hostOf(c.url) === target) ?? null
+  return contexts.find((c) => originOf(c.url) === target) ?? null
 }
 
 /**
