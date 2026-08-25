@@ -14,6 +14,31 @@ import { buildMcpUrl, isValidGroupKey, parseMcpUrl, TOOL_GROUPS } from './groups
 import { probeMcpEndpoint } from './probe.js'
 
 /**
+ * The host:port a URL resolves to, for comparing whether two URLs point at
+ * the same Temps instance. Returns null for an unparsable URL so callers
+ * treat it as "no match" rather than crashing.
+ */
+export function hostOf(url: string): string | null {
+  try {
+    return new URL(url).host
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Finds a saved CLI context whose URL points at the same host as `url`, if
+ * any. Used to decide whether a credential is actually bound to a target --
+ * see `ensureMcpAuth`'s doc comment for why this matters.
+ */
+async function findContextByUrl(url: string): Promise<{ url: string; apiKey: string } | null> {
+  const target = hostOf(url)
+  if (!target) return null
+  const contexts = await listContexts()
+  return contexts.find((c) => hostOf(c.url) === target) ?? null
+}
+
+/**
  * Auth gate for the mcp command family. Unlike the plain `requireAuth()` used
  * by every other command (which just errors out with "run `temps login`"),
  * this offers to run the device-flow login right here -- the mcp wizard is
@@ -21,8 +46,54 @@ import { probeMcpEndpoint } from './probe.js'
  * remember the separate `login` command, and re-run `mcp add` is unnecessary
  * friction. Skipped entirely in `--yes` (non-interactive) mode, where the
  * caller must already have a valid context or pass `--api-key`.
+ *
+ * SECURITY: when `urlOverride` names a specific target, this must NEVER fall
+ * back to whatever credential happens to be ambiently active for a
+ * *different* server. `credentials.isAuthenticated()` / `requireAuth()` are
+ * URL-agnostic -- they answer "is *some* session active", not "is a session
+ * active *for this host*". Without this check, `mcp add --url <anything>`
+ * (or the "Enter a different URL..." wizard prompt) would silently reuse the
+ * active context's API key for whatever URL was given, which sends that key
+ * as an Authorization header to it -- e.g. a mistyped or malicious URL would
+ * receive a fully working credential for the real instance it belongs to.
  */
 async function ensureMcpAuth(opts: { yes?: boolean; urlOverride?: string } = {}): Promise<string> {
+  if (opts.urlOverride) {
+    const matched = await findContextByUrl(opts.urlOverride)
+    if (matched) {
+      return matched.apiKey
+    }
+
+    if (opts.yes) {
+      console.error(
+        `Not authenticated to ${opts.urlOverride} and no --api-key provided. ` +
+          'Refusing to reuse a credential from a different Temps instance.',
+      )
+      process.exit(1)
+    }
+
+    warning(`No saved login is bound to ${opts.urlOverride}.`)
+    info("Your active session's key belongs to a different server and will not be reused for it.")
+    const wantsLogin = await promptConfirm({
+      message: `Log in to ${opts.urlOverride} now?`,
+      default: true,
+    })
+    if (!wantsLogin) {
+      console.error(`Not authenticated to ${opts.urlOverride}. Please run: temps login --url ${opts.urlOverride}`)
+      process.exit(1)
+    }
+
+    await loginWithDevice({ url: opts.urlOverride })
+    const ctx = await findContextByUrl(opts.urlOverride)
+    if (ctx) return ctx.apiKey
+    // loginWithDevice always establishes a context for the URL it was given;
+    // this is an unreachable safety net, not an expected path.
+    console.error(`Login to ${opts.urlOverride} did not produce a usable session.`)
+    process.exit(1)
+  }
+
+  // No specific target named -- fall back to the ambient session, same as
+  // every other CLI command.
   if (await credentials.isAuthenticated()) {
     return requireAuth()
   }
@@ -39,12 +110,9 @@ async function ensureMcpAuth(opts: { yes?: boolean; urlOverride?: string } = {})
     return requireAuth() // reuses the standard "run `temps login`" exit
   }
 
-  // Defaults to --url when the caller pinned one (e.g. a command copied from
-  // the Settings UI, which names this instance explicitly) -- otherwise the
-  // ambient context/legacy default, same as before.
   const url = await promptText({
     message: 'Temps server URL (leave blank to use the default)',
-    default: opts.urlOverride ?? getApiUrl(),
+    default: getApiUrl(),
   })
 
   await loginWithDevice({ url: url || undefined })
@@ -113,7 +181,14 @@ async function selectMcpTarget(options: { url?: string; yes?: boolean }): Promis
 
   if (selected === CUSTOM_TARGET) {
     const url = await promptText({ message: 'Temps server URL' })
-    return { url: url || undefined }
+    if (!url) return {}
+    // If the typed URL happens to match a saved context (same host), bind
+    // its known-good credential instead of leaving this unbound -- avoids
+    // an unnecessary re-login and, more importantly, ensures the credential
+    // ensureMcpAuth resolves later is actually known to belong to this URL
+    // rather than falling through to an ambient key for a different server.
+    const matched = await findContextByUrl(url)
+    return matched ? { url, apiKey: matched.apiKey } : { url }
   }
 
   const ctx = await getContext(selected)
@@ -168,8 +243,11 @@ export function registerMcpCommands(program: Command): void {
 }
 
 async function setMcpServerEnabled(enabled: boolean, urlOverride?: string): Promise<void> {
-  await ensureMcpAuth({ urlOverride })
-  await setupClient(urlOverride)
+  // The resolved key must actually be wired into setupClient -- passing it
+  // no apiKeyOverride would fall through to the ambient credential
+  // regardless of what ensureMcpAuth just verified for urlOverride.
+  const apiKey = await ensureMcpAuth({ urlOverride })
+  await setupClient(urlOverride, apiKey)
 
   await withSpinner(enabled ? 'Enabling the Temps MCP server...' : 'Disabling the Temps MCP server...', async () => {
     // PUT /settings replaces every field not present in the body with its
@@ -200,8 +278,11 @@ async function disableAction(options: { url?: string }): Promise<void> {
 
 async function addAction(clientArg: string | undefined, options: AddOptions): Promise<void> {
   const target = await selectMcpTarget({ url: options.url, yes: options.yes })
-  await ensureMcpAuth({ yes: options.yes, urlOverride: target.url })
-  await setupClient(target.url, target.apiKey)
+  // The credential ensureMcpAuth resolves here is guaranteed bound to
+  // target.url (or the process exits) -- never an ambient key for a
+  // different server. Reused below instead of re-deriving via requireAuth().
+  const authenticatedApiKey = await ensureMcpAuth({ yes: options.yes, urlOverride: target.url })
+  await setupClient(target.url, target.apiKey ?? authenticatedApiKey)
 
   const clientId =
     clientArg ||
@@ -297,12 +378,12 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
       newline()
       success(`Created API key "${created.name}" (${created.key_prefix}...)`)
     } else {
-      // Prefer the key resolved for the chosen instance (from the picker
-      // above or --url) over requireAuth()'s ambient resolution, which
-      // reflects whatever context is globally active -- possibly a
+      // authenticatedApiKey (from ensureMcpAuth, above) is already bound to
+      // target.url -- never requireAuth()'s ambient resolution, which
+      // reflects whatever context is globally active and could be a
       // *different* server than the one just chosen, which would otherwise
       // embed the wrong credentials into this client's config.
-      apiKey = target.apiKey ?? (await requireAuth())
+      apiKey = target.apiKey ?? authenticatedApiKey
     }
   }
 
