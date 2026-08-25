@@ -33,6 +33,7 @@ temps-core = { path = "../temps-core" }
 temps-deployer = { path = "../temps-deployer" }
 temps-network = { path = "../temps-network" }
 temps-dns-resolver = { path = "../temps-dns-resolver" }
+temps-providers = { path = "../temps-providers" }
 ipnet = "2.10"
 parking_lot = "0.12"
 rand = { workspace = true }

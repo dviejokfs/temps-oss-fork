@@ -853,6 +853,29 @@ impl RedisService {
         Ok(redis_config)
     }
 
+    /// Parse the configuration of an already-running Redis service without
+    /// applying create-time defaults. In particular, a missing password means
+    /// the live container was created without `--requirepass`; generating a
+    /// fresh password during a health check can never authenticate and makes
+    /// an operational service look down.
+    fn get_redis_probe_config(&self, service_config: ServiceConfig) -> Result<RedisConfig> {
+        let parameters = service_config.parameters;
+        let string_parameter = |key: &str| {
+            parameters
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+
+        Ok(RedisConfig {
+            host: string_parameter("host").unwrap_or_else(default_host),
+            port: string_parameter("port").unwrap_or_else(|| "6379".to_string()),
+            password: string_parameter("password").unwrap_or_default(),
+            docker_image: string_parameter("docker_image").unwrap_or_else(default_docker_image),
+            container_name: string_parameter("container_name").filter(|value| !value.is_empty()),
+        })
+    }
+
     /// Verify that a Docker image can be pulled without actually downloading the full image
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
     #[allow(dead_code)]
@@ -1937,7 +1960,7 @@ impl ExternalService for RedisService {
         const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
         const DEGRADED_MS: u128 = 2000;
 
-        let cfg = match self.get_redis_config(service_config) {
+        let cfg = match self.get_redis_probe_config(service_config) {
             Ok(c) => c,
             Err(e) => {
                 return Ok(HealthProbeResult::down(format!(
@@ -3012,6 +3035,35 @@ mod tests {
     use super::*;
 
     use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
+
+    #[test]
+    fn health_probe_config_preserves_missing_and_short_passwords() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = RedisService::new("probe-config".to_string(), docker);
+        let without_password = service
+            .get_redis_probe_config(ServiceConfig {
+                name: "probe-config".to_string(),
+                service_type: ServiceType::Redis,
+                version: None,
+                parameters: serde_json::json!({"host": "localhost", "port": "6380"}),
+            })
+            .unwrap();
+        assert_eq!(without_password.password, "");
+
+        let short_password = service
+            .get_redis_probe_config(ServiceConfig {
+                name: "probe-config".to_string(),
+                service_type: ServiceType::Redis,
+                version: None,
+                parameters: serde_json::json!({
+                    "host": "localhost",
+                    "port": "6380",
+                    "password": "short"
+                }),
+            })
+            .unwrap();
+        assert_eq!(short_password.password, "short");
+    }
 
     /// `restore_capabilities` must declare in-place and new-service restore as
     /// supported, and explicitly NOT claim PITR (Redis has no WAL archive).

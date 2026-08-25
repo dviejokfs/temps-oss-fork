@@ -2718,6 +2718,27 @@ fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
 /// connection" bug this timeout extension exists to fix.
 const CONSOLE_IO_TIMEOUT_SECS: u64 = 3600;
 
+/// Decide whether a request should be denied by per-project/environment IP
+/// restriction, given the client IP the proxy managed to resolve (if any).
+///
+/// Pulled out of `early_request_filter` as a pure function so the two cases
+/// that matter — resolved IP denied by an active policy, and *unresolvable*
+/// IP under an active policy — are unit-testable without a full pingora
+/// session. See the call site's comment for why an unresolvable IP must fail
+/// closed only when this project/environment actually has a policy
+/// configured (`ProjectIpGate::has_active_policy`), not unconditionally.
+fn ip_restriction_denies(
+    gate: &dyn temps_core::ProjectIpGate,
+    project_id: i32,
+    environment_id: i32,
+    parsed_ip: Option<std::net::IpAddr>,
+) -> bool {
+    match parsed_ip {
+        Some(ip) => !gate.is_allowed(project_id, environment_id, ip),
+        None => gate.has_active_policy(project_id, environment_id),
+    }
+}
+
 /// Whether a `Content-Type` value's media type — its "essence", the part
 /// before any `;` parameters — is exactly `text/event-stream`.
 ///
@@ -4310,35 +4331,48 @@ impl ProxyHttp for LoadBalancer {
             // must not be able to distinguish "this project doesn't exist"
             // from "this project is restricted and you're not on the
             // allowlist" by response shape.
-            if let Some(ip) = ctx
+            //
+            // `ctx.ip_address` can fail to resolve to a parseable `IpAddr`
+            // (non-INET socket, missing/garbled forwarded-for value —
+            // resolve_session_client_ip falls back to the literal
+            // "unknown"). We must not silently skip enforcement in that
+            // case: fail closed (deny) when this project/environment
+            // actually has an active restriction policy, since an
+            // unresolvable IP under an active policy is exactly what an
+            // attacker (or a misconfigured proxy) would produce. When there
+            // is no policy at all for this project/environment — the common
+            // case — an unresolvable IP must NOT deny, matching today's
+            // behavior; this feature is opt-in and most traffic has nothing
+            // to do with it.
+            let parsed_ip = ctx
                 .ip_address
                 .as_deref()
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-            {
-                if !self.project_ip_gate.is_allowed(
-                    project_ctx.project.id,
-                    project_ctx.environment.id,
-                    ip,
-                ) {
-                    warn!(
-                        environment_id = project_ctx.environment.id,
-                        project_id = project_ctx.project.id,
-                        ip = %ip,
-                        "Request denied by project IP restriction"
-                    );
-                    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("X-Request-ID", &ctx.request_id)?;
-                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                    session
-                        .write_response_header(Box::new(response), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
-                        .await?;
-                    ctx.routing_status = "project_ip_restricted".to_string();
-                    return Ok(true);
-                }
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok());
+            let ip_restricted = ip_restriction_denies(
+                self.project_ip_gate.as_ref(),
+                project_ctx.project.id,
+                project_ctx.environment.id,
+                parsed_ip,
+            );
+            if ip_restricted {
+                warn!(
+                    environment_id = project_ctx.environment.id,
+                    project_id = project_ctx.project.id,
+                    ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                    "Request denied by project IP restriction"
+                );
+                let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
+                    .await?;
+                ctx.routing_status = "project_ip_restricted".to_string();
+                return Ok(true);
             }
 
             // Check if this is a CAPTCHA endpoint - allow these to bypass attack mode
@@ -7355,6 +7389,64 @@ mod content_type_tests {
         assert!(!is_event_stream_content_type(""));
         // A prefix match must not count either.
         assert!(!is_event_stream_content_type("text/event-stream-x"));
+    }
+}
+
+#[cfg(test)]
+mod ip_restriction_fail_closed_tests {
+    use super::ip_restriction_denies;
+    use std::net::IpAddr;
+    use temps_core::ProjectIpGate;
+
+    /// Stands in for `temps-ee-ip-access`'s `CachedIpAccessGate` when a
+    /// project/environment is on a closed/restricted mode: `is_allowed`
+    /// denies (baring an explicit allowlist match, irrelevant here since we
+    /// never reach it — the IP is unresolvable) and `has_active_policy`
+    /// truthfully reports the restriction exists.
+    struct RestrictedGate;
+    impl ProjectIpGate for RestrictedGate {
+        fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
+            false
+        }
+        fn has_active_policy(&self, _project_id: i32, _environment_id: i32) -> bool {
+            true
+        }
+    }
+
+    /// Stands in for the common case: no restriction configured for this
+    /// project/environment at all (also what `temps_core::OpenIpGate`,
+    /// the OSS default, always reports).
+    struct UnrestrictedGate;
+    impl ProjectIpGate for UnrestrictedGate {
+        fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
+            true
+        }
+        // has_active_policy uses the trait default (`false`).
+    }
+
+    #[test]
+    fn unresolvable_ip_under_an_active_policy_is_denied() {
+        // Regression: an unparseable/absent client IP must fail closed when
+        // the project/environment actually has an IP restriction policy —
+        // silently skipping enforcement here is exactly the gap an attacker
+        // (or a proxy misconfiguration) would exploit.
+        assert!(ip_restriction_denies(&RestrictedGate, 1, 1, None));
+    }
+
+    #[test]
+    fn unresolvable_ip_under_no_policy_is_not_denied() {
+        // Matches today's behavior for the common case: most projects have
+        // no IP restriction configured, so a resolution failure (e.g. a
+        // non-INET socket in local/test environments) must not start
+        // denying that traffic.
+        assert!(!ip_restriction_denies(&UnrestrictedGate, 1, 1, None));
+    }
+
+    #[test]
+    fn resolved_ip_still_goes_through_is_allowed_as_before() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(ip_restriction_denies(&RestrictedGate, 1, 1, Some(ip)));
+        assert!(!ip_restriction_denies(&UnrestrictedGate, 1, 1, Some(ip)));
     }
 }
 

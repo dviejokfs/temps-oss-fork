@@ -13,10 +13,10 @@ import {
   listServicesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
+  CreatableServiceTypeRoute,
   TemplateResponse,
   ConnectionResponse,
   ExternalServiceInfo,
-  ServiceTypeRoute,
 } from '@/api/client/types.gen'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -182,7 +182,8 @@ export function TemplateConfigurator({
   // State
   const [showSecrets, setShowSecrets] = useState<Record<number, boolean>>({})
   const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] = useState(false)
-  const [selectedServiceType, setSelectedServiceType] = useState<ServiceTypeRoute | null>(null)
+  const [selectedServiceType, setSelectedServiceType] =
+    useState<CreatableServiceTypeRoute | null>(null)
   const [newlyCreatedServiceIds, setNewlyCreatedServiceIds] = useState<number[]>([])
 
   // Fetch connections

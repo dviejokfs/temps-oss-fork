@@ -3656,6 +3656,8 @@ export type CostAnalysis = {
     usage_source: UsageSource;
 };
 
+export type CreatableServiceTypeRoute = 'mariadb' | 'mongodb' | 'postgres' | 'redis' | 's3' | 'kv' | 'blob' | 'rustfs';
+
 export type CreateAlertRuleRequest = {
     /**
      * Minimum minutes between notifications for same rule+group
@@ -3923,7 +3925,7 @@ export type CreateExternalServiceRequest = {
     parameters: {
         [key: string]: unknown;
     };
-    service_type: ServiceTypeRoute;
+    service_type: CreatableServiceTypeRoute;
     /**
      * Service topology: "standalone" (default) or "cluster" (HA multi-member).
      */
