@@ -12,6 +12,21 @@ use tracing::{debug, error, info, warn};
 
 use super::types::{validate_check_path, StatusPageError};
 
+/// Grace period before the scheduler runs its first health check cycle.
+///
+/// In split mode (`temps proxy` + `temps serve --role=console`) these are
+/// independent OS processes with no startup handshake between them, and even
+/// in single-process mode the proxy's listener setup (route/project-change
+/// listeners, admin gate, DB connections) can still be in flight when the
+/// console's plugins finish registering. A check that fires the instant this
+/// scheduler starts races the proxy socket bind: `check_monitor` gets a
+/// connection-refused, which is treated as a definitive "container is down"
+/// and reported as `major_outage` with no retry (see the `is_connect()`
+/// branch below). This delay absorbs that boot window so the first cycle
+/// observes the platform in its normal running state; every cycle after the
+/// first runs on the regular interval.
+const STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(20);
+
 /// Service for performing health checks on monitored environments
 pub struct HealthCheckService {
     db: Arc<DatabaseConnection>,
@@ -504,6 +519,13 @@ impl HealthCheckService {
     /// waiting for the next scheduled cycle.
     pub async fn start_scheduler(self: Arc<Self>, mut job_receiver: Box<dyn JobReceiver>) {
         debug!("Starting health check scheduler with realtime monitor creation handling");
+
+        // See STARTUP_GRACE_PERIOD: wait out the proxy's boot window before
+        // touching any monitor. This also delays `initialize_monitors` below,
+        // which prevents the MonitorCreated events it emits for newly-seen
+        // environments from triggering an immediate check during the same
+        // race window.
+        sleep(STARTUP_GRACE_PERIOD).await;
 
         // Initialize monitors for all environments first
         if let Err(e) = self.initialize_monitors().await {
