@@ -90,6 +90,13 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
 
       let content = ''
       if (fs.existsSync(configPath)) {
+        // Tighten permissions BEFORE writing the new credential into this
+        // file, not after: a config that predates this fix (or was created
+        // by another tool) may still be at a looser mode like 0o644, and
+        // `mode` on writeFile is ignored for an existing file -- it does not
+        // chmod. Restricting first means the bearer key is never written to
+        // a file that's world/group-readable, even for an instant.
+        await fs.promises.chmod(configPath, 0o600)
         content = await fs.promises.readFile(configPath, 'utf8')
       }
 
@@ -106,14 +113,11 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
         formattingOptions: { tabSize: 2, insertSpaces: true },
       })
       const updated = jsonc.applyEdits(content, edits)
-      // The file embeds an API key (in an Authorization header value), so it
-      // must never be world-readable, in either of two cases:
-      //  - Brand new file: pass `mode` to writeFile so open()'s O_CREAT path
-      //    creates it at 0o600 atomically -- there is no window where the
-      //    credential sits on disk at a looser mode.
-      //  - Pre-existing file: `mode` is ignored by writeFile on an existing
-      //    file (it doesn't chmod), so a config that predates this fix, or
-      //    was created by another tool at 0o644, needs an explicit chmod.
+      // Brand-new file: pass `mode` so open()'s O_CREAT path creates it at
+      // 0o600 atomically -- there is no window where the credential sits on
+      // disk at a looser mode. The chmod afterward is a cheap no-op in that
+      // case, and a safety net in general (e.g. a platform where `mode` on
+      // writeFile isn't fully honored).
       await fs.promises.writeFile(configPath, updated, { encoding: 'utf8', mode: 0o600 })
       await fs.promises.chmod(configPath, 0o600)
       return { success: true }
@@ -127,6 +131,11 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
     try {
       if (!fs.existsSync(configPath)) return { success: true, alreadyInstalled: true }
 
+      // Same rationale as addServer: tighten before reading/writing, not
+      // after -- other MCP servers' credentials may already be in this file,
+      // and rewriting it should never happen at a looser mode than 0o600.
+      await fs.promises.chmod(configPath, 0o600)
+
       const content = await fs.promises.readFile(configPath, 'utf8')
       const prop = this.getServerPropertyName()
       const existing = jsonc.parse(content) as Record<string, any> | undefined
@@ -138,9 +147,7 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
         formattingOptions: { tabSize: 2, insertSpaces: true },
       })
       const updated = jsonc.applyEdits(content, edits)
-      // Other MCP servers' credentials may remain in this file after removing
-      // ours -- keep it locked down the same way addServer does.
-      await fs.promises.writeFile(configPath, updated, 'utf8')
+      await fs.promises.writeFile(configPath, updated, { encoding: 'utf8', mode: 0o600 })
       await fs.promises.chmod(configPath, 0o600)
       return { success: true }
     } catch (error) {
