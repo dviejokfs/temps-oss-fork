@@ -5,11 +5,42 @@ use tracing::error;
 
 use crate::error::McpError;
 
+/// Confine a deployment token to its bound project, independent of
+/// `check_project_access`'s admin/checker logic below.
+///
+/// This is the MCP-crate equivalent of `temps_auth::project_scope_guard!`
+/// (which can't be used directly here: it `return`s a `Problem`, not an
+/// `McpError`, since it's designed for Axum handlers). It must run for
+/// every tool that takes a `project_id`, called *before* or alongside
+/// `check_project_access` — not folded into it — because
+/// `check_project_access`'s deployment-token bypass returns `Ok(())`
+/// immediately, which would otherwise skip tenant-boundary enforcement
+/// entirely for the one principal type it exists to confine.
+///
+/// No-op (`Ok(())`) for user/API-key/session/CLI auth, matching
+/// [`AuthContext::is_scoped_to_project`]'s semantics.
+pub(crate) fn check_project_scope(auth: &AuthContext, project_id: i32) -> Result<(), McpError> {
+    if auth.is_scoped_to_project(project_id) {
+        Ok(())
+    } else {
+        Err(McpError::ProjectAccessDenied { project_id })
+    }
+}
+
 /// Check whether `auth` may access `project_id` via the optional checker.
 ///
 /// Mirrors the `resolve_hidden_projects` REST handler's admin / deployment-token
 /// exemption: platform admins, instance admins, and deployment tokens are
 /// allowed unconditionally without ever consulting the `ProjectAccessChecker`.
+///
+/// This function does NOT confine a deployment token to its bound project —
+/// that is a distinct tenant-boundary check, enforced separately by
+/// [`check_project_scope`], which every tool handler calls alongside this
+/// function. Deployment tokens bypass `ProjectAccessChecker` here today only
+/// because the current permission-mapping in `context.rs` excludes them from
+/// `ProjectsRead`/`DeploymentsCreate` — an accident of that unrelated table,
+/// not a guarantee. `check_project_scope` is what makes the bypass safe even
+/// if that mapping changes.
 ///
 /// - Admin bypass (`is_deployment_token`, `is_admin`, or `PlatformAdmin` role)
 ///   → return `Ok(())` immediately, checker is not called.
@@ -24,7 +55,8 @@ pub(crate) async fn check_project_access(
 ) -> Result<(), McpError> {
     // Admin / deployment-token bypass: matches resolve_hidden_projects semantics.
     // Neither the checker nor the OSS-default path is consulted for these
-    // principals — they see everything, unconditionally.
+    // principals — they see everything, unconditionally. Tenant confinement
+    // for deployment tokens is enforced separately by `check_project_scope`.
     if auth.is_deployment_token() || auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
         return Ok(());
     }
@@ -206,9 +238,10 @@ mod tests {
         );
     }
 
-    /// Deployment tokens must also bypass the `ProjectAccessChecker` — the
-    /// token is already project-scoped by its own tenant-boundary mechanism
-    /// (`is_scoped_to_project`), which the handler layer enforces separately.
+    /// Deployment tokens also bypass the `ProjectAccessChecker` in this
+    /// function. Tenant confinement to the token's own project is a separate
+    /// concern, enforced by `check_project_scope` — see that function's tests
+    /// below for the case where the requested project does NOT match.
     #[tokio::test]
     async fn check_project_access_deployment_token_bypasses_checker() {
         let checker = DenyingChecker {
@@ -219,5 +252,36 @@ mod tests {
             result.is_ok(),
             "deployment token must bypass the checker and be allowed"
         );
+    }
+
+    // ── check_project_scope (tenant-boundary confinement) ──────────────────────
+
+    #[test]
+    fn check_project_scope_allows_deployment_token_for_its_own_project() {
+        // deployment_token_auth() is bound to project 1 (see its constructor call).
+        let result = check_project_scope(&deployment_token_auth(), 1);
+        assert!(result.is_ok(), "token must access its own bound project");
+    }
+
+    #[test]
+    fn check_project_scope_denies_deployment_token_for_a_different_project() {
+        // deployment_token_auth() is bound to project 1; requesting project 42
+        // must be denied even though check_project_access would bypass the
+        // checker entirely for this same auth context.
+        let result = check_project_scope(&deployment_token_auth(), 42);
+        assert!(
+            matches!(
+                result,
+                Err(McpError::ProjectAccessDenied { project_id: 42 })
+            ),
+            "deployment token scoped to project 1 must not reach project 42"
+        );
+    }
+
+    #[test]
+    fn check_project_scope_is_a_noop_for_non_deployment_token_auth() {
+        // Non-admin session auth has no per-project confinement at this layer.
+        let result = check_project_scope(&non_admin_auth(), 999);
+        assert!(result.is_ok(), "session auth is not project-scoped");
     }
 }

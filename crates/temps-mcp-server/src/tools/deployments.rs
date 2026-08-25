@@ -7,7 +7,7 @@ use temps_core::AuditLogger;
 use temps_deployments::DeploymentService;
 use tracing::error;
 
-use crate::access::check_project_access;
+use crate::access::{check_project_access, check_project_scope};
 use crate::audit::{AuditContext, McpDeploymentTriggeredAudit};
 use crate::error::McpError;
 use crate::proposal::ProposalStore;
@@ -161,6 +161,10 @@ pub async fn execute(
         "list_deployments" => {
             let project_id = require_i32(arguments, "project_id", name)?;
 
+            // Tenant-boundary check first: confines a deployment token to its
+            // own bound project regardless of the checker/admin bypass below.
+            check_project_scope(ctx.auth, project_id)?;
+
             // Per-project access check — a single `user_can_access_project`
             // call is correct here (not the hidden-list pattern) because this
             // is a direct, project-scoped read.  Admins bypass via auth.
@@ -170,11 +174,21 @@ pub async fn execute(
                 .get("environment_id")
                 .and_then(serde_json::Value::as_i64)
                 .map(|v| v as i32);
-            let page = arguments.get("page").and_then(serde_json::Value::as_i64);
+            // `get_project_deployments` casts both values `as u64` with no
+            // validation (`page.unwrap_or(1) as u64`); a negative i64 wraps to
+            // a huge u64, and Sea-ORM's pagination OFFSET/LIMIT bind then
+            // panics (`TryFromIntError(PosOverflow)` in sea-query-binder) when
+            // converting that back down for Postgres — which kills the whole
+            // console listener task, not just this request. Clamp both here,
+            // at the boundary where the value is attacker-controlled.
+            let page = arguments
+                .get("page")
+                .and_then(serde_json::Value::as_i64)
+                .map(|v| v.max(1));
             let per_page = arguments
                 .get("per_page")
                 .and_then(serde_json::Value::as_i64)
-                .map(|v| v.min(100));
+                .map(|v| v.clamp(1, 100));
 
             let response = deployment_service
                 .get_project_deployments(project_id, page, per_page, environment_id)
@@ -201,6 +215,10 @@ pub async fn execute(
                 .get("branch")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
+
+            // Tenant-boundary check first: confines a deployment token to its
+            // own bound project regardless of the checker/admin bypass below.
+            check_project_scope(ctx.auth, project_id)?;
 
             // Project access check at the propose step.  The check is
             // repeated at confirm time as well, because the two steps are
@@ -270,10 +288,13 @@ pub async fn execute(
                     // and confirm steps are separate HTTP requests: the token
                     // holder at confirm time may differ from the one who proposed
                     // (e.g. a replayed or forwarded token).  Fail-closed on any
-                    // access denial or infra error.  Admins bypass via auth.
+                    // access denial or infra error.  Admins bypass via auth;
+                    // deployment tokens are still confined to their own project
+                    // by check_project_scope below regardless of that bypass.
                     //
-                    // This check runs BEFORE take() so a denied attempt does NOT
+                    // These checks run BEFORE take() so a denied attempt does NOT
                     // consume the token — the authorised proposer can still confirm.
+                    check_project_scope(ctx.auth, project_id)?;
                     check_project_access(checker, ctx.auth, project_id).await?;
 
                     // Access granted: now consume the token atomically.  If a

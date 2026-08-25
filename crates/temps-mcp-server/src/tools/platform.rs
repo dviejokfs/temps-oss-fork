@@ -7,7 +7,7 @@ use temps_core::project_access::ProjectAccessChecker;
 use temps_projects::ProjectService;
 use tracing::error;
 
-use crate::access::check_project_access;
+use crate::access::{check_project_access, check_project_scope};
 use crate::error::McpError;
 use crate::protocol::{McpTool, McpToolResult};
 
@@ -130,6 +130,10 @@ pub async fn execute(
                     arg: "project_id".to_string(),
                     tool: name.to_string(),
                 })? as i32;
+
+            // Tenant-boundary check first: confines a deployment token to its
+            // own bound project regardless of the checker/admin bypass below.
+            check_project_scope(auth, project_id)?;
 
             // Per-project access check.  Uses the same fail-closed semantics
             // as list_deployments: None checker → allow (OSS default);
