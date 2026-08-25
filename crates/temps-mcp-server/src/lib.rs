@@ -24,6 +24,7 @@
 //! (default: `false`).  `GET /mcp/tools` returns `404` when the flag is off,
 //! signalling the wizard that MCP is not yet configured on this instance.
 
+pub mod access;
 pub mod audit;
 pub mod error;
 pub mod handlers;

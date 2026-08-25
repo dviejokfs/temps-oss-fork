@@ -6,6 +6,7 @@ use temps_core::AuditLogger;
 use temps_deployments::DeploymentService;
 use tracing::error;
 
+use crate::access::check_project_access;
 use crate::audit::{AuditContext, McpDeploymentTriggeredAudit};
 use crate::error::McpError;
 use crate::proposal::ProposalStore;
@@ -107,36 +108,6 @@ pub fn tools(write_enabled: bool) -> Vec<McpTool> {
     }
 
     result
-}
-
-/// Check whether `user_id` may access `project_id` via the optional checker.
-///
-/// - `None` checker → no RBAC configured → allow (OSS default).
-/// - `Ok(true)` → explicitly allowed.
-/// - `Ok(false)` → denied.
-/// - `Err(_)` → infrastructure failure → fail closed (deny).
-async fn check_project_access(
-    checker: Option<&dyn ProjectAccessChecker>,
-    user_id: i32,
-    project_id: i32,
-) -> Result<(), McpError> {
-    let Some(checker) = checker else {
-        // No checker registered → OSS default: allow everything.
-        return Ok(());
-    };
-
-    match checker.user_can_access_project(user_id, project_id).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(McpError::ProjectAccessDenied { project_id }),
-        Err(e) => {
-            // Fail closed: infrastructure failure must not silently widen access.
-            error!(
-                user_id,
-                project_id, "MCP project access check failed (infra error): {}", e
-            );
-            Err(McpError::ProjectAccessDenied { project_id })
-        }
-    }
 }
 
 /// Shared services and auth context threaded into [`execute`].
@@ -269,16 +240,21 @@ pub async fn execute(
                     tool: name.to_string(),
                 })?;
 
-            let proposal = proposals.take(token).map_err(McpError::from)?;
+            // Peek at the proposal without consuming it.  This lets us extract
+            // arguments and run the access check BEFORE the token is removed.
+            // A denied access check must not consume the token, so the
+            // legitimate confirmer can retry — preventing a denial-of-service
+            // where an unauthorised caller invalidates valid proposal tokens.
+            let peeked = proposals.peek(token).map_err(McpError::from)?;
 
             // Execute the proposed action.
-            match proposal.tool_name.as_str() {
+            match peeked.tool_name.as_str() {
                 "trigger_deployment" => {
                     let project_id =
-                        require_i32(&proposal.arguments, "project_id", "confirm_action")?;
+                        require_i32(&peeked.arguments, "project_id", "confirm_action")?;
                     let environment_id =
-                        require_i32(&proposal.arguments, "environment_id", "confirm_action")?;
-                    let branch = proposal
+                        require_i32(&peeked.arguments, "environment_id", "confirm_action")?;
+                    let branch = peeked
                         .arguments
                         .get("branch")
                         .and_then(serde_json::Value::as_str)
@@ -289,7 +265,16 @@ pub async fn execute(
                     // holder at confirm time may differ from the one who proposed
                     // (e.g. a replayed or forwarded token).  Fail-closed on any
                     // access denial or infra error.
+                    //
+                    // This check runs BEFORE take() so a denied attempt does NOT
+                    // consume the token — the authorised proposer can still confirm.
                     check_project_access(checker, actor.user_id, project_id).await?;
+
+                    // Access granted: now consume the token atomically.  If a
+                    // concurrent confirm won the race between our peek and here,
+                    // take() returns NotFound — the expected single-use behaviour,
+                    // propagated normally.
+                    proposals.take(token).map_err(McpError::from)?;
 
                     let audit_event = McpDeploymentTriggeredAudit {
                         context: AuditContext {
@@ -408,7 +393,7 @@ mod tests {
         store.take(&token).expect_err("second take must fail");
     }
 
-    // ── ProjectAccessChecker mocks ────────────────────────────────────────────
+    // ── ProjectAccessChecker mock ─────────────────────────────────────────────
 
     /// A checker that denies access to a specific project_id.
     struct DenyingChecker {
@@ -426,64 +411,54 @@ mod tests {
         }
     }
 
-    /// A checker that always returns an infra error.
-    struct FailingChecker;
+    // ── confirm_action token-preservation test ────────────────────────────────
 
-    #[async_trait]
-    impl ProjectAccessChecker for FailingChecker {
-        async fn user_can_access_project(
-            &self,
-            _user_id: i32,
-            _project_id: i32,
-        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-            Err("infra failure".into())
-        }
-    }
-
-    // ── check_project_access unit tests ──────────────────────────────────────
-
+    /// An unauthorised `confirm_action` attempt (checker denies the project)
+    /// must NOT remove the proposal token from the store.  The legitimate
+    /// confirmer must be able to retry with the same token afterward.
     #[tokio::test]
-    async fn check_project_access_none_checker_allows() {
-        // No checker registered → OSS default → allow.
-        let result = check_project_access(None, 1, 42).await;
-        assert!(result.is_ok());
-    }
+    async fn unauthorized_confirm_does_not_consume_token() {
+        let store = ProposalStore::new();
+        let token = store.create(
+            "trigger_deployment".to_string(),
+            serde_json::json!({
+                "project_id": 42,
+                "environment_id": 1,
+                "branch": null
+            }),
+        );
 
-    #[tokio::test]
-    async fn check_project_access_allows_permitted_project() {
-        let checker = DenyingChecker {
-            denied_project_id: 99,
-        };
-        let result = check_project_access(Some(&checker), 1, 42).await;
-        assert!(result.is_ok(), "project 42 must be allowed");
-    }
-
-    #[tokio::test]
-    async fn check_project_access_denies_forbidden_project() {
         let checker = DenyingChecker {
             denied_project_id: 42,
         };
-        let result = check_project_access(Some(&checker), 1, 42).await;
-        assert!(
-            matches!(
-                result,
-                Err(McpError::ProjectAccessDenied { project_id: 42 })
-            ),
-            "project 42 must be denied"
-        );
-    }
 
-    #[tokio::test]
-    async fn check_project_access_infra_failure_fails_closed() {
-        // Infrastructure failure must produce ProjectAccessDenied, not a silent allow.
-        let checker = FailingChecker;
-        let result = check_project_access(Some(&checker), 1, 42).await;
+        // Step 1: peek must succeed (token exists and is valid).
+        let peeked = store
+            .peek(&token)
+            .expect("peek must succeed before any access check");
+        let project_id =
+            require_i32(&peeked.arguments, "project_id", "confirm_action").expect("project_id");
+
+        // Step 2: access check must deny.
+        let access_result = check_project_access(Some(&checker), 99, project_id).await;
         assert!(
             matches!(
-                result,
+                access_result,
                 Err(McpError::ProjectAccessDenied { project_id: 42 })
             ),
-            "infra failure must fail closed as ProjectAccessDenied"
+            "access check must deny project 42 for user 99"
         );
+
+        // Step 3: because we did NOT call take(), the token must still be
+        // present in the store — peek() and take() must both still succeed.
+        let peeked_again = store
+            .peek(&token)
+            .expect("token must still be present after a denied access check");
+        assert_eq!(peeked_again.tool_name, "trigger_deployment");
+
+        let taken = store
+            .take(&token)
+            .expect("authorised confirmer must still be able to consume the token");
+        assert_eq!(taken.tool_name, "trigger_deployment");
     }
 }

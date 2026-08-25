@@ -68,6 +68,37 @@ impl ProposalStore {
         token
     }
 
+    /// Peek at the proposal identified by `token` without consuming it.
+    ///
+    /// Returns the same data as [`take`] (tool name and arguments) after the
+    /// same validity checks, but does NOT remove the entry from the map.
+    ///
+    /// An expired proposal is still removed opportunistically and
+    /// `Err(ProposalTakeError::Expired)` is returned — expiry is not an
+    /// "awaiting authorisation" state; the proposal is simply gone.
+    ///
+    /// Use this to extract arguments for an access check before committing
+    /// to consuming the token via [`take`].  A denied access check that calls
+    /// only `peek` leaves the token intact so the legitimate confirmer can retry.
+    pub fn peek(&self, token: &str) -> Result<TakenProposal, ProposalTakeError> {
+        let mut store = self.lock_store();
+
+        let proposal = store.get(token).ok_or(ProposalTakeError::NotFound)?;
+
+        if proposal.created_at.elapsed() > PROPOSAL_TTL {
+            // Remove expired entries opportunistically, same as take().
+            store.remove(token);
+            return Err(ProposalTakeError::Expired);
+        }
+
+        // Clone the data out — we hold the lock throughout and do NOT remove
+        // the entry.  The proposal remains available for a subsequent take().
+        Ok(TakenProposal {
+            tool_name: proposal.tool_name.clone(),
+            arguments: proposal.arguments.clone(),
+        })
+    }
+
     /// Consume the proposal identified by `token`.
     ///
     /// Returns `Err(ProposalTakeError::NotFound)` when the token is unknown,
@@ -86,14 +117,17 @@ impl ProposalStore {
         // Remove on success — proposals are single-use.  A subsequent call
         // with the same token returns NotFound, identical to an unknown token,
         // which is correct: after consumption the token has no further meaning.
-        let proposal = store
-            .remove(token)
-            .expect("token was confirmed present two lines above");
-
-        Ok(TakenProposal {
-            tool_name: proposal.tool_name,
-            arguments: proposal.arguments,
-        })
+        //
+        // We hold the mutex throughout (no TOCTOU), so the remove() cannot
+        // fail in practice — but we handle it gracefully rather than panicking.
+        if let Some(proposal) = store.remove(token) {
+            Ok(TakenProposal {
+                tool_name: proposal.tool_name,
+                arguments: proposal.arguments,
+            })
+        } else {
+            Err(ProposalTakeError::NotFound)
+        }
     }
 }
 
@@ -155,6 +189,59 @@ impl ProposalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── peek() tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn peek_returns_data_without_consuming() {
+        let store = ProposalStore::new();
+        let args = serde_json::json!({ "project_id": 1 });
+        let token = store.create("trigger_deployment".to_string(), args.clone());
+
+        // peek() must return the data ...
+        let peeked = store.peek(&token).expect("peek must succeed");
+        assert_eq!(peeked.tool_name, "trigger_deployment");
+        assert_eq!(peeked.arguments, args);
+
+        // ... without removing the entry — take() must still succeed.
+        let taken = store.take(&token).expect("take after peek must succeed");
+        assert_eq!(taken.tool_name, "trigger_deployment");
+
+        // Now it's consumed — a second take must fail.
+        store.take(&token).expect_err("second take must fail");
+    }
+
+    #[test]
+    fn peek_expired_proposal_returns_expired_and_cleans_up() {
+        let store = ProposalStore::new();
+        let token = store.create("trigger_deployment".to_string(), serde_json::json!({}));
+
+        // Backdate past the TTL.
+        store.backdate(&token, PROPOSAL_TTL + Duration::from_secs(1));
+
+        // peek() on an expired proposal must reject it (Expired) ...
+        let err = store
+            .peek(&token)
+            .expect_err("peek on expired token must fail");
+        assert!(matches!(err, ProposalTakeError::Expired));
+
+        // ... and must clean it up so a subsequent take() sees NotFound, not Expired.
+        let err2 = store
+            .take(&token)
+            .expect_err("take after expired peek must fail");
+        assert!(matches!(err2, ProposalTakeError::NotFound));
+    }
+
+    #[test]
+    fn peek_unknown_token_returns_not_found() {
+        let store = ProposalStore::new();
+        let err = store
+            .peek("no-such-token")
+            .expect_err("unknown token must fail");
+        assert!(matches!(err, ProposalTakeError::NotFound));
+    }
+
+    // ── take() / create() / general tests ────────────────────────────────────
 
     #[test]
     fn create_and_take_proposal() {

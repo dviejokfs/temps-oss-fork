@@ -5,6 +5,7 @@ use temps_core::project_access::ProjectAccessChecker;
 use temps_projects::ProjectService;
 use tracing::error;
 
+use crate::access::check_project_access;
 use crate::error::McpError;
 use crate::protocol::McpTool;
 
@@ -49,13 +50,16 @@ pub fn tools() -> Vec<McpTool> {
 /// Execute a platform-group tool call.
 ///
 /// `user_id` is threaded in so that `list_projects` can apply per-user
-/// project visibility filtering via the optional `checker`.
+/// project visibility filtering via the optional `checker`, and
+/// `get_project` can enforce per-project access.
 ///
 /// # Errors
 ///
 /// - [`McpError::UnknownTool`] when `name` is not in [`tools()`].
 /// - [`McpError::MissingArgument`] / [`McpError::InvalidArgument`] on bad
 ///   input.
+/// - [`McpError::ProjectAccessDenied`] when the caller lacks access to the
+///   requested project.
 /// - [`McpError::ProjectNotFound`] / [`McpError::ProjectService`] on backend
 ///   errors.
 pub async fn execute(
@@ -115,6 +119,11 @@ pub async fn execute(
                     arg: "project_id".to_string(),
                     tool: name.to_string(),
                 })? as i32;
+
+            // Per-project access check.  Uses the same fail-closed semantics
+            // as list_deployments: None checker → allow (OSS default);
+            // Ok(false) or Err(_) → deny.
+            check_project_access(checker, user_id, project_id).await?;
 
             let project = project_service
                 .get_project(project_id)
@@ -275,5 +284,47 @@ mod tests {
         let checker: Option<&dyn ProjectAccessChecker> = None;
         // The None branch in execute() doesn't call hidden_project_ids at all.
         assert!(checker.is_none());
+    }
+
+    /// `get_project` must deny access when the checker returns false for the
+    /// requested project.  We test the access-check layer directly (without a
+    /// real ProjectService) using `check_project_access` — the same function
+    /// called inside the `"get_project"` match arm.
+    #[tokio::test]
+    async fn get_project_denies_forbidden_project() {
+        // HidingChecker denies user_can_access_project for hidden_id = 7.
+        let checker = HidingChecker { hidden_id: 7 };
+
+        // Simulate what execute() does in the "get_project" arm.
+        let result = check_project_access(Some(&checker), 1, 7).await;
+        assert!(
+            matches!(result, Err(McpError::ProjectAccessDenied { project_id: 7 })),
+            "get_project must be denied for project 7"
+        );
+
+        // A different project must still be allowed.
+        let allowed = check_project_access(Some(&checker), 1, 42).await;
+        assert!(allowed.is_ok(), "project 42 must be allowed");
+    }
+
+    /// `get_project` must fail closed when the checker returns an infra error.
+    #[tokio::test]
+    async fn get_project_infra_failure_fails_closed() {
+        let checker = FailingChecker;
+        let result = check_project_access(Some(&checker), 1, 42).await;
+        assert!(
+            matches!(
+                result,
+                Err(McpError::ProjectAccessDenied { project_id: 42 })
+            ),
+            "infra failure must fail closed as ProjectAccessDenied"
+        );
+    }
+
+    /// `get_project` with no checker must allow any project (OSS default).
+    #[tokio::test]
+    async fn get_project_none_checker_allows() {
+        let result = check_project_access(None, 1, 42).await;
+        assert!(result.is_ok(), "None checker must allow all projects");
     }
 }
