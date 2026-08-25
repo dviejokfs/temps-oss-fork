@@ -66,6 +66,9 @@ pub enum NodeError {
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error("Failed to read DNS registry: {0}")]
+    DnsRegistry(#[from] temps_dns::DnsRegistryError),
 }
 
 /// Request to register a new worker node.
@@ -490,7 +493,18 @@ impl NodeService {
         if let Some(dns) = request.dns_resolver {
             active.dns_resolver_running = Set(Some(dns.running));
             active.dns_resolver_tasks_alive = Set(Some(dns.tasks_alive));
-            active.dns_resolver_last_sync_at = Set(dns.last_sync_success_at);
+            // A resolver that just self-healed after a crash is `running`
+            // but hasn't completed its first sync yet, so this heartbeat's
+            // `last_sync_success_at` is `None` even though the DB already
+            // holds a good prior timestamp. Only overwrite when there's a
+            // real newer timestamp, or when the resolver isn't running at
+            // all (in which case the old timestamp is genuinely stale) —
+            // never regress a known-good sync time to NULL just because
+            // the resolver is mid-recovery, which downstream consumers
+            // (the CLI's health classifier) would misread as "healthy".
+            if dns.last_sync_success_at.is_some() || !dns.running {
+                active.dns_resolver_last_sync_at = Set(dns.last_sync_success_at);
+            }
             active.dns_resolver_consecutive_failures = Set(dns.consecutive_sync_failures);
             active.dns_resolver_last_error = Set(dns.last_sync_error);
             active.dns_resolver_record_count = Set(Some(dns.record_count));
@@ -565,6 +579,17 @@ impl NodeService {
             .all(self.db.as_ref())
             .await?;
         Ok(nodes)
+    }
+
+    /// Total DNS records currently registered in the cluster zone (ADR-024).
+    /// Thin delegation to `temps_dns::DnsRegistry` — kept here so the
+    /// `cluster_dns_status` handler goes through this service like it
+    /// already does for `list_all`, rather than constructing the
+    /// data-access-layer `DnsRegistry` type directly.
+    pub async fn total_dns_record_count(&self) -> Result<i64, NodeError> {
+        let dns_registry = temps_dns::DnsRegistry::new(self.db.clone());
+        let count = dns_registry.total_record_count().await?;
+        Ok(count)
     }
 
     /// List only active nodes (heartbeat within the threshold).
@@ -1656,6 +1681,71 @@ mod tests {
                 "a None dns_resolver must not assign {column} at all: {sql}"
             );
         }
+    }
+
+    /// A resolver that just self-healed after a crash reports `running:
+    /// true` but `last_sync_success_at: None` (it hasn't completed its
+    /// first sync tick yet). This must NOT regress a previously stored,
+    /// known-good `dns_resolver_last_sync_at` to NULL — that would make
+    /// the CLI's health classifier misreport the mid-recovery window as
+    /// "healthy" instead of showing the resolver is still catching up.
+    #[tokio::test]
+    async fn test_heartbeat_does_not_wipe_last_sync_at_when_restarted_resolver_has_not_synced_yet()
+    {
+        let mut node = sample_node();
+        node.dns_resolver_running = Some(true);
+        node.dns_resolver_last_sync_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let updated = node.clone();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![node]])
+                .append_query_results(vec![vec![updated]])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+
+        let result = service
+            .heartbeat(
+                1,
+                HeartbeatRequest {
+                    architecture: None,
+                    capacity: serde_json::json!({"cpu": 50}),
+                    labels: None,
+                    dns_resolver: Some(DnsResolverHeartbeatUpdate {
+                        running: true,
+                        tasks_alive: true,
+                        last_sync_success_at: None,
+                        consecutive_sync_failures: 0,
+                        last_sync_error: None,
+                        record_count: 0,
+                    }),
+                },
+            )
+            .await;
+        assert!(result.is_ok());
+
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        let update = log
+            .last()
+            .expect("heartbeat must issue at least one statement");
+        let sql = &update.statements()[0].sql;
+        // The resolver is still `running`, so the "just went down" escape
+        // hatch doesn't apply — `last_sync_success_at` being `None` must
+        // NOT be assigned onto the row, leaving the previously stored
+        // timestamp untouched.
+        assert!(
+            !sql.contains("\"dns_resolver_last_sync_at\" ="),
+            "a restarted-but-not-yet-synced resolver must not wipe the \
+             existing dns_resolver_last_sync_at: {sql}"
+        );
+        // Other DNS fields on a real heartbeat still update normally.
+        assert!(
+            sql.contains("\"dns_resolver_running\" ="),
+            "dns_resolver_running must still be assigned: {sql}"
+        );
     }
 
     // ── AffectedDeployment unit tests ──────────────────────────────

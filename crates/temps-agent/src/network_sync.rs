@@ -536,7 +536,9 @@ async fn reconcile_resolver(
         // Drop the dead handle. `shutdown()` on an already-exited task just
         // awaits the (already-finished) JoinHandles, so this is safe even
         // though one of them is what triggered the respawn.
-        resolver.take().unwrap().shutdown().await;
+        if let Some(handle) = resolver.take() {
+            handle.shutdown().await;
+        }
     }
 
     let dns_cfg = DnsResolverConfig::new(
@@ -572,10 +574,17 @@ async fn reconcile_resolver(
                 "DNS resolver failed to start; this node has no in-cluster DNS \
                  (heartbeats / deployments / proxy continue to work)"
             );
-            // Leave `resolver` as None and `overlay_bridge_address` unset —
-            // the typical failure (port 53 already bound) won't fix itself
-            // by retrying immediately, but the next sync tick (POLL_INTERVAL
-            // later) will try again rather than waiting for an agent restart.
+            // `resolver` is already None here (the dead handle, if any, was
+            // dropped above before this respawn attempt). Clear
+            // `overlay_bridge_address` too — otherwise a previous, now-dead
+            // resolver's IP would stay published, and new containers would
+            // get `--dns=<dead IP>` with no listener behind it. The typical
+            // failure (port 53 already bound) won't fix itself by retrying
+            // immediately, but the next sync tick (POLL_INTERVAL later) will
+            // try again rather than waiting for an agent restart.
+            if let Ok(mut slot) = overlay_bridge_address.write() {
+                *slot = None;
+            }
             start_error = Some(e.to_string());
         }
     }

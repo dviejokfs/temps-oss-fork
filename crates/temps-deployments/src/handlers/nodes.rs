@@ -2010,17 +2010,11 @@ async fn cluster_dns_status(
         }
     };
 
-    // Ad hoc construction, same pattern as `list_peers`'s `PostgresAllocator`:
-    // `DnsRegistry` is a thin wrapper over the DB connection with no extra
-    // state, so a fresh instance per request is cheap and avoids widening
-    // `AppState`'s dependency surface for a single read-only count.
-    let dns_registry = temps_dns::DnsRegistry::new(app_state.db.clone());
-    let total_record_count = dns_registry.total_record_count().await.map_err(|e| {
-        error!("Failed to count DNS records for cluster status: {}", e);
-        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("DNS Registry Error")
-            .with_detail(format!("Failed to count DNS records: {}", e))
-    })?;
+    let total_record_count = app_state
+        .node_service
+        .total_dns_record_count()
+        .await
+        .map_err(Problem::from)?;
 
     let nodes = app_state
         .node_service
@@ -2848,6 +2842,12 @@ impl From<NodeError> for Problem {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail("An internal error occurred")
+            }
+            NodeError::DnsRegistry(ref e) => {
+                error!("DNS registry error in node operation: {}", e);
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("DNS Registry Error")
+                    .with_detail(format!("Failed to count DNS records: {}", e))
             }
         }
     }
