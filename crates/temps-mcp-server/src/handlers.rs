@@ -303,7 +303,7 @@ async fn handle_tool_call(
         return crate::tools::platform::execute(
             tool_name,
             args,
-            auth.user_id(),
+            auth,
             &state.project_service,
             state.project_access_checker.as_deref(),
         )
@@ -325,6 +325,7 @@ async fn handle_tool_call(
             proposals: &state.proposals,
             audit_service: &state.audit_service,
             actor: &actor,
+            auth,
             checker: state.project_access_checker.as_deref(),
         };
         return crate::tools::deployments::execute(tool_name, args, write_enabled, &exec_ctx).await;

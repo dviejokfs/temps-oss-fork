@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use serde_json::json;
+use temps_auth::context::AuthContext;
 use temps_core::project_access::ProjectAccessChecker;
 use temps_core::AuditLogger;
 use temps_deployments::DeploymentService;
@@ -119,6 +120,10 @@ pub struct DeploymentExecCtx<'a> {
     pub proposals: &'a Arc<ProposalStore>,
     pub audit_service: &'a Arc<dyn AuditLogger>,
     pub actor: &'a AuditActor,
+    /// Full auth context for the MCP caller.  Used by `check_project_access`
+    /// to apply the admin / deployment-token bypass before consulting
+    /// `checker`.  `actor` is kept separately for audit-log attribution.
+    pub auth: &'a AuthContext,
     /// Optional per-project access checker (absent on instances without
     /// team-based RBAC configured).
     pub checker: Option<&'a dyn ProjectAccessChecker>,
@@ -153,8 +158,8 @@ pub async fn execute(
 
             // Per-project access check — a single `user_can_access_project`
             // call is correct here (not the hidden-list pattern) because this
-            // is a direct, project-scoped read.
-            check_project_access(checker, actor.user_id, project_id).await?;
+            // is a direct, project-scoped read.  Admins bypass via auth.
+            check_project_access(checker, ctx.auth, project_id).await?;
 
             let environment_id = arguments
                 .get("environment_id")
@@ -198,8 +203,8 @@ pub async fn execute(
             // repeated at confirm time as well, because the two steps are
             // separate HTTP requests and either could be replayed or misused
             // independently (e.g. a propose token passed to a different
-            // session that has lost the project access).
-            check_project_access(checker, actor.user_id, project_id).await?;
+            // session that has lost the project access).  Admins bypass via auth.
+            check_project_access(checker, ctx.auth, project_id).await?;
 
             // Propose rather than execute immediately.  The human confirms
             // via confirm_action.
@@ -264,11 +269,11 @@ pub async fn execute(
                     // and confirm steps are separate HTTP requests: the token
                     // holder at confirm time may differ from the one who proposed
                     // (e.g. a replayed or forwarded token).  Fail-closed on any
-                    // access denial or infra error.
+                    // access denial or infra error.  Admins bypass via auth.
                     //
                     // This check runs BEFORE take() so a denied attempt does NOT
                     // consume the token — the authorised proposer can still confirm.
-                    check_project_access(checker, actor.user_id, project_id).await?;
+                    check_project_access(checker, ctx.auth, project_id).await?;
 
                     // Access granted: now consume the token atomically.  If a
                     // concurrent confirm won the race between our peek and here,
@@ -341,6 +346,44 @@ fn require_i32(arguments: &serde_json::Value, arg: &str, tool: &str) -> Result<i
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use chrono::Utc;
+    use temps_auth::context::AuthContext;
+    use temps_auth::permissions::Role;
+    use temps_entities::users;
+
+    // ── AuthContext helpers ───────────────────────────────────────────────────
+
+    fn make_user(id: i32) -> users::Model {
+        let now = Utc::now();
+        users::Model {
+            id,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn user_auth(id: i32) -> AuthContext {
+        AuthContext::new_session(make_user(id), Role::User)
+    }
+
+    fn platform_admin_auth() -> AuthContext {
+        AuthContext::new_session(make_user(1), Role::PlatformAdmin)
+    }
 
     #[test]
     fn tools_read_only_excludes_write_tools() {
@@ -439,14 +482,15 @@ mod tests {
         let project_id =
             require_i32(&peeked.arguments, "project_id", "confirm_action").expect("project_id");
 
-        // Step 2: access check must deny.
-        let access_result = check_project_access(Some(&checker), 99, project_id).await;
+        // Step 2: access check must deny a non-admin user.
+        let unauth = user_auth(99);
+        let access_result = check_project_access(Some(&checker), &unauth, project_id).await;
         assert!(
             matches!(
                 access_result,
                 Err(McpError::ProjectAccessDenied { project_id: 42 })
             ),
-            "access check must deny project 42 for user 99"
+            "access check must deny project 42 for non-admin user 99"
         );
 
         // Step 3: because we did NOT call take(), the token must still be
@@ -460,5 +504,22 @@ mod tests {
             .take(&token)
             .expect("authorised confirmer must still be able to consume the token");
         assert_eq!(taken.tool_name, "trigger_deployment");
+    }
+
+    /// A PlatformAdmin attempting `confirm_action` must bypass the checker
+    /// and be allowed unconditionally.
+    #[tokio::test]
+    async fn platform_admin_confirm_bypasses_checker() {
+        let checker = DenyingChecker {
+            denied_project_id: 42,
+        };
+        let admin = platform_admin_auth();
+        // PlatformAdmin must not be denied even for project 42 which the
+        // checker would deny for a regular user.
+        let result = check_project_access(Some(&checker), &admin, 42).await;
+        assert!(
+            result.is_ok(),
+            "PlatformAdmin must bypass the checker at the confirm step"
+        );
     }
 }

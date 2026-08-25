@@ -12001,6 +12001,7 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-deployments",
+ "temps-entities",
  "temps-projects",
  "thiserror 2.0.20",
  "tokio",

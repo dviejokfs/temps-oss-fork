@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use serde_json::json;
+use temps_auth::context::AuthContext;
+use temps_auth::permissions::Role;
 use temps_core::project_access::ProjectAccessChecker;
 use temps_projects::ProjectService;
 use tracing::error;
@@ -49,9 +51,9 @@ pub fn tools() -> Vec<McpTool> {
 
 /// Execute a platform-group tool call.
 ///
-/// `user_id` is threaded in so that `list_projects` can apply per-user
-/// project visibility filtering via the optional `checker`, and
-/// `get_project` can enforce per-project access.
+/// `auth` is threaded in so that `list_projects` can apply per-user project
+/// visibility filtering via the optional `checker` (with admin bypass), and
+/// `get_project` can enforce per-project access (also with admin bypass).
 ///
 /// # Errors
 ///
@@ -65,7 +67,7 @@ pub fn tools() -> Vec<McpTool> {
 pub async fn execute(
     name: &str,
     arguments: &serde_json::Value,
-    user_id: i32,
+    auth: &AuthContext,
     project_service: &Arc<ProjectService>,
     checker: Option<&dyn ProjectAccessChecker>,
 ) -> Result<serde_json::Value, McpError> {
@@ -78,11 +80,19 @@ pub async fn execute(
 
             // Apply project visibility filtering when a checker is registered.
             // Mirrors the REST handler's `resolve_hidden_projects` semantics:
+            // - Admin / deployment-token bypass → show everything, no filtering.
             // - `None` checker → no access grants configured → show everything.
             // - `Ok(None)` from checker → checker has no opinion → show everything.
             // - `Ok(Some(ids))` → exclude those IDs.
             // - `Err(_)` → infrastructure failure → fail the request (fail-closed).
-            let projects = if let Some(checker) = checker {
+            let user_id = auth.user_id();
+            let projects = if auth.is_deployment_token()
+                || auth.is_admin()
+                || auth.has_role(&Role::PlatformAdmin)
+            {
+                // Platform/instance admins and deployment tokens see all projects.
+                projects
+            } else if let Some(checker) = checker {
                 match checker.hidden_project_ids(user_id).await {
                     Ok(Some(hidden_ids)) if !hidden_ids.is_empty() => projects
                         .into_iter()
@@ -122,8 +132,8 @@ pub async fn execute(
 
             // Per-project access check.  Uses the same fail-closed semantics
             // as list_deployments: None checker → allow (OSS default);
-            // Ok(false) or Err(_) → deny.
-            check_project_access(checker, user_id, project_id).await?;
+            // Ok(false) or Err(_) → deny.  Admins bypass via check_project_access.
+            check_project_access(checker, auth, project_id).await?;
 
             let project = project_service
                 .get_project(project_id)
@@ -152,6 +162,44 @@ pub async fn execute(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use chrono::Utc;
+    use temps_auth::context::AuthContext;
+    use temps_auth::permissions::Role;
+    use temps_entities::users;
+
+    // ── AuthContext helpers ───────────────────────────────────────────────────
+
+    fn make_user(id: i32) -> users::Model {
+        let now = Utc::now();
+        users::Model {
+            id,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn non_admin_auth() -> AuthContext {
+        AuthContext::new_session(make_user(1), Role::User)
+    }
+
+    fn platform_admin_auth() -> AuthContext {
+        AuthContext::new_session(make_user(1), Role::PlatformAdmin)
+    }
 
     #[test]
     fn tools_list_is_non_empty() {
@@ -296,14 +344,14 @@ mod tests {
         let checker = HidingChecker { hidden_id: 7 };
 
         // Simulate what execute() does in the "get_project" arm.
-        let result = check_project_access(Some(&checker), 1, 7).await;
+        let result = check_project_access(Some(&checker), &non_admin_auth(), 7).await;
         assert!(
             matches!(result, Err(McpError::ProjectAccessDenied { project_id: 7 })),
             "get_project must be denied for project 7"
         );
 
         // A different project must still be allowed.
-        let allowed = check_project_access(Some(&checker), 1, 42).await;
+        let allowed = check_project_access(Some(&checker), &non_admin_auth(), 42).await;
         assert!(allowed.is_ok(), "project 42 must be allowed");
     }
 
@@ -311,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn get_project_infra_failure_fails_closed() {
         let checker = FailingChecker;
-        let result = check_project_access(Some(&checker), 1, 42).await;
+        let result = check_project_access(Some(&checker), &non_admin_auth(), 42).await;
         assert!(
             matches!(
                 result,
@@ -324,7 +372,19 @@ mod tests {
     /// `get_project` with no checker must allow any project (OSS default).
     #[tokio::test]
     async fn get_project_none_checker_allows() {
-        let result = check_project_access(None, 1, 42).await;
+        let result = check_project_access(None, &non_admin_auth(), 42).await;
         assert!(result.is_ok(), "None checker must allow all projects");
+    }
+
+    /// A PlatformAdmin must bypass the checker and always be allowed.
+    #[tokio::test]
+    async fn get_project_platform_admin_bypasses_checker() {
+        // Even a checker that would deny the project must not block a PlatformAdmin.
+        let checker = HidingChecker { hidden_id: 7 };
+        let result = check_project_access(Some(&checker), &platform_admin_auth(), 7).await;
+        assert!(
+            result.is_ok(),
+            "PlatformAdmin must bypass the checker for get_project"
+        );
     }
 }
