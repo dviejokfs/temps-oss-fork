@@ -107,12 +107,14 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
       })
       const updated = jsonc.applyEdits(content, edits)
       // The file embeds an API key (in an Authorization header value), so it
-      // must never be world-readable. `mode` on writeFile only applies when
-      // the file is newly created (via the open() syscall's O_CREAT path) --
-      // it does NOT chmod an already-existing file on overwrite, so a config
-      // that predates this fix (or was created by some other tool at 0o644)
-      // would stay world-readable forever. chmod explicitly, every write.
-      await fs.promises.writeFile(configPath, updated, 'utf8')
+      // must never be world-readable, in either of two cases:
+      //  - Brand new file: pass `mode` to writeFile so open()'s O_CREAT path
+      //    creates it at 0o600 atomically -- there is no window where the
+      //    credential sits on disk at a looser mode.
+      //  - Pre-existing file: `mode` is ignored by writeFile on an existing
+      //    file (it doesn't chmod), so a config that predates this fix, or
+      //    was created by another tool at 0o644, needs an explicit chmod.
+      await fs.promises.writeFile(configPath, updated, { encoding: 'utf8', mode: 0o600 })
       await fs.promises.chmod(configPath, 0o600)
       return { success: true }
     } catch (error) {
