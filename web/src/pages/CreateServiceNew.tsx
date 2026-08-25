@@ -276,21 +276,24 @@ export function CreateService() {
   const [topology, setTopology] = useState<'standalone' | 'cluster'>(
     'standalone'
   )
+  const [standaloneNodeId, setStandaloneNodeId] =
+    useState<string>('control-plane')
   const [clusterMembers, setClusterMembers] = useState<ClusterMemberRequest[]>(
     []
   )
 
   const preset = useServiceTypePreset(serviceType)
 
-  // Fetch available nodes to determine if cluster topology can be offered
+  // Standalone services can be placed on any active worker. PostgreSQL also
+  // uses this list to configure its optional HA topology.
   const { data: nodesResponse } = useQuery({
     ...adminListNodesOptions(),
-    enabled: supportsCluster,
+    enabled: !!serviceType,
   })
   const nodes = useMemo(
     () =>
       (nodesResponse?.nodes ?? []).filter(
-        (n: NodeInfoResponse) => n.status === 'active'
+        (n: NodeInfoResponse) => n.status === 'active' && n.role === 'worker'
       ),
     [nodesResponse]
   )
@@ -395,6 +398,12 @@ export function CreateService() {
         service_type: serviceType as ServiceTypeRoute,
         name: serviceName,
         parameters: cleanedParameters,
+        ...(topology === 'standalone' && {
+          node_id:
+            standaloneNodeId === 'control-plane'
+              ? null
+              : Number(standaloneNodeId),
+        }),
         ...(topology === 'cluster' && {
           topology: 'cluster',
           members: clusterMembers,
@@ -609,6 +618,42 @@ export function CreateService() {
                 />
               </>
             )}
+          </div>
+        )}
+
+        {topology === 'standalone' && (
+          <div className="space-y-2">
+            <Label>Deployment node</Label>
+            <p className="text-sm text-muted-foreground">
+              Choose the machine whose Docker daemon will run this service.
+            </p>
+            <Select
+              value={standaloneNodeId}
+              onValueChange={setStandaloneNodeId}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Select node..." />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="control-plane">
+                  <div className="flex items-center gap-2">
+                    <Server className="h-3 w-3" />
+                    Control Plane
+                  </div>
+                </SelectItem>
+                {nodes.map((node) => (
+                  <SelectItem key={node.id} value={String(node.id)}>
+                    <div className="flex items-center gap-2">
+                      <Server className="h-3 w-3" />
+                      {node.name}
+                      <span className="text-muted-foreground text-xs">
+                        ({node.private_address})
+                      </span>
+                    </div>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
         )}
 
