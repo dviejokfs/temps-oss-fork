@@ -10618,6 +10618,7 @@ name = "temps-analytics-performance"
 version = "0.1.0-beta.56"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "lazy_static",
@@ -11941,6 +11942,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bollard",
+ "chrono",
  "env_logger",
  "hickory-resolver",
  "if-addrs",
@@ -11951,6 +11953,7 @@ dependencies = [
  "serde_json",
  "temps-auth",
  "temps-core",
+ "temps-entities",
  "tokio",
  "tokio-test",
  "tower",

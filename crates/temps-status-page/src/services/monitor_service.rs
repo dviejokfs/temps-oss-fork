@@ -2,7 +2,7 @@ use chrono::Utc;
 use futures::future::BoxFuture;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, Set,
+    QueryOrder, QuerySelect, Set,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -288,6 +288,19 @@ impl MonitorService {
 
         let response: MonitorResponse = monitor.into();
         Ok(self.populate_monitor_url(response).await)
+    }
+
+    /// Resolve the project a monitor belongs to, for project-access checks
+    /// that must run before any other work on by-monitor-id routes (which
+    /// carry no `project_id` in their path).
+    pub async fn get_monitor_project_id(&self, monitor_id: i32) -> Result<i32, StatusPageError> {
+        status_monitors::Entity::find_by_id(monitor_id)
+            .select_only()
+            .column(status_monitors::Column::ProjectId)
+            .into_tuple::<i32>()
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(StatusPageError::NotFound)
     }
 
     /// List all monitors for a project
@@ -1160,6 +1173,41 @@ mod tests {
             Err(StatusPageError::NotFound) => {}
             _ => panic!("Expected NotFound error"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_monitor_project_id() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let config_service = create_mock_config_service(&db);
+        let service = MonitorService::new(db.clone(), config_service);
+
+        let project = create_test_project(&db).await;
+        let environment = create_test_environment(&db, project.id).await;
+
+        let request = CreateMonitorRequest {
+            name: "Test Monitor".to_string(),
+            monitor_type: "web".to_string(),
+            environment_id: environment.id,
+            check_interval_seconds: Some(60),
+            ..Default::default()
+        };
+
+        let created = service.create_monitor(project.id, request).await.unwrap();
+        let project_id = service.get_monitor_project_id(created.id).await.unwrap();
+
+        assert_eq!(project_id, project.id);
+    }
+
+    #[tokio::test]
+    async fn test_get_monitor_project_id_not_found() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let config_service = create_mock_config_service(&db);
+        let service = MonitorService::new(db.clone(), config_service);
+
+        let result = service.get_monitor_project_id(99999).await;
+        assert!(matches!(result, Err(StatusPageError::NotFound)));
     }
 
     #[tokio::test]

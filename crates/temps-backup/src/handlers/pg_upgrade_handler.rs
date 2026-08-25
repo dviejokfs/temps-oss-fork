@@ -34,6 +34,7 @@ use temps_providers::externalsvc::postgres_upgrade::PostgresUpgradeError;
 use temps_providers::postgres_upgrade_service::StartMajorUpgradeRequest;
 use utoipa::{OpenApi, ToSchema};
 
+use crate::handlers::authz::require_service_access;
 use crate::handlers::types::BackupAppState;
 
 // ---- DTOs --------------------------------------------------------------
@@ -147,6 +148,14 @@ async fn start_pg_upgrade(
     Json(req): Json<StartPgUpgradeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    require_service_access(
+        &state,
+        &auth,
+        service_id,
+        "external service",
+        "PostgreSQL upgrade",
+    )
+    .await?;
 
     let inserted = state
         .pg_upgrade_service
@@ -181,6 +190,14 @@ async fn list_pg_upgrades(
     Path(service_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    require_service_access(
+        &state,
+        &auth,
+        service_id,
+        "external service",
+        "PostgreSQL upgrade",
+    )
+    .await?;
 
     let rows = postgres_major_upgrades::Entity::find()
         .filter(postgres_major_upgrades::Column::ServiceId.eq(service_id))
@@ -216,6 +233,14 @@ async fn get_pg_upgrade(
     Path((service_id, id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    require_service_access(
+        &state,
+        &auth,
+        service_id,
+        "external service",
+        "PostgreSQL upgrade",
+    )
+    .await?;
 
     let row = load_upgrade_for_service(&state, service_id, id).await?;
     Ok((StatusCode::OK, Json(PgUpgradeResponse::from(row))))
@@ -245,6 +270,14 @@ async fn retry_pg_upgrade(
     Path((service_id, id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    require_service_access(
+        &state,
+        &auth,
+        service_id,
+        "external service",
+        "PostgreSQL upgrade",
+    )
+    .await?;
 
     // Ownership check before mutating — keeps the service method oblivious
     // to URL structure and prevents retrying another service's upgrade.
@@ -278,6 +311,14 @@ async fn cancel_pg_upgrade(
     Path((service_id, id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    require_service_access(
+        &state,
+        &auth,
+        service_id,
+        "external service",
+        "PostgreSQL upgrade",
+    )
+    .await?;
 
     // Ownership check before mutating.
     let _ = load_upgrade_for_service(&state, service_id, id).await?;
@@ -311,6 +352,14 @@ async fn rollback_pg_upgrade(
     Path((service_id, id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    require_service_access(
+        &state,
+        &auth,
+        service_id,
+        "external service",
+        "PostgreSQL upgrade",
+    )
+    .await?;
     require_sensitive_action(
         state.sensitive_action_authorizer.as_ref(),
         &auth,
@@ -349,6 +398,14 @@ async fn get_pg_upgrade_logs(
     Path((service_id, id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    require_service_access(
+        &state,
+        &auth,
+        service_id,
+        "external service",
+        "PostgreSQL upgrade",
+    )
+    .await?;
 
     let row = load_upgrade_for_service(&state, service_id, id).await?;
 

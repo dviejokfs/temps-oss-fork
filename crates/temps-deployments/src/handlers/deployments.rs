@@ -2477,6 +2477,7 @@ pub async fn stream_container_metrics(
     responses(
         (status = 200, description = "Successfully retrieved activity graph", body = ActivityGraphResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -2484,12 +2485,37 @@ pub async fn stream_container_metrics(
     )
 )]
 pub async fn get_activity_graph(
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
     Query(query): Query<ActivityGraphQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Note: No specific permission check needed as this is general activity overview
-    // Users can only see their own projects based on the RequireAuth check
+    permission_guard!(auth, DeploymentsRead);
+
+    match query.project_id {
+        Some(project_id) => {
+            // Caller asked for one project's activity — same authorization as
+            // every other project-scoped read in this file.
+            project_access_guard!(auth, project_id, app_state.project_access_checker);
+        }
+        None => {
+            // No `project_id` means the graph aggregates commit activity across
+            // every project on the instance. `RequireAuth` only proves the
+            // caller is *some* authenticated user, not which projects they may
+            // see, so this instance-wide view is restricted to administrators —
+            // everyone else must pass `project_id` to scope the graph to a
+            // project they can already access.
+            if !(auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin)) {
+                return Err(temps_core::error_builder::forbidden()
+                    .title("Insufficient Permissions")
+                    .detail(
+                        "Viewing the instance-wide activity graph requires an administrator \
+                         role; pass project_id to view a specific project's activity",
+                    )
+                    .value("user_role", auth.effective_role.to_string())
+                    .build());
+            }
+        }
+    }
 
     match app_state
         .deployment_service
@@ -2624,6 +2650,23 @@ mod tests {
             _project_id: i32,
         ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Some(vec!["projects:read".to_string()]))
+        }
+    }
+
+    /// A checker that denies every project — used to prove that
+    /// `get_activity_graph` now enforces project access instead of relying on
+    /// `RequireAuth` alone (which only proves *some* authenticated user, not
+    /// which projects they may see).
+    struct DenyAllProjectAccess;
+
+    #[async_trait]
+    impl ProjectAccessChecker for DenyAllProjectAccess {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(false)
         }
     }
 
@@ -4590,6 +4633,100 @@ mod tests {
             historical_media.screenshot_location.as_deref(),
             Some("screenshots/media.webp")
         );
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_activity_graph_endpoint_enforces_project_access() {
+        use axum::extract::Request;
+        use axum::middleware;
+
+        if !database_test_prerequisites_available().await {
+            println!("Docker/test database not available, skipping");
+            return;
+        }
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Test database not available, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_activity_graph_http_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("create temporary data directory");
+        let mut app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+        Arc::get_mut(&mut app_state)
+            .expect("test app state is not shared yet")
+            .project_access_checker = Some(Arc::new(DenyAllProjectAccess));
+
+        async fn serve(app: Router) -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let address = listener.local_addr().expect("read test server address");
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve test application");
+            });
+            address
+        }
+
+        // A non-admin user with no team access to project 1: previously this
+        // endpoint had no permission_guard!/project_access_guard! at all and
+        // would have happily handed back that project's activity graph.
+        let user_auth = middleware::from_fn(
+            |mut request: Request, next: axum::middleware::Next| async move {
+                request
+                    .extensions_mut()
+                    .insert(create_test_auth_context_for_role(temps_auth::Role::User));
+                next.run(request).await
+            },
+        );
+        let user_address = serve(
+            configure_routes()
+                .layer(user_auth)
+                .with_state(app_state.clone()),
+        )
+        .await;
+
+        let denied = reqwest::get(format!(
+            "http://{user_address}/deployments/activity-graph?project_id=1"
+        ))
+        .await
+        .expect("request activity graph for an inaccessible project");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        // Same non-admin user, no project_id at all: this aggregates every
+        // project's activity across the whole instance, so it must be denied
+        // too rather than silently scoped to "your own projects" — RequireAuth
+        // proves nothing about which projects the caller may see.
+        let denied_instance_wide =
+            reqwest::get(format!("http://{user_address}/deployments/activity-graph"))
+                .await
+                .expect("request instance-wide activity graph as a non-admin");
+        assert_eq!(denied_instance_wide.status(), StatusCode::FORBIDDEN);
+
+        // An administrator may still see the instance-wide graph.
+        let admin_auth = middleware::from_fn(
+            |mut request: Request, next: axum::middleware::Next| async move {
+                request.extensions_mut().insert(create_test_auth_context());
+                next.run(request).await
+            },
+        );
+        let admin_address = serve(
+            configure_routes()
+                .layer(admin_auth)
+                .with_state(app_state.clone()),
+        )
+        .await;
+        let allowed = reqwest::get(format!("http://{admin_address}/deployments/activity-graph"))
+            .await
+            .expect("request instance-wide activity graph as an admin");
+        assert_eq!(allowed.status(), StatusCode::OK);
 
         std::fs::remove_dir_all(temp_dir).ok();
     }

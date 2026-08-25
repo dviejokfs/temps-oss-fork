@@ -5,6 +5,7 @@ use crate::handlers::audit::{
     S3SourceCreatedAudit, S3SourceDeletedAudit, S3SourceUpdatedAudit, ScheduleRunNowAudit,
     ScheduleServiceDetachedAudit, ScheduleServicesAttachedAudit,
 };
+use crate::handlers::authz::require_service_access;
 use crate::handlers::types::BackupAppState;
 use crate::services::BackupTriggerParams;
 use crate::services::{
@@ -1010,6 +1011,7 @@ async fn list_external_service_backups(
     axum::extract::Query(params): axum::extract::Query<ListExternalServiceBackupsParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_service_access(&app_state, &auth, service_id, "external service", "backup").await?;
 
     let (entries, total) = app_state
         .backup_service
@@ -1053,6 +1055,14 @@ async fn list_schedule_services(
         .list_services_for_schedule(id)
         .await
         .map_err(Problem::from)?;
+
+    // Every service attached to the schedule must be reachable by the caller
+    // — otherwise this endpoint discloses which (possibly cross-project)
+    // services a schedule touches to a caller who cannot reach them.
+    for service in &services {
+        require_service_access(&app_state, &auth, service.id, "external service", "backup").await?;
+    }
+
     let body: Vec<ExternalServiceSummary> = services.into_iter().map(Into::into).collect();
     Ok(Json(body))
 }
@@ -1085,6 +1095,14 @@ async fn attach_schedule_services(
     Json(request): Json<AttachScheduleServicesRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsCreate);
+
+    // Check every service_id being attached, not just the first — an
+    // unauthorized service anywhere in the batch rejects the whole request
+    // before anything is mutated.
+    for service_id in &request.service_ids {
+        require_service_access(&app_state, &auth, *service_id, "external service", "backup")
+            .await?;
+    }
 
     let inserted = app_state
         .backup_service
@@ -1149,6 +1167,7 @@ async fn detach_schedule_service(
     Path((id, service_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsDelete);
+    require_service_access(&app_state, &auth, service_id, "external service", "backup").await?;
 
     let removed = app_state
         .backup_service
@@ -1198,6 +1217,7 @@ async fn list_service_schedules(
     Path(service_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_service_access(&app_state, &auth, service_id, "external service", "backup").await?;
     let schedules = app_state
         .backup_service
         .list_schedules_for_service(service_id)
@@ -2634,6 +2654,7 @@ async fn run_external_service_backup(
     Json(request): Json<RunExternalServiceBackupRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsCreate);
+    require_service_access(&app_state, &auth, id, "external service", "backup").await?;
 
     let service = app_state
         .backup_service

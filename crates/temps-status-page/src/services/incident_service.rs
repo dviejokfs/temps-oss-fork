@@ -178,6 +178,19 @@ impl IncidentService {
         Ok(incident.into())
     }
 
+    /// Resolve the project an incident belongs to, for project-access checks
+    /// that must run before any other work on by-incident-id routes (which
+    /// carry no `project_id` in their path).
+    pub async fn get_incident_project_id(&self, incident_id: i32) -> Result<i32, StatusPageError> {
+        status_incidents::Entity::find_by_id(incident_id)
+            .select_only()
+            .column(status_incidents::Column::ProjectId)
+            .into_tuple::<i32>()
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(StatusPageError::NotFound)
+    }
+
     /// List incidents for a project
     pub async fn list_incidents(
         &self,
@@ -439,5 +452,77 @@ impl IncidentService {
             interval: interval.to_string(),
             buckets,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{ActiveModelTrait, Set};
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::projects;
+
+    async fn create_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
+        // Use nanoseconds for better uniqueness in parallel tests
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let slug = format!("test-project-{}", nanos);
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set(slug.clone()),
+            directory: Set(slug),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Nixpacks),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            ..Default::default()
+        };
+        project.insert(db.as_ref()).await.unwrap()
+    }
+
+    fn sample_incident_request() -> CreateIncidentRequest {
+        CreateIncidentRequest {
+            title: "Test Incident".to_string(),
+            description: None,
+            severity: "minor".to_string(),
+            environment_id: None,
+            monitor_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_incident_project_id() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+
+        let project = create_test_project(&db).await;
+        let created = service
+            .create_incident(project.id, sample_incident_request())
+            .await
+            .unwrap();
+
+        let project_id = service.get_incident_project_id(created.id).await.unwrap();
+
+        assert_eq!(project_id, project.id);
+    }
+
+    #[tokio::test]
+    async fn test_get_incident_project_id_not_found() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+
+        let result = service.get_incident_project_id(99999).await;
+        assert!(matches!(result, Err(StatusPageError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_get_incident_not_found() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+
+        let result = service.get_incident(99999).await;
+        assert!(matches!(result, Err(StatusPageError::NotFound)));
     }
 }
