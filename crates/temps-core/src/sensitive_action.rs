@@ -67,6 +67,13 @@ pub enum SensitiveAction {
         project_id: i32,
         token_id: i32,
     },
+    /// Retroactively backfill retention-days on already-ingested telemetry
+    /// rows (spans, proxy_logs) for a project down to the configured policy.
+    /// This is a hard-to-reverse purge of historical data (EE retention
+    /// policies, ADR 0017 §7).
+    RetentionRetroactiveApply {
+        project_id: i32,
+    },
 }
 
 impl SensitiveAction {
@@ -93,6 +100,7 @@ impl SensitiveAction {
             Self::DeleteGitConnection { .. } => "delete_git_connection",
             Self::RotateDeploymentToken { .. } => "rotate_deployment_token",
             Self::DeleteDeploymentToken { .. } => "delete_deployment_token",
+            Self::RetentionRetroactiveApply { .. } => "retention_retroactive_apply",
         }
     }
 }
@@ -252,6 +260,22 @@ mod tests {
             }
             .as_str(),
             "delete_deployment_token"
+        );
+        assert_eq!(
+            SensitiveAction::RetentionRetroactiveApply { project_id: 42 }.as_str(),
+            "retention_retroactive_apply"
+        );
+    }
+
+    /// The retention-retroactive-apply variant must round-trip through
+    /// `as_str()` independent of which `project_id` it carries — the
+    /// identifier is used for policy matching and audit records, so it must
+    /// not vary with the resource the action targets.
+    #[test]
+    fn retention_retroactive_apply_identifier_is_resource_independent() {
+        assert_eq!(
+            SensitiveAction::RetentionRetroactiveApply { project_id: 1 }.as_str(),
+            SensitiveAction::RetentionRetroactiveApply { project_id: 999 }.as_str(),
         );
     }
 }
