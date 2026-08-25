@@ -222,6 +222,10 @@ async fn apply(
     let alloc = parse_alloc(&alloc_wire)?;
     let peers: Result<Vec<Peer>, _> = payload.peers.iter().map(parse_peer).collect();
     let peers = peers?;
+    // Captured before `bootstrap()` consumes `alloc` below. Needed every
+    // tick (not just the first) since resolver reconciliation now runs
+    // unconditionally — see the `reconcile_resolver` call at the bottom.
+    let bridge_address = alloc.bridge_address;
 
     // Capture the bridge gateway up front — `bootstrap` consumes
     // `alloc` and the route sweep at the bottom needs the IP after.
@@ -244,12 +248,9 @@ async fn apply(
             peers = peers.len(),
             "bringing up multi-host overlay"
         );
-        let bridge_address = alloc.bridge_address;
         // Clone before bootstrap consumes alloc — we need it for the
         // Docker network creation step right after.
         let alloc_for_docker = alloc.clone();
-        // Clone peers too — we need them for the per-container route
-        // sweep at the bottom of this function.
         manager
             .bootstrap(alloc, peers.clone())
             .await
@@ -270,37 +271,6 @@ async fn apply(
                  won't have cross-node IPs (continuing single-host)"
             );
         }
-
-        // Bring up the per-node DNS resolver (ADR-024) and publish the bridge
-        // address **only when the control plane has cluster DNS enabled**
-        // (`AppSettings.cluster_dns.enabled`, received as
-        // `cluster_dns_enabled` in the wire payload).
-        //
-        // When disabled (the default), we leave `overlay_bridge_address` as
-        // `None` so `DockerRuntime` writes NO custom `HostConfig.Dns` to
-        // containers — they fall back to Docker's embedded DNS, exactly as
-        // before ADR-024. This prevents the DNS-timeout-cascade failure mode
-        // (22–27 s TCP delays when the injected resolver is slow for external
-        // hostnames).
-        if payload.cluster_dns_enabled {
-            // Failure here is non-fatal — apps that resolve cluster FQDNs
-            // lose resolution on this node, but heartbeats/deployments/proxy
-            // keep working.
-            spawn_resolver(config, bridge_address, resolver).await;
-
-            // Publish the bridge address so `service_handlers::create_service`
-            // can wire it into every container's `--dns`. Done right after the
-            // resolver is up so the slot is never advertised before the
-            // resolver is actually accepting queries.
-            if let Ok(mut slot) = overlay_bridge_address.write() {
-                *slot = Some(bridge_address);
-            }
-        } else {
-            info!(
-                "cluster DNS resolver disabled (AppSettings.cluster_dns.enabled=false from \
-                 control plane); containers will use Docker's embedded DNS"
-            );
-        }
     } else {
         let changed = manager
             .reconcile_peers(peers.clone())
@@ -310,6 +280,20 @@ async fn apply(
             info!("multi-host peer list updated");
         }
     }
+
+    // Reconcile the per-node DNS resolver (ADR-024) against the control
+    // plane's current `cluster_dns_enabled` setting and the resolver's own
+    // task health. Runs on *every* tick — not just the first bootstrap — so
+    // toggling the setting or a crashed resolver task both self-heal within
+    // one poll interval instead of requiring an agent restart.
+    reconcile_resolver(
+        payload.cluster_dns_enabled,
+        bridge_address,
+        resolver,
+        config,
+        overlay_bridge_address,
+    )
+    .await;
 
     // Re-inject per-peer routes inside every overlay-attached
     // container's netns. The routes don't survive a container netns
@@ -421,17 +405,63 @@ async fn sweep_overlay_container_routes(
     Ok(())
 }
 
-/// Boot the per-node DNS resolver after the overlay is up. Idempotent:
-/// once `resolver` is `Some`, this is a no-op (the resolver runs for the
-/// lifetime of the agent process).
-async fn spawn_resolver(
-    config: &AgentConfig,
+/// Reconcile the per-node DNS resolver against the control plane's current
+/// `cluster_dns_enabled` setting and the resolver's own task health. Called
+/// on every sync tick (ADR-024's original design only ran this once, at
+/// first bootstrap — toggling the setting afterward, or the resolver task
+/// crashing, both required a manual agent restart to recover from; this
+/// closes that gap):
+///
+/// - Enabled, no resolver running (first time, or after a crash/shutdown):
+///   start one.
+/// - Enabled, resolver running but one of its background tasks has died
+///   (`status().tasks_alive == false`): drop the stale handle and start a
+///   fresh one. A half-dead resolver (e.g. server task panicked, sync task
+///   still running) is worse than no resolver — it can serve a frozen,
+///   increasingly stale zone without any caller knowing.
+/// - Enabled, resolver running and healthy: no-op.
+/// - Disabled, resolver running: shut it down and clear the published
+///   bridge address so new containers stop getting `--dns=<bridge_ip>` and
+///   fall back to Docker's embedded DNS, matching what a fresh disabled
+///   node would see.
+/// - Disabled, no resolver running: no-op.
+async fn reconcile_resolver(
+    cluster_dns_enabled: bool,
     bridge_address: IpAddr,
     resolver: &mut Option<DnsResolverHandle>,
+    config: &AgentConfig,
+    overlay_bridge_address: &Arc<std::sync::RwLock<Option<IpAddr>>>,
 ) {
-    if resolver.is_some() {
+    if !cluster_dns_enabled {
+        if let Some(handle) = resolver.take() {
+            info!(
+                "cluster DNS resolver disabled (AppSettings.cluster_dns.enabled=false from \
+                 control plane); shutting down and falling back to Docker's embedded DNS"
+            );
+            handle.shutdown().await;
+            if let Ok(mut slot) = overlay_bridge_address.write() {
+                *slot = None;
+            }
+        }
         return;
     }
+
+    if let Some(handle) = resolver.as_ref() {
+        let status = handle.status();
+        if status.tasks_alive {
+            return;
+        }
+        warn!(
+            bridge = %bridge_address,
+            consecutive_sync_failures = status.sync.consecutive_failures,
+            "DNS resolver task exited unexpectedly; respawning"
+        );
+        // Drop the dead handle. `shutdown()` on an already-exited task just
+        // awaits the (already-finished) JoinHandles, so this is safe even
+        // though one of them is what triggered the respawn.
+        resolver.take().unwrap().shutdown().await;
+    }
+
     let dns_cfg = DnsResolverConfig::new(
         config.node_id,
         config.token.clone(),
@@ -448,6 +478,14 @@ async fn spawn_resolver(
                 "DNS resolver started"
             );
             *resolver = Some(handle);
+
+            // Publish the bridge address so `service_handlers::create_service`
+            // can wire it into every container's `--dns`. Done right after the
+            // resolver is up so the slot is never advertised before the
+            // resolver is actually accepting queries.
+            if let Ok(mut slot) = overlay_bridge_address.write() {
+                *slot = Some(bridge_address);
+            }
         }
         Err(e) => {
             warn!(
@@ -456,10 +494,10 @@ async fn spawn_resolver(
                 "DNS resolver failed to start; this node has no in-cluster DNS \
                  (heartbeats / deployments / proxy continue to work)"
             );
-            // Leave `resolver` as None — next bootstrap (e.g. on agent
-            // restart) will retry. We do NOT retry mid-loop because the
-            // typical failure (port 53 already bound) won't fix itself
-            // by retrying.
+            // Leave `resolver` as None and `overlay_bridge_address` unset —
+            // the typical failure (port 53 already bound) won't fix itself
+            // by retrying immediately, but the next sync tick (POLL_INTERVAL
+            // later) will try again rather than waiting for an agent restart.
         }
     }
 }

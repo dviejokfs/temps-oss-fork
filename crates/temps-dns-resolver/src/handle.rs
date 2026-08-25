@@ -10,7 +10,7 @@
 //!
 //! `ResolverHandle::shutdown()` notifies all child tasks and awaits them.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use hickory_server::server::Server;
@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use crate::authority::ZoneAuthority;
 use crate::config::ResolverConfig;
 use crate::error::ResolverError;
-use crate::sync_client::SyncClient;
+use crate::sync_client::{SyncClient, SyncStatus};
 use crate::upstream::UpstreamResolver;
 use crate::zone_store::ZoneStore;
 
@@ -31,11 +31,28 @@ use crate::zone_store::ZoneStore;
 /// most DNS traffic is UDP.
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Snapshot of resolver health, for the agent heartbeat and any local
+/// troubleshooting surface (see `ResolverHandle::status`).
+#[derive(Debug, Clone)]
+pub struct ResolverStatus {
+    /// `false` means one of the sync or DNS server tasks has exited —
+    /// crashed, panicked, or otherwise stopped — while the handle is still
+    /// held. A healthy resolver never observes this; it's the signal the
+    /// agent's sync loop uses to decide to respawn.
+    pub tasks_alive: bool,
+    pub sync: SyncStatus,
+    /// Number of records currently served (from the last successful sync,
+    /// or from the on-disk snapshot if the resolver hasn't synced yet).
+    pub record_count: usize,
+    pub zone_generation: i64,
+}
+
 pub struct ResolverHandle {
     pub zone: Arc<ZoneStore>,
     shutdown: Arc<Notify>,
     sync_task: JoinHandle<()>,
     server_task: JoinHandle<()>,
+    sync_status: Arc<RwLock<SyncStatus>>,
 }
 
 impl ResolverHandle {
@@ -47,20 +64,29 @@ impl ResolverHandle {
         zone.load_from_disk();
 
         let shutdown = Arc::new(Notify::new());
+        let sync_status = Arc::new(RwLock::new(SyncStatus::default()));
 
         // ----- Sync loop -----
         // Worker nodes long-poll the control plane over HTTP. In control-plane
         // mode (`disable_sync`, ADR-024) the caller owns the `ZoneStore` and
         // feeds it directly from the local `service_endpoints` DB, so we skip
         // the HTTP sync entirely and just park a task on `shutdown` to keep the
-        // handle's shape (and `shutdown()` semantics) unchanged.
+        // handle's shape (and `shutdown()` semantics) unchanged. Status stays
+        // at its `Default` (never-synced) value in this mode — callers should
+        // read `disable_sync`/local-mode context separately rather than treat
+        // that as a health signal.
         let sync_task = if config.disable_sync {
             let sd = shutdown.clone();
             tokio::spawn(async move {
                 sd.notified().await;
             })
         } else {
-            let sync_client = SyncClient::new(config.clone(), zone.clone(), shutdown.clone())?;
+            let sync_client = SyncClient::new(
+                config.clone(),
+                zone.clone(),
+                shutdown.clone(),
+                sync_status.clone(),
+            )?;
             tokio::spawn(async move { sync_client.run().await })
         };
 
@@ -129,7 +155,25 @@ impl ResolverHandle {
             shutdown,
             sync_task,
             server_task,
+            sync_status,
         })
+    }
+
+    /// Point-in-time health snapshot. Non-blocking and cheap enough to call
+    /// on every agent heartbeat: `JoinHandle::is_finished` doesn't consume
+    /// the handle, and the sync status is a clone out of a short-held lock.
+    pub fn status(&self) -> ResolverStatus {
+        let snapshot = self.zone.snapshot();
+        ResolverStatus {
+            tasks_alive: !self.sync_task.is_finished() && !self.server_task.is_finished(),
+            sync: self
+                .sync_status
+                .read()
+                .map(|s| s.clone())
+                .unwrap_or_default(),
+            record_count: snapshot.records().len(),
+            zone_generation: snapshot.generation(),
+        }
     }
 
     /// Notify both background tasks and wait for them to exit. Idempotent —

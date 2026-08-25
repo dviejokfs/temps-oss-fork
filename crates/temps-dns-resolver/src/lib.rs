@@ -29,9 +29,9 @@ pub mod zone_store;
 
 pub use config::ResolverConfig;
 pub use error::ResolverError;
-pub use handle::ResolverHandle;
+pub use handle::{ResolverHandle, ResolverStatus};
 pub use record::{OwnerKind, RecordKind, ZoneRecord};
-pub use sync_client::SyncClient;
+pub use sync_client::{SyncClient, SyncStatus};
 pub use zone_store::ZoneStore;
 
 pub type Result<T> = std::result::Result<T, ResolverError>;
