@@ -1480,6 +1480,9 @@ impl WorkflowExecutionService {
                     .replicas(replicas)
                     .environment_variables(env_variables)
                     .remote_environment_variables(remote_env_variables)
+                    .cross_node_service_blockers(
+                        crate::services::workflow_planner::read_cross_node_blockers(config),
+                    )
                     .secrets(secrets)
                     .resources(resources)
                     .log_id(db_job.log_id.clone())
