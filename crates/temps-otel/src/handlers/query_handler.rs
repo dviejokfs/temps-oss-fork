@@ -1394,6 +1394,13 @@ pub async fn get_pipeline_history(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
 
+    // Validate the caller's own input BEFORE checking server capability.
+    // Reversing these hides a fixable mistake behind an unrelated one: on a
+    // server without metric collection, a malformed range would answer
+    // "Metrics Unavailable" and the caller would never learn their start_time
+    // was after their end_time.
+    let (from, to, step) = resolve_pipeline_window(&params)?;
+
     // Metric collection is optional. Say so explicitly rather than returning
     // an empty chart, which would read as "nothing was dropped".
     let store = state.metrics_store.as_ref().ok_or_else(|| {
@@ -1405,8 +1412,6 @@ pub async fn get_pipeline_history(
                  /otel/pipeline-stats.",
             )
     })?;
-
-    let (from, to, step) = resolve_pipeline_window(&params)?;
 
     let mut series = Vec::with_capacity(crate::plugin::OTEL_PIPELINE_STAT_COUNT);
     for name in crate::plugin::OTEL_PIPELINE_METRIC_NAMES {

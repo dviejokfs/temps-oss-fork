@@ -944,6 +944,85 @@ mod tests {
         );
     }
 
+    // ── Duplicate-write safety (Greptile P1) ────────────────────────────
+
+    /// The regression guard for silent duplicate rows.
+    ///
+    /// `otel_spans`/`otel_metrics`/`otel_log_events` have no unique key, so a
+    /// retry after a *possibly-committed* write inserts the batch twice with
+    /// no error. `DbErr::Conn` is exactly that case — the connection died at
+    /// an unknown point — so the retry loop must call storage once and stop.
+    #[tokio::test(start_paused = true)]
+    async fn test_postgres_conn_failure_is_not_retried() {
+        let mock = MockOtelStorage::new();
+        mock.fail_store_spans_with(
+            "Connection Error: connection reset by peer",
+            StorageErrorKind::PostgresConn,
+            None,
+        );
+        let (svc, storage) = make_service(mock);
+
+        let spans = decode::decode_traces_request(&single_error_span_payload(), 1, None).unwrap();
+        let result = svc.ingest_spans(spans).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            storage.store_spans_call_count(),
+            1,
+            "a connection failure with an unknown outcome must not be re-sent — \
+             the batch insert has no unique key, so a retry would duplicate it"
+        );
+    }
+
+    /// The counterpart: the pool never handed out a connection, so nothing was
+    /// transmitted and re-sending is provably safe. This must still heal.
+    #[tokio::test(start_paused = true)]
+    async fn test_postgres_pool_acquire_failure_is_retried() {
+        let mock = MockOtelStorage::new();
+        mock.fail_store_spans_with(
+            "Failed to acquire connection from pool: Connection pool timed out",
+            StorageErrorKind::PostgresConnAcquire,
+            Some(1),
+        );
+        let (svc, storage) = make_service(mock);
+
+        let spans = decode::decode_traces_request(&single_error_span_payload(), 1, None).unwrap();
+        let stored = svc
+            .ingest_spans(spans)
+            .await
+            .expect("a pool-acquire failure never reached the server, so retry is safe");
+
+        assert_eq!(stored, 1);
+        assert_eq!(storage.store_spans_call_count(), 2);
+        assert_eq!(svc.pipeline_stats().spans_dropped, 0);
+    }
+
+    /// ClickHouse writes go to `ReplacingMergeTree`, which converges duplicate
+    /// rows by design — so transport errors there keep their full retry
+    /// coverage. Pinning this stops a future "make retries safer" change from
+    /// pessimising the idempotent backend along with the non-idempotent one.
+    #[tokio::test(start_paused = true)]
+    async fn test_clickhouse_transport_failures_keep_retrying() {
+        for kind in [
+            StorageErrorKind::ClickHouseNetwork,
+            StorageErrorKind::ClickHouseTimeout,
+            StorageErrorKind::ClickHouseOther,
+        ] {
+            let mock = MockOtelStorage::new();
+            mock.fail_store_spans_with("transient", kind, Some(1));
+            let (svc, storage) = make_service(mock);
+
+            let spans =
+                decode::decode_traces_request(&single_error_span_payload(), 1, None).unwrap();
+            assert!(
+                svc.ingest_spans(spans).await.is_ok(),
+                "{} must still be retried",
+                kind.as_class()
+            );
+            assert_eq!(storage.store_spans_call_count(), 2, "{}", kind.as_class());
+        }
+    }
+
     // ── Ingest error recording ──────────────────────────────────────────
 
     /// The whole point of Phase 2: after retries are exhausted, the *reason*

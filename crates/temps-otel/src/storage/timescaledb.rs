@@ -275,6 +275,9 @@ impl TimescaleDbStorage {
     /// all nullable so the INSERT is safe on instances that have not yet run
     /// the migration — Postgres will error with "column does not exist" but
     /// the migration is always applied before ingest in production.
+    /// Not idempotent — see [`TimescaleDbStorage::batch_insert_spans`] for why
+    /// these tables cannot currently carry a unique key, and why retry safety
+    /// is enforced by the error classification instead.
     async fn batch_insert_metrics(&self, points: &[MetricPoint]) -> StorageResult<u64> {
         if points.is_empty() {
             return Ok(0);
@@ -407,6 +410,34 @@ impl TimescaleDbStorage {
         Ok(result.rows_affected())
     }
 
+    /// # Not idempotent — callers must not retry on an unknown outcome
+    ///
+    /// This is a plain multi-row `INSERT` with no `ON CONFLICT` clause, so
+    /// re-sending the same batch inserts every row a second time. There is no
+    /// unique key to conflict on, and adding one is not currently possible:
+    /// `otel_spans` is a hypertable with a **space partition on `id`**
+    /// (`create_hypertable('otel_spans', 'start_time', partitioning_column =>
+    /// 'id', number_partitions => 4)`), and TimescaleDB refuses any unique
+    /// index that omits a partitioning column:
+    ///
+    /// ```text
+    /// ERROR: cannot create a unique index without the column "id" (used in partitioning)
+    /// ```
+    ///
+    /// Including `id` would defeat the purpose — it is `BIGSERIAL`, so each
+    /// attempt draws a fresh value and `ON CONFLICT` would never fire. The
+    /// natural key we would want, `(project_id, trace_id, span_id,
+    /// start_time)`, is therefore unavailable until the `id` space dimension
+    /// is removed, which means rebuilding the hypertable (TimescaleDB has no
+    /// "drop dimension") and copying up to 90 days of spans. That is its own
+    /// migration, not a line in this function.
+    ///
+    /// Until then, safety lives in the *retry classification* instead: see
+    /// [`crate::error::StorageErrorKind::is_transient`], which only lets the
+    /// Postgres path retry a failure that proves nothing was ever sent.
+    /// `timescaledb_storage_test.rs::duplicate_batch_insert_duplicates_rows`
+    /// pins the current non-idempotent behaviour so this comment cannot go
+    /// stale silently.
     async fn batch_insert_spans(&self, spans: &[SpanRecord]) -> StorageResult<u64> {
         if spans.is_empty() {
             return Ok(0);
@@ -619,6 +650,9 @@ impl TimescaleDbStorage {
         Ok(result.rows_affected())
     }
 
+    /// Not idempotent — see [`TimescaleDbStorage::batch_insert_spans`] for why
+    /// these tables cannot currently carry a unique key, and why retry safety
+    /// is enforced by the error classification instead.
     async fn batch_insert_logs(&self, records: &[LogRecord]) -> StorageResult<u64> {
         if records.is_empty() {
             return Ok(0);

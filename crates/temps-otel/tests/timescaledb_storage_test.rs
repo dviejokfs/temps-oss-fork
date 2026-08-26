@@ -401,6 +401,107 @@ async fn test_store_spans_empty_batch() {
     assert_eq!(stored, 0);
 }
 
+// ── Duplicate-write characterization (Greptile P1) ──────────────────
+//
+// These three tests pin a *hazard*, not a desired behaviour: the TimescaleDB
+// batch inserts are NOT idempotent, so re-sending a batch duplicates every
+// row silently. That is why `StorageErrorKind::is_transient` refuses to retry
+// a Postgres failure whose outcome is unknown.
+//
+// They cannot currently be fixed with `ON CONFLICT DO NOTHING`: all three
+// tables are hypertables with a space partition on `id`, and TimescaleDB
+// rejects a unique index that omits a partitioning column — while `id` is
+// `BIGSERIAL`, so including it would make the conflict target never match.
+//
+// **If one of these starts failing, that is good news**: it means a real
+// unique key was added. Update the test to assert deduplication, and widen
+// the retry classification in `error.rs` to allow `DbErr::Conn` again.
+
+#[tokio::test]
+async fn duplicate_batch_insert_duplicates_rows() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    let spans = vec![sample_span(
+        1,
+        "trace_dup",
+        "span_dup",
+        None,
+        "GET /dup",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        10.0,
+    )];
+
+    // Two sends of the byte-identical batch — exactly what a retry does.
+    assert_eq!(storage.store_spans(spans.clone()).await.unwrap(), 1);
+    assert_eq!(storage.store_spans(spans).await.unwrap(), 1);
+
+    let found = storage
+        .get_trace(1, "trace_dup")
+        .await
+        .expect("trace lookup succeeds");
+    assert_eq!(
+        found.len(),
+        2,
+        "otel_spans has no unique key, so the same (project, trace, span) lands twice — \
+         this is the hazard that makes retrying an unknown-outcome write unsafe"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_metric_batch_insert_duplicates_rows() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    let points = vec![sample_metric(1, "dup.metric", 42.0)];
+    assert_eq!(storage.store_metrics(points.clone()).await.unwrap(), 1);
+    assert_eq!(storage.store_metrics(points).await.unwrap(), 1);
+
+    let buckets = storage
+        .query_metrics(MetricQuery {
+            project_id: 1,
+            metric_name: Some("dup.metric".into()),
+            bucket_interval: Some("1 hour".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("metric query succeeds");
+
+    let total: i64 = buckets.iter().map(|b| b.count).sum();
+    assert_eq!(
+        total, 2,
+        "otel_metrics has no unique key, so the same point is counted twice — \
+         a retried batch would inflate every aggregate built on it"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_log_batch_insert_duplicates_rows() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    let logs = vec![sample_log(1, LogSeverity::Error, "dup log line", None)];
+    assert_eq!(storage.store_logs(logs.clone()).await.unwrap(), 1);
+    assert_eq!(storage.store_logs(logs).await.unwrap(), 1);
+
+    let found = storage
+        .query_logs(LogQuery {
+            project_id: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("log query succeeds");
+    assert_eq!(
+        found.len(),
+        2,
+        "otel_log_events has no unique key, so an identical record lands twice"
+    );
+}
+
 // ── Metric tests ────────────────────────────────────────────────────
 
 #[tokio::test]

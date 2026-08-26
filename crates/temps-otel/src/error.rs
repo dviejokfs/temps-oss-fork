@@ -118,7 +118,16 @@ pub enum StorageErrorKind {
     /// ClickHouse failed in a way we could not classify (bad response, custom
     /// serde error, or a variant added by a future `clickhouse` release).
     ClickHouseOther,
-    /// Postgres connection could not be acquired or was lost mid-statement.
+    /// The connection pool never handed out a connection — it timed out or was
+    /// closed. Nothing was transmitted, so the write provably did not happen.
+    ///
+    /// This is the *only* Postgres failure a non-idempotent write may retry;
+    /// see [`StorageErrorKind::is_transient`].
+    PostgresConnAcquire,
+    /// An established Postgres connection failed. The statement may have been
+    /// transmitted, executed and committed before the failure was observed, so
+    /// the outcome is **unknown**. Not retryable — see
+    /// [`StorageErrorKind::is_transient`].
     PostgresConn,
     /// Postgres executed and rejected the statement, or returned an
     /// unusable row — a query/data problem, not a connectivity one.
@@ -130,22 +139,65 @@ pub enum StorageErrorKind {
 }
 
 impl StorageErrorKind {
-    /// Whether a retry could plausibly succeed.
+    /// Whether a retry could plausibly succeed **without risking a duplicate
+    /// write**.
     ///
-    /// Transport-level failures (network, timeout, connection) are worth
-    /// another attempt; everything describing the *payload* is not, because
-    /// the identical batch reproduces it exactly.
+    /// Retrying is only safe when one of two things holds: the write is
+    /// idempotent, or the failure proves the write never reached the server.
+    /// The two backends sit on opposite sides of that line, which is why this
+    /// is not simply "was it a transport error".
+    ///
+    /// # ClickHouse — idempotent, so transport errors retry freely
+    ///
+    /// The `spans` and `metrics` tables are `ReplacingMergeTree(_version)`
+    /// keyed on the natural identity of a row (`ORDER BY (project_id,
+    /// trace_id, span_id)` for spans). A re-sent batch converges to one
+    /// canonical row per span, by design — the migration was written that way
+    /// precisely because OTLP exporters retry. So `Network`, `TimedOut` and
+    /// the unclassified `ClickHouseOther` are all retried.
+    ///
+    /// # Postgres/TimescaleDB — NOT idempotent, so only "never sent" retries
+    ///
+    /// `otel_spans`, `otel_metrics` and `otel_log_events` have no unique key,
+    /// so re-sending a batch inserts it twice. They cannot easily get one:
+    /// all three are hypertables with a **space partition on `id`**
+    /// (`create_hypertable(..., partitioning_column => 'id')`), and
+    /// TimescaleDB rejects any unique index that omits a partitioning column
+    /// ("cannot create a unique index without the column \"id\" (used in
+    /// partitioning)"). Since `id` is `BIGSERIAL`, a fresh value is generated
+    /// per attempt, so including it would make `ON CONFLICT` never fire.
+    /// Fixing that properly means rebuilding all three hypertables — see the
+    /// note on `TimescaleDbStorage::batch_insert_spans`.
+    ///
+    /// That leaves the second condition: retry only when the failure proves
+    /// nothing was transmitted. Exactly one variant does:
+    /// [`StorageErrorKind::PostgresConnAcquire`], which sea-orm raises only
+    /// for `PoolTimedOut`/`PoolClosed` — both occur before a connection
+    /// exists. [`StorageErrorKind::PostgresConn`] wraps an arbitrary
+    /// `sqlx::Error` (I/O, protocol, TLS) that can surface *after* the server
+    /// committed but before the acknowledgement arrived, so retrying it would
+    /// silently double every row in the batch. Dropping a batch is bad;
+    /// silently double-counting every span in a trace — inflating
+    /// `spans_stored` and every downstream aggregate, undetectably and
+    /// permanently — is worse.
+    ///
+    /// # Unclassified errors
     ///
     /// [`StorageErrorKind::ClickHouseOther`] is deliberately treated as
-    /// transient. The behaviour this replaced dropped every failed batch
-    /// unconditionally, so a wrong guess costs a couple of sub-second retries,
-    /// while the opposite wrong guess costs permanent, silent data loss.
+    /// transient: the write it guards is idempotent, so a wrong guess costs a
+    /// couple of sub-second retries while the opposite wrong guess costs
+    /// permanent, silent data loss.
     pub fn is_transient(&self) -> bool {
         match self {
+            // Idempotent destination (ReplacingMergeTree): safe to re-send.
             StorageErrorKind::ClickHouseNetwork
             | StorageErrorKind::ClickHouseTimeout
-            | StorageErrorKind::ClickHouseOther
-            | StorageErrorKind::PostgresConn => true,
+            | StorageErrorKind::ClickHouseOther => true,
+            // Non-idempotent destination, but the batch provably never left us.
+            StorageErrorKind::PostgresConnAcquire => true,
+            // Outcome unknown against a non-idempotent destination.
+            StorageErrorKind::PostgresConn => false,
+            // Deterministic: the identical batch reproduces these exactly.
             StorageErrorKind::ClickHouseSchema
             | StorageErrorKind::ClickHouseSerialization
             | StorageErrorKind::PostgresQuery
@@ -164,6 +216,7 @@ impl StorageErrorKind {
             StorageErrorKind::ClickHouseSchema => "clickhouse_schema",
             StorageErrorKind::ClickHouseSerialization => "clickhouse_serialization",
             StorageErrorKind::ClickHouseOther => "clickhouse_other",
+            StorageErrorKind::PostgresConnAcquire => "postgres_conn_acquire",
             StorageErrorKind::PostgresConn => "postgres_conn",
             StorageErrorKind::PostgresQuery => "postgres_query",
             StorageErrorKind::Precondition => "precondition",
@@ -245,20 +298,30 @@ impl OtelError {
 
 /// Classify a [`sea_orm::DbErr`] into a [`StorageErrorKind`].
 ///
-/// Only the two connection-level variants are transient: the pool could not
-/// hand out a connection, or an established connection failed. Everything else
-/// — `Query`, `Type`, `RecordNotInserted`, `RecordNotFound`, `Exec`,
-/// `Migration`, … — describes the *statement or the data*, and will fail
-/// identically on the next attempt.
+/// The two connection-level variants are deliberately kept **apart** rather
+/// than lumped together, because they answer different questions about whether
+/// the statement reached the server — which is what decides whether a
+/// non-idempotent write may be retried. See [`StorageErrorKind::is_transient`].
 ///
-/// Matches the classification already used by `temps-status-page`'s retry
-/// helpers (`ConnectionAcquire | Conn => retry`), kept deliberately narrow so
-/// a malformed batch is never retried three times before it is dropped.
+/// Everything else — `Query`, `Type`, `RecordNotInserted`, `RecordNotFound`,
+/// `Exec`, `Migration`, … — describes the *statement or the data* and will
+/// fail identically on the next attempt.
+///
+/// This is narrower than `temps-status-page`'s retry helper, which treats
+/// `ConnectionAcquire | Conn` alike. That helper guards idempotent
+/// single-row upserts; this one guards append-only batch inserts with no
+/// unique key, where a wrongly-retried write duplicates silently.
 pub(crate) fn db_err_kind(err: &sea_orm::DbErr) -> StorageErrorKind {
     match err {
-        sea_orm::DbErr::Conn(_) | sea_orm::DbErr::ConnectionAcquire(_) => {
-            StorageErrorKind::PostgresConn
-        }
+        // sea-orm raises this from `sqlx_conn_acquire_err` for exactly two
+        // sqlx errors — `PoolTimedOut` and `PoolClosed` — both of which happen
+        // before a connection is obtained, hence before any bytes reach
+        // Postgres. That "provably never sent" guarantee is what makes it the
+        // only Postgres failure a non-idempotent write may retry.
+        sea_orm::DbErr::ConnectionAcquire(_) => StorageErrorKind::PostgresConnAcquire,
+        // Wraps an arbitrary `sqlx::Error` on an already-established
+        // connection, so the statement may already have committed.
+        sea_orm::DbErr::Conn(_) => StorageErrorKind::PostgresConn,
         _ => StorageErrorKind::PostgresQuery,
     }
 }
@@ -434,20 +497,49 @@ mod tests {
         assert!(!err.is_transient());
     }
 
+    /// A dropped connection may have dropped *after* Postgres committed, so
+    /// the outcome is unknown. Since the OTel batch inserts have no unique
+    /// key, retrying would silently duplicate every row — see
+    /// `StorageErrorKind::is_transient`.
     #[test]
-    fn test_is_transient_database_conn_is_transient() {
+    fn test_is_transient_database_conn_is_not_transient() {
         let err = OtelError::Database(sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
             "connection reset by peer".into(),
         )));
-        assert!(err.is_transient());
+        assert!(
+            !err.is_transient(),
+            "an established-connection failure has an unknown outcome and must not be retried \
+             against a non-idempotent table"
+        );
     }
 
+    /// `ConnectionAcquire` is raised only for `PoolTimedOut`/`PoolClosed`,
+    /// both of which occur before a connection exists — so nothing was ever
+    /// transmitted and a retry cannot duplicate anything.
     #[test]
     fn test_is_transient_database_connection_acquire_is_transient() {
-        let err = OtelError::Database(sea_orm::DbErr::ConnectionAcquire(
+        for err in [
+            sea_orm::DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::Timeout),
+            sea_orm::DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::ConnectionClosed),
+        ] {
+            assert!(OtelError::Database(err).is_transient());
+        }
+    }
+
+    /// The whole point of splitting the two connection variants: they must not
+    /// collapse back into one class, or the retry decision loses the only
+    /// signal that distinguishes "never sent" from "outcome unknown".
+    #[test]
+    fn test_connection_acquire_and_conn_are_distinct_classes() {
+        let acquire = OtelError::Database(sea_orm::DbErr::ConnectionAcquire(
             sea_orm::ConnAcquireErr::Timeout,
         ));
-        assert!(err.is_transient());
+        let conn = OtelError::Database(sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
+            "reset".into(),
+        )));
+        assert_ne!(acquire.error_class(), conn.error_class());
+        assert!(acquire.is_transient());
+        assert!(!conn.is_transient());
     }
 
     #[test]
@@ -487,6 +579,10 @@ mod tests {
                 "clickhouse_serialization",
             ),
             (StorageErrorKind::ClickHouseOther, "clickhouse_other"),
+            (
+                StorageErrorKind::PostgresConnAcquire,
+                "postgres_conn_acquire",
+            ),
             (StorageErrorKind::PostgresConn, "postgres_conn"),
             (StorageErrorKind::PostgresQuery, "postgres_query"),
             (StorageErrorKind::Precondition, "precondition"),
@@ -505,7 +601,7 @@ mod tests {
         let conn = OtelError::Database(sea_orm::DbErr::ConnectionAcquire(
             sea_orm::ConnAcquireErr::Timeout,
         ));
-        assert_eq!(conn.error_class(), "postgres_conn");
+        assert_eq!(conn.error_class(), "postgres_conn_acquire");
 
         let query = OtelError::Database(sea_orm::DbErr::RecordNotInserted);
         assert_eq!(query.error_class(), "postgres_query");
@@ -523,6 +619,7 @@ mod tests {
             "clickhouse_schema",
             "clickhouse_serialization",
             "clickhouse_other",
+            "postgres_conn_acquire",
             "postgres_conn",
             "postgres_query",
             "precondition",
@@ -609,7 +706,7 @@ mod tests {
             StorageErrorKind::ClickHouseNetwork,
             StorageErrorKind::ClickHouseTimeout,
             StorageErrorKind::ClickHouseOther,
-            StorageErrorKind::PostgresConn,
+            StorageErrorKind::PostgresConnAcquire,
         ];
         for kind in transient {
             assert!(kind.is_transient(), "{} must be transient", kind.as_class());
@@ -623,6 +720,7 @@ mod tests {
         let terminal = [
             StorageErrorKind::ClickHouseSchema,
             StorageErrorKind::ClickHouseSerialization,
+            StorageErrorKind::PostgresConn,
             StorageErrorKind::PostgresQuery,
             StorageErrorKind::Precondition,
         ];
@@ -641,6 +739,7 @@ mod tests {
             StorageErrorKind::ClickHouseSchema,
             StorageErrorKind::ClickHouseSerialization,
             StorageErrorKind::ClickHouseOther,
+            StorageErrorKind::PostgresConnAcquire,
             StorageErrorKind::PostgresConn,
             StorageErrorKind::PostgresQuery,
             StorageErrorKind::Precondition,

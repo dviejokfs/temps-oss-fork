@@ -110,6 +110,15 @@ impl MockOtelStorage {
         *self.fail_store_spans_times.lock().unwrap() = times;
     }
 
+    /// Make `store_spans` fail with a specific [`StorageErrorKind`] on its
+    /// first `times` calls (`None` = every call), for tests that assert on the
+    /// retry decision for one particular kind.
+    pub fn fail_store_spans_with(&self, message: &str, kind: StorageErrorKind, times: Option<u32>) {
+        *self.fail_store_spans.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_spans_kind.lock().unwrap() = Some(kind);
+        *self.fail_store_spans_times.lock().unwrap() = times;
+    }
+
     /// Make `store_spans` fail with a **terminal** storage error on every call.
     pub fn fail_store_spans_fatally(&self, message: &str) {
         *self.fail_store_spans.lock().unwrap() = Some(message.to_string());
