@@ -328,6 +328,11 @@ const NodesPage = lazy(() =>
     default: m.NodesPage,
   }))
 )
+const McpServerPage = lazy(() =>
+  import('./pages/settings/McpServerPage').then((m) => ({
+    default: m.McpServerPage,
+  }))
+)
 const NodeDetailPage = lazy(() =>
   import('./pages/settings/NodesPage').then((m) => ({
     default: m.NodeDetailPage,
@@ -684,6 +689,7 @@ const FullAppRoutes = () => {
                         path="otel-pipeline"
                         element={<OtelPipelineStatusPage />}
                       />
+                      <Route path="mcp-server" element={<McpServerPage />} />
                     </Route>
                     {/* Top-level resources surfaced in the main sidebar */}
                     <Route path="/domains" element={<Domains />} />

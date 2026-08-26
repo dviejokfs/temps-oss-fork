@@ -60,6 +60,7 @@ temps-import = { path = "../temps-import" }
 temps-infra = { path = "../temps-infra" }
 temps-log-aggregator = { path = "../temps-log-aggregator" }
 temps-logs = { path = "../temps-logs" }
+temps-mcp-server = { path = "../temps-mcp-server" }
 temps-migrations = { path = "../temps-migrations" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
