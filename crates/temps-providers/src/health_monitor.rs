@@ -12,10 +12,11 @@
 
 use crate::externalsvc::mariadb::{BinlogArchiveInterval, MariaDbConfig, MariaDbService};
 use crate::externalsvc::postgres_wal_health::{self, PostgresWalHealth};
-use crate::externalsvc::{HealthProbeStatus, S3Credentials, ServiceType};
+use crate::externalsvc::{HealthProbeStatus, S3Credentials};
 use crate::services::ExternalServiceManager;
 use bollard::Docker;
 use chrono::Utc;
+use futures::{stream, StreamExt};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
 };
@@ -177,14 +178,17 @@ impl ExternalServiceHealthMonitor {
 
         let service_ids: Vec<i32> = services.iter().map(|s| s.id).collect();
 
-        for service in services {
-            if let Err(e) = self.check_service(&service).await {
-                warn!(
-                    "Health check error for service {} ({}): {}",
-                    service.id, service.name, e
-                );
-            }
-        }
+        const MAX_CONCURRENT_HEALTH_CHECKS: usize = 8;
+        stream::iter(services)
+            .for_each_concurrent(MAX_CONCURRENT_HEALTH_CHECKS, |service| async move {
+                if let Err(e) = self.check_service(&service).await {
+                    warn!(
+                        "Health check error for service {} ({}): {}",
+                        service.id, service.name, e
+                    );
+                }
+            })
+            .await;
 
         // Drop stats baselines for services that no longer exist so the map
         // doesn't grow forever as services are created and deleted.
@@ -236,6 +240,7 @@ impl ExternalServiceHealthMonitor {
         // Degraded but never escalate Down upward — liveness wins.
         let wal_snapshot = if service.service_type == "postgres"
             && service.topology == "standalone"
+            && service.node_id.is_none()
             && !matches!(status, HealthProbeStatus::Down)
         {
             self.run_postgres_wal_probe(service).await
@@ -322,6 +327,7 @@ impl ExternalServiceHealthMonitor {
         //    Failures here never affect health monitoring of other services.
         if service.service_type == "mariadb"
             && service.topology == "standalone"
+            && service.node_id.is_none()
             && service.status == "running"
             && !matches!(status, HealthProbeStatus::Down)
         {
@@ -333,7 +339,7 @@ impl ExternalServiceHealthMonitor {
         //    store. Gated on the same per-service `metrics_enabled` flag the
         //    engine-metrics scraper uses. Failures are logged and swallowed —
         //    metrics must never disrupt health monitoring.
-        if service.status == "running" && service.metrics_enabled {
+        if service.status == "running" && service.node_id.is_none() && service.metrics_enabled {
             if let Some(store) = self.metrics_store.clone() {
                 self.record_container_metrics(&store, service).await;
             }
@@ -641,17 +647,6 @@ impl ExternalServiceHealthMonitor {
         &self,
         service: &external_services::Model,
     ) -> (HealthProbeStatus, Option<i32>, Option<String>) {
-        let service_type = match ServiceType::from_str(&service.service_type) {
-            Ok(t) => t,
-            Err(_) => {
-                return (
-                    HealthProbeStatus::Down,
-                    None,
-                    Some(format!("Unknown service type: {}", service.service_type)),
-                );
-            }
-        };
-
         // Cluster services need a fan-out probe — the standalone
         // ExternalService::health_probe path can't reach a multi-host
         // cluster (it falls through to localhost:5432). Route through the
@@ -661,22 +656,7 @@ impl ExternalServiceHealthMonitor {
             return (result.status, result.response_time_ms, result.error_message);
         }
 
-        let service_config = match self.manager.get_service_config(service.id).await {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                return (
-                    HealthProbeStatus::Down,
-                    None,
-                    Some(format!("Failed to load service config: {}", e)),
-                );
-            }
-        };
-
-        let instance = self
-            .manager
-            .get_service_instance(service.name.clone(), service_type);
-
-        match instance.health_probe(service_config).await {
+        match self.manager.probe_service_health(service).await {
             Ok(result) => (result.status, result.response_time_ms, result.error_message),
             Err(e) => (
                 HealthProbeStatus::Down,

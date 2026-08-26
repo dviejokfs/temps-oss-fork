@@ -1428,6 +1428,11 @@ export type AppSettings = {
     internal_url?: string | null;
     letsencrypt?: LetsEncryptSettings;
     /**
+     * MCP server settings (ADR-039). Off by default — enable via the Settings
+     * UI to expose the MCP endpoint to the Temps CLI wizard.
+     */
+    mcp_server?: McpServerSettings;
+    /**
      * Metrics observability settings. Controls the MetricsStore backend,
      * scrape interval, and tiered retention windows.
      */
@@ -1552,6 +1557,11 @@ export type AppSettingsResponse = {
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
+    /**
+     * MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
+     * content — passed through as-is so the settings UI can show and edit it.
+     */
+    mcp_server: McpServerSettings;
     /**
      * Number of enabled, running services the MetricsScraper currently
      * includes. Used for the lightweight storage estimate in the UI.
@@ -3656,6 +3666,8 @@ export type CostAnalysis = {
     usage_source: UsageSource;
 };
 
+export type CreatableServiceTypeRoute = 'mariadb' | 'mongodb' | 'postgres' | 'redis' | 's3' | 'kv' | 'blob' | 'rustfs';
+
 export type CreateAlertRuleRequest = {
     /**
      * Minimum minutes between notifications for same rule+group
@@ -3923,7 +3935,7 @@ export type CreateExternalServiceRequest = {
     parameters: {
         [key: string]: unknown;
     };
-    service_type: ServiceTypeRoute;
+    service_type: CreatableServiceTypeRoute;
     /**
      * Service topology: "standalone" (default) or "cluster" (HA multi-member).
      */
@@ -10442,6 +10454,26 @@ export type McpDefinitionResponse = {
     project_id?: number | null;
     slug: string;
     updated_at: string;
+};
+
+/**
+ * MCP server settings (ADR-039).
+ *
+ * The MCP endpoint lets AI tools (e.g. the Temps CLI wizard) interact with
+ * this Temps instance through the Model Context Protocol.  Disabled by
+ * default so new installs do not expose the endpoint until the operator
+ * explicitly opts in.
+ *
+ * `bool` defaults to `false` in Rust and JSON (`#[serde(default)]`), so the
+ * safe-off behaviour is automatic for new installs and legacy settings rows.
+ */
+export type McpServerSettings = {
+    /**
+     * Master switch. When `false` (default), `GET /mcp/tools` returns `404`
+     * and all other MCP endpoints return `404` too.  Set to `true` via the
+     * Settings UI to activate the MCP server.
+     */
+    enabled?: boolean;
 };
 
 export type MessageContent = string | Array<ContentPart>;
@@ -25158,6 +25190,10 @@ export type ListBackupAlertsErrors = {
      */
     401: ProblemDetails;
     /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -25243,6 +25279,14 @@ export type RunExternalServiceBackupErrors = {
      */
     400: ProblemDetails;
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * External service or S3 source not found
      */
     404: ProblemDetails;
@@ -25289,6 +25333,10 @@ export type ListExternalServiceBackupsErrors = {
      * Unauthorized
      */
     401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Internal server error
      */
@@ -25361,6 +25409,10 @@ export type ListS3SourcesErrors = {
      */
     401: ProblemDetails;
     /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -25393,6 +25445,10 @@ export type CreateS3SourceErrors = {
      * Unauthorized
      */
     401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Internal server error
      */
@@ -25427,6 +25483,10 @@ export type TestS3ConnectionPreviewErrors = {
      */
     401: ProblemDetails;
     /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -25453,6 +25513,14 @@ export type DeleteS3SourceData = {
 };
 
 export type DeleteS3SourceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * S3 source not found
      */
@@ -25485,6 +25553,14 @@ export type GetS3SourceData = {
 
 export type GetS3SourceErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * S3 source not found
      */
     404: ProblemDetails;
@@ -25515,6 +25591,14 @@ export type UpdateS3SourceData = {
 };
 
 export type UpdateS3SourceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * S3 source not found
      */
@@ -25558,6 +25642,10 @@ export type ListSourceBackupsErrors = {
      */
     401: ProblemDetails;
     /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * S3 source not found
      */
     404: unknown;
@@ -25592,6 +25680,14 @@ export type RunBackupForSourceErrors = {
      * Invalid request
      */
     400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * S3 source not found
      */
@@ -25628,6 +25724,10 @@ export type SetDefaultS3SourceErrors = {
      */
     401: ProblemDetails;
     /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * S3 source not found
      */
     404: ProblemDetails;
@@ -25662,6 +25762,10 @@ export type TestS3SourceConnectionErrors = {
      * Unauthorized
      */
     401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * S3 source not found
      */
@@ -25770,6 +25874,10 @@ export type ListBackupSchedulesErrors = {
      */
     401: ProblemDetails;
     /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -25799,6 +25907,10 @@ export type CreateBackupScheduleErrors = {
      */
     401: ProblemDetails;
     /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -25825,6 +25937,14 @@ export type DeleteBackupScheduleData = {
 };
 
 export type DeleteBackupScheduleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Backup schedule not found
      */
@@ -25857,6 +25977,14 @@ export type GetBackupScheduleData = {
 
 export type GetBackupScheduleErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Backup schedule not found
      */
     404: unknown;
@@ -25865,6 +25993,8 @@ export type GetBackupScheduleErrors = {
      */
     500: unknown;
 };
+
+export type GetBackupScheduleError = GetBackupScheduleErrors[keyof GetBackupScheduleErrors];
 
 export type GetBackupScheduleResponses = {
     /**
@@ -25893,6 +26023,10 @@ export type UpdateBackupScheduleErrors = {
      * Unauthorized
      */
     401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Schedule not found
      */
@@ -25925,6 +26059,14 @@ export type ListBackupsForScheduleData = {
 
 export type ListBackupsForScheduleErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Backup schedule not found
      */
     404: unknown;
@@ -25933,6 +26075,8 @@ export type ListBackupsForScheduleErrors = {
      */
     500: unknown;
 };
+
+export type ListBackupsForScheduleError = ListBackupsForScheduleErrors[keyof ListBackupsForScheduleErrors];
 
 export type ListBackupsForScheduleResponses = {
     /**
@@ -25954,6 +26098,14 @@ export type DisableBackupScheduleData = {
 
 export type DisableBackupScheduleErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Backup schedule not found
      */
     404: unknown;
@@ -25962,6 +26114,8 @@ export type DisableBackupScheduleErrors = {
      */
     500: unknown;
 };
+
+export type DisableBackupScheduleError = DisableBackupScheduleErrors[keyof DisableBackupScheduleErrors];
 
 export type DisableBackupScheduleResponses = {
     /**
@@ -25983,6 +26137,14 @@ export type EnableBackupScheduleData = {
 
 export type EnableBackupScheduleErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Backup schedule not found
      */
     404: unknown;
@@ -25991,6 +26153,8 @@ export type EnableBackupScheduleErrors = {
      */
     500: unknown;
 };
+
+export type EnableBackupScheduleError = EnableBackupScheduleErrors[keyof EnableBackupScheduleErrors];
 
 export type EnableBackupScheduleResponses = {
     /**
@@ -26286,6 +26450,10 @@ export type GetBackupErrors = {
      * Unauthorized
      */
     401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Backup not found
      */
@@ -26811,10 +26979,16 @@ export type GetActivityGraphErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Internal server error
      */
     500: unknown;
 };
+
+export type GetActivityGraphError = GetActivityGraphErrors[keyof GetActivityGraphErrors];
 
 export type GetActivityGraphResponses = {
     /**
@@ -27541,6 +27715,14 @@ export type LookupDnsARecordsErrors = {
      * Invalid domain name or lookup failed
      */
     400: DnsLookupError;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
 };
 
 export type LookupDnsARecordsError = LookupDnsARecordsErrors[keyof LookupDnsARecordsErrors];
@@ -30974,6 +31156,14 @@ export type StartRestoreErrors = {
      */
     400: ProblemDetails;
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Backup or service not found
      */
     404: ProblemDetails;
@@ -31003,6 +31193,14 @@ export type GetRestoreCapabilitiesData = {
 };
 
 export type GetRestoreCapabilitiesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Service not found
      */
@@ -31038,6 +31236,14 @@ export type PlanRestoreErrors = {
      */
     400: ProblemDetails;
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Backup or service not found
      */
     404: ProblemDetails;
@@ -31065,6 +31271,23 @@ export type ListRestoreRunsForServiceData = {
     query?: never;
     url: '/external-services/{id}/restore-runs';
 };
+
+export type ListRestoreRunsForServiceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+};
+
+export type ListRestoreRunsForServiceError = ListRestoreRunsForServiceErrors[keyof ListRestoreRunsForServiceErrors];
 
 export type ListRestoreRunsForServiceResponses = {
     /**
@@ -31956,10 +32179,20 @@ export type ListPgUpgradesData = {
 
 export type ListPgUpgradesErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Internal error
      */
     500: unknown;
 };
+
+export type ListPgUpgradesError = ListPgUpgradesErrors[keyof ListPgUpgradesErrors];
 
 export type ListPgUpgradesResponses = {
     /**
@@ -31988,6 +32221,14 @@ export type StartPgUpgradeErrors = {
      */
     400: unknown;
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * An upgrade is already running for this service
      */
     409: unknown;
@@ -32000,6 +32241,8 @@ export type StartPgUpgradeErrors = {
      */
     500: unknown;
 };
+
+export type StartPgUpgradeError = StartPgUpgradeErrors[keyof StartPgUpgradeErrors];
 
 export type StartPgUpgradeResponses = {
     /**
@@ -32028,6 +32271,14 @@ export type GetPgUpgradeData = {
 
 export type GetPgUpgradeErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Not found
      */
     404: unknown;
@@ -32036,6 +32287,8 @@ export type GetPgUpgradeErrors = {
      */
     500: unknown;
 };
+
+export type GetPgUpgradeError = GetPgUpgradeErrors[keyof GetPgUpgradeErrors];
 
 export type GetPgUpgradeResponses = {
     /**
@@ -32064,6 +32317,14 @@ export type CancelPgUpgradeData = {
 
 export type CancelPgUpgradeErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Not found
      */
     404: unknown;
@@ -32076,6 +32337,8 @@ export type CancelPgUpgradeErrors = {
      */
     500: unknown;
 };
+
+export type CancelPgUpgradeError = CancelPgUpgradeErrors[keyof CancelPgUpgradeErrors];
 
 export type CancelPgUpgradeResponses = {
     /**
@@ -32104,6 +32367,14 @@ export type GetPgUpgradeLogsData = {
 
 export type GetPgUpgradeLogsErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Not found
      */
     404: unknown;
@@ -32112,6 +32383,8 @@ export type GetPgUpgradeLogsErrors = {
      */
     500: unknown;
 };
+
+export type GetPgUpgradeLogsError = GetPgUpgradeLogsErrors[keyof GetPgUpgradeLogsErrors];
 
 export type GetPgUpgradeLogsResponses = {
     /**
@@ -32144,6 +32417,14 @@ export type RetryPgUpgradeErrors = {
      */
     400: unknown;
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Not found
      */
     404: unknown;
@@ -32152,6 +32433,8 @@ export type RetryPgUpgradeErrors = {
      */
     500: unknown;
 };
+
+export type RetryPgUpgradeError = RetryPgUpgradeErrors[keyof RetryPgUpgradeErrors];
 
 export type RetryPgUpgradeResponses = {
     /**
@@ -32180,6 +32463,14 @@ export type RollbackPgUpgradeData = {
 
 export type RollbackPgUpgradeErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Not found
      */
     404: unknown;
@@ -32192,6 +32483,8 @@ export type RollbackPgUpgradeErrors = {
      */
     500: unknown;
 };
+
+export type RollbackPgUpgradeError = RollbackPgUpgradeErrors[keyof RollbackPgUpgradeErrors];
 
 export type RollbackPgUpgradeResponses = {
     /**
@@ -35358,6 +35651,10 @@ export type GetProjectsMonitorHealthErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
     /**
      * Internal server error
      */
@@ -50535,6 +50832,14 @@ export type GetRestoreRunData = {
 };
 
 export type GetRestoreRunErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Restore run not found
      */

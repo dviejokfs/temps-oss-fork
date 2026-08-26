@@ -213,6 +213,7 @@ const settingsGroups: SettingsGroupDef[] = [
         icon: Puzzle,
         featureKey: 'plugin-system',
       },
+      { title: 'MCP Server', url: '/settings/mcp-server', icon: Bot },
     ],
   },
   {

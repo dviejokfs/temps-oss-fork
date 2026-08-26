@@ -922,6 +922,15 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`
 
 `git revert` defaults to a non-conventional subject (`Revert "original message"`). Never accept that default — always pass an explicit conventional message, e.g. `git revert --no-edit` then `git commit --amend -m "test: drop temporary failing test"`, or better, pass `-m` directly on the revert itself.
 
+### DCO Sign-off
+
+**Every commit must be signed off** (`Signed-off-by: Name <email>` trailer) —
+this is the Developer Certificate of Origin required on this OSS repo. Always
+commit with `git commit -s` (or `-s` on `git commit --amend`/`git revert`).
+A PR with an unsigned commit fails the DCO check regardless of how many
+commits are on the branch — every commit in `base..HEAD` needs its own
+trailer, not just the final one.
+
 ---
 
 ## Workspace Structure

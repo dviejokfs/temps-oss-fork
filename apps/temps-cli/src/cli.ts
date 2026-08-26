@@ -61,6 +61,7 @@ import { registerFunnelsCommands } from './commands/funnels/index.js'
 import { registerNotificationPreferencesCommands } from './commands/notification-preferences/index.js'
 import { registerSkillsCommands } from './commands/skills/index.js'
 import { registerMcpServersCommands } from './commands/mcp-servers/index.js'
+import { registerMcpCommands } from './commands/mcp/index.js'
 import { registerSecretsCommands } from './commands/secrets/index.js'
 import { registerSandboxCommands } from './commands/sandbox/index.js'
 import { registerWorkflowCommands } from './commands/workflow/index.js'
@@ -211,6 +212,7 @@ export function createProgram(): Command {
   registerNotificationPreferencesCommands(program)
   registerSkillsCommands(program)
   registerMcpServersCommands(program)
+  registerMcpCommands(program)
   registerSecretsCommands(program)
   registerSandboxCommands(program)
   registerWorkflowCommands(program)

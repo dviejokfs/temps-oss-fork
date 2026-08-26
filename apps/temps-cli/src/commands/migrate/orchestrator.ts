@@ -31,7 +31,7 @@ import type {
   StepResult,
   MigrationStep,
 } from './types.js'
-import type { ServiceTypeRoute } from '../../api/types.gen.js'
+import type { CreatableServiceTypeRoute } from '../../api/types.gen.js'
 
 // ---------------------------------------------------------------------------
 // Orchestrator
@@ -290,7 +290,7 @@ async function executeCreateService(
   }
 
   // Map service type to Temps ServiceTypeRoute
-  const serviceTypeMap: Record<string, ServiceTypeRoute> = {
+  const serviceTypeMap: Record<string, CreatableServiceTypeRoute> = {
     postgres: 'postgres',
     redis: 'redis',
     mongodb: 'mongodb',

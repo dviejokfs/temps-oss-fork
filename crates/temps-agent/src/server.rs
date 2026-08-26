@@ -121,6 +121,14 @@ pub fn build_router(
         )
         .route("/agent/services/exec", post(service_handlers::service_exec))
         .route(
+            "/agent/services/runtime-env",
+            post(service_handlers::runtime_env),
+        )
+        .route(
+            "/agent/services/health-probe",
+            post(service_handlers::health_probe),
+        )
+        .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
         )

@@ -107,7 +107,6 @@ interface DeleteOptions {
 export function registerMcpServersCommands(program: Command): void {
   const mcp = program
     .command('mcp-servers')
-    .alias('mcp')
     .description('Manage MCP server definitions (global or project-scoped)')
 
   mcp
