@@ -44,8 +44,18 @@ pub enum OtelError {
     #[error("Unsupported content encoding: {encoding}")]
     UnsupportedEncoding { encoding: String },
 
+    /// A storage-backend failure (ClickHouse, TimescaleDB raw SQL, migrations).
+    ///
+    /// `kind` records *which* backend failed and *how*, classified at
+    /// construction time while the backend's typed error is still available.
+    /// `message` is a lossy `Display` rendering that callers cannot
+    /// re-classify afterwards, so never string-match on it — read
+    /// [`OtelError::is_transient`] or [`OtelError::error_class`] instead.
     #[error("Storage error: {message}")]
-    Storage { message: String },
+    Storage {
+        message: String,
+        kind: StorageErrorKind,
+    },
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
@@ -70,6 +80,187 @@ pub enum OtelError {
 
     #[error("Internal error: {message}")]
     Internal { message: String },
+}
+
+/// Which storage backend failed, and in what way.
+///
+/// Two jobs in one small enum, both of which need the backend's *typed* error
+/// and so must be decided at construction:
+///
+/// 1. **Retry decision** — [`StorageErrorKind::is_transient`] splits transport
+///    failures (retry) from payload/schema failures (don't).
+/// 2. **Operator diagnosis** — [`StorageErrorKind::as_class`] gives a stable,
+///    low-cardinality label for the ingest-error report, so a dropped batch is
+///    attributable to *ClickHouse being unreachable* rather than just
+///    "storage error".
+///
+/// The `ClickHouse*`/`Postgres*` split matters because
+/// [`OtelError::Storage`] is produced by both backends — the ClickHouse
+/// helpers in `storage/clickhouse` and the raw-SQL paths in
+/// `storage/timescaledb.rs` and `ingest/auth.rs`. Collapsing them would tell an
+/// operator a write failed but not which system to go look at.
+///
+/// Low cardinality is a hard requirement, not a nicety: these strings become
+/// rows in `otel_ingest_errors`, whose size bound is
+/// (signals x classes). Never add a variant that embeds an ID, a table name,
+/// or any other unbounded value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageErrorKind {
+    /// ClickHouse transport failure — socket error, connection refused/reset.
+    ClickHouseNetwork,
+    /// ClickHouse request exceeded its deadline.
+    ClickHouseTimeout,
+    /// Row/table shape disagreement: schema mismatch, bad columns header,
+    /// truncated row. Our data or our DDL understanding is wrong.
+    ClickHouseSchema,
+    /// (De)compression or serde failure encoding the batch for ClickHouse.
+    ClickHouseSerialization,
+    /// ClickHouse failed in a way we could not classify (bad response, custom
+    /// serde error, or a variant added by a future `clickhouse` release).
+    ClickHouseOther,
+    /// Postgres connection could not be acquired or was lost mid-statement.
+    PostgresConn,
+    /// Postgres executed and rejected the statement, or returned an
+    /// unusable row — a query/data problem, not a connectivity one.
+    PostgresQuery,
+    /// A precondition this crate enforces before touching a backend at all
+    /// (e.g. a label key outside the allowed character set, an invalid
+    /// database name). Never transient.
+    Precondition,
+}
+
+impl StorageErrorKind {
+    /// Whether a retry could plausibly succeed.
+    ///
+    /// Transport-level failures (network, timeout, connection) are worth
+    /// another attempt; everything describing the *payload* is not, because
+    /// the identical batch reproduces it exactly.
+    ///
+    /// [`StorageErrorKind::ClickHouseOther`] is deliberately treated as
+    /// transient. The behaviour this replaced dropped every failed batch
+    /// unconditionally, so a wrong guess costs a couple of sub-second retries,
+    /// while the opposite wrong guess costs permanent, silent data loss.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            StorageErrorKind::ClickHouseNetwork
+            | StorageErrorKind::ClickHouseTimeout
+            | StorageErrorKind::ClickHouseOther
+            | StorageErrorKind::PostgresConn => true,
+            StorageErrorKind::ClickHouseSchema
+            | StorageErrorKind::ClickHouseSerialization
+            | StorageErrorKind::PostgresQuery
+            | StorageErrorKind::Precondition => false,
+        }
+    }
+
+    /// Stable snake_case label for the ingest-error report and logs.
+    ///
+    /// These strings are persisted and grouped on, so treat them as a wire
+    /// format: renaming one splits an existing group in two.
+    pub fn as_class(&self) -> &'static str {
+        match self {
+            StorageErrorKind::ClickHouseNetwork => "clickhouse_network",
+            StorageErrorKind::ClickHouseTimeout => "clickhouse_timeout",
+            StorageErrorKind::ClickHouseSchema => "clickhouse_schema",
+            StorageErrorKind::ClickHouseSerialization => "clickhouse_serialization",
+            StorageErrorKind::ClickHouseOther => "clickhouse_other",
+            StorageErrorKind::PostgresConn => "postgres_conn",
+            StorageErrorKind::PostgresQuery => "postgres_query",
+            StorageErrorKind::Precondition => "precondition",
+        }
+    }
+}
+
+impl OtelError {
+    /// Stable, low-cardinality label describing *why* an ingest write failed.
+    ///
+    /// Written to `otel_ingest_errors` and grouped on, so it must never embed
+    /// an ID, a message fragment, or anything else unbounded — see
+    /// [`StorageErrorKind`].
+    pub fn error_class(&self) -> &'static str {
+        match self {
+            OtelError::Storage { kind, .. } => kind.as_class(),
+            OtelError::Database(db_err) => db_err_kind(db_err).as_class(),
+            OtelError::S3 { .. } => "s3",
+            OtelError::Io(_) => "io",
+            OtelError::Serialization(_) => "serialization",
+            OtelError::QuotaExceeded { .. } => "quota_exceeded",
+            OtelError::RateLimitExceeded { .. } | OtelError::ServiceRateLimitExceeded { .. } => {
+                "rate_limited"
+            }
+            OtelError::IngestSaturated { .. } => "ingest_saturated",
+            OtelError::ProtobufDecode { .. } => "protobuf_decode",
+            OtelError::DecompressionFailed { .. } => "decompression_failed",
+            OtelError::UnsupportedEncoding { .. } => "unsupported_encoding",
+            OtelError::Validation { .. } => "validation",
+            OtelError::AuthFailed { .. }
+            | OtelError::MissingAuthToken { .. }
+            | OtelError::InvalidApiKey => "auth_failed",
+            OtelError::ProjectNotFound { .. }
+            | OtelError::DashboardNotFound { .. }
+            | OtelError::MetricAlertNotFound { .. } => "not_found",
+            OtelError::Internal { .. } => "internal",
+        }
+    }
+
+    /// Whether this error is a transient failure that a bounded retry could
+    /// plausibly recover from.
+    ///
+    /// Used by the ingest path (see `OtelService::ingest_spans` and friends) to
+    /// decide between "wait a few milliseconds and write the batch again" and
+    /// "give up now" — the second is the right answer for anything the retry
+    /// cannot change, and waiting on it only holds the ingest permit longer.
+    ///
+    /// Only storage/database failures can be transient. Auth failures,
+    /// validation errors, quota/rate-limit rejections, decode failures and
+    /// not-found errors are all deterministic given the same input, so they
+    /// return `false`.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            // Classified at construction from the backend's typed error —
+            // see the `Storage` variant's docs.
+            OtelError::Storage { kind, .. } => kind.is_transient(),
+            OtelError::Database(db_err) => db_err_kind(db_err).is_transient(),
+            OtelError::AuthFailed { .. }
+            | OtelError::MissingAuthToken { .. }
+            | OtelError::InvalidApiKey
+            | OtelError::ProjectNotFound { .. }
+            | OtelError::RateLimitExceeded { .. }
+            | OtelError::ServiceRateLimitExceeded { .. }
+            | OtelError::IngestSaturated { .. }
+            | OtelError::QuotaExceeded { .. }
+            | OtelError::ProtobufDecode { .. }
+            | OtelError::DecompressionFailed { .. }
+            | OtelError::UnsupportedEncoding { .. }
+            | OtelError::S3 { .. }
+            | OtelError::Validation { .. }
+            | OtelError::DashboardNotFound { .. }
+            | OtelError::MetricAlertNotFound { .. }
+            | OtelError::Io(_)
+            | OtelError::Serialization(_)
+            | OtelError::Internal { .. } => false,
+        }
+    }
+}
+
+/// Classify a [`sea_orm::DbErr`] into a [`StorageErrorKind`].
+///
+/// Only the two connection-level variants are transient: the pool could not
+/// hand out a connection, or an established connection failed. Everything else
+/// — `Query`, `Type`, `RecordNotInserted`, `RecordNotFound`, `Exec`,
+/// `Migration`, … — describes the *statement or the data*, and will fail
+/// identically on the next attempt.
+///
+/// Matches the classification already used by `temps-status-page`'s retry
+/// helpers (`ConnectionAcquire | Conn => retry`), kept deliberately narrow so
+/// a malformed batch is never retried three times before it is dropped.
+pub(crate) fn db_err_kind(err: &sea_orm::DbErr) -> StorageErrorKind {
+    match err {
+        sea_orm::DbErr::Conn(_) | sea_orm::DbErr::ConnectionAcquire(_) => {
+            StorageErrorKind::PostgresConn
+        }
+        _ => StorageErrorKind::PostgresQuery,
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +370,7 @@ mod tests {
     fn test_display_storage() {
         let err = OtelError::Storage {
             message: "disk full".into(),
+            kind: StorageErrorKind::PostgresQuery,
         };
         assert_eq!(err.to_string(), "Storage error: disk full");
     }
@@ -220,6 +412,283 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
         let otel_err: OtelError = io_err.into();
         assert!(otel_err.to_string().contains("file missing"));
+    }
+
+    // ── is_transient() classification ───────────────────────────────────
+
+    #[test]
+    fn test_is_transient_storage_retryable() {
+        let err = OtelError::Storage {
+            message: "ClickHouse insert failed: network error: connection reset".into(),
+            kind: StorageErrorKind::ClickHouseNetwork,
+        };
+        assert!(err.is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_storage_not_retryable() {
+        let err = OtelError::Storage {
+            message: "ClickHouse insert failed: schema mismatch: column `foo` missing".into(),
+            kind: StorageErrorKind::ClickHouseSchema,
+        };
+        assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_database_conn_is_transient() {
+        let err = OtelError::Database(sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
+            "connection reset by peer".into(),
+        )));
+        assert!(err.is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_database_connection_acquire_is_transient() {
+        let err = OtelError::Database(sea_orm::DbErr::ConnectionAcquire(
+            sea_orm::ConnAcquireErr::Timeout,
+        ));
+        assert!(err.is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_database_record_not_inserted_is_fatal() {
+        let err = OtelError::Database(sea_orm::DbErr::RecordNotInserted);
+        assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_database_type_error_is_fatal() {
+        let err = OtelError::Database(sea_orm::DbErr::Type(
+            "invalid value for column `duration_ms`".into(),
+        ));
+        assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_database_query_error_is_fatal() {
+        let err = OtelError::Database(sea_orm::DbErr::Query(sea_orm::RuntimeErr::Internal(
+            "syntax error at or near \"SELECT\"".into(),
+        )));
+        assert!(!err.is_transient());
+    }
+
+    // ── error_class() derivation ────────────────────────────────────────
+
+    /// The class must name the *backend and failure mode*, so an operator can
+    /// tell "ClickHouse is down" from "our rows don't match the table".
+    #[test]
+    fn test_error_class_distinguishes_backend_and_mode() {
+        let cases = [
+            (StorageErrorKind::ClickHouseNetwork, "clickhouse_network"),
+            (StorageErrorKind::ClickHouseTimeout, "clickhouse_timeout"),
+            (StorageErrorKind::ClickHouseSchema, "clickhouse_schema"),
+            (
+                StorageErrorKind::ClickHouseSerialization,
+                "clickhouse_serialization",
+            ),
+            (StorageErrorKind::ClickHouseOther, "clickhouse_other"),
+            (StorageErrorKind::PostgresConn, "postgres_conn"),
+            (StorageErrorKind::PostgresQuery, "postgres_query"),
+            (StorageErrorKind::Precondition, "precondition"),
+        ];
+        for (kind, expected) in cases {
+            let err = OtelError::Storage {
+                message: "irrelevant".into(),
+                kind,
+            };
+            assert_eq!(err.error_class(), expected);
+        }
+    }
+
+    #[test]
+    fn test_error_class_maps_database_variants() {
+        let conn = OtelError::Database(sea_orm::DbErr::ConnectionAcquire(
+            sea_orm::ConnAcquireErr::Timeout,
+        ));
+        assert_eq!(conn.error_class(), "postgres_conn");
+
+        let query = OtelError::Database(sea_orm::DbErr::RecordNotInserted);
+        assert_eq!(query.error_class(), "postgres_query");
+    }
+
+    /// The class is persisted and grouped on, so the set of possible values
+    /// must be *closed*: two errors differing only by an ID or message must
+    /// collapse to the same class, and every class must come from the known
+    /// allowlist. A leak here makes `otel_ingest_errors` grow without bound.
+    #[test]
+    fn test_error_class_is_low_cardinality() {
+        const KNOWN_CLASSES: &[&str] = &[
+            "clickhouse_network",
+            "clickhouse_timeout",
+            "clickhouse_schema",
+            "clickhouse_serialization",
+            "clickhouse_other",
+            "postgres_conn",
+            "postgres_query",
+            "precondition",
+            "s3",
+            "io",
+            "serialization",
+            "quota_exceeded",
+            "rate_limited",
+            "ingest_saturated",
+            "protobuf_decode",
+            "decompression_failed",
+            "unsupported_encoding",
+            "validation",
+            "auth_failed",
+            "not_found",
+            "internal",
+        ];
+
+        let cases = vec![
+            OtelError::S3 {
+                project_id: 12345,
+                reason: "bucket unreachable".into(),
+            },
+            OtelError::QuotaExceeded {
+                project_id: 999,
+                used_bytes: 10,
+                limit_bytes: 5,
+            },
+            OtelError::ProjectNotFound { project_id: 777 },
+            OtelError::RateLimitExceeded {
+                project_id: 5,
+                limit: 100,
+            },
+            OtelError::Internal {
+                message: "unique detail 42".into(),
+            },
+            OtelError::Storage {
+                message: "row 918273 rejected".into(),
+                kind: StorageErrorKind::ClickHouseSchema,
+            },
+        ];
+        for err in &cases {
+            let class = err.error_class();
+            assert!(
+                KNOWN_CLASSES.contains(&class),
+                "class {class:?} is outside the known allowlist — a new variant \
+                 needs an entry here and in the dashboard"
+            );
+            assert!(
+                !err.to_string().contains(class) || KNOWN_CLASSES.contains(&class),
+                "class must not be derived from the message"
+            );
+        }
+
+        // Two errors of the same kind differing only by their identifiers must
+        // land in the same group.
+        let a = OtelError::ProjectNotFound { project_id: 1 };
+        let b = OtelError::ProjectNotFound { project_id: 2 };
+        assert_eq!(a.error_class(), b.error_class());
+    }
+
+    /// Rate-limit rejections from both limiters share one class: an operator
+    /// cares that traffic was shed, not which limiter shed it.
+    #[test]
+    fn test_error_class_groups_both_rate_limiters() {
+        let project = OtelError::RateLimitExceeded {
+            project_id: 1,
+            limit: 10,
+        };
+        let service = OtelError::ServiceRateLimitExceeded {
+            service_id: 2,
+            limit: 10,
+        };
+        assert_eq!(project.error_class(), "rate_limited");
+        assert_eq!(service.error_class(), service.error_class());
+        assert_eq!(project.error_class(), service.error_class());
+    }
+
+    /// `is_transient` and `error_class` must agree: every class derived from a
+    /// transient kind must itself come from a transient error.
+    #[test]
+    fn test_storage_error_kind_transience_matches_class() {
+        let transient = [
+            StorageErrorKind::ClickHouseNetwork,
+            StorageErrorKind::ClickHouseTimeout,
+            StorageErrorKind::ClickHouseOther,
+            StorageErrorKind::PostgresConn,
+        ];
+        for kind in transient {
+            assert!(kind.is_transient(), "{} must be transient", kind.as_class());
+            let err = OtelError::Storage {
+                message: "m".into(),
+                kind,
+            };
+            assert!(err.is_transient());
+        }
+
+        let terminal = [
+            StorageErrorKind::ClickHouseSchema,
+            StorageErrorKind::ClickHouseSerialization,
+            StorageErrorKind::PostgresQuery,
+            StorageErrorKind::Precondition,
+        ];
+        for kind in terminal {
+            assert!(!kind.is_transient(), "{} must be fatal", kind.as_class());
+        }
+    }
+
+    /// Class strings are a persisted wire format — a rename splits an existing
+    /// group in two, so pin them explicitly and keep them unique.
+    #[test]
+    fn test_storage_error_kind_classes_are_unique() {
+        let kinds = [
+            StorageErrorKind::ClickHouseNetwork,
+            StorageErrorKind::ClickHouseTimeout,
+            StorageErrorKind::ClickHouseSchema,
+            StorageErrorKind::ClickHouseSerialization,
+            StorageErrorKind::ClickHouseOther,
+            StorageErrorKind::PostgresConn,
+            StorageErrorKind::PostgresQuery,
+            StorageErrorKind::Precondition,
+        ];
+        let unique: std::collections::HashSet<&str> = kinds.iter().map(|k| k.as_class()).collect();
+        assert_eq!(unique.len(), kinds.len(), "duplicate class label");
+    }
+
+    #[test]
+    fn test_is_transient_auth_failed_is_false() {
+        let err = OtelError::AuthFailed {
+            reason: "invalid token".into(),
+        };
+        assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_non_storage_variants_are_false() {
+        let cases = vec![
+            OtelError::InvalidApiKey,
+            OtelError::ProjectNotFound { project_id: 42 },
+            OtelError::RateLimitExceeded {
+                project_id: 7,
+                limit: 500,
+            },
+            OtelError::IngestSaturated { limit: 64 },
+            OtelError::QuotaExceeded {
+                project_id: 1,
+                used_bytes: 10,
+                limit_bytes: 5,
+            },
+            OtelError::ProtobufDecode {
+                reason: "truncated".into(),
+            },
+            OtelError::Validation {
+                message: "empty name".into(),
+            },
+            OtelError::S3 {
+                project_id: 3,
+                reason: "timeout".into(),
+            },
+            OtelError::Internal {
+                message: "unexpected state".into(),
+            },
+        ];
+        for err in cases {
+            assert!(!err.is_transient(), "expected fatal: {err}");
+        }
     }
 
     #[test]

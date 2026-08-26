@@ -10,8 +10,11 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryRes
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
-use super::{BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage, StorageResult};
-use crate::error::OtelError;
+use super::{
+    clamp_ingest_error_limit, truncate_sample_message, BaselinePoint, DeployEvent, MinuteAggregate,
+    OtelStorage, StorageResult, INGEST_ERROR_WINDOW_DAYS,
+};
+use crate::error::{OtelError, StorageErrorKind};
 use crate::types::*;
 
 // ── Interval / aggregation helpers ─────────────────────────────────────────
@@ -828,6 +831,88 @@ impl OtelStorage for TimescaleDbStorage {
                 Ok(0)
             }
         }
+    }
+
+    /// Upsert the `(signal_type, error_class)` group, bumping its count and
+    /// refreshing `last_seen` and the sample message.
+    ///
+    /// A real upsert (rather than an append + read-time aggregate) is the
+    /// reason this lives in Postgres: the unique constraint keeps the table
+    /// bounded at (signals x classes) rows forever, so it needs no partition,
+    /// no TTL and no prune job. Contrast ClickHouse, whose merge-based
+    /// deduplication is not read-your-writes consistent and would force an
+    /// append-only table plus a `GROUP BY` on every read.
+    ///
+    /// `sample_message` is deliberately overwritten by the newest occurrence:
+    /// when a failure mode is ongoing, the most recent message is the most
+    /// useful one to show, and keeping the first would pin the report to a
+    /// stale detail.
+    async fn record_ingest_error(
+        &self,
+        signal_type: &str,
+        error_class: &str,
+        message: &str,
+    ) -> StorageResult<()> {
+        // Bound the stored sample so one pathological backend error cannot
+        // write an unbounded blob into a control table.
+        let sample = truncate_sample_message(message);
+
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO otel_ingest_errors \
+                     (signal_type, error_class, sample_message, count, first_seen, last_seen) \
+                 VALUES ($1, $2, $3, 1, NOW(), NOW()) \
+                 ON CONFLICT (signal_type, error_class) DO UPDATE SET \
+                     count = otel_ingest_errors.count + 1, \
+                     last_seen = NOW(), \
+                     sample_message = EXCLUDED.sample_message",
+                [signal_type.into(), error_class.into(), sample.into()],
+            ))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn recent_ingest_errors(&self, limit: u32) -> StorageResult<Vec<IngestErrorSummary>> {
+        let limit = clamp_ingest_error_limit(limit);
+
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                // Read-time window instead of a prune job: the table is
+                // already bounded by its unique constraint, so the only thing
+                // a background sweep would buy is hiding stale groups — which
+                // this WHERE clause does directly, without a timer.
+                format!(
+                    "SELECT signal_type, error_class, sample_message, count, first_seen, last_seen \
+                     FROM otel_ingest_errors \
+                     WHERE last_seen > NOW() - INTERVAL '{INGEST_ERROR_WINDOW_DAYS} days' \
+                     ORDER BY last_seen DESC \
+                     LIMIT $1"
+                ),
+                [i64::from(limit).into()],
+            ))
+            .await?;
+
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                // `count` is BIGINT; read it as i64 and clamp, never as u64 —
+                // sea-orm cannot `try_get` an unsigned integer from a Postgres
+                // bigint column.
+                let count: i64 = row.try_get("", "count").ok()?;
+                Some(IngestErrorSummary {
+                    signal_type: row.try_get("", "signal_type").ok()?,
+                    error_class: row.try_get("", "error_class").ok()?,
+                    sample_message: row.try_get("", "sample_message").ok()?,
+                    count: count.max(0) as u64,
+                    first_seen: row.try_get("", "first_seen").ok()?,
+                    last_seen: row.try_get("", "last_seen").ok()?,
+                })
+            })
+            .collect())
     }
 
     /// Query bucketed metric aggregates — full-fidelity port of the ClickHouse
@@ -2332,11 +2417,15 @@ impl OtelStorage for TimescaleDbStorage {
             Some(row) => {
                 let id: i64 = row.try_get("", "id").map_err(|e| OtelError::Storage {
                     message: format!("Failed to get insight id: {}", e),
+                    // Column/type mismatch on a returned row — deterministic.
+                    kind: StorageErrorKind::PostgresQuery,
                 })?;
                 Ok(id)
             }
             None => Err(OtelError::Storage {
                 message: "Insight upsert returned no rows".into(),
+                // The statement ran; it just matched nothing.
+                kind: StorageErrorKind::PostgresQuery,
             }),
         }
     }
