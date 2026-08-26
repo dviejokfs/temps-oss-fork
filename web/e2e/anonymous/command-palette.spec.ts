@@ -132,7 +132,9 @@ test.describe('command palette', () => {
   })
 
   test('finds Temps Cloud by name and by what it does', async ({ page }) => {
-    const search = page.getByPlaceholder('Type a command or search...')
+    // The example query changes as the palette evolves; the combobox role is
+    // its stable, user-facing contract.
+    const search = page.getByRole('combobox')
     const entry = page.locator('[cmdk-item]').filter({ hasText: 'Temps Cloud' })
 
     await search.fill('temps cloud')
