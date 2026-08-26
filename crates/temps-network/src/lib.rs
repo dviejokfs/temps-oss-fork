@@ -50,3 +50,20 @@ pub use manager::NetworkManager;
 
 /// Convenient `Result` alias for the crate.
 pub type Result<T> = std::result::Result<T, NetworkError>;
+
+/// Auto-detect the underlay network device — the interface carrying the
+/// host's IPv4 default route — instead of assuming a hardcoded name like
+/// `eth0`. Cloud providers with predictable interface naming (Hetzner's
+/// `enp6s0`, AWS's `ens5`, etc.) never use `eth0`, so relying on that
+/// default fails VXLAN bootstrap on most real deployments.
+#[cfg(target_os = "linux")]
+pub async fn detect_underlay_device() -> Result<String> {
+    linux::detect_underlay_device().await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn detect_underlay_device() -> Result<String> {
+    Err(NetworkError::UnsupportedPlatform {
+        target: std::env::consts::OS,
+    })
+}

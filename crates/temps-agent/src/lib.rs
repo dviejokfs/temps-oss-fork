@@ -111,6 +111,15 @@ pub struct AgentConfig {
     /// verifies the control plane's client certificate.
     #[serde(default)]
     pub cluster_ca_path: Option<std::path::PathBuf>,
+    /// Network device the VXLAN overlay should bind to as its underlay
+    /// parent (e.g. `enp6s0`). `None` (the default) auto-detects the
+    /// device carrying the host's IPv4 default route at startup — set
+    /// this only when a host has multiple candidate interfaces and the
+    /// default route doesn't point at the one that should carry overlay
+    /// traffic. `#[serde(default)]` so older `agent.json` files without
+    /// this field still parse.
+    #[serde(default)]
+    pub underlay_dev: Option<String>,
 }
 
 fn default_dns_data_dir() -> std::path::PathBuf {
@@ -397,6 +406,7 @@ mod tests {
             tls_cert_path: None,
             tls_key_path: None,
             cluster_ca_path: None,
+            underlay_dev: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();

@@ -182,6 +182,14 @@ pub async fn teardown(config: &NetworkConfig) -> crate::Result<()> {
     Ok(())
 }
 
+/// Auto-detect the underlay device from the host's IPv4 default route. See
+/// [`route::default_route_device`] for why this replaces a hardcoded
+/// `eth0` guess.
+pub async fn detect_underlay_device() -> crate::Result<String> {
+    let (handle, _conn) = open_handle().await?;
+    route::default_route_device(&handle).await
+}
+
 /// Helper that opens an rtnetlink connection and spawns its background task
 /// onto the current tokio runtime, returning a usable handle.
 async fn open_handle() -> crate::Result<(rtnetlink::Handle, tokio::task::JoinHandle<()>)> {

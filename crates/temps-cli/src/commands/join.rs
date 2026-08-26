@@ -47,6 +47,14 @@ pub struct JoinCommand {
     /// its own CA (ADR-020 WS-2.2).
     #[arg(long)]
     pub ca_fingerprint: Option<String>,
+
+    /// Network device the VXLAN overlay should bind to as its underlay
+    /// parent (e.g. "enp6s0"). Defaults to auto-detecting the device
+    /// carrying this host's IPv4 default route — set this only when the
+    /// default route doesn't point at the interface that should carry
+    /// overlay traffic (e.g. a private network on a VLAN sub-interface).
+    #[arg(long)]
+    pub underlay_dev: Option<String>,
 }
 
 /// Response body from the control plane registration endpoint.
@@ -339,6 +347,7 @@ impl JoinCommand {
             tls_cert_path: tls_paths.as_ref().map(|p| p.0.clone()),
             tls_key_path: tls_paths.as_ref().map(|p| p.1.clone()),
             cluster_ca_path: tls_paths.as_ref().map(|p| p.2.clone()),
+            underlay_dev: self.underlay_dev.clone(),
         };
         self.save_agent_config(&config)?;
 
@@ -517,6 +526,7 @@ impl JoinCommand {
             tls_cert_path: tls_paths.as_ref().map(|p| p.0.clone()),
             tls_key_path: tls_paths.as_ref().map(|p| p.1.clone()),
             cluster_ca_path: tls_paths.as_ref().map(|p| p.2.clone()),
+            underlay_dev: self.underlay_dev.clone(),
         };
         self.save_agent_config(&config)?;
 

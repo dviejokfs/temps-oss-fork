@@ -233,6 +233,24 @@ async fn fixture() -> (Env, NetworkManager, Cleanup) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn detect_underlay_device_matches_default_route() {
+    // Regression test for the bug where the underlay device was hardcoded
+    // to "eth0" everywhere, breaking any host whose default-route
+    // interface has a different name (e.g. cloud "predictable naming"
+    // like enp6s0/ens5). Inside the DinD harness the default route goes
+    // out `TEMPS_IT_UNDERLAY_DEV` (or "eth0" if unset), so auto-detection
+    // must land on the same device the rest of the suite already assumes.
+    cleanup_all().await;
+    let env = Env::from_env();
+
+    let detected = temps_network::detect_underlay_device()
+        .await
+        .expect("detect_underlay_device");
+
+    assert_eq!(detected, env.underlay_dev);
+}
+
+#[tokio::test]
 async fn bootstrap_creates_all_kernel_state() {
     let (env, mgr, _cleanup) = fixture().await;
     let alloc = env.alloc();

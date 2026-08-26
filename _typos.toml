@@ -21,6 +21,12 @@ AIMD = "AIMD"
 # MongoDB query operator `$nin` ("not in"), in the data browser's filter
 # allowlist. typos reads it as a misspelling of "nine"/"min".
 nin = "nin"
+# Linux routing term "oif" (outgoing interface index) and the matching
+# `netlink_packet_route::route::RouteAttribute::Oif` enum variant from the
+# upstream netlink-packet-route crate. typos "corrects" it to "of"/"Of",
+# which silently breaks compilation since `Of` isn't a real variant.
+oif = "oif"
+Oif = "Oif"
 
 [default.extend-identifiers]
 # W3C traceparent spec example span-id used in test fixtures

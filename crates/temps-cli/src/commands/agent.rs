@@ -47,6 +47,12 @@ pub struct AgentCommand {
     /// Overrides labels from saved config. Sent in every heartbeat.
     #[arg(long, env = "TEMPS_NODE_LABELS", value_delimiter = ',')]
     pub labels: Vec<String>,
+
+    /// Network device the VXLAN overlay should bind to as its underlay
+    /// parent (e.g. "enp6s0"). Overrides the saved config. Defaults to
+    /// auto-detecting the device carrying this host's IPv4 default route.
+    #[arg(long, env = "TEMPS_AGENT_UNDERLAY_DEV")]
+    pub underlay_dev: Option<String>,
 }
 
 impl AgentCommand {
@@ -304,6 +310,11 @@ impl AgentCommand {
         let tls_key_path = saved.as_ref().and_then(|c| c.tls_key_path.clone());
         let cluster_ca_path = saved.as_ref().and_then(|c| c.cluster_ca_path.clone());
 
+        let underlay_dev = self
+            .underlay_dev
+            .clone()
+            .or_else(|| saved.as_ref().and_then(|c| c.underlay_dev.clone()));
+
         Ok(temps_agent::AgentConfig {
             listen_address,
             token,
@@ -318,6 +329,7 @@ impl AgentCommand {
             tls_cert_path,
             tls_key_path,
             cluster_ca_path,
+            underlay_dev,
         })
     }
 

@@ -66,6 +66,12 @@ pub enum NetworkError {
         reason: String,
     },
 
+    /// Auto-detecting the underlay device (the interface carrying the
+    /// default route) failed. Callers fall back to an operator-supplied
+    /// override or a hardcoded default and log this reason.
+    #[error("could not auto-detect underlay device from the default route: {reason}")]
+    UnderlayDetection { reason: String },
+
     // ----- firewall -----
     /// nftables rule installation failed.
     #[error("nftables operation '{op}' on table '{table}' failed: {reason}")]

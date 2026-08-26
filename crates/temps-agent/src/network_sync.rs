@@ -179,7 +179,27 @@ async fn run(
         config.node_id
     );
 
-    let net_config = NetworkConfig::default();
+    let mut net_config = NetworkConfig::default();
+    match &config.underlay_dev {
+        Some(dev) => {
+            info!(underlay_dev = %dev, "using operator-configured underlay device");
+            net_config.underlay_dev = dev.clone();
+        }
+        None => match temps_network::detect_underlay_device().await {
+            Ok(dev) => {
+                info!(underlay_dev = %dev, "auto-detected underlay device from default route");
+                net_config.underlay_dev = dev;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    fallback = %net_config.underlay_dev,
+                    "could not auto-detect underlay device; falling back to default. \
+                     Set AgentConfig.underlay_dev (or 'temps join --underlay-dev') to override"
+                );
+            }
+        },
+    }
     let manager = match NetworkManager::new(net_config) {
         Ok(m) => m,
         Err(e) => {
