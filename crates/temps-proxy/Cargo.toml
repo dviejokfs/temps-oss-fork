@@ -28,7 +28,6 @@ bytes = { workspace = true }
 cookie = { workspace = true }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
-flate2 = { workspace = true }
 tracing = { workspace = true }
 memchr = "2.7"
 htmd = "0.5"

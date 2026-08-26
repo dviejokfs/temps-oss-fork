@@ -2348,7 +2348,7 @@ impl From<PostgresUpgradeError> for temps_core::problemdetails::Problem {
                     .with_detail(error.to_string())
             }
 
-            PostgresUpgradeError::PreBackupFailed { .. }
+            internal_error @ (PostgresUpgradeError::PreBackupFailed { .. }
             | PostgresUpgradeError::SnapshotFailed { .. }
             | PostgresUpgradeError::DumpFailed { .. }
             | PostgresUpgradeError::NewContainerFailed { .. }
@@ -2359,10 +2359,11 @@ impl From<PostgresUpgradeError> for temps_core::problemdetails::Problem {
             | PostgresUpgradeError::Docker { .. }
             | PostgresUpgradeError::Log { .. }
             | PostgresUpgradeError::ServiceConfiguration { .. }
-            | PostgresUpgradeError::Database(_) => {
+            | PostgresUpgradeError::Database(_)) => {
+                tracing::error!(error = %internal_error, "PostgreSQL upgrade request failed internally");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(error.to_string())
+                    .with_detail("The PostgreSQL upgrade operation could not be completed")
             }
         }
     }

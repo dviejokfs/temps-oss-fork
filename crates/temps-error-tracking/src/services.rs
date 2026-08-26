@@ -11,5 +11,5 @@ pub use error_analytics_service::{ErrorAnalyticsService, ErrorDashboardStats};
 pub use error_crud_service::ErrorCRUDService;
 pub use error_ingestion_service::ErrorIngestionService;
 pub use error_tracking_service::ErrorTrackingService;
-pub use source_map_service::SourceMapService;
+pub use source_map_service::{SourceMapService, MAX_SOURCE_MAP_BYTES};
 pub use types::*;

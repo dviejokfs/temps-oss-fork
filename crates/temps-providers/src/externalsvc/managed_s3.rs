@@ -116,6 +116,11 @@ impl ManagedS3BackendSelection {
     }
 
     pub fn validate_for_service_create(&self) -> Result<()> {
+        if self.backend == ManagedS3BackendKind::Minio {
+            return Err(anyhow!(
+                "managed S3 backend 'minio' is deprecated and cannot be used for new services; use the default 'rustfs' backend"
+            ));
+        }
         if self.backend.requires_external_provider() {
             // The out-of-process provider dispatch is not yet wired into
             // service creation: `create_service_instance` maps both S3 and Blob
@@ -216,13 +221,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_minio_backend() {
+    fn parses_legacy_minio_backend_but_rejects_new_creation() {
         let selection = ManagedS3BackendSelection::from_parameters(&serde_json::json!({
             "backend": "minio"
         }))
         .unwrap();
         assert_eq!(selection.backend, ManagedS3BackendKind::Minio);
-        assert!(selection.validate_for_service_create().is_ok());
+        let error = selection.validate_for_service_create().unwrap_err();
+        assert!(error.to_string().contains("deprecated"));
     }
 
     #[test]
