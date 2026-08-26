@@ -163,6 +163,13 @@ check. `git revert` defaults to `Revert "original message"`, which is
 not conventional. Never use `git revert --no-edit` and leave it —
 either pass an explicit conventional `-m`, or amend right after.
 
+## DCO Sign-off
+
+Every commit must be signed off (`Signed-off-by: Name <email>` trailer).
+Always use `git commit -s` (and `-s` on `--amend`/`revert`). Like the
+Changelog check, the DCO check validates every commit in `base..HEAD`,
+not just the tip.
+
 ## Per-record config columns, not env vars
 
 When adding a new runtime knob, default to a column on the relevant
