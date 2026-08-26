@@ -4,8 +4,10 @@
 //!
 //! 1. Build the [`ZoneStore`], hydrate it from `<snapshot_dir>/zone.json`
 //!    so the resolver answers from disk *before* the first sync round.
-//! 2. Spawn the [`SyncClient`] long-poll loop.
-//! 3. Bind UDP + TCP listeners on each `listen_addr`.
+//! 2. Bind UDP + TCP listeners on each `listen_addr`.
+//! 3. Spawn the [`SyncClient`] long-poll loop — only once every listener is
+//!    bound, so a bind failure returns `Err` without leaving an orphaned,
+//!    never-notified sync task running.
 //! 4. Run a Hickory `ServerFuture` driving [`ZoneAuthority`].
 //!
 //! `ResolverHandle::shutdown()` notifies all child tasks and awaits them.
@@ -66,30 +68,6 @@ impl ResolverHandle {
         let shutdown = Arc::new(Notify::new());
         let sync_status = Arc::new(RwLock::new(SyncStatus::default()));
 
-        // ----- Sync loop -----
-        // Worker nodes long-poll the control plane over HTTP. In control-plane
-        // mode (`disable_sync`, ADR-024) the caller owns the `ZoneStore` and
-        // feeds it directly from the local `service_endpoints` DB, so we skip
-        // the HTTP sync entirely and just park a task on `shutdown` to keep the
-        // handle's shape (and `shutdown()` semantics) unchanged. Status stays
-        // at its `Default` (never-synced) value in this mode — callers should
-        // read `disable_sync`/local-mode context separately rather than treat
-        // that as a health signal.
-        let sync_task = if config.disable_sync {
-            let sd = shutdown.clone();
-            tokio::spawn(async move {
-                sd.notified().await;
-            })
-        } else {
-            let sync_client = SyncClient::new(
-                config.clone(),
-                zone.clone(),
-                shutdown.clone(),
-                sync_status.clone(),
-            )?;
-            tokio::spawn(async move { sync_client.run().await })
-        };
-
         // ----- Upstream forwarder -----
         // Built once per resolver. `None` means the operator has
         // configured an empty upstream pool — strict authoritative
@@ -133,6 +111,39 @@ impl ResolverHandle {
             server.register_listener(tcp, TCP_IDLE_TIMEOUT, u16::MAX as usize);
             info!(%addr, "DNS resolver listening (UDP + TCP)");
         }
+
+        // ----- Sync loop -----
+        // Spawned only after every listener above is bound. Before this PR
+        // callers only invoked `start()` once per agent lifetime, so an
+        // orphaned sync task on a failed bind leaked at most once; the
+        // per-tick reconciliation added in ADR-024's self-healing follow-up
+        // retries `start()` on every sync tick, which would otherwise spawn
+        // one more never-notified poller per retry (the caller's `shutdown`
+        // clone is dropped on early return, but the task's own clone keeps
+        // it looping forever, hammering the control plane's DNS change feed).
+        //
+        // Worker nodes long-poll the control plane over HTTP. In control-plane
+        // mode (`disable_sync`, ADR-024) the caller owns the `ZoneStore` and
+        // feeds it directly from the local `service_endpoints` DB, so we skip
+        // the HTTP sync entirely and just park a task on `shutdown` to keep the
+        // handle's shape (and `shutdown()` semantics) unchanged. Status stays
+        // at its `Default` (never-synced) value in this mode — callers should
+        // read `disable_sync`/local-mode context separately rather than treat
+        // that as a health signal.
+        let sync_task = if config.disable_sync {
+            let sd = shutdown.clone();
+            tokio::spawn(async move {
+                sd.notified().await;
+            })
+        } else {
+            let sync_client = SyncClient::new(
+                config.clone(),
+                zone.clone(),
+                shutdown.clone(),
+                sync_status.clone(),
+            )?;
+            tokio::spawn(async move { sync_client.run().await })
+        };
 
         let shutdown_for_server = shutdown.clone();
         let server_task = tokio::spawn(async move {

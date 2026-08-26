@@ -40,6 +40,24 @@ struct AckBody {
     applied_generation: i64,
 }
 
+/// Cap for `SyncBadResponse::reason`. Enough to see a Problem+JSON detail or
+/// a short plaintext error; not enough for a proxy's full HTML error page to
+/// bloat the `nodes.dns_resolver_last_error` column it eventually lands in.
+const SYNC_ERROR_REASON_MAX_BYTES: usize = 512;
+
+/// Truncate to a char boundary at or before `SYNC_ERROR_REASON_MAX_BYTES`,
+/// tagging the result so a reader knows text was cut rather than complete.
+fn truncate_reason(reason: &str) -> String {
+    if reason.len() <= SYNC_ERROR_REASON_MAX_BYTES {
+        return reason.to_string();
+    }
+    let mut end = SYNC_ERROR_REASON_MAX_BYTES;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", &reason[..end])
+}
+
 /// Point-in-time health of the sync loop, read by `ResolverHandle::status()`
 /// for the agent heartbeat and any local troubleshooting surface. Cloned out
 /// of a shared lock rather than computed on demand, so a stuck loop (e.g.
@@ -160,7 +178,14 @@ impl SyncClient {
             return Err(ResolverError::SyncBadResponse {
                 node_id: self.config.node_id,
                 status: status.as_u16(),
-                reason: resp.text().await.unwrap_or_default(),
+                // Truncated: a non-2xx body can be an arbitrarily large
+                // intervening proxy/WAF error page rather than a small
+                // Problem+JSON detail, and this reason round-trips through
+                // the agent heartbeat into the `nodes.dns_resolver_last_error`
+                // column and back out through `GET /cluster/dns/status` — an
+                // unbounded body here would bloat that row and every reader
+                // of it, not just this log line.
+                reason: truncate_reason(&resp.text().await.unwrap_or_default()),
             });
         }
         let body: ChangesResponse = resp.json().await.map_err(|e| ResolverError::SyncHttp {

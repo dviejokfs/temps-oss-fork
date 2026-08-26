@@ -2846,8 +2846,8 @@ impl From<NodeError> for Problem {
             NodeError::DnsRegistry(ref e) => {
                 error!("DNS registry error in node operation: {}", e);
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("DNS Registry Error")
-                    .with_detail(format!("Failed to count DNS records: {}", e))
+                    .with_title("Internal Server Error")
+                    .with_detail("An internal error occurred")
             }
         }
     }

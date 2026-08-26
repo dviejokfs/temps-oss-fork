@@ -180,6 +180,24 @@ fn identity_conflict_value(
         .cloned()
 }
 
+/// Cap for `nodes.dns_resolver_last_error`, mirrored from
+/// `temps_dns_resolver::sync_client::SYNC_ERROR_REASON_MAX_BYTES` — the
+/// agent should already send a short reason, but the control plane must not
+/// trust that unconditionally.
+const DNS_ERROR_MAX_BYTES: usize = 512;
+
+/// Truncate to a char boundary at or before `DNS_ERROR_MAX_BYTES`.
+fn truncate_dns_error(reason: &str) -> String {
+    if reason.len() <= DNS_ERROR_MAX_BYTES {
+        return reason.to_string();
+    }
+    let mut end = DNS_ERROR_MAX_BYTES;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", &reason[..end])
+}
+
 pub struct NodeService {
     db: Arc<DatabaseConnection>,
 }
@@ -506,7 +524,13 @@ impl NodeService {
                 active.dns_resolver_last_sync_at = Set(dns.last_sync_success_at);
             }
             active.dns_resolver_consecutive_failures = Set(dns.consecutive_sync_failures);
-            active.dns_resolver_last_error = Set(dns.last_sync_error);
+            // Defensive clamp on top of the agent's own truncation
+            // (`temps_dns_resolver::sync_client::truncate_reason`) — an
+            // older or buggy agent binary shouldn't be able to write an
+            // unbounded string into this column just because it skipped
+            // that step.
+            active.dns_resolver_last_error =
+                Set(dns.last_sync_error.map(|e| truncate_dns_error(&e)));
             active.dns_resolver_record_count = Set(Some(dns.record_count));
         }
         active.update(self.db.as_ref()).await?;
