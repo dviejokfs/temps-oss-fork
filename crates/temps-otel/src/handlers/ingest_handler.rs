@@ -1376,6 +1376,7 @@ mod tests {
     fn test_error_storage_maps_to_500() {
         let err = OtelError::Storage {
             message: "disk full".into(),
+            kind: crate::error::StorageErrorKind::PostgresQuery,
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
