@@ -9700,6 +9700,47 @@ export type IncrResponse = {
     value: number;
 };
 
+/**
+ * One aggregated ingest-failure group: "this signal failed this way N times".
+ *
+ * The pipeline-stats counters say *how many* records were dropped;
+ * this says *why*. Rows are grouped by `(signal_type, error_class)` rather
+ * than stored per-event, so a sustained outage collapses into one row with a
+ * rising `count` instead of flooding the table.
+ *
+ * `sample_message` is one representative backend error string, kept for the
+ * detail a class name cannot carry (the failing column, the refused address).
+ * It is a sample, not a guarantee: which occurrence it came from is
+ * unspecified.
+ */
+export type IngestErrorSummary = {
+    /**
+     * How many times this `(signal_type, error_class)` pair has failed.
+     */
+    count: number;
+    /**
+     * Stable, low-cardinality failure class — see `OtelError::error_class`.
+     */
+    error_class: string;
+    first_seen: string;
+    last_seen: string;
+    /**
+     * A representative backend error message for this group.
+     */
+    sample_message: string;
+    /**
+     * Which signal was being written: `metrics`, `spans`, or `logs`.
+     */
+    signal_type: string;
+};
+
+export type IngestErrorsResponse = {
+    /**
+     * Failure groups, most recently seen first.
+     */
+    errors: Array<IngestErrorSummary>;
+};
+
 export type InitAuthResponse = {
     auth_url: string;
     session_token: string;
@@ -12749,7 +12790,75 @@ export type PgUpgradeResponse = {
 };
 
 /**
+ * One `(timestamp, value)` sample in a pipeline series.
+ */
+export type PipelineHistoryPoint = {
+    /**
+     * ISO 8601 timestamp with `Z` suffix (bucket start).
+     */
+    time: string;
+    /**
+     * Bucket value — the mean per-sample delta, see [`PipelineSeries`].
+     */
+    value: number;
+};
+
+/**
+ * Time-series history for every counter the pipeline-stats sampler publishes.
+ */
+export type PipelineHistoryResponse = {
+    /**
+     * Resolved window end (ISO 8601, `Z`).
+     */
+    end_time: string;
+    /**
+     * Interval the sampler writes at, in seconds. The client needs this to
+     * label values honestly: a bucket is the *mean delta per sample*, so
+     * "events per `sample_interval_seconds`", not a bucket total.
+     */
+    sample_interval_seconds: number;
+    /**
+     * One entry per sampled counter, always the full set in a stable order —
+     * a counter with no data yet is present with an empty `points`, never
+     * omitted, so the client can render an empty chart instead of dropping
+     * the panel.
+     */
+    series: Array<PipelineSeries>;
+    /**
+     * Resolved window start (ISO 8601, `Z`).
+     */
+    start_time: string;
+    /**
+     * Bucket width actually used, in seconds. Server-derived from the window
+     * so a caller cannot request 1-minute buckets over 7 days.
+     */
+    step_seconds: number;
+};
+
+/**
+ * One charted counter over the requested window.
+ */
+export type PipelineSeries = {
+    /**
+     * Metric name, e.g. `otel.spans_dropped`.
+     */
+    name: string;
+    /**
+     * Buckets in ascending time order. Empty when the window predates the
+     * first sample (a freshly started server has no history yet).
+     */
+    points: Array<PipelineHistoryPoint>;
+};
+
+/**
  * Internal pipeline statistics for self-observability.
+ *
+ * All fields are cumulative process-lifetime counters. Every one of them is
+ * also sampled every 60 seconds by the plugin's stats sampler and written to
+ * the unified metrics store as a **delta** counter named `otel.<field>`
+ * (`SourceKind::Node`, node_id 0) — see `pipeline_stat_deltas` in
+ * `plugin.rs`. Adding a field here means adding it there too, otherwise the
+ * new counter is only ever visible through the API response.
  */
 export type PipelineStats = {
     ingest_errors: number;
@@ -37747,6 +37856,44 @@ export type GetHealthResponses = {
 
 export type GetHealthResponse = GetHealthResponses[keyof GetHealthResponses];
 
+export type GetIngestErrorsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Max groups to return (default 20, max 100)
+         */
+        limit?: number;
+    };
+    url: '/otel/ingest-errors';
+};
+
+export type GetIngestErrorsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetIngestErrorsError = GetIngestErrorsErrors[keyof GetIngestErrorsErrors];
+
+export type GetIngestErrorsResponses = {
+    /**
+     * Recent ingest failure groups
+     */
+    200: IngestErrorsResponse;
+};
+
+export type GetIngestErrorsResponse = GetIngestErrorsResponses[keyof GetIngestErrorsResponses];
+
 export type ListInsightsData = {
     body?: never;
     path: {
@@ -38099,6 +38246,56 @@ export type QueryMetricsResponses = {
 };
 
 export type QueryMetricsResponse = QueryMetricsResponses[keyof QueryMetricsResponses];
+
+export type GetPipelineHistoryData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Preset window: 1h | 6h | 24h | 7d (default 24h). Ignored when start_time and end_time are both set.
+         */
+        range?: string;
+        /**
+         * Explicit window start (RFC 3339); must be paired with end_time
+         */
+        start_time?: string;
+        /**
+         * Explicit window end (RFC 3339); must be paired with start_time
+         */
+        end_time?: string;
+    };
+    url: '/otel/pipeline-history';
+};
+
+export type GetPipelineHistoryErrors = {
+    /**
+     * Invalid time range
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Metrics store not available
+     */
+    503: ProblemDetails;
+};
+
+export type GetPipelineHistoryError = GetPipelineHistoryErrors[keyof GetPipelineHistoryErrors];
+
+export type GetPipelineHistoryResponses = {
+    /**
+     * Pipeline counter history
+     */
+    200: PipelineHistoryResponse;
+};
+
+export type GetPipelineHistoryResponse = GetPipelineHistoryResponses[keyof GetPipelineHistoryResponses];
 
 export type GetPipelineStatsData = {
     body?: never;
