@@ -13,6 +13,8 @@
 //! CH DDL is not transactional, so partial rollback is not attempted.
 
 use crate::error::OtelError;
+use crate::error::StorageErrorKind;
+use crate::storage::clickhouse::ch_err_kind;
 
 /// One migration: a stable name (tracking row key) and the SQL body.
 struct Migration {
@@ -89,6 +91,8 @@ fn validate_database_name(name: &str) -> Result<(), OtelError> {
     if name.is_empty() {
         return Err(OtelError::Storage {
             message: "ClickHouse database name must not be empty".to_string(),
+            // Operator configuration, not a transport failure.
+            kind: StorageErrorKind::Precondition,
         });
     }
     if let Some(bad_char) = name
@@ -100,6 +104,8 @@ fn validate_database_name(name: &str) -> Result<(), OtelError> {
                 "ClickHouse database name '{name}' contains invalid character '{bad_char}'; \
                  only [A-Za-z0-9_] are permitted"
             ),
+            // Operator configuration, not a transport failure.
+            kind: StorageErrorKind::Precondition,
         });
     }
     Ok(())
@@ -136,6 +142,7 @@ pub async fn apply_migrations(
         .execute()
         .await
         .map_err(|e| OtelError::Storage {
+            kind: ch_err_kind(&e),
             message: format!(
                 "ClickHouse OTel: failed to CREATE DATABASE IF NOT EXISTS `{database_name}`: {e}"
             ),
@@ -155,6 +162,7 @@ pub async fn apply_migrations(
         .fetch_all::<AppliedRow>()
         .await
         .map_err(|e| OtelError::Storage {
+            kind: ch_err_kind(&e),
             message: format!("ClickHouse OTel: failed to read migration tracking table: {e}"),
         })?
         .into_iter()
@@ -188,6 +196,7 @@ pub async fn apply_migrations(
             .execute()
             .await
             .map_err(|e| OtelError::Storage {
+                kind: ch_err_kind(&e),
                 message: format!(
                     "ClickHouse OTel: failed to record migration `{}` as applied: {e}",
                     migration.name
@@ -219,6 +228,7 @@ async fn execute_multi(client: &::clickhouse::Client, sql: &str) -> Result<(), O
             .execute()
             .await
             .map_err(|e| OtelError::Storage {
+                kind: ch_err_kind(&e),
                 message: format!(
                     "ClickHouse OTel DDL failed: {e}\nstatement: {}",
                     truncate(stmt, 200)

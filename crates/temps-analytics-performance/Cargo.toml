@@ -47,3 +47,4 @@ woothee = "0.13"
 [dev-dependencies]
 maplit = "1.0"
 sea-orm = { version = "1.1.2", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "mock"] }
+async-trait = { workspace = true }

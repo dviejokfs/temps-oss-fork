@@ -29,6 +29,7 @@ pub mod retry;
 pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
+pub mod static_files;
 pub mod telemetry;
 pub mod time_window;
 pub mod tls;
@@ -104,10 +105,10 @@ pub use app_settings::{
     AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AppSettings, BuildLimitsSettings,
     CeilingEnforcement, ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings,
     DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, ImageRetentionSettings,
-    LetsEncryptSettings, MetricsStoreKind, MonitoringSettings, MultiNodeSettings,
-    ObservabilityCompressionSettings, ObservabilityRetentionSettings, PreviewGatewaySettings,
-    ProviderConfig, RateLimitSettings, RequestTimeoutSettings, ScreenshotSettings,
-    SecurityHeadersSettings, SelfUpdateSettings, TenantResourceCeilings,
+    LetsEncryptSettings, McpServerSettings, MetricsStoreKind, MonitoringSettings,
+    MultiNodeSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
+    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, RequestTimeoutSettings,
+    ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings, TenantResourceCeilings,
 };
 pub use async_trait;
 pub use chrono;

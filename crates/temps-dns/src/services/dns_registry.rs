@@ -34,8 +34,8 @@
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
-    TransactionTrait,
+    DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    Statement, TransactionTrait,
 };
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -705,6 +705,20 @@ impl DnsRegistry {
             .await?;
         Ok(row)
     }
+
+    /// Total number of records currently in the `*.temps.local` zone, across
+    /// every owner and node. Used by the cluster DNS status endpoint
+    /// (`GET /api/cluster/dns/status`) to give an operator a cluster-wide
+    /// number alongside each node's per-resolver `record_count`.
+    pub async fn total_record_count(&self) -> Result<i64, DnsRegistryError> {
+        let count = service_endpoints::Entity::find()
+            .count(self.db.as_ref())
+            .await?;
+        // `count()` returns u64; the zone is bounded by cluster size and
+        // container count, nowhere near i64::MAX, but saturate rather than
+        // wrap on the (impossible in practice) overflow case.
+        Ok(i64::try_from(count).unwrap_or(i64::MAX))
+    }
 }
 
 /// Drift-detector row returned by [`DnsRegistry::list_stale_resolvers`].
@@ -987,5 +1001,71 @@ mod tests {
         assert_eq!(rows.len(), 1, "upsert keeps one row per (fqdn, type, ip)");
         assert_eq!(rows[0].owner_id, 200, "newest owner wins");
         assert_eq!(rows[0].generation, g2, "row carries the newest generation");
+    }
+
+    #[tokio::test]
+    async fn test_total_record_count() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let registry = DnsRegistry::new(db.clone());
+
+        assert_eq!(
+            registry.total_record_count().await.unwrap(),
+            0,
+            "a fresh zone has no records"
+        );
+
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::Deployment,
+                300,
+                &[
+                    EndpointDraft {
+                        fqdn: "count-a.echo.temps.local".into(),
+                        record_type: RecordType::A,
+                        target_ip: Some("172.20.0.10".into()),
+                        target_port: Some(80),
+                        ttl: 10,
+                        owner_kind: OwnerKind::Deployment,
+                        owner_id: 300,
+                        node_id: None,
+                    },
+                    EndpointDraft {
+                        fqdn: "count-b.echo.temps.local".into(),
+                        record_type: RecordType::A,
+                        target_ip: Some("172.20.0.11".into()),
+                        target_port: Some(80),
+                        ttl: 10,
+                        owner_kind: OwnerKind::Deployment,
+                        owner_id: 300,
+                        node_id: None,
+                    },
+                ],
+            )
+            .await
+            .expect("publish should succeed");
+
+        assert_eq!(
+            registry.total_record_count().await.unwrap(),
+            2,
+            "count reflects every record across owners"
+        );
+
+        registry
+            .delete_by_owner(OwnerKind::Deployment, 300)
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(
+            registry.total_record_count().await.unwrap(),
+            0,
+            "count drops back to zero once records are removed"
+        );
     }
 }

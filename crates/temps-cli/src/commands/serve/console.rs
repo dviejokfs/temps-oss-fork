@@ -49,6 +49,7 @@ use temps_infra::InfraPlugin;
 use temps_kv::KvPlugin;
 use temps_log_aggregator::{LogAggregatorPlugin, StorageConfig};
 use temps_logs::LogsPlugin;
+use temps_mcp_server::{McpHandlerState, McpServerPlugin};
 use temps_monitoring::{
     AlarmService, ContainerHealthConfig, ContainerHealthMonitor, DiskSpaceMonitor,
     MonitoringPlugin, OutageDetectionService,
@@ -2466,6 +2467,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let deployments_plugin = Box::new(DeploymentsPlugin::new());
     plugin_manager.register_plugin(deployments_plugin);
 
+    // 9.0. McpServerPlugin (ADR-039) - MCP server for AI tool integration.
+    // Depends on ProjectsPlugin and DeploymentsPlugin (services registered above).
+    // Routes are at root level (not under /api); assembled below after plugin init.
+    debug!("Registering McpServerPlugin");
+    let mcp_plugin = Box::new(McpServerPlugin::new());
+    plugin_manager.register_plugin(mcp_plugin);
+
     // 8.8. SandboxPlugin - Vercel-compatible `/v1/sandbox/*` API.
     // Consumes the shared SandboxProvider registered by AgentsPlugin.
     debug!("Registering SandboxPlugin");
@@ -3358,8 +3366,28 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let plugin_api_router =
         Router::new().nest("/api", public_router.clone().merge(admin_router.clone()));
 
+    // Build root-level MCP routes (ADR-039). These live outside /api so the
+    // CLI wizard's unauthenticated probe (GET /mcp/tools) works without a key.
+    // The authenticated sub-router gets the full plugin middleware stack (auth,
+    // request metadata) applied so RequireAuth works just like any /api handler.
+    let mcp_root_router = {
+        let service_context = plugin_manager.service_context();
+        if let Some(mcp_state) = service_context.get_service::<McpHandlerState>() {
+            let mcp_routers = temps_mcp_server::build_mcp_routers(mcp_state);
+            let auth_mcp = plugin_manager.apply_middleware_to_router(
+                mcp_routers.authenticated,
+                plugin_manager.get_middleware(),
+            );
+            Router::new().merge(mcp_routers.public).merge(auth_mcp)
+        } else {
+            debug!("McpHandlerState not registered; MCP routes skipped");
+            Router::new()
+        }
+    };
+
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
+        .merge(mcp_root_router)
         .nest("/api", public_router)
         .layer(axum::middleware::from_fn(track_server_errors));
 
