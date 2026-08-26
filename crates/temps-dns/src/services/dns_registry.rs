@@ -443,6 +443,28 @@ impl DnsRegistry {
         Ok(res.rows_affected)
     }
 
+    /// Every record currently published for one owner, newest generation
+    /// first. Read-only companion to [`Self::replace_endpoints_for_owner`].
+    ///
+    /// Callers use this to answer "is this name actually resolvable?"
+    /// *before* handing an address to a workload. Without it the only way
+    /// to find out an FQDN was never published is a connection timeout
+    /// inside the user's container, which is exactly the silent failure
+    /// this method exists to prevent.
+    pub async fn list_by_owner(
+        &self,
+        owner_kind: OwnerKind,
+        owner_id: i64,
+    ) -> Result<Vec<service_endpoints::Model>, DnsRegistryError> {
+        service_endpoints::Entity::find()
+            .filter(service_endpoints::Column::OwnerKind.eq(owner_kind.as_str()))
+            .filter(service_endpoints::Column::OwnerId.eq(owner_id))
+            .order_by_desc(service_endpoints::Column::Generation)
+            .all(self.db.as_ref())
+            .await
+            .map_err(DnsRegistryError::Database)
+    }
+
     /// Hourly janitor: delete `service_endpoints` rows whose owner has
     /// vanished from `service_members` (Tier 2 GC) or `external_services`
     /// (Tier 3 GC). Returns the number of orphan records deleted.
