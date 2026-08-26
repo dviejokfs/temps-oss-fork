@@ -83,17 +83,29 @@ pub async fn execute(
 
             // Apply project visibility filtering when a checker is registered.
             // Mirrors the REST handler's `resolve_hidden_projects` semantics:
-            // - Admin / deployment-token bypass → show everything, no filtering.
+            // - Admin bypass → show everything, no filtering.
+            // - Deployment token → confined to its own bound project,
+            //   independent of the checker (tenant boundary, not RBAC).
+            //   Unlike get_project/list_deployments this can't call
+            //   check_project_scope directly (there's no single project_id to
+            //   check against a list) — filter to the token's own project
+            //   instead. This is currently unreachable (see check_project_scope's
+            //   doc comment for why), but the filter must exist regardless: a
+            //   list_all bypass here would be the one place that widens if the
+            //   permission mapping this relies on ever changes.
             // - `None` checker → no access grants configured → show everything.
             // - `Ok(None)` from checker → checker has no opinion → show everything.
             // - `Ok(Some(ids))` → exclude those IDs.
             // - `Err(_)` → infrastructure failure → fail the request (fail-closed).
             let user_id = auth.user_id();
-            let projects = if auth.is_deployment_token()
-                || auth.is_admin()
-                || auth.has_role(&Role::PlatformAdmin)
-            {
-                // Platform/instance admins and deployment tokens see all projects.
+            let projects = if auth.is_deployment_token() {
+                let token_project_id = auth.project_id();
+                projects
+                    .into_iter()
+                    .filter(|p| Some(p.id) == token_project_id)
+                    .collect()
+            } else if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
+                // Platform/instance admins see all projects.
                 projects
             } else if let Some(checker) = checker {
                 match checker.hidden_project_ids(user_id).await {
@@ -123,13 +135,18 @@ pub async fn execute(
         }
 
         "get_project" => {
-            let project_id = arguments
+            let project_id_raw = arguments
                 .get("project_id")
                 .and_then(serde_json::Value::as_i64)
                 .ok_or_else(|| McpError::MissingArgument {
                     arg: "project_id".to_string(),
                     tool: name.to_string(),
-                })? as i32;
+                })?;
+            let project_id =
+                i32::try_from(project_id_raw).map_err(|_| McpError::InvalidArgument {
+                    arg: "project_id".to_string(),
+                    reason: format!("{project_id_raw} does not fit in a 32-bit ID"),
+                })?;
 
             // Tenant-boundary check first: confines a deployment token to its
             // own bound project regardless of the checker/admin bypass below.
@@ -202,6 +219,17 @@ mod tests {
 
     fn platform_admin_auth() -> AuthContext {
         AuthContext::new_session(make_user(1), Role::PlatformAdmin)
+    }
+
+    fn deployment_token_auth(project_id: i32) -> AuthContext {
+        AuthContext::new_deployment_token(
+            project_id,
+            None,
+            None,
+            1,
+            "test-token".to_string(),
+            vec![],
+        )
     }
 
     #[test]
@@ -327,6 +355,35 @@ mod tests {
         let checker = FailingChecker;
         let result = checker.hidden_project_ids(1).await;
         assert!(result.is_err(), "infra failure must propagate as Err");
+    }
+
+    /// A deployment token must only ever see its own bound project in
+    /// list_projects, never the full instance list — regression guard for
+    /// the gap where deployment tokens previously bypassed filtering
+    /// entirely (same unconditional-bypass shape as the admin bypass, but
+    /// deployment tokens are tenant-scoped, not instance-wide).
+    #[test]
+    fn list_projects_deployment_token_sees_only_its_own_project() {
+        struct Project {
+            id: i32,
+        }
+        let projects = vec![Project { id: 1 }, Project { id: 42 }, Project { id: 100 }];
+
+        let auth = deployment_token_auth(42);
+        assert!(auth.is_deployment_token());
+
+        let token_project_id = auth.project_id();
+        let visible: Vec<i32> = projects
+            .into_iter()
+            .filter(|p| Some(p.id) == token_project_id)
+            .map(|p| p.id)
+            .collect();
+
+        assert_eq!(
+            visible,
+            vec![42],
+            "deployment token bound to project 42 must see only project 42"
+        );
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ import { promptCheckbox, promptConfirm, promptSearch, promptSelect, promptText }
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { CLIENT_ADAPTERS, getClientAdapter, listClientIds } from './clients/index.js'
+import { TOKEN_ENV_VAR as CODEX_TOKEN_ENV_VAR } from './clients/codex.js'
 import { buildMcpUrl, isValidGroupKey, parseMcpUrl, TOOL_GROUPS } from './groups.js'
 import { probeMcpEndpoint } from './probe.js'
 
@@ -422,6 +423,17 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
     success(`${adapter.label} configured.`)
   }
   info(`Restart ${adapter.label} to pick up the change.`)
+
+  // Codex resolves its bearer token from its OWN process environment at
+  // connect time -- config.toml only stores the env var's name, never the
+  // value (see codex.ts's TOKEN_ENV_VAR doc comment). Without this export,
+  // `codex mcp add` reports success but real codex sessions will silently
+  // fail to authenticate.
+  if (adapter.id === 'codex') {
+    newline()
+    warning(`Codex reads its bearer token from the ${CODEX_TOKEN_ENV_VAR} environment variable at connect time -- export it in your shell profile, or every codex session will fail to authenticate to Temps:`)
+    info(`  export ${CODEX_TOKEN_ENV_VAR}='Bearer ${apiKey}'`)
+  }
 }
 
 async function removeAction(clientArg: string | undefined): Promise<void> {

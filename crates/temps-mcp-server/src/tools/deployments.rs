@@ -173,22 +173,25 @@ pub async fn execute(
             let environment_id = arguments
                 .get("environment_id")
                 .and_then(serde_json::Value::as_i64)
-                .map(|v| v as i32);
-            // `get_project_deployments` casts both values `as u64` with no
-            // validation (`page.unwrap_or(1) as u64`); a negative i64 wraps to
-            // a huge u64, and Sea-ORM's pagination OFFSET/LIMIT bind then
-            // panics (`TryFromIntError(PosOverflow)` in sea-query-binder) when
-            // converting that back down for Postgres — which kills the whole
-            // console listener task, not just this request. Clamp both here,
-            // at the boundary where the value is attacker-controlled.
+                .map(i32::try_from)
+                .transpose()
+                .map_err(|_| McpError::InvalidArgument {
+                    arg: "environment_id".to_string(),
+                    reason: "does not fit in a 32-bit ID".to_string(),
+                })?;
+            // `get_project_deployments` clamps page/per_page itself (that's
+            // the authoritative fix, since it's the one place every caller —
+            // REST and MCP — goes through). Clamping again here is
+            // defense-in-depth for this attacker-controlled boundary, not the
+            // primary fix: see clamp_page/clamp_per_page's doc comments.
             let page = arguments
                 .get("page")
                 .and_then(serde_json::Value::as_i64)
-                .map(|v| v.max(1));
+                .map(clamp_page);
             let per_page = arguments
                 .get("per_page")
                 .and_then(serde_json::Value::as_i64)
-                .map(|v| v.clamp(1, 100));
+                .map(clamp_per_page);
 
             let response = deployment_service
                 .get_project_deployments(project_id, page, per_page, environment_id)
@@ -349,14 +352,35 @@ pub async fn execute(
 
 /// Extract and coerce an integer argument from a JSON object.
 fn require_i32(arguments: &serde_json::Value, arg: &str, tool: &str) -> Result<i32, McpError> {
-    arguments
+    let v = arguments
         .get(arg)
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| McpError::MissingArgument {
             arg: arg.to_string(),
             tool: tool.to_string(),
-        })
-        .map(|v| v as i32)
+        })?;
+    i32::try_from(v).map_err(|_| McpError::InvalidArgument {
+        arg: arg.to_string(),
+        reason: format!("{v} does not fit in a 32-bit ID"),
+    })
+}
+
+/// Clamp a caller-supplied `page` to a range that can never overflow when
+/// `DeploymentService::get_project_deployments` computes `OFFSET = per_page *
+/// (page - 1)` as an unchecked `u64 * u64` (Sea-ORM's `Paginator::fetch_page`)
+/// and binds the result back down to Postgres's `i64`. `i32::MAX` combined
+/// with `per_page`'s max of 100 keeps the offset far below `i64::MAX`, and is
+/// already a far larger page count than any real deployment history.
+fn clamp_page(v: i64) -> i64 {
+    v.clamp(1, i64::from(i32::MAX))
+}
+
+/// Clamp a caller-supplied `per_page` to `[1, 100]`, matching this
+/// codebase's pagination convention (CLAUDE.md: default 20, max 100) and
+/// keeping the OFFSET computation `clamp_page` protects against bounded on
+/// both operands, not just one.
+fn clamp_per_page(v: i64) -> i64 {
+    v.clamp(1, 100)
 }
 
 #[cfg(test)]
@@ -426,6 +450,58 @@ mod tests {
         let err = require_i32(&args, "project_id", "list_deployments")
             .expect_err("missing arg must fail");
         assert!(matches!(err, McpError::MissingArgument { .. }));
+    }
+
+    #[test]
+    fn require_i32_out_of_range_returns_invalid_argument_not_a_silent_truncation() {
+        // Rust's `as i32` would silently wrap this to a small, wrong value
+        // instead of erroring — verify the typed rejection instead.
+        let args = serde_json::json!({ "project_id": 4_294_967_297_i64 });
+        let err = require_i32(&args, "project_id", "list_deployments")
+            .expect_err("out-of-range value must be rejected, not truncated");
+        assert!(matches!(err, McpError::InvalidArgument { .. }));
+    }
+
+    // ── clamp_page / clamp_per_page (pagination-overflow regression guard) ────
+    //
+    // Regression coverage for the crash reproduced live against a running
+    // server: a negative or extreme `page`/`per_page` reaches
+    // `DeploymentService::get_project_deployments`'s unchecked `as u64` cast,
+    // and Sea-ORM's OFFSET computation then panics converting back to
+    // Postgres's `i64` — killing the console's HTTP listener task. These
+    // functions are the MCP-layer defense-in-depth clamp (the authoritative
+    // fix lives in the service itself); test them directly since `execute()`
+    // needs a real `Arc<DeploymentService>` and can't be unit tested here.
+
+    #[test]
+    fn clamp_page_floors_negative_to_one() {
+        assert_eq!(clamp_page(-5), 1);
+        assert_eq!(clamp_page(i64::MIN), 1);
+    }
+
+    #[test]
+    fn clamp_page_leaves_in_range_value_untouched() {
+        assert_eq!(clamp_page(1), 1);
+        assert_eq!(clamp_page(42), 42);
+    }
+
+    #[test]
+    fn clamp_page_caps_extreme_positive_value() {
+        // This is the exact overflow this function exists to prevent: an
+        // in-range i64 that, uncapped, would make per_page * (page - 1)
+        // overflow i64 once bound to Postgres.
+        assert_eq!(clamp_page(1_000_000_000_000_000_000), i64::from(i32::MAX));
+        assert_eq!(clamp_page(i64::MAX), i64::from(i32::MAX));
+    }
+
+    #[test]
+    fn clamp_per_page_clamps_both_directions() {
+        assert_eq!(clamp_per_page(-5), 1);
+        assert_eq!(clamp_per_page(0), 1);
+        assert_eq!(clamp_per_page(1), 1);
+        assert_eq!(clamp_per_page(100), 100);
+        assert_eq!(clamp_per_page(101), 100);
+        assert_eq!(clamp_per_page(i64::MAX), 100);
     }
 
     #[tokio::test]

@@ -2,7 +2,19 @@ import { execFileSync } from 'node:child_process'
 import { MCP_SERVER_NAME, redactSecrets, type InstallResult, type McpClientAdapter, type McpServerEntry } from './base.js'
 import { execErrorMessage, resolveOnPath } from './exec-utils.js'
 
-const TOKEN_ENV_VAR = 'TEMPS_MCP_AUTH_HEADER'
+/**
+ * Codex resolves this env var from its OWN process environment at MCP
+ * connect time (confirmed via `codex mcp add --help`: "Optional environment
+ * variable to read for a bearer token"), not from the environment of the
+ * `codex mcp add` subprocess this adapter shells out to below -- config.toml
+ * only ever stores the variable's *name* (`bearer_token_env_var = "..."`),
+ * never its value. That means setting it just for this subprocess call does
+ * nothing for the real `codex` sessions the user launches afterward; it must
+ * be exported in the user's shell profile. See index.ts's addAction, which
+ * prints that instruction for this adapter specifically after a successful
+ * add.
+ */
+export const TOKEN_ENV_VAR = 'TEMPS_MCP_AUTH_HEADER'
 
 /**
  * Pulls the connection URL out of `codex mcp get <name>` stdout. Pure and

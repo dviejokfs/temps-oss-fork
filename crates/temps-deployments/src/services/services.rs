@@ -1343,8 +1343,15 @@ impl DeploymentService {
         per_page: Option<i64>,
         environment_id: Option<i32>,
     ) -> Result<DeploymentListResponse, DeploymentError> {
-        let page = page.unwrap_or(1) as u64;
-        let per_page = per_page.unwrap_or(10) as u64;
+        // Clamp before the `as u64` cast: an out-of-range or negative i64 here
+        // wraps to a huge u64 on cast, and Sea-ORM's OFFSET (page_size * page)
+        // then overflows the i64 bind sea-query-binder sends to Postgres,
+        // panicking with `TryFromIntError(PosOverflow)` and taking down the
+        // whole HTTP listener task -- not just this request. Every caller
+        // (REST and MCP) reaches this cast, so it must be enforced here, not
+        // only at a caller's argument-parsing boundary.
+        let page = page.unwrap_or(1).clamp(1, i64::from(i32::MAX)) as u64;
+        let per_page = per_page.unwrap_or(10).clamp(1, 100) as u64;
 
         // Build base query with project_id filter
         let mut query =
