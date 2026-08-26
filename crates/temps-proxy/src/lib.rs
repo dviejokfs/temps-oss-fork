@@ -25,6 +25,7 @@ pub mod redaction;
 pub mod server;
 pub mod service;
 pub mod services;
+mod static_file_serving;
 pub mod storage;
 pub mod tls_cert_loader;
 pub mod tls_fingerprint;

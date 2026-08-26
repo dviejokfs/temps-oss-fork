@@ -322,6 +322,16 @@ pub struct ProjectResponse {
     pub updated_at: i64,
     pub last_deployment: Option<i64>,
     pub git_provider_connection_id: Option<i32>,
+    /// Git provider behind `git_provider_connection_id`: `github`,
+    /// `github_app`, `gitlab`, `gitea`, `bitbucket` or `generic`. `null` when
+    /// the project has no connection (public repository, Docker image or
+    /// uploaded source).
+    ///
+    /// Clients must use this rather than guessing the host from `git_url`: a
+    /// self-hosted GitLab/Gitea/Bitbucket instance can live on any domain, and
+    /// a connected project may have no clone URL stored at all.
+    #[schema(example = "gitlab")]
+    pub git_provider_type: Option<String>,
     /// Authoritative repository visibility. A missing connection alone does
     /// not imply that an incompletely configured repository is public.
     pub is_public_repo: bool,
@@ -404,6 +414,7 @@ impl ProjectResponse {
             updated_at: project.updated_at.timestamp_millis(),
             last_deployment: project.last_deployment.map(|d| d.timestamp_millis()),
             git_provider_connection_id: project.git_provider_connection_id,
+            git_provider_type: project.git_provider_type,
             is_public_repo: project.is_public_repo,
             git_url: project.git_url,
             attack_mode: project.attack_mode,
@@ -689,6 +700,10 @@ where
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateProjectSettingsRequest {
+    /// Human-facing project display name. Unlike `slug` this is not part of any
+    /// URL and is not required to be unique. Changing it also changes the
+    /// `OTEL_SERVICE_NAME` injected into subsequent deployments.
+    pub name: Option<String>,
     pub slug: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub main_branch: Option<String>,
@@ -750,6 +765,35 @@ pub struct UpdateProjectSettingsRequest {
     /// from appearing in cross-project discovery results. Default true (consistent
     /// with the OSS global-observability model). Omit to leave unchanged.
     pub cross_project_trace_sharing: Option<bool>,
+}
+
+impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjectSettingsParams {
+    fn from(request: UpdateProjectSettingsRequest) -> Self {
+        Self {
+            name: request.name,
+            slug: request.slug,
+            git_provider_connection_id: request.git_provider_connection_id,
+            main_branch: request.main_branch,
+            repo_owner: request.repo_owner,
+            repo_name: request.repo_name,
+            preset: request.preset,
+            directory: request.directory,
+            attack_mode: request.attack_mode,
+            enable_preview_environments: request.enable_preview_environments,
+            preview_envs_on_demand: request.preview_envs_on_demand,
+            preview_envs_idle_timeout_seconds: request.preview_envs_idle_timeout_seconds,
+            preview_envs_wake_timeout_seconds: request.preview_envs_wake_timeout_seconds,
+            preset_config: request.preset_config,
+            ai_alert_summaries_enabled: request.ai_alert_summaries_enabled,
+            ai_debug_chat_enabled: request.ai_debug_chat_enabled,
+            ai_write_actions_enabled: request.ai_write_actions_enabled,
+            cross_project_trace_sharing: request.cross_project_trace_sharing,
+            error_source_context_enabled: request.error_source_context_enabled,
+            error_source_root: request.error_source_root,
+            ai_api_traffic_summary_enabled: request.ai_api_traffic_summary_enabled,
+            image_retention_hours: request.image_retention_hours,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

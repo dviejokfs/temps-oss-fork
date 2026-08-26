@@ -31,13 +31,14 @@ import {
   FormField,
   FormItem,
   FormLabel,
+  FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
@@ -49,7 +50,20 @@ interface GeneralSettingsProps {
 }
 
 const projectSchema = z.object({
-  name: z.string().min(1, 'Project name is required'),
+  name: z
+    .string()
+    .trim()
+    .min(1, 'Project name is required')
+    .max(100, 'Project name must be 100 characters or fewer'),
+  slug: z
+    .string()
+    .trim()
+    .min(1, 'Project slug is required')
+    .max(63, 'Project slug must be 63 characters or fewer')
+    .regex(
+      /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
+      'Use lowercase letters, numbers and single hyphens (no leading or trailing hyphen)'
+    ),
 })
 
 type ProjectFormValues = z.infer<typeof projectSchema>
@@ -67,28 +81,59 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const projectForm = useForm<ProjectFormValues>({
     resolver: zodResolver(projectSchema),
     defaultValues: {
-      name: project?.slug || '',
+      name: project?.name || '',
+      slug: project?.slug || '',
     },
   })
+
+  // `defaultValues` are only read on mount, but this component stays mounted
+  // when the route switches between two projects' settings pages. Without this
+  // reset the form would still hold the previous project's identity, and Save
+  // would rename the newly-selected project to the old one's name and slug.
+  //
+  // Keyed on the project *identity*, not its values: a plain refetch of the
+  // same project must not overwrite whatever the user is currently typing.
+  const syncedProjectId = useRef<number | undefined>(undefined)
+  useEffect(() => {
+    if (project?.id === undefined || syncedProjectId.current === project.id) {
+      return
+    }
+    syncedProjectId.current = project.id
+    projectForm.reset({
+      name: project.name || '',
+      slug: project.slug || '',
+    })
+  }, [project?.id, project?.name, project?.slug, projectForm])
 
   const handleSaveProject = async (values: ProjectFormValues) => {
     if (!project?.id) return
 
-    await toast.promise(
-      updateProjectSettings.mutateAsync({
-        path: { project_id: project.id! },
-        body: {
-          slug: values.name,
-        },
-      }),
-      {
-        loading: 'Updating project...',
-        success: 'Project updated successfully',
-        error: 'Failed to update project',
-      }
-    )
+    const request = updateProjectSettings.mutateAsync({
+      path: { project_id: project.id! },
+      body: {
+        name: values.name,
+        slug: values.slug,
+      },
+    })
+    toast.promise(request, {
+      loading: 'Updating project...',
+      success: 'Project updated successfully',
+      error: 'Failed to update project',
+    })
+    // The toast surfaces the failure; bail out here so a rejected save never
+    // falls through to refetch/navigate, and never escapes as an unhandled
+    // rejection.
+    let updated
+    try {
+      updated = await request
+    } catch {
+      return
+    }
     refetch()
-    navigate(`/projects/${values.name}/settings/general`)
+    // Navigate to the slug the server persisted, not the one submitted: the
+    // server normalizes it, so routing on the raw input can land on a URL that
+    // does not exist.
+    navigate(`/projects/${updated?.slug ?? values.slug}/settings/general`)
   }
 
   const handleToggleCrossProjectTraceSharing = async (enabled: boolean) => {
@@ -179,6 +224,26 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                 name="name"
                 render={({ field }) => (
                   <FormItem>
+                    <FormLabel>Project Name</FormLabel>
+                    <FormControl>
+                      <Input {...field} className="max-w-[400px]" />
+                    </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      The display name shown on the dashboard, in alerts, and in
+                      notifications. Also used as the OpenTelemetry service name
+                      for future deployments, so renaming starts a new series in
+                      traces and metrics.
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={projectForm.control}
+                name="slug"
+                render={({ field }) => (
+                  <FormItem>
                     <FormLabel>Project Slug</FormLabel>
                     <FormControl>
                       <Input {...field} className="max-w-[400px]" />
@@ -186,6 +251,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                     <FormDescription className="text-muted-foreground">
                       This will be used in your project&apos;s URL
                     </FormDescription>
+                    <FormMessage />
                   </FormItem>
                 )}
               />

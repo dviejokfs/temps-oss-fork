@@ -923,9 +923,7 @@ impl FirecrackerSetupCommand {
         let config = serde_json::json!({
             "boot-source": {
                 "kernel_image_path": dirs.kernel_file(),
-                "boot_args": format!(
-                    "console=ttyS0 reboot=k panic=1 pci=off init=/temps-smoke-init"
-                ),
+                "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/temps-smoke-init",
             },
             "drives": [{
                 "drive_id": "rootfs",

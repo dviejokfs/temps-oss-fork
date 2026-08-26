@@ -4,7 +4,7 @@ use crate::services::service::{
     SessionReplayWithVisitor, Viewport,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::Json,
     routing::{get, post, put},
@@ -182,8 +182,13 @@ pub struct ErrorResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct AddEventsRequest {
     pub events: String, // Base64 encoded, compressed events
+    /// Client-generated id, stable across retries of the same batch. When
+    /// present the append is idempotent; omitted, delivery is at-least-once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -229,6 +234,10 @@ pub struct SessionReplayInitResponse {
 pub struct SessionReplayEventsRequest {
     pub session_id: String,
     pub events: String, // Base64 encoded, compressed events
+    /// Client-generated id, stable across retries of the same batch. When
+    /// present the append is idempotent; omitted, delivery is at-least-once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
 }
 
 impl From<SessionReplayInfo> for SessionReplayInfoDto {
@@ -372,6 +381,13 @@ impl From<SessionReplayError> for Problem {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Database error")
             }
             SessionReplayError::IoError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "IO error"),
+            SessionReplayError::InvalidBatchId { .. } => {
+                (StatusCode::BAD_REQUEST, "Invalid batch id")
+            }
+            SessionReplayError::BatchTooLarge { .. } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Session replay batch too large",
+            ),
         };
 
         ErrorBuilder::new(status)
@@ -736,7 +752,12 @@ pub async fn add_events(
 
     match state
         .session_replay_service
-        .add_session_events(project_id, &session_id, &request.events)
+        .add_session_events(
+            project_id,
+            &session_id,
+            &request.events,
+            request.batch_id.as_deref(),
+        )
         .await
     {
         Ok(event_count) => Ok(Json(AddEventsResponse {
@@ -910,7 +931,12 @@ pub async fn add_session_replay_events(
 
     match state
         .session_replay_service
-        .add_session_events(project_id, &request.session_id, &request.events)
+        .add_session_events(
+            project_id,
+            &request.session_id,
+            &request.events,
+            request.batch_id.as_deref(),
+        )
         .await
     {
         Ok(event_count) => {
@@ -949,6 +975,14 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
 }
 
+/// Largest request body accepted on the unauthenticated replay ingest routes.
+///
+/// Caps the compressed payload before axum buffers it, so a client cannot hold
+/// a worker thread by drip-feeding a huge body. The service applies a second,
+/// independent cap to the *decompressed* size — this limit alone would not
+/// bound that, since zlib expands roughly 1000:1 on repetitive input.
+const SESSION_REPLAY_INGEST_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
 /// Public ingest routes for session replay — called directly by browser SDKs.
 pub fn configure_public_routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -957,6 +991,7 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
             "/_temps/session-replay/events",
             post(add_session_replay_events),
         )
+        .layer(DefaultBodyLimit::max(SESSION_REPLAY_INGEST_BODY_LIMIT))
 }
 
 #[cfg(test)]

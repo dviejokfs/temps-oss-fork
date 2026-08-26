@@ -1707,7 +1707,7 @@ impl DeployImageJob {
 
             write_log!(
                 LogLevel::Info,
-                format!("📋 Streaming container logs for 15s...")
+                "📋 Streaming container logs for 15s...".to_string()
             );
 
             // Connect to Docker

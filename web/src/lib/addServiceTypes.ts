@@ -1,7 +1,7 @@
-import type { ServiceTypeRoute } from '@/api/client'
+import type { CreatableServiceTypeRoute } from '@/api/client'
 
 export interface AddServiceTypeOption {
-  id: ServiceTypeRoute
+  id: CreatableServiceTypeRoute
   name: string
   description: string
 }

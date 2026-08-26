@@ -11,6 +11,25 @@ interface ShowOptions {
   json?: boolean
 }
 
+/**
+ * Which Git host the project is connected to, as reported by its provider
+ * connection. Never inferred from the clone URL — a self-hosted instance can
+ * live on any domain, and a connected project may store no clone URL at all.
+ */
+function gitProviderLabel(providerType?: string | null): string {
+  const labels: Record<string, string> = {
+    github: 'GitHub',
+    github_app: 'GitHub (App)',
+    gitlab: 'GitLab',
+    gitea: 'Gitea',
+    bitbucket: 'Bitbucket',
+    generic: 'Self-hosted Git',
+  }
+
+  if (!providerType) return 'Not connected'
+  return labels[providerType.toLowerCase()] ?? providerType
+}
+
 export async function show(options: ShowOptions): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -62,6 +81,7 @@ export async function show(options: ShowOptions): Promise<void> {
     Directory: project.directory,
     'Main Branch': project.main_branch,
     Repository: project.repo_name ? `${project.repo_owner}/${project.repo_name}` : 'Not connected',
+    'Git Provider': gitProviderLabel(project.git_provider_type),
     'Attack Mode': project.attack_mode ? 'Enabled' : 'Disabled',
     'Preview Envs': project.enable_preview_environments ? 'Enabled' : 'Disabled',
     Created: formatDate(new Date(project.created_at * 1000).toISOString()),

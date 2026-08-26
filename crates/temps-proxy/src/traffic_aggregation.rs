@@ -10,6 +10,19 @@ use utoipa::ToSchema;
 
 use crate::service::proxy_log_service::ProxyLogServiceError;
 
+/// Widest window any traffic aggregation will serve. Matches
+/// [`temps_core::time_window::MAX_WINDOW_DAYS_SCOPED`] — every aggregation is
+/// project-scoped, so it earns the project-scoped cap.
+pub const MAX_TRAFFIC_WINDOW_DAYS: i64 = temps_core::time_window::MAX_WINDOW_DAYS_SCOPED;
+
+/// Widest window an aggregation requesting an exact distinct count will serve.
+///
+/// `unique_ips`/`unique_paths` compile to `uniqExact` on ClickHouse and
+/// `COUNT(DISTINCT …)` on TimescaleDB. Both materialize the distinct set per
+/// group, so their memory is a function of how many distinct values fall in the
+/// window — something neither pagination nor the group-count ceiling bounds.
+pub const MAX_UNIQUE_COUNT_WINDOW_DAYS: i64 = 7;
+
 pub const MAX_TRAFFIC_DIMENSIONS: usize = 4;
 pub const MAX_TRAFFIC_METRICS: usize = 14;
 pub const MAX_TRAFFIC_FILTERS: usize = 12;
@@ -219,28 +232,42 @@ impl TrafficAggregationRequest {
         if self.start_time >= self.end_time {
             return Err(invalid("start_time must be before end_time"));
         }
-        if self.end_time - self.start_time > chrono::Duration::days(30) {
-            return Err(invalid("traffic aggregation windows cannot exceed 30 days"));
-        }
         let span = self.end_time - self.start_time;
-        let has_high_cardinality_dimension = self.dimensions.iter().any(|dimension| {
-            matches!(
-                dimension,
-                TrafficDimension::ClientIp | TrafficDimension::Path | TrafficDimension::Host
-            )
-        });
-        let has_high_cardinality_metric = self.metrics.iter().any(|metric| {
-            matches!(
-                metric,
-                TrafficMetric::UniqueIps | TrafficMetric::UniquePaths
-            )
-        });
-        if (has_high_cardinality_dimension || has_high_cardinality_metric)
-            && span > chrono::Duration::days(7)
-        {
-            return Err(invalid(
-                "traffic aggregations using high-cardinality dimensions or unique counts cannot exceed 7 days",
-            ));
+        if span > chrono::Duration::days(MAX_TRAFFIC_WINDOW_DAYS) {
+            return Err(invalid(format!(
+                "traffic aggregation windows cannot exceed {MAX_TRAFFIC_WINDOW_DAYS} days"
+            )));
+        }
+        // Grouping by a high-cardinality dimension used to be capped at 7 days
+        // alongside the unique counts. It no longer is: every aggregation here
+        // is project-scoped, and `temps_core::time_window` already establishes
+        // 30 days as the sanctioned cap for a project-scoped read precisely
+        // because such a query is bounded by ONE project's volume rather than
+        // the deployment's. What the cap really protected against is GROUP BY
+        // cardinality, which the storage layer bounds directly (ClickHouse
+        // `max_rows_to_group_by`, Postgres `statement_timeout`) and reports as
+        // an actionable error — a far better fit than a blanket time rule that
+        // also rejected the small projects it was never meant to limit.
+        //
+        // The unique counts keep the tighter cap. `uniqExact`/`COUNT(DISTINCT)`
+        // build a real per-group set, so their cost scales with the DISTINCT
+        // count inside the window rather than with the number of groups
+        // returned, and pagination cannot bound it.
+        if span > chrono::Duration::days(MAX_UNIQUE_COUNT_WINDOW_DAYS) {
+            let unique_metric = self.metrics.iter().copied().find(|metric| {
+                matches!(
+                    metric,
+                    TrafficMetric::UniqueIps | TrafficMetric::UniquePaths
+                )
+            });
+            if let Some(metric) = unique_metric {
+                return Err(invalid(format!(
+                    "metric '{}' counts distinct values and cannot span more than \
+                     {MAX_UNIQUE_COUNT_WINDOW_DAYS} days. Narrow the time range, or \
+                     drop that metric to query up to {MAX_TRAFFIC_WINDOW_DAYS} days.",
+                    metric.api_name()
+                )));
+            }
         }
         if self.dimensions.len() >= 3 && span > chrono::Duration::days(1) {
             return Err(invalid(
@@ -439,24 +466,49 @@ mod tests {
     }
 
     #[test]
-    fn bounds_high_cardinality_windows_and_page_offsets() {
-        let mut high_cardinality = request();
-        high_cardinality.start_time = high_cardinality.end_time - chrono::Duration::days(8);
-        assert!(matches!(
-            high_cardinality.validate(),
-            Err(ProxyLogServiceError::InvalidFilter(message))
-                if message.contains("cannot exceed 7 days")
-        ));
+    fn allows_high_cardinality_dimensions_up_to_the_project_scoped_cap() {
+        // `path` + `client_ip` for a month is what the API Traffic tab asks for
+        // when the user picks "Last 30 Days". It is project-scoped, so it gets
+        // the project-scoped cap rather than the old 7-day one.
+        let mut month = request();
+        month.dimensions = vec![TrafficDimension::ClientIp, TrafficDimension::Path];
+        month.metrics = vec![TrafficMetric::Requests];
+        month.order_by = vec![TrafficOrderBy {
+            field: TrafficOrderField::Metric(TrafficMetric::Requests),
+            direction: TrafficSortDirection::Desc,
+        }];
+        month.start_time = month.end_time - chrono::Duration::days(30);
+        assert!(month.validate().is_ok());
 
+        let mut too_wide = month.clone();
+        too_wide.start_time = too_wide.end_time - chrono::Duration::days(31);
+        assert!(matches!(
+            too_wide.validate(),
+            Err(ProxyLogServiceError::InvalidFilter(message))
+                if message.contains("cannot exceed 30 days")
+        ));
+    }
+
+    #[test]
+    fn bounds_unique_count_windows_and_page_offsets() {
+        // The distinct counts keep the tighter cap regardless of grouping, and
+        // the message must name the offending metric so the client knows which
+        // one to drop.
         let mut unique_rollup = request();
         unique_rollup.dimensions.clear();
         unique_rollup.metrics = vec![TrafficMetric::UniqueIps];
-        unique_rollup.start_time = unique_rollup.end_time - chrono::Duration::days(30);
+        unique_rollup.order_by.clear();
+        unique_rollup.start_time = unique_rollup.end_time - chrono::Duration::days(8);
         assert!(matches!(
             unique_rollup.validate(),
             Err(ProxyLogServiceError::InvalidFilter(message))
-                if message.contains("cannot exceed 7 days")
+                if message.contains("unique_ips") && message.contains("more than 7 days")
         ));
+
+        // Same window, same grouping, minus the distinct count: allowed.
+        let mut without_unique = unique_rollup.clone();
+        without_unique.metrics = vec![TrafficMetric::Requests];
+        assert!(without_unique.validate().is_ok());
 
         let mut three_dimensions = request();
         three_dimensions.dimensions.push(TrafficDimension::Method);

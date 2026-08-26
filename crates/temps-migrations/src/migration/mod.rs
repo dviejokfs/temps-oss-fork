@@ -198,6 +198,8 @@ mod m20260817_000001_add_system_dimension_to_proxy_stats;
 mod m20260817_000001_index_deployments_retention_scan;
 mod m20260817_000002_create_secret_compose_services;
 mod m20260818_000001_add_allow_alternate_sources;
+mod m20260819_000001_create_session_replay_ingest_batches;
+mod m20260821_000001_add_email_retry_tracking;
 
 pub struct Migrator;
 
@@ -433,6 +435,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260817_000001_index_deployments_retention_scan::Migration),
             Box::new(m20260817_000002_create_secret_compose_services::Migration),
             Box::new(m20260818_000001_add_allow_alternate_sources::Migration),
+            Box::new(m20260819_000001_create_session_replay_ingest_batches::Migration),
+            Box::new(m20260821_000001_add_email_retry_tracking::Migration),
         ]
     }
 }

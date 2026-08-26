@@ -199,6 +199,11 @@ impl TempsPlugin for GitPlugin {
                 .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
                 .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
+            // Central sensitive-action policy (MFA step-up), used to gate
+            // destructive git provider and connection operations like delete.
+            let sensitive_action_authorizer =
+                context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
             let git_app_state = crate::handlers::types::create_git_app_state(
                 repository_service,
                 git_provider_manager,
@@ -208,6 +213,7 @@ impl TempsPlugin for GitPlugin {
                 cache_manager,
                 connection_health_service,
                 telemetry,
+                sensitive_action_authorizer,
             );
             context.register_plugin_state("git", git_app_state);
 
@@ -221,6 +227,20 @@ impl TempsPlugin for GitPlugin {
         let git_app_state = context
             .get_plugin_state::<crate::handlers::types::GitAppState>("git")
             .expect("GitAppState should be available");
+
+        // Rebind the authorizer here rather than trust the one captured in
+        // `register_services`: an EE/custom `SensitiveActionAuthorizer` may
+        // be registered by a plugin later in registration order, and
+        // last-write-wins service registration means the earliest-registered
+        // instance otherwise wins silently. `configure_routes` runs only
+        // after every plugin's `register_services` has completed, so
+        // re-resolving here always sees the final policy — same pattern as
+        // AuthPlugin's `with_sensitive_action_authorizer`.
+        let git_app_state = Arc::new(crate::handlers::types::GitAppState {
+            sensitive_action_authorizer: context
+                .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+            ..(*git_app_state).clone()
+        });
 
         // Configure routes using the existing route configuration
         let router = handlers::configure_routes().with_state(git_app_state);

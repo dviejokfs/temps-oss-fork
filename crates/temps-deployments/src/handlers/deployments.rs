@@ -22,22 +22,25 @@ use futures::SinkExt;
 use temps_auth::RequireAuth;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
+    require_sensitive_action,
 };
-use temps_core::{AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata};
+use temps_core::{
+    AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata, SensitiveAction,
+};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
 use crate::handlers::failure_report::*;
 use crate::handlers::types::{
     ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
-    ContainerDetailResponse, ContainerEnvironmentVariableValueResponse, ContainerInfoResponse,
-    ContainerListResponse, ContainerLogsQuery, ContainerMetricHistoryPoint,
-    ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
-    DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
-    DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
-    EnvVarResponse, FailureReportPreviewResponse, LatestDeploymentMediaResponse,
-    LatestDeploymentMediaResponseItem, PromoteDeploymentRequest, ResourceLimitsResponse,
-    SendFailureReportRequest,
+    ContainerDetailResponse, ContainerEnvironmentVariableValueResponse, ContainerHistoryEntry,
+    ContainerHistoryListResponse, ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery,
+    ContainerMetricHistoryPoint, ContainerMetricsHistoryQuery, ContainerMetricsResponse,
+    DeploymentContainerLogContentResponse, DeploymentContainerLogResponse,
+    DeploymentContainerLogsListResponse, DeploymentJobResponse, DeploymentJobsResponse,
+    DeploymentListResponse, DeploymentResponse, DeploymentStateResponse, EnvVarResponse,
+    FailureReportPreviewResponse, LatestDeploymentMediaResponse, LatestDeploymentMediaResponseItem,
+    PromoteDeploymentRequest, ResourceLimitsResponse, SendFailureReportRequest,
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
@@ -133,6 +136,7 @@ fn public_compose_service_url(
         teardown_deployment,
         teardown_environment,
         list_containers,
+        list_container_history,
         get_container_logs_by_id,
         get_container_logs,
         get_container_detail,
@@ -164,6 +168,8 @@ fn public_compose_service_url(
         ContainerMetricsResponse,
         ContainerMetricsHistoryQuery,
         ContainerMetricHistoryPoint,
+        ContainerHistoryEntry,
+        ContainerHistoryListResponse,
         ContainerActionResponse,
         ActivityGraphQuery,
         ActivityGraphResponse,
@@ -342,6 +348,10 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics",
             get(get_container_metrics),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/container-history",
+            get(list_container_history),
         )
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/history",
@@ -985,6 +995,15 @@ pub async fn teardown_environment(
         project_id,
         state.project_access_checker
     );
+    require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DeleteEnvironment {
+            project_id,
+            environment_id: env_id,
+        },
+    )
+    .await?;
 
     info!(
         "Tearing down environment {} for project: {}",
@@ -2245,9 +2264,11 @@ pub async fn get_container_metrics_history(
 
     // Resolves the docker container ID to its `deployment_containers` row and
     // verifies it belongs to this project/environment (404 otherwise).
-    let (container, _) = state
+    // Uses `get_container_row_any` (not `get_container_detail`) so history is
+    // still available for containers replaced by a later redeploy.
+    let container = state
         .deployment_service
-        .get_container_detail(project_id, environment_id, container_id.clone())
+        .get_container_row_any(project_id, environment_id, container_id.clone())
         .await?;
 
     let (window, step) = temps_metrics::range_to_step(&params.range);
@@ -2288,6 +2309,57 @@ pub async fn get_container_metrics_history(
     Ok(Json(response).into_response())
 }
 
+/// List every container that has ever run for an environment — current and
+/// replaced by a later redeploy. Use each entry's `container_id` (or `id`)
+/// with the `/containers/{container_id}/metrics/history` endpoint to fetch
+/// persisted metrics for a specific container generation, including ones
+/// that no longer exist because a redeploy replaced them.
+#[utoipa::path(
+    tag = "Deployments",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/container-history",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID")
+    ),
+    responses(
+        (status = 200, description = "Every container that has ever run for this environment, current and replaced", body = ContainerHistoryListResponse),
+        (status = 404, description = "Environment not found", body = temps_core::problemdetails::ProblemDetails),
+        (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_container_history(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id)): Path<(i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let rows = state
+        .deployment_service
+        .list_environment_container_history(project_id, environment_id)
+        .await?;
+
+    let containers = rows
+        .into_iter()
+        .map(|c| ContainerHistoryEntry {
+            id: c.id,
+            container_id: c.container_id,
+            container_name: c.container_name,
+            service_name: c.service_name,
+            deployment_id: c.deployment_id,
+            deployed_at: c.deployed_at.to_rfc3339(),
+            finished_at: c.finished_at.map(|t| t.to_rfc3339()),
+            deleted_at: c.deleted_at.map(|t| t.to_rfc3339()),
+            is_current: c.deleted_at.is_none(),
+        })
+        .collect();
+
+    Ok(Json(ContainerHistoryListResponse { containers }).into_response())
+}
+
 /// Stream container metrics via Server-Sent Events (SSE)
 #[utoipa::path(
     tag = "Containers",
@@ -2324,10 +2396,14 @@ pub async fn stream_container_metrics(
         .and_then(|i| i.parse::<u64>().ok())
         .unwrap_or(1000); // Default: 1 second
 
-    // Verify container exists and get initial stats
-    let _stats = state
+    // Verify container exists and is accessible before opening the stream.
+    // A DB-only lookup, not `get_container_metrics` — that would pay for a
+    // full Docker two-sample CPU read (~1s, see `sample_container_stats_twice`)
+    // just to discard the result, adding needless latency before the first
+    // real tick.
+    let _detail = state
         .deployment_service
-        .get_container_metrics(project_id, environment_id, container_id.clone())
+        .get_container_detail(project_id, environment_id, container_id.clone())
         .await?;
 
     let service = state.deployment_service.clone();
@@ -2401,6 +2477,7 @@ pub async fn stream_container_metrics(
     responses(
         (status = 200, description = "Successfully retrieved activity graph", body = ActivityGraphResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -2408,12 +2485,37 @@ pub async fn stream_container_metrics(
     )
 )]
 pub async fn get_activity_graph(
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
     Query(query): Query<ActivityGraphQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Note: No specific permission check needed as this is general activity overview
-    // Users can only see their own projects based on the RequireAuth check
+    permission_guard!(auth, DeploymentsRead);
+
+    match query.project_id {
+        Some(project_id) => {
+            // Caller asked for one project's activity — same authorization as
+            // every other project-scoped read in this file.
+            project_access_guard!(auth, project_id, app_state.project_access_checker);
+        }
+        None => {
+            // No `project_id` means the graph aggregates commit activity across
+            // every project on the instance. `RequireAuth` only proves the
+            // caller is *some* authenticated user, not which projects they may
+            // see, so this instance-wide view is restricted to administrators —
+            // everyone else must pass `project_id` to scope the graph to a
+            // project they can already access.
+            if !(auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin)) {
+                return Err(temps_core::error_builder::forbidden()
+                    .title("Insufficient Permissions")
+                    .detail(
+                        "Viewing the instance-wide activity graph requires an administrator \
+                         role; pass project_id to view a specific project's activity",
+                    )
+                    .value("user_role", auth.effective_role.to_string())
+                    .build());
+            }
+        }
+    }
 
     match app_state
         .deployment_service
@@ -2511,6 +2613,25 @@ mod tests {
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
+    /// Test double for handlers unrelated to sensitive-action gating --
+    /// always allows, so existing tests built before that gate was added
+    /// don't need to know about it.
+    struct AllowAllSensitiveActions;
+
+    #[async_trait]
+    impl temps_core::SensitiveActionAuthorizer for AllowAllSensitiveActions {
+        async fn authorize(
+            &self,
+            _action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            Ok(temps_core::SensitiveActionDecision::Allow)
+        }
+    }
+
     struct MediaWithoutDeploymentsRead;
 
     #[async_trait]
@@ -2529,6 +2650,23 @@ mod tests {
             _project_id: i32,
         ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Some(vec!["projects:read".to_string()]))
+        }
+    }
+
+    /// A checker that denies every project — used to prove that
+    /// `get_activity_graph` now enforces project access instead of relying on
+    /// `RequireAuth` alone (which only proves *some* authenticated user, not
+    /// which projects they may see).
+    struct DenyAllProjectAccess;
+
+    #[async_trait]
+    impl ProjectAccessChecker for DenyAllProjectAccess {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(false)
         }
     }
 
@@ -3013,6 +3151,35 @@ mod tests {
     /// Helper to create a mock AuthContext for testing
     fn create_test_auth_context() -> temps_auth::AuthContext {
         create_test_auth_context_for_role(temps_auth::Role::Admin)
+    }
+
+    /// Helper to create a mock AuthContext with a persisted session (non-None
+    /// session_id). Required for handlers that call `require_sensitive_action`,
+    /// because a bare `new_session()` with `session_id: None` yields a `None`
+    /// principal and causes an immediate 401 before the authorizer is consulted.
+    fn create_test_auth_context_persisted_session() -> temps_auth::AuthContext {
+        use temps_entities::users;
+        let user = users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: Some("hashed_password".to_string()),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        temps_auth::AuthContext::new_persisted_session(user, temps_auth::Role::Admin, 1)
     }
 
     #[test]
@@ -4165,6 +4332,7 @@ mod tests {
                 as Arc<dyn temps_core::PublicHostnameResolver>,
             metrics_store: None,
             failure_report_service,
+            sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
         })
     }
 
@@ -4465,6 +4633,100 @@ mod tests {
             historical_media.screenshot_location.as_deref(),
             Some("screenshots/media.webp")
         );
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_activity_graph_endpoint_enforces_project_access() {
+        use axum::extract::Request;
+        use axum::middleware;
+
+        if !database_test_prerequisites_available().await {
+            println!("Docker/test database not available, skipping");
+            return;
+        }
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Test database not available, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_activity_graph_http_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("create temporary data directory");
+        let mut app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+        Arc::get_mut(&mut app_state)
+            .expect("test app state is not shared yet")
+            .project_access_checker = Some(Arc::new(DenyAllProjectAccess));
+
+        async fn serve(app: Router) -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let address = listener.local_addr().expect("read test server address");
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve test application");
+            });
+            address
+        }
+
+        // A non-admin user with no team access to project 1: previously this
+        // endpoint had no permission_guard!/project_access_guard! at all and
+        // would have happily handed back that project's activity graph.
+        let user_auth = middleware::from_fn(
+            |mut request: Request, next: axum::middleware::Next| async move {
+                request
+                    .extensions_mut()
+                    .insert(create_test_auth_context_for_role(temps_auth::Role::User));
+                next.run(request).await
+            },
+        );
+        let user_address = serve(
+            configure_routes()
+                .layer(user_auth)
+                .with_state(app_state.clone()),
+        )
+        .await;
+
+        let denied = reqwest::get(format!(
+            "http://{user_address}/deployments/activity-graph?project_id=1"
+        ))
+        .await
+        .expect("request activity graph for an inaccessible project");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        // Same non-admin user, no project_id at all: this aggregates every
+        // project's activity across the whole instance, so it must be denied
+        // too rather than silently scoped to "your own projects" — RequireAuth
+        // proves nothing about which projects the caller may see.
+        let denied_instance_wide =
+            reqwest::get(format!("http://{user_address}/deployments/activity-graph"))
+                .await
+                .expect("request instance-wide activity graph as a non-admin");
+        assert_eq!(denied_instance_wide.status(), StatusCode::FORBIDDEN);
+
+        // An administrator may still see the instance-wide graph.
+        let admin_auth = middleware::from_fn(
+            |mut request: Request, next: axum::middleware::Next| async move {
+                request.extensions_mut().insert(create_test_auth_context());
+                next.run(request).await
+            },
+        );
+        let admin_address = serve(
+            configure_routes()
+                .layer(admin_auth)
+                .with_state(app_state.clone()),
+        )
+        .await;
+        let allowed = reqwest::get(format!("http://{admin_address}/deployments/activity-graph"))
+            .await
+            .expect("request instance-wide activity graph as an admin");
+        assert_eq!(allowed.status(), StatusCode::OK);
 
         std::fs::remove_dir_all(temp_dir).ok();
     }
@@ -5370,9 +5632,13 @@ mod tests {
         .await
         .expect("Failed to create test environment");
 
+        // teardown_environment calls require_sensitive_action, so the auth
+        // context must have a non-None session_id to produce a principal.
+        // Use new_persisted_session here; the AllowAllSensitiveActions
+        // authorizer in the test AppState will permit the action.
         let auth_middleware = middleware::from_fn(
             |mut req: Request, next: axum::middleware::Next| async move {
-                let auth_context = create_test_auth_context();
+                let auth_context = create_test_auth_context_persisted_session();
                 req.extensions_mut().insert(auth_context);
                 req.extensions_mut().insert(create_test_request_metadata());
                 next.run(req).await

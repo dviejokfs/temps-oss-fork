@@ -43,6 +43,7 @@ import {
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { listBackupChildrenOptions } from '@/lib/backup-children'
 import { deleteBackup } from '@/lib/backup-cleanup'
 import { cancelBackup } from '@/lib/schedule-runs'
@@ -59,6 +60,7 @@ import {
   FileArchive,
   HardDrive,
   Loader2,
+  RotateCcw,
   Trash2,
   XCircle,
 } from 'lucide-react'
@@ -235,7 +237,7 @@ export function BackupDetail() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
 
-  const { data: backup, isLoading } = useQuery({
+  const { data: backup, isLoading, error, refetch } = useQuery({
     ...getBackupOptions({
       path: { id: backupId! },
     }),
@@ -297,6 +299,8 @@ export function BackupDetail() {
   const queryClient = useQueryClient()
   const [showCancelDialog, setShowCancelDialog] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   const cancelMutation = useMutation({
     mutationFn: () => cancelBackup(backup!.id),
@@ -328,6 +332,10 @@ export function BackupDetail() {
       navigate(`/backups/s3-sources/${id}`)
     },
     onError: (err: unknown) => {
+      if (handleSensitiveActionError(err, () => deleteMutation.mutate())) {
+        setShowDeleteDialog(false)
+        return
+      }
       const message = err instanceof Error ? err.message : 'Unknown error'
       toast.error('Failed to delete backup', { description: message })
     },
@@ -337,6 +345,34 @@ export function BackupDetail() {
     return (
       <div className="flex items-center justify-center py-16">
         <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      </div>
+    )
+  }
+
+  if (error && !backup) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-4 py-16">
+        <AlertCircle className="h-8 w-8 text-destructive" />
+        <div className="text-center">
+          <h2 className="text-lg font-semibold">Failed to load backup</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {error instanceof Error
+              ? error.message
+              : 'An unexpected error occurred. Please try again.'}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={() => void refetch()}>
+            <RotateCcw className="mr-2 h-4 w-4" />
+            Retry
+          </Button>
+          <Button variant="ghost" asChild>
+            <Link to={`/backups/s3-sources/${id}`}>
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              Back to S3 Source
+            </Link>
+          </Button>
+        </div>
       </div>
     )
   }
@@ -877,6 +913,8 @@ export function BackupDetail() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {verificationDialog}
     </div>
   )
 }

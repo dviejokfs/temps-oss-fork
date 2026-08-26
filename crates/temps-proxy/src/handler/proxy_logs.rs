@@ -47,6 +47,13 @@ impl From<ProxyLogServiceError> for Problem {
                     .with_title("Traffic Aggregation Timed Out")
                     .with_detail(error.to_string())
             }
+            // The caller can fix this by asking for less, so it is a 400 with
+            // the remedy spelled out — not a 500 the user can only stare at.
+            ProxyLogServiceError::TrafficAggregationTooManyGroups { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Traffic Aggregation Too Large")
+                    .with_detail(error.to_string())
+            }
             // The ClickHouse error's `reason` is the stringified client error,
             // which can embed the internal endpoint host or schema fragments —
             // don't reflect it to the caller. Log the full detail and surface

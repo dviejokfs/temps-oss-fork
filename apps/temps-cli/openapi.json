@@ -481,6 +481,13 @@
       },
       "AddEventsRequest": {
         "properties": {
+          "batchId": {
+            "description": "Client-generated id, stable across retries of the same batch. When\npresent the append is idempotent; omitted, delivery is at-least-once.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "events": {
             "type": "string"
           }
@@ -2882,6 +2889,17 @@
               }
             ]
           },
+          "mcp_server": {
+            "default": {
+              "enabled": false
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/McpServerSettings",
+                "description": "MCP server settings (ADR-039). Off by default — enable via the Settings\nUI to expose the MCP endpoint to the Temps CLI wizard."
+              }
+            ]
+          },
           "monitoring": {
             "default": {
               "clickhouse_url": null,
@@ -3155,6 +3173,10 @@
           "letsencrypt": {
             "$ref": "#/components/schemas/LetsEncryptSettings"
           },
+          "mcp_server": {
+            "$ref": "#/components/schemas/McpServerSettings",
+            "description": "MCP (Model Context Protocol) server toggle (ADR-039). No sensitive\ncontent — passed through as-is so the settings UI can show and edit it."
+          },
           "monitored_services_count": {
             "description": "Number of enabled, running services the MetricsScraper currently\nincludes. Used for the lightweight storage estimate in the UI.",
             "format": "int64",
@@ -3251,7 +3273,8 @@
           "connection_limits",
           "tenant_resource_ceilings",
           "self_update",
-          "image_retention"
+          "image_retention",
+          "mcp_server"
         ],
         "type": "object"
       },
@@ -6543,6 +6566,76 @@
         ],
         "type": "object"
       },
+      "ContainerHistoryEntry": {
+        "description": "One container that has ever run for an environment — current or replaced\nby a later redeploy. `id` is the internal row ID to pass as the\n`container_id` path segment when calling the metrics/history endpoint for\nthis specific container generation (its docker `container_id` also works\nsince the history handler now resolves either).",
+        "properties": {
+          "container_id": {
+            "type": "string"
+          },
+          "container_name": {
+            "type": "string"
+          },
+          "deleted_at": {
+            "example": "2025-10-12T12:15:47.609192Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployed_at": {
+            "example": "2025-10-12T12:15:47.609192Z",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "finished_at": {
+            "example": "2025-10-12T12:15:47.609192Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_current": {
+            "description": "True if this row is the environment's currently-active container\n(deleted_at is null) — false for containers replaced by a later\nredeploy.",
+            "type": "boolean"
+          },
+          "service_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "container_id",
+          "container_name",
+          "deployment_id",
+          "deployed_at",
+          "is_current"
+        ],
+        "type": "object"
+      },
+      "ContainerHistoryListResponse": {
+        "properties": {
+          "containers": {
+            "items": {
+              "$ref": "#/components/schemas/ContainerHistoryEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "containers"
+        ],
+        "type": "object"
+      },
       "ContainerInfoResponse": {
         "properties": {
           "container_id": {
@@ -7478,6 +7571,19 @@
         ],
         "type": "object"
       },
+      "CreatableServiceTypeRoute": {
+        "enum": [
+          "mariadb",
+          "mongodb",
+          "postgres",
+          "redis",
+          "s3",
+          "kv",
+          "blob",
+          "rustfs"
+        ],
+        "type": "string"
+      },
       "CreateAlertRuleRequest": {
         "properties": {
           "cooldown_minutes": {
@@ -8138,7 +8244,7 @@
             "type": "object"
           },
           "service_type": {
-            "$ref": "#/components/schemas/ServiceTypeRoute"
+            "$ref": "#/components/schemas/CreatableServiceTypeRoute"
           },
           "topology": {
             "description": "Service topology: \"standalone\" (default) or \"cluster\" (HA multi-member).",
@@ -8447,7 +8553,7 @@
             "type": "string"
           },
           "ip_address": {
-            "description": "IP address in CIDR notation (e.g., \"192.168.1.1\" or \"10.0.0.0/24\")",
+            "description": "IPv4 or IPv6 address, in CIDR notation for ranges (e.g., \"192.168.1.1\",\n\"10.0.0.0/24\", \"2001:db8::1\", or \"2001:db8::/32\")",
             "example": "192.168.1.100",
             "type": "string"
           },
@@ -22817,6 +22923,18 @@
         ],
         "type": "object"
       },
+      "McpServerSettings": {
+        "description": "MCP server settings (ADR-039).\n\nThe MCP endpoint lets AI tools (e.g. the Temps CLI wizard) interact with\nthis Temps instance through the Model Context Protocol.  Disabled by\ndefault so new installs do not expose the endpoint until the operator\nexplicitly opts in.\n\n`bool` defaults to `false` in Rust and JSON (`#[serde(default)]`), so the\nsafe-off behaviour is automatic for new installs and legacy settings rows.",
+        "properties": {
+          "enabled": {
+            "default": false,
+            "description": "Master switch. When `false` (default), `GET /mcp/tools` returns `404`\nand all other MCP endpoints return `404` too.  Set to `true` via the\nSettings UI to activate the MCP server.",
+            "example": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "MessageContent": {
         "oneOf": [
           {
@@ -29144,6 +29262,14 @@
             "format": "int32",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "git_provider_type": {
+            "description": "Git provider behind `git_provider_connection_id`: `github`,\n`github_app`, `gitlab`, `gitea`, `bitbucket` or `generic`. `null` when\nthe project has no connection (public repository, Docker image or\nuploaded source).\n\nClients must use this rather than guessing the host from `git_url`: a\nself-hosted GitLab/Gitea/Bitbucket instance can live on any domain, and\na connected project may have no clone URL stored at all.",
+            "example": "gitlab",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -36633,6 +36759,13 @@
       },
       "SessionReplayEventsRequest": {
         "properties": {
+          "batchId": {
+            "description": "Client-generated id, stable across retries of the same batch. When\npresent the append is idempotent; omitted, delivery is at-least-once.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "events": {
             "type": "string"
           },
@@ -37384,6 +37517,19 @@
           "results",
           "message"
         ],
+        "type": "object"
+      },
+      "SetupMfaRequest": {
+        "properties": {
+          "current_password": {
+            "description": "Required to enroll MFA on an account that has a password set.\nOmit (or leave empty) for SSO-only accounts with no local password.",
+            "example": "current_password_value",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "SiblingRef": {
@@ -43516,6 +43662,13 @@
             ]
           },
           "main_branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Human-facing project display name. Unlike `slug` this is not part of any\nURL and is not required to be unique. Changing it also changes the\n`OTEL_SERVICE_NAME` injected into subsequent deployments.",
             "type": [
               "string",
               "null"
@@ -53234,6 +53387,16 @@
             },
             "description": "Unauthorized"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -53490,6 +53653,26 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -53578,6 +53761,16 @@
               }
             },
             "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "500": {
             "content": {
@@ -53709,6 +53902,16 @@
             },
             "description": "Unauthorized"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -53772,6 +53975,16 @@
               }
             },
             "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "500": {
             "content": {
@@ -53839,6 +54052,16 @@
             },
             "description": "Unauthorized"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -53878,6 +54101,26 @@
         "responses": {
           "204": {
             "description": "S3 source deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "content": {
@@ -53933,6 +54176,26 @@
               }
             },
             "description": "S3 source details"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "content": {
@@ -53998,6 +54261,26 @@
               }
             },
             "description": "S3 source updated"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "content": {
@@ -54075,6 +54358,16 @@
             },
             "description": "Unauthorized"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "S3 source not found"
           },
@@ -54138,6 +54431,26 @@
               }
             },
             "description": "Invalid request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "content": {
@@ -54206,6 +54519,16 @@
             },
             "description": "Unauthorized"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -54272,6 +54595,16 @@
               }
             },
             "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "content": {
@@ -54481,6 +54814,16 @@
             },
             "description": "Unauthorized"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -54535,6 +54878,16 @@
             },
             "description": "Unauthorized"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -54574,6 +54927,26 @@
         "responses": {
           "204": {
             "description": "Backup schedule deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "content": {
@@ -54629,6 +55002,26 @@
               }
             },
             "description": "Backup schedule details"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "description": "Backup schedule not found"
@@ -54702,6 +55095,16 @@
             },
             "description": "Unauthorized"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -54762,6 +55165,26 @@
             },
             "description": "List of backups for the schedule"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "Backup schedule not found"
           },
@@ -54805,6 +55228,26 @@
             },
             "description": "Backup schedule disabled"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "Backup schedule not found"
           },
@@ -54847,6 +55290,26 @@
               }
             },
             "description": "Backup schedule enabled"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "description": "Backup schedule not found"
@@ -55421,6 +55884,16 @@
               }
             },
             "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "content": {
@@ -56487,6 +56960,16 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "500": {
             "description": "Internal server error"
@@ -57627,8 +58110,19 @@
               }
             },
             "description": "Invalid domain name or lookup failed"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Lookup DNS A records for a domain",
         "tags": [
           "DNS"
@@ -62434,6 +62928,26 @@
             },
             "description": "Validation error"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -62480,6 +62994,26 @@
               }
             },
             "description": "Capabilities declared by the service"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "content": {
@@ -62548,6 +63082,26 @@
             },
             "description": "Validation error"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -62597,6 +63151,36 @@
               }
             },
             "description": "Recent restore runs for the service"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
           }
         },
         "security": [
@@ -63910,6 +64494,26 @@
             },
             "description": "Recent upgrades"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "500": {
             "description": "Internal error"
           }
@@ -63961,6 +64565,26 @@
           },
           "400": {
             "description": "Invalid request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "409": {
             "description": "An upgrade is already running for this service"
@@ -64019,6 +64643,26 @@
             },
             "description": "Upgrade"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "Not found"
           },
@@ -64072,6 +64716,26 @@
               }
             },
             "description": "Cancellation requested"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "description": "Not found"
@@ -64130,6 +64794,26 @@
             },
             "description": "Log content"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "Not found"
           },
@@ -64187,6 +64871,26 @@
           "400": {
             "description": "Upgrade is not in a retriable state"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "Not found"
           },
@@ -64240,6 +64944,26 @@
               }
             },
             "description": "Rollback complete"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
           },
           "404": {
             "description": "Not found"
@@ -68807,6 +69531,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
           },
           "500": {
             "description": "Internal server error"
@@ -82628,6 +83355,74 @@
         ]
       }
     },
+    "/projects/{project_id}/environments/{environment_id}/container-history": {
+      "get": {
+        "operationId": "list_container_history",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerHistoryListResponse"
+                }
+              }
+            },
+            "description": "Every container that has ever run for this environment, current and replaced"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List every container that has ever run for an environment — current and\nreplaced by a later redeploy. Use each entry's `container_id` (or `id`)\nwith the `/containers/{container_id}/metrics/history` endpoint to fetch\npersisted metrics for a specific container generation, including ones\nthat no longer exist because a redeploy replaced them.",
+        "tags": [
+          "Deployments"
+        ]
+      }
+    },
     "/projects/{project_id}/environments/{environment_id}/container-logs": {
       "get": {
         "operationId": "get_container_logs",
@@ -93927,6 +94722,26 @@
             },
             "description": "Restore run progress"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -96566,6 +97381,16 @@
     "/users/me/mfa/setup": {
       "post": {
         "operationId": "setup_mfa",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetupMfaRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -96577,8 +97402,11 @@
             },
             "description": "MFA setup data"
           },
+          "400": {
+            "description": "Current password is required but was not provided"
+          },
           "401": {
-            "description": "Unauthorized"
+            "description": "Unauthorized or current password is incorrect"
           },
           "409": {
             "description": "MFA is already enabled; verify and disable it before re-enrollment"
