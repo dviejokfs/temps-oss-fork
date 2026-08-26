@@ -622,9 +622,23 @@ export function OtelPipelineStatusPage() {
               <AlertTriangle className="h-4 w-4 text-amber-500" />
               <AlertTitle>History unavailable</AlertTitle>
               <AlertDescription>
-                Pipeline history could not be loaded. This is recorded by the
-                metrics store, which may not be enabled on this server — the
-                live counters below are unaffected.
+                {(historyError as any)?.status === 503 ? (
+                  <>
+                    Pipeline history is recorded by the metrics store, which is
+                    not enabled on this server — the live counters below are
+                    unaffected. Enable it from{' '}
+                    <Link
+                      to="/settings/metrics-monitoring"
+                      className="inline-flex items-center gap-1 font-medium underline underline-offset-2"
+                    >
+                      Metrics &amp; monitoring settings
+                      <ArrowRight className="h-3 w-3" />
+                    </Link>
+                    .
+                  </>
+                ) : (
+                  'Pipeline history could not be loaded. The live counters below are unaffected.'
+                )}
               </AlertDescription>
             </Alert>
           ) : (

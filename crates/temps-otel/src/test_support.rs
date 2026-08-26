@@ -44,6 +44,29 @@ pub struct MockOtelStorage {
     /// Total number of `store_spans` invocations, including failed ones, so
     /// tests can assert how many retry attempts actually happened.
     pub store_spans_calls: Arc<Mutex<u32>>,
+    /// If set, `store_metrics` will return this error instead. Mirrors
+    /// `fail_store_spans` for the metrics ingest retry-failure-injection tests.
+    pub fail_store_metrics: Arc<Mutex<Option<String>>>,
+    /// [`StorageErrorKind`] stamped onto the injected `fail_store_metrics`
+    /// error. `None` defaults to a terminal kind, mirroring
+    /// `fail_store_spans_kind`.
+    pub fail_store_metrics_kind: Arc<Mutex<Option<StorageErrorKind>>>,
+    /// How many *leading* `store_metrics` calls the injected failure applies
+    /// to. `None` means "every call". Mirrors `fail_store_spans_times`.
+    pub fail_store_metrics_times: Arc<Mutex<Option<u32>>>,
+    /// Total number of `store_metrics` invocations, including failed ones.
+    /// Mirrors `store_spans_calls`.
+    pub store_metrics_calls: Arc<Mutex<u32>>,
+    /// If set, `store_logs` will return this error instead. Used to exercise
+    /// `ingest_logs`'s non-fatal-DB-failure contract: even a terminal DB
+    /// error must not fail the overall `ingest_logs` call, because the S3
+    /// archive path is attempted regardless.
+    pub fail_store_logs: Arc<Mutex<Option<String>>>,
+    /// [`StorageErrorKind`] stamped onto the injected `fail_store_logs` error.
+    pub fail_store_logs_kind: Arc<Mutex<Option<StorageErrorKind>>>,
+    /// Total number of `store_logs` invocations, including failed ones.
+    /// Mirrors `store_spans_calls`.
+    pub store_logs_calls: Arc<Mutex<u32>>,
     /// If set, archive_logs will return this error.
     pub fail_archive_logs: Arc<Mutex<Option<String>>>,
     /// Counts calls to `get_storage_quota`, so tests can assert on
@@ -97,6 +120,18 @@ impl MockOtelStorage {
         *self.store_spans_calls.lock().unwrap()
     }
 
+    /// Number of times `store_metrics` has been called (failures included).
+    /// Mirrors `store_spans_call_count`.
+    pub fn store_metrics_call_count(&self) -> u32 {
+        *self.store_metrics_calls.lock().unwrap()
+    }
+
+    /// Number of times `store_logs` has been called (failures included).
+    /// Mirrors `store_spans_call_count`.
+    pub fn store_logs_call_count(&self) -> u32 {
+        *self.store_logs_calls.lock().unwrap()
+    }
+
     /// Ingest-failure groups recorded so far.
     pub fn recorded_ingest_errors(&self) -> Vec<IngestErrorSummary> {
         self.ingest_errors.lock().unwrap().clone()
@@ -124,6 +159,33 @@ impl MockOtelStorage {
         *self.fail_store_spans.lock().unwrap() = Some(message.to_string());
         *self.fail_store_spans_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseSchema);
         *self.fail_store_spans_times.lock().unwrap() = None;
+    }
+
+    /// Make `store_metrics` fail with a **transient** storage error on its
+    /// first `times` calls, then succeed. `times: None` fails every call
+    /// forever. Mirrors `fail_store_spans_transiently`.
+    pub fn fail_store_metrics_transiently(&self, message: &str, times: Option<u32>) {
+        *self.fail_store_metrics.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_metrics_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseNetwork);
+        *self.fail_store_metrics_times.lock().unwrap() = times;
+    }
+
+    /// Make `store_metrics` fail with a **terminal** storage error on every
+    /// call. Mirrors `fail_store_spans_fatally`.
+    pub fn fail_store_metrics_fatally(&self, message: &str) {
+        *self.fail_store_metrics.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_metrics_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseSchema);
+        *self.fail_store_metrics_times.lock().unwrap() = None;
+    }
+
+    /// Make `store_logs` fail with a **terminal** storage error on every
+    /// call. Mirrors `fail_store_spans_fatally`. Used to exercise
+    /// `ingest_logs`'s non-fatal-DB-failure contract: `ingest_logs` must
+    /// still return `Ok(count)` even when this fires, because the S3 archive
+    /// path is attempted regardless of the DB write's outcome.
+    pub fn fail_store_logs_fatally(&self, message: &str) {
+        *self.fail_store_logs.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_logs_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseSchema);
     }
 
     /// Aggregate the stored spans exactly as a real backend would: filter,
@@ -287,6 +349,32 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
 #[async_trait]
 impl OtelStorage for MockOtelStorage {
     async fn store_metrics(&self, points: Vec<MetricPoint>) -> StorageResult<u64> {
+        let call_index = {
+            let mut calls = self.store_metrics_calls.lock().unwrap();
+            let index = *calls;
+            *calls += 1;
+            index
+        };
+
+        if let Some(msg) = self.fail_store_metrics.lock().unwrap().as_ref() {
+            // `fail_store_metrics_times = Some(n)` fails only the first n
+            // calls, letting a test model a blip that heals on retry —
+            // mirrors `store_spans`.
+            let still_failing = match *self.fail_store_metrics_times.lock().unwrap() {
+                Some(times) => call_index < times,
+                None => true,
+            };
+            if still_failing {
+                return Err(OtelError::Storage {
+                    message: msg.clone(),
+                    kind: self
+                        .fail_store_metrics_kind
+                        .lock()
+                        .unwrap()
+                        .unwrap_or(StorageErrorKind::ClickHouseSchema),
+                });
+            }
+        }
         let count = points.len() as u64;
         self.metrics.lock().unwrap().extend(points);
         Ok(count)
@@ -324,6 +412,18 @@ impl OtelStorage for MockOtelStorage {
     }
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
+        *self.store_logs_calls.lock().unwrap() += 1;
+
+        if let Some(msg) = self.fail_store_logs.lock().unwrap().as_ref() {
+            return Err(OtelError::Storage {
+                message: msg.clone(),
+                kind: self
+                    .fail_store_logs_kind
+                    .lock()
+                    .unwrap()
+                    .unwrap_or(StorageErrorKind::ClickHouseSchema),
+            });
+        }
         let count = records.len() as u64;
         self.logs.lock().unwrap().extend(records);
         Ok(count)
@@ -372,7 +472,22 @@ impl OtelStorage for MockOtelStorage {
 
     async fn recent_ingest_errors(&self, limit: u32) -> StorageResult<Vec<IngestErrorSummary>> {
         let limit = crate::storage::clamp_ingest_error_limit(limit);
-        let mut groups = self.ingest_errors.lock().unwrap().clone();
+        // Match the real TimescaleDB backend's `WHERE last_seen > NOW() -
+        // INTERVAL '{INGEST_ERROR_WINDOW_DAYS} days'` filter (see
+        // `timescaledb::record_ingest_error`'s doc comment) — without this, a
+        // unit test built on this mock would get a false-green on window
+        // filtering, since the real backend excludes stale groups and this
+        // one didn't.
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::days(crate::storage::INGEST_ERROR_WINDOW_DAYS as i64);
+        let mut groups: Vec<IngestErrorSummary> = self
+            .ingest_errors
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|g| g.last_seen > cutoff)
+            .cloned()
+            .collect();
         groups.sort_by_key(|g| std::cmp::Reverse(g.last_seen));
         groups.truncate(limit as usize);
         Ok(groups)

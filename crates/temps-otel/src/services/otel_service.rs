@@ -944,6 +944,240 @@ mod tests {
         );
     }
 
+    // ── Metrics ingest: bounded retry around the storage write ──────────
+    //
+    // Mirrors the spans retry tests above (`test_ingest_spans_retries_*`,
+    // `test_ingest_spans_fatal_failure_does_not_retry`,
+    // `test_ingest_spans_exhausts_retries_and_counts_once`) — before this,
+    // only the spans path had failure-injection coverage for
+    // `store_with_retry`, even though `ingest_metrics` and `ingest_logs` go
+    // through the exact same helper.
+
+    /// A transient blip on the first metrics write must be healed by the
+    /// retry: the batch lands, nothing is counted as dropped, and the caller
+    /// sees a normal success.
+    #[tokio::test(start_paused = true)]
+    async fn test_ingest_metrics_retries_transient_failure_then_succeeds() {
+        let mock = MockOtelStorage::new();
+        mock.fail_store_metrics_transiently("connection reset by peer", Some(1));
+        let (svc, storage) = make_service(mock);
+
+        let point = test_support::metric_point(1, "http.server.duration", chrono::Utc::now(), &[]);
+
+        let stored = svc
+            .ingest_metrics(vec![point])
+            .await
+            .expect("transient failure should be retried, not surfaced");
+
+        assert_eq!(stored, 1);
+        assert_eq!(
+            storage.store_metrics_call_count(),
+            2,
+            "expected one failed attempt plus one successful retry"
+        );
+        assert_eq!(storage.stored_metrics().len(), 1, "batch must survive");
+
+        let stats = svc.pipeline_stats();
+        assert_eq!(stats.metrics_received, 1);
+        assert_eq!(stats.metrics_stored, 1);
+        assert_eq!(
+            stats.metrics_dropped, 0,
+            "a healed blip must not count drops"
+        );
+        assert_eq!(stats.ingest_errors, 0);
+    }
+
+    /// A terminal error must fail the metrics write on the very first
+    /// attempt — no sleeping, no second call.
+    #[tokio::test(start_paused = true)]
+    async fn test_ingest_metrics_fatal_failure_does_not_retry() {
+        let mock = MockOtelStorage::new();
+        mock.fail_store_metrics_fatally("schema mismatch: column `histogram_bounds` is missing");
+        let (svc, storage) = make_service(mock);
+
+        let point = test_support::metric_point(1, "http.server.duration", chrono::Utc::now(), &[]);
+
+        let started = tokio::time::Instant::now();
+        let result = svc.ingest_metrics(vec![point]).await;
+        let elapsed = started.elapsed();
+
+        assert!(matches!(
+            result,
+            Err(OtelError::Storage {
+                kind: StorageErrorKind::ClickHouseSchema,
+                ..
+            })
+        ));
+        assert_eq!(
+            storage.store_metrics_call_count(),
+            1,
+            "a terminal error must not be retried"
+        );
+        assert_eq!(
+            elapsed,
+            Duration::ZERO,
+            "no backoff may be incurred for a terminal error"
+        );
+
+        let stats = svc.pipeline_stats();
+        assert_eq!(stats.metrics_dropped, 1);
+        assert_eq!(stats.ingest_errors, 1);
+    }
+
+    /// A sustained outage still surfaces as an error after the bounded retry
+    /// is exhausted, and the counters must reflect one *ingest* failure — not
+    /// one per attempt — with the whole batch counted as dropped exactly
+    /// once. The failure reason must also be durable, mirroring the spans
+    /// path's `test_exhausted_retries_record_the_failure_reason`.
+    #[tokio::test(start_paused = true)]
+    async fn test_ingest_metrics_exhausts_retries_records_failure() {
+        let mock = MockOtelStorage::new();
+        mock.fail_store_metrics_transiently("connection reset by peer", None);
+        let (svc, storage) = make_service(mock);
+
+        let points = vec![
+            test_support::metric_point(1, "http.server.duration", chrono::Utc::now(), &[]),
+            test_support::metric_point(1, "http.server.duration", chrono::Utc::now(), &[]),
+        ];
+
+        let result = svc.ingest_metrics(points).await;
+
+        assert!(matches!(
+            result,
+            Err(OtelError::Storage {
+                kind: StorageErrorKind::ClickHouseNetwork,
+                ..
+            })
+        ));
+        assert_eq!(
+            storage.store_metrics_call_count(),
+            STORAGE_WRITE_MAX_ATTEMPTS,
+            "expected the full bounded attempt budget"
+        );
+
+        let stats = svc.pipeline_stats();
+        assert_eq!(stats.metrics_received, 2);
+        assert_eq!(stats.metrics_stored, 0);
+        assert_eq!(
+            stats.metrics_dropped, 2,
+            "the batch is dropped once, not once per attempt"
+        );
+        assert_eq!(
+            stats.ingest_errors, 1,
+            "3 attempts are still a single ingest failure"
+        );
+
+        let recorded = svc.recent_ingest_errors(20).await.unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].signal_type, "metrics");
+        assert_eq!(recorded[0].error_class, "clickhouse_network");
+    }
+
+    // ── Logs ingest: the DB write is non-fatal to the overall result ────
+
+    /// `ingest_logs` deliberately diverges from `ingest_spans`/`ingest_metrics`:
+    /// even a *terminal* DB failure must not fail the call, because the S3
+    /// archive path is attempted regardless — see the doc comment on
+    /// `OtelService::ingest_logs`. The DB failure still counts as a drop and
+    /// records an ingest-error group, but the method itself returns
+    /// `Ok(count)`.
+    #[tokio::test(start_paused = true)]
+    async fn test_ingest_logs_db_failure_is_non_fatal() {
+        let mock = MockOtelStorage::new();
+        mock.fail_store_logs_fatally("schema mismatch: column `severity` is missing");
+        let (svc, storage) = make_service(mock);
+
+        let now = chrono::Utc::now();
+        let make_log = |severity: LogSeverity, body: &str| LogRecord {
+            project_id: 1,
+            deployment_id: None,
+            resource: ResourceInfo::default(),
+            timestamp: now,
+            observed_timestamp: now,
+            severity,
+            severity_text: severity.to_string(),
+            body: body.to_string(),
+            trace_id: None,
+            span_id: None,
+            attributes: Default::default(),
+        };
+        let logs = vec![
+            make_log(LogSeverity::Error, "db is down"),
+            make_log(LogSeverity::Info, "still archiving"),
+        ];
+        let count = logs.len() as u64;
+
+        let result = svc.ingest_logs(logs).await;
+
+        assert_eq!(
+            result.unwrap(),
+            count,
+            "ingest_logs must return Ok(count) even when the DB write fails terminally"
+        );
+        assert_eq!(
+            storage.store_logs_call_count(),
+            1,
+            "a terminal DB error must not be retried"
+        );
+
+        let stats = svc.pipeline_stats();
+        assert_eq!(stats.logs_received, count);
+        assert_eq!(
+            stats.logs_dropped, count,
+            "the DB write failure must count the whole batch as dropped"
+        );
+        assert_eq!(stats.ingest_errors, 1);
+        assert_eq!(
+            stats.logs_stored_s3, count,
+            "the S3 archive path must still run despite the DB failure"
+        );
+
+        let recorded = svc.recent_ingest_errors(20).await.unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].signal_type, "logs");
+    }
+
+    // ── Mock ingest-error window filter matches the real backend ────────
+
+    /// `MockOtelStorage::recent_ingest_errors` must apply the same 7-day
+    /// window filter the real TimescaleDB backend does (see
+    /// `timescaledb_storage_test.rs::test_recent_ingest_errors_excludes_entries_older_than_the_window`),
+    /// or a unit test relying on the mock would get a false-green on window
+    /// filtering.
+    #[tokio::test]
+    async fn test_mock_recent_ingest_errors_filters_stale_groups() {
+        let mock = MockOtelStorage::new();
+        let now = chrono::Utc::now();
+        mock.ingest_errors.lock().unwrap().push(IngestErrorSummary {
+            signal_type: "spans".into(),
+            error_class: "clickhouse_network".into(),
+            sample_message: "recent".into(),
+            count: 1,
+            first_seen: now,
+            last_seen: now,
+        });
+        mock.ingest_errors.lock().unwrap().push(IngestErrorSummary {
+            signal_type: "logs".into(),
+            error_class: "postgres_conn".into(),
+            sample_message: "stale".into(),
+            count: 1,
+            first_seen: now - chrono::Duration::days(8),
+            last_seen: now - chrono::Duration::days(8),
+        });
+
+        let recorded = mock.recent_ingest_errors(50).await.unwrap();
+
+        assert!(
+            recorded.iter().any(|e| e.signal_type == "spans"),
+            "a group within the 7-day window must still be returned"
+        );
+        assert!(
+            !recorded.iter().any(|e| e.signal_type == "logs"),
+            "a group whose last_seen is 8 days old must be filtered out by the mock too, \
+             got {recorded:?}"
+        );
+    }
+
     // ── Duplicate-write safety (Greptile P1) ────────────────────────────
 
     /// The regression guard for silent duplicate rows.

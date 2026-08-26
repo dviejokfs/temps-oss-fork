@@ -116,12 +116,60 @@ async fn setup_e2e() -> Option<(
 ///   is what distinguishes a 403 from a 401.
 /// * `None` — no `AuthContext` is injected at all, so `RequireAuth` rejects
 ///   the request before any handler body runs.
+///
+/// Always builds the app with `metrics_store: None` — see
+/// [`setup_e2e_with_metrics_store`] for the variant that wires a real one in.
 async fn setup_e2e_as(
     role: Option<temps_auth::Role>,
 ) -> Option<(
     temps_database::test_utils::TestDatabase,
     axum::Router,
     i32, // project_id
+)> {
+    setup_e2e_as_full(role, false)
+        .await
+        .map(|(db, router, project_id, _store)| (db, router, project_id))
+}
+
+/// [`setup_e2e`] with a real [`temps_metrics::MetricsStore`] wired into
+/// `OtelAppState::metrics_store`, for testing `GET /otel/pipeline-history`'s
+/// 200 success path. `setup_e2e`/`setup_e2e_as` always build with
+/// `metrics_store: None`, which makes that path structurally unreachable —
+/// the handler returns 503 before it ever queries or serializes a series.
+///
+/// Returns the store handle alongside the router so a test can write points
+/// directly, standing in for one tick of the real background pipeline-stats
+/// sampler (`plugin.rs`'s 60-second `tokio::spawn` loop, which this manually
+/// wired test harness — unlike the full plugin registration path — never
+/// starts).
+async fn setup_e2e_with_metrics_store() -> Option<(
+    temps_database::test_utils::TestDatabase,
+    axum::Router,
+    i32, // project_id
+    std::sync::Arc<dyn temps_metrics::MetricsStore>,
+)> {
+    let (db, router, project_id, store) =
+        setup_e2e_as_full(Some(temps_auth::Role::Admin), true).await?;
+    Some((
+        db,
+        router,
+        project_id,
+        store.expect("metrics store was requested"),
+    ))
+}
+
+/// Shared implementation behind [`setup_e2e_as`] and
+/// [`setup_e2e_with_metrics_store`]. `with_metrics_store` controls whether
+/// `OtelAppState::metrics_store` is `Some(..)` (backed by a real
+/// `TimescaleMetricsStore` on the same test database) or `None`.
+async fn setup_e2e_as_full(
+    role: Option<temps_auth::Role>,
+    with_metrics_store: bool,
+) -> Option<(
+    temps_database::test_utils::TestDatabase,
+    axum::Router,
+    i32, // project_id
+    Option<std::sync::Arc<dyn temps_metrics::MetricsStore>>,
 )> {
     let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
@@ -242,9 +290,22 @@ async fn setup_e2e_as(
         None,
         facet_cache,
     ));
+    // Build a MetricsStore pointing at the same TimescaleDB connection only
+    // when requested — mirrors how `plugin.rs` builds `TimescaleMetricsStore`
+    // for the real app, but this harness never spawns the background
+    // pipeline-stats sampler, so tests that need history data write points
+    // directly via the returned handle.
+    let metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>> = if with_metrics_store {
+        Some(Arc::new(temps_metrics::TimescaleMetricsStore::new(
+            db.clone(),
+        )))
+    } else {
+        None
+    };
+
     let app_state = OtelAppState {
         otel_service,
-        metrics_store: None,
+        metrics_store: metrics_store.clone(),
         metrics_write_tx: None,
         dashboard_service,
         metric_alert_service,
@@ -280,7 +341,7 @@ async fn setup_e2e_as(
         .layer(auth_middleware)
         .with_state(app_state);
 
-    Some((test_db, router, project_id))
+    Some((test_db, router, project_id, metrics_store))
 }
 
 /// Helper: build a protobuf ExportTraceServiceRequest with a trace tree.
@@ -1024,6 +1085,23 @@ async fn test_e2e_pipeline_history_rejects_invalid_windows() {
         return;
     };
 
+    // The "too-wide window" case is computed from `Utc::now()` rather than
+    // hardcoded, so it keeps exceeding the 7-day cap (`MAX_WINDOW_DAYS`)
+    // indefinitely instead of silently becoming a fixed historical range that
+    // stops testing anything as time passes.
+    //
+    // Uses `to_rfc3339_opts(.., true)` (forces a `Z` suffix) rather than the
+    // plain `to_rfc3339()`, which renders the UTC offset as `+00:00` — the
+    // unescaped `+` is interpreted as a literal space once it lands in a URL
+    // query string, corrupting the timestamp before it ever reaches the
+    // handler's parser.
+    let now = chrono::Utc::now();
+    let too_wide_start =
+        (now - chrono::Duration::days(80)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let too_wide_end = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let too_wide_uri =
+        format!("/otel/pipeline-history?start_time={too_wide_start}&end_time={too_wide_end}");
+
     let cases = [
         (
             "/otel/pipeline-history?start_time=2026-08-20T00:00:00Z&end_time=2026-08-19T00:00:00Z",
@@ -1033,10 +1111,7 @@ async fn test_e2e_pipeline_history_rejects_invalid_windows() {
             "/otel/pipeline-history?start_time=2026-08-20T00:00:00Z",
             "Invalid Time Range",
         ),
-        (
-            "/otel/pipeline-history?start_time=2026-06-01T00:00:00Z&end_time=2026-08-20T00:00:00Z",
-            "Time Range Too Wide",
-        ),
+        (too_wide_uri.as_str(), "Time Range Too Wide"),
     ];
 
     for (uri, expected_title) in cases {
@@ -1065,6 +1140,116 @@ async fn test_e2e_pipeline_history_rejects_invalid_windows() {
             "a Problem Details response must carry an actionable detail for {uri}"
         );
     }
+}
+
+/// The 200 success path, structurally unreachable via `setup_e2e` because it
+/// hardcodes `metrics_store: None` (see `test_e2e_pipeline_history_reports_metrics_store_unavailable`
+/// above) — the handler returns 503 before it ever reaches the
+/// query/serialize logic. `setup_e2e_with_metrics_store` wires a real
+/// `TimescaleMetricsStore` in instead.
+///
+/// Ingests one trace (so the pipeline has something to report) and then
+/// writes one round of `otel.*` counter points directly to the metrics store
+/// to stand in for a single tick of the real background pipeline-stats
+/// sampler — `plugin.rs` spawns that sampler on a 60-second interval as part
+/// of full plugin registration, which this manually-wired test harness does
+/// not build, so a real 60s wait is neither necessary nor practical here.
+#[tokio::test]
+async fn test_e2e_pipeline_history_returns_series_when_metrics_store_available() {
+    let Some((_db, router, project_id, metrics_store)) = setup_e2e_with_metrics_store().await
+    else {
+        return;
+    };
+
+    // 1. At least one ingest.
+    let trace_id: [u8; 16] = [0x77; 16];
+    let request = build_trace_request(&trace_id, "pipeline-history-e2e");
+    let body = request.encode_to_vec();
+    let ingest_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/otel/v1/traces")
+                .header("content-type", "application/x-protobuf")
+                .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("x-temps-project-id", project_id.to_string())
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+
+    // 2. One simulated sampler tick — same shape the real sampler writes:
+    //    one Counter point per name in `OTEL_PIPELINE_METRIC_NAMES`, against
+    //    `SourceKind::Node` / `CONTROL_PLANE_NODE_ID`.
+    let now = chrono::Utc::now();
+    let points: Vec<temps_metrics::MetricPoint> = temps_otel::plugin::OTEL_PIPELINE_METRIC_NAMES
+        .iter()
+        .map(|name| temps_metrics::MetricPoint {
+            time: now,
+            source_kind: temps_metrics::SourceKind::Node,
+            source_id: temps_otel::plugin::CONTROL_PLANE_NODE_ID,
+            name: name.to_string(),
+            value: 1.0,
+            kind: temps_metrics::MetricKind::Counter,
+            engine: Some("otel".to_string()),
+            environment: None,
+            node_id: Some(temps_otel::plugin::CONTROL_PLANE_NODE_ID),
+            labels: std::collections::HashMap::new(),
+        })
+        .collect();
+    metrics_store
+        .write_batch(points)
+        .await
+        .expect("simulated sampler-tick write succeeds");
+
+    // 3. Query the default window and assert the response carries real data.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/otel/pipeline-history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let series = json["series"].as_array().expect("series must be an array");
+    assert!(
+        !series.is_empty(),
+        "expected non-empty series once ingest happened and a sampler tick was recorded, \
+         got: {json}"
+    );
+
+    for entry in series {
+        let name = entry["name"].as_str().unwrap_or_default();
+        assert!(
+            name.starts_with("otel."),
+            "every series name must be an otel.* pipeline counter, got {name:?}"
+        );
+        assert!(
+            entry["points"].is_array(),
+            "every series must carry a non-null points array, got {entry}"
+        );
+    }
+
+    // Proves the query round-trips real data rather than 13 always-present
+    // but permanently-empty series shells.
+    let has_data_point = series
+        .iter()
+        .any(|s| s["points"].as_array().is_some_and(|p| !p.is_empty()));
+    assert!(
+        has_data_point,
+        "expected at least one series to contain the point written by the simulated \
+         sampler tick, got: {json}"
+    );
 }
 
 // ── Pipeline stats E2E test ─────────────────────────────────────────

@@ -2279,3 +2279,183 @@ async fn test_span_stats_filters_by_service_name_and_status() {
     assert_eq!(named.len(), 1);
     assert!((named[0].max_duration_ms - 900.0).abs() < 1.0);
 }
+
+// ── Ingest error reporting (`record_ingest_error` / `recent_ingest_errors`) ─
+//
+// `record_ingest_error` upserts on `(signal_type, error_class)`, so these
+// tests exercise the three behaviours that are specific to the real Postgres
+// backend and cannot be pinned by the in-memory `MockOtelStorage` in
+// `otel_service.rs`'s unit tests: the upsert itself, the `WHERE last_seen >
+// NOW() - INTERVAL '7 days'` window filter, and the insert-time truncation of
+// an oversized sample message.
+
+/// Recording the same `(signal_type, error_class)` twice must bump the
+/// existing row's `count` rather than inserting a second row — the whole
+/// point of the `ON CONFLICT (signal_type, error_class) DO UPDATE` upsert.
+#[tokio::test]
+async fn test_record_ingest_error_upsert_bumps_count_not_a_new_row() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    storage
+        .record_ingest_error("spans", "clickhouse_network", "connection reset by peer")
+        .await
+        .expect("first record succeeds");
+    storage
+        .record_ingest_error(
+            "spans",
+            "clickhouse_network",
+            "connection reset by peer (again)",
+        )
+        .await
+        .expect("second record succeeds");
+
+    let errors = storage
+        .recent_ingest_errors(50)
+        .await
+        .expect("recent_ingest_errors succeeds");
+
+    let matching: Vec<_> = errors
+        .iter()
+        .filter(|e| e.signal_type == "spans" && e.error_class == "clickhouse_network")
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "the same (signal_type, error_class) pair must upsert into one row, \
+         not insert a second — got {errors:?}"
+    );
+    assert_eq!(
+        matching[0].count, 2,
+        "count must bump on the second occurrence"
+    );
+    assert!(
+        matching[0].sample_message.contains("(again)"),
+        "sample_message must be overwritten by the newest occurrence, got {:?}",
+        matching[0].sample_message
+    );
+}
+
+/// `recent_ingest_errors` must exclude groups whose `last_seen` has aged out
+/// of the 7-day reporting window (`INGEST_ERROR_WINDOW_DAYS`), so a failure
+/// mode that was fixed a while ago does not sit on the dashboard forever.
+/// Backdates a row's `last_seen` directly via SQL — there is no ingest-side
+/// way to fabricate an old timestamp — and proves it disappears while a fresh
+/// group in the same query stays visible.
+#[tokio::test]
+async fn test_recent_ingest_errors_excludes_entries_older_than_the_window() {
+    use sea_orm::ConnectionTrait;
+
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    // A fresh group — must remain in the report.
+    storage
+        .record_ingest_error("metrics", "postgres_conn", "recent failure")
+        .await
+        .expect("record succeeds");
+
+    // A group that will be backdated past the 7-day window — must disappear.
+    storage
+        .record_ingest_error("logs", "clickhouse_timeout", "stale failure")
+        .await
+        .expect("record succeeds");
+
+    _db.db
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE otel_ingest_errors SET last_seen = NOW() - INTERVAL '8 days' \
+             WHERE signal_type = $1 AND error_class = $2",
+            vec!["logs".into(), "clickhouse_timeout".into()],
+        ))
+        .await
+        .expect("backdating last_seen succeeds");
+
+    let errors = storage
+        .recent_ingest_errors(50)
+        .await
+        .expect("recent_ingest_errors succeeds");
+
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.signal_type == "metrics" && e.error_class == "postgres_conn"),
+        "a group last seen within the 7-day window must still be reported, got {errors:?}"
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e.signal_type == "logs" && e.error_class == "clickhouse_timeout"),
+        "a group whose last_seen is 8 days old must be excluded by the window filter, \
+         but was returned: {errors:?}"
+    );
+}
+
+/// A sample message longer than the 500-character cap must be truncated
+/// *before* the row is written — proving `truncate_sample_message` (see
+/// timescaledb.rs around `record_ingest_error`'s `INSERT`) is actually invoked
+/// on the insert path, not just available as an unused helper. Reads the raw
+/// column value directly (not only through `recent_ingest_errors`) so the
+/// assertion pins the on-disk value, not just this read path's shape.
+#[tokio::test]
+async fn test_record_ingest_error_truncates_long_sample_message_before_insert() {
+    use sea_orm::ConnectionTrait;
+
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    let long_message = "x".repeat(600);
+    storage
+        .record_ingest_error("spans", "clickhouse_other", &long_message)
+        .await
+        .expect("record succeeds");
+
+    // Via the storage-layer read path.
+    let errors = storage
+        .recent_ingest_errors(50)
+        .await
+        .expect("recent_ingest_errors succeeds");
+    let matching = errors
+        .iter()
+        .find(|e| e.signal_type == "spans" && e.error_class == "clickhouse_other")
+        .expect("group present");
+    assert!(
+        matching.sample_message.chars().count() <= 501,
+        "sample_message must be truncated to at most 500 chars + ellipsis, got {} chars",
+        matching.sample_message.chars().count()
+    );
+    assert!(
+        matching.sample_message.ends_with('…'),
+        "a truncated message must end with an ellipsis, got {:?}",
+        matching.sample_message
+    );
+    assert_ne!(
+        matching.sample_message, long_message,
+        "the 600-char message must actually be truncated, not stored verbatim"
+    );
+
+    // Via the raw column, to prove truncation happened at INSERT time and is
+    // not an artifact of the read path.
+    let row = _db
+        .db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT sample_message FROM otel_ingest_errors \
+             WHERE signal_type = $1 AND error_class = $2",
+            vec!["spans".into(), "clickhouse_other".into()],
+        ))
+        .await
+        .expect("query succeeds")
+        .expect("row exists");
+    let stored: String = row
+        .try_get("", "sample_message")
+        .expect("sample_message column readable");
+    assert!(
+        stored.chars().count() <= 501,
+        "the raw DB column must already be truncated at insert time, got {} chars",
+        stored.chars().count()
+    );
+}
