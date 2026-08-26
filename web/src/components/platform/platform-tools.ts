@@ -193,6 +193,22 @@ export const platformToolGroups: PlatformToolGroup[] = [
         featureKey: 'ai-agents-workflows',
       },
       {
+        title: 'MCP server',
+        description:
+          'Let Claude Code, Cursor, Codex, and other AI clients connect to this Temps instance.',
+        url: '/settings/mcp-server',
+        icon: Bot,
+        keywords: [
+          'model context protocol',
+          'claude',
+          'cursor',
+          'codex',
+          'windsurf',
+          'zed',
+          'tools',
+        ],
+      },
+      {
         title: 'Settings',
         description: 'Configure access, infrastructure, and security.',
         url: '/settings',

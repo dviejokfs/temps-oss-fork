@@ -2875,6 +2875,17 @@
               }
             ]
           },
+          "mcp_server": {
+            "default": {
+              "enabled": false
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/McpServerSettings",
+                "description": "MCP server settings (ADR-039). Off by default — enable via the Settings\nUI to expose the MCP endpoint to the Temps CLI wizard."
+              }
+            ]
+          },
           "monitoring": {
             "default": {
               "clickhouse_url": null,
@@ -3144,6 +3155,10 @@
           "letsencrypt": {
             "$ref": "#/components/schemas/LetsEncryptSettings"
           },
+          "mcp_server": {
+            "$ref": "#/components/schemas/McpServerSettings",
+            "description": "MCP (Model Context Protocol) server toggle (ADR-039). No sensitive\ncontent — passed through as-is so the settings UI can show and edit it."
+          },
           "monitored_services_count": {
             "description": "Number of enabled, running services the MetricsScraper currently\nincludes. Used for the lightweight storage estimate in the UI.",
             "format": "int64",
@@ -3239,7 +3254,8 @@
           "connection_limits",
           "tenant_resource_ceilings",
           "self_update",
-          "image_retention"
+          "image_retention",
+          "mcp_server"
         ],
         "type": "object"
       },
@@ -22731,6 +22747,18 @@
           "created_at",
           "updated_at"
         ],
+        "type": "object"
+      },
+      "McpServerSettings": {
+        "description": "MCP server settings (ADR-039).\n\nThe MCP endpoint lets AI tools (e.g. the Temps CLI wizard) interact with\nthis Temps instance through the Model Context Protocol.  Disabled by\ndefault so new installs do not expose the endpoint until the operator\nexplicitly opts in.\n\n`bool` defaults to `false` in Rust and JSON (`#[serde(default)]`), so the\nsafe-off behaviour is automatic for new installs and legacy settings rows.",
+        "properties": {
+          "enabled": {
+            "default": false,
+            "description": "Master switch. When `false` (default), `GET /mcp/tools` returns `404`\nand all other MCP endpoints return `404` too.  Set to `true` via the\nSettings UI to activate the MCP server.",
+            "example": false,
+            "type": "boolean"
+          }
+        },
         "type": "object"
       },
       "MessageContent": {
