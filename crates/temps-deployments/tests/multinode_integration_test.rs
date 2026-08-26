@@ -39,6 +39,12 @@ fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> node
         compute_cidr: None,
         underlay_address: None,
         last_heartbeat: Some(chrono::Utc::now() - chrono::Duration::seconds(heartbeat_age_secs)),
+        dns_resolver_running: None,
+        dns_resolver_tasks_alive: None,
+        dns_resolver_last_sync_at: None,
+        dns_resolver_consecutive_failures: 0,
+        dns_resolver_last_error: None,
+        dns_resolver_record_count: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -376,6 +382,7 @@ async fn test_heartbeat_reactivates_offline_node() {
                 architecture: None,
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
+                dns_resolver: None,
             },
         )
         .await;
@@ -401,6 +408,7 @@ async fn test_heartbeat_preserves_draining_status() {
                 architecture: None,
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
+                dns_resolver: None,
             },
         )
         .await;
@@ -476,6 +484,7 @@ async fn test_heartbeat_records_reported_architecture() {
                 architecture: Some("linux/arm64".to_string()),
                 capacity: serde_json::json!({"cpu_percent": 10}),
                 labels: None,
+                dns_resolver: None,
             },
         )
         .await;
@@ -508,6 +517,7 @@ async fn test_heartbeat_without_architecture_keeps_the_stored_one() {
                 architecture: None,
                 capacity: serde_json::json!({"cpu_percent": 10}),
                 labels: None,
+                dns_resolver: None,
             },
         )
         .await;
