@@ -24,6 +24,7 @@ use crate::{
     digest::{DigestScheduler, DigestService},
     handlers::{configure_routes, NotificationProvidersApiDoc, NotificationState},
     services::{NotificationPreferencesService, NotificationService},
+    NotificationRoutingService,
 };
 
 /// Notifications Plugin for managing notification providers and services
@@ -62,6 +63,10 @@ impl TempsPlugin for NotificationsPlugin {
             ));
             context.register_service(notification_service.clone());
 
+            let notification_routing_service =
+                Arc::new(NotificationRoutingService::new(db.clone()));
+            context.register_service(notification_routing_service.clone());
+
             // Register the notification service as the trait object directly
             // This avoids double-wrapping since the plugin system will wrap it in Arc
             let dyn_notification_service: Arc<dyn temps_core::notifications::NotificationService> =
@@ -84,6 +89,7 @@ impl TempsPlugin for NotificationsPlugin {
             // Create NotificationState for handlers
             let notification_state = Arc::new(NotificationState::new(
                 notification_service.clone(),
+                notification_routing_service,
                 notification_preferences_service.clone(),
                 digest_service.clone(),
                 audit_service,

@@ -38,3 +38,5 @@ tokio-test = "0.4"
 testcontainers = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
+sea-orm-migration = { workspace = true }
+temps-migrations = { path = "../temps-migrations" }

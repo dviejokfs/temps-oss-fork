@@ -8,14 +8,25 @@ use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
-#[sea_orm(table_name = "notification_providers")]
+#[sea_orm(table_name = "notification_routes")]
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub name: String,
-    pub provider_type: String,
-    pub config: String,
     pub enabled: bool,
+    /// Lowest notification severity matched by this route.
+    /// Stored as a lowercase `NotificationSeverity` name.
+    pub min_severity: String,
+    /// Highest notification severity matched by this route.
+    /// Stored as a lowercase `NotificationSeverity` name.
+    pub max_severity: String,
+    /// Set only for the auto-generated catch-all route created alongside a
+    /// provider (see `NotificationRoutingService::create_catch_all_route_for_provider`).
+    /// `None` for routes an operator created explicitly. The database FK
+    /// cascades on provider deletion, and the service layer uses this
+    /// column (not name parsing) to keep the route's display name in sync
+    /// when the provider is renamed.
+    pub catch_all_provider_id: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -24,11 +35,24 @@ pub struct Model {
 pub enum Relation {
     #[sea_orm(has_many = "super::notification_route_providers::Entity")]
     NotificationRouteProviders,
+    #[sea_orm(
+        belongs_to = "super::notification_providers::Entity",
+        from = "Column::CatchAllProviderId",
+        to = "super::notification_providers::Column::Id",
+        on_delete = "Cascade"
+    )]
+    CatchAllProvider,
 }
 
 impl Related<super::notification_route_providers::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::NotificationRouteProviders.def()
+    }
+}
+
+impl Related<super::notification_providers::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::CatchAllProvider.def()
     }
 }
 
