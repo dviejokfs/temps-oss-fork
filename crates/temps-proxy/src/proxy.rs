@@ -1203,6 +1203,7 @@ impl LoadBalancer {
         method: &str,
         accept: Option<&str>,
         fetch_destination: Option<&str>,
+        upgrade_insecure_requests: Option<&str>,
     ) -> bool {
         // API responses never represent a browser page, even when a framework
         // returns an HTML error document for an API-prefixed route.
@@ -1220,7 +1221,12 @@ impl LoadBalancer {
         // navigation with both an HTML Accept value and Fetch Metadata that
         // identifies a top-level document. Requiring both excludes generic
         // HTTP clients, framework data fetches, and embedded resources.
-        if !is_browser_document_request(method, accept, fetch_destination) {
+        if !is_browser_document_request(
+            method,
+            accept,
+            fetch_destination,
+            upgrade_insecure_requests,
+        ) {
             return false;
         }
 
@@ -1260,6 +1266,11 @@ impl LoadBalancer {
             .headers
             .get("sec-fetch-dest")
             .and_then(|value| value.to_str().ok());
+        let upgrade_insecure_requests = session
+            .req_header()
+            .headers
+            .get("upgrade-insecure-requests")
+            .and_then(|value| value.to_str().ok());
 
         if Self::should_track_page(
             &ctx.path,
@@ -1267,6 +1278,7 @@ impl LoadBalancer {
             &ctx.method,
             request_accept,
             fetch_destination,
+            upgrade_insecure_requests,
         ) {
             self.ensure_visitor_session(ctx).await;
         }
@@ -2734,6 +2746,7 @@ fn is_browser_document_request(
     method: &str,
     accept: Option<&str>,
     fetch_destination: Option<&str>,
+    upgrade_insecure_requests: Option<&str>,
 ) -> bool {
     if method != "GET" {
         return false;
@@ -2752,7 +2765,16 @@ fn is_browser_document_request(
 
     match fetch_destination {
         Some(destination) => destination.eq_ignore_ascii_case("document"),
-        None => true,
+        // Fetch Metadata is browser-sent only to potentially trustworthy
+        // origins (HTTPS, localhost), so it never arrives on a plain-HTTP
+        // deployment. On that path, Accept alone doesn't exclude non-browser
+        // clients (curl/wget/scrapers all send a browser-shaped Accept).
+        // Upgrade-Insecure-Requests is sent by browsers on top-level
+        // navigations to HTTP origins and essentially never by non-browser
+        // clients, so require it here. This still doesn't distinguish an
+        // <iframe> load from a top-level navigation — both send the header —
+        // which Fetch Metadata alone can't fix either.
+        None => upgrade_insecure_requests.is_some_and(|value| value.trim() == "1"),
     }
 }
 
@@ -5296,6 +5318,11 @@ impl ProxyHttp for LoadBalancer {
             .as_ref()
             .and_then(|headers| headers.get("sec-fetch-dest"))
             .map(String::as_str);
+        let upgrade_insecure_requests = ctx
+            .request_headers
+            .as_ref()
+            .and_then(|headers| headers.get("upgrade-insecure-requests"))
+            .map(String::as_str);
 
         // Check if we should track this page view
         let should_track = Self::should_track_page(
@@ -5304,6 +5331,7 @@ impl ProxyHttp for LoadBalancer {
             &ctx.method,
             request_accept,
             fetch_destination,
+            upgrade_insecure_requests,
         );
 
         // Only browser HTML documents create visitor/session state (skip SSE,
