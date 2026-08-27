@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 use tracing::{debug, info};
 
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/gotempsh/temps/releases";
@@ -413,9 +413,14 @@ impl UpgradeCommand {
             &staged_path,
         )?;
 
+        // Close the writable staging handle before the file can ever be
+        // executed. This is also required by the in-process updater's
+        // preflight: Unix rejects an executable that is still open for write.
+        let staged_path = seal_staged_binary(staged_file)?;
+
         // Replace the binary atomically
         println!("  Replacing binary at {}...", binary_path.display());
-        finalize_staged_binary(&binary_path, staged_file)?;
+        finalize_staged_binary(&binary_path, staged_path)?;
 
         println!();
         println!(
@@ -579,8 +584,10 @@ impl UpgradeCommand {
             &staged_path,
         )?;
 
+        let staged_path = seal_staged_binary(staged_file)?;
+
         println!("  Replacing binary at {}...", binary_path.display());
-        finalize_staged_binary(&binary_path, staged_file)?;
+        finalize_staged_binary(&binary_path, staged_path)?;
 
         // Install the license into the data dir so the binary finds it.
         let data_dir = resolve_data_dir(&self.data_dir)?;
@@ -1461,11 +1468,13 @@ pub(crate) fn create_upgrade_temp_file(
         })
 }
 
-/// Atomically persist an owned staged binary over the target.
-pub(crate) fn finalize_staged_binary(
-    binary_path: &Path,
-    staged_file: NamedTempFile,
-) -> anyhow::Result<()> {
+/// Finish writing a staged executable, make it durable, and close its writable
+/// handle.
+///
+/// Closing the handle is part of the correctness contract: the in-process
+/// updater executes this path for its preflight, and Unix can reject (or kill)
+/// an executable while any process still has it open for writing.
+pub(crate) fn seal_staged_binary(staged_file: NamedTempFile) -> anyhow::Result<TempPath> {
     let staged_path = staged_file.path().to_path_buf();
 
     #[cfg(unix)]
@@ -1483,24 +1492,32 @@ pub(crate) fn finalize_staged_binary(
 
     staged_file.as_file().sync_all().map_err(|e| {
         anyhow::anyhow!(
-            "Failed to sync staged binary {} before replacing {}: {}",
+            "Failed to sync staged binary {} before closing its write handle: {}",
             staged_path.display(),
-            binary_path.display(),
             e
         )
     })?;
 
+    Ok(staged_file.into_temp_path())
+}
+
+/// Atomically persist a sealed staged binary over the target.
+pub(crate) fn finalize_staged_binary(
+    binary_path: &Path,
+    staged_path: TempPath,
+) -> anyhow::Result<()> {
+    let staged_path_for_error = staged_path.to_path_buf();
+
     // The destination normally exists, so overwrite-capable `persist` is the
     // correct atomic operation; `persist_noclobber` would reject an upgrade.
-    let installed_file = staged_file.persist(binary_path).map_err(|e| {
+    staged_path.persist(binary_path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to atomically replace binary {} using staged file {}: {}",
             binary_path.display(),
-            staged_path.display(),
+            staged_path_for_error.display(),
             e.error
         )
     })?;
-    drop(installed_file);
 
     sync_binary_parent(binary_path)?;
     Ok(())
@@ -1600,7 +1617,8 @@ pub(crate) fn replace_binary(binary_path: &Path, new_binary: &[u8]) -> anyhow::R
             )
         })?;
 
-    finalize_staged_binary(binary_path, staged_file)
+    let staged_path = seal_staged_binary(staged_file)?;
+    finalize_staged_binary(binary_path, staged_path)
 }
 
 // ── EE proxy helpers ────────────────────────────────────────────────────────
@@ -2493,6 +2511,7 @@ mod tests {
         let staged_path = staged.path().to_path_buf();
         staged.as_file_mut().write_all(b"new").unwrap();
 
+        let staged = seal_staged_binary(staged).unwrap();
         finalize_staged_binary(&target, staged).unwrap();
 
         assert!(!staged_path.exists());
