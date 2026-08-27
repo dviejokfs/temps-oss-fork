@@ -154,6 +154,14 @@ async fn nft_table_exists(family: &str, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+async fn iptables_chain_contains(chain: &str, fragments: &[&str]) -> bool {
+    let output = Command::new("iptables").args(["-S", chain]).output().await;
+    matches!(output, Ok(output) if output.status.success() && {
+        let rules = String::from_utf8_lossy(&output.stdout);
+        fragments.iter().all(|fragment| rules.contains(fragment))
+    })
+}
+
 async fn fdb_has_entry(dev: &str, dst: &str) -> bool {
     let out = Command::new("bridge")
         .args(["fdb", "show", "dev", dev])
@@ -198,6 +206,43 @@ async fn docker_container_running(name: &str) -> bool {
 
 async fn cleanup_all() {
     // Best-effort tear-down of anything a previous test may have left.
+    while Command::new("iptables")
+        .args([
+            "-C",
+            "DOCKER-USER",
+            "-m",
+            "comment",
+            "--comment",
+            "temps-overlay-forward-hook-v1",
+            "-j",
+            "TEMPS_OVERLAY_FORWARD",
+        ])
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        let _ = Command::new("iptables")
+            .args([
+                "-D",
+                "DOCKER-USER",
+                "-m",
+                "comment",
+                "--comment",
+                "temps-overlay-forward-hook-v1",
+                "-j",
+                "TEMPS_OVERLAY_FORWARD",
+            ])
+            .output()
+            .await;
+    }
+    let _ = Command::new("iptables")
+        .args(["-F", "TEMPS_OVERLAY_FORWARD"])
+        .output()
+        .await;
+    let _ = Command::new("iptables")
+        .args(["-X", "TEMPS_OVERLAY_FORWARD"])
+        .output()
+        .await;
     let _ = Command::new("docker")
         .args(["network", "rm", "temps-overlay"])
         .output()
@@ -313,6 +358,18 @@ async fn bootstrap_creates_all_kernel_state() {
     assert!(
         nft_table_exists("inet", "temps_network").await,
         "nftables table must exist"
+    );
+    assert!(
+        iptables_chain_contains(
+            "TEMPS_OVERLAY_FORWARD",
+            &[
+                "-i vxlan-temps0",
+                "-o vxlan-temps0",
+                &env.peer_cidr.to_string()
+            ]
+        )
+        .await,
+        "Docker's default-DROP FORWARD chain must permit scoped VXLAN traffic"
     );
 }
 
@@ -465,6 +522,10 @@ async fn teardown_removes_everything_and_is_idempotent() {
     assert!(
         !nft_table_exists("inet", "temps_network").await,
         "nftables table must be gone"
+    );
+    assert!(
+        !iptables_chain_contains("TEMPS_OVERLAY_FORWARD", &[]).await,
+        "owned Docker forwarding chain must be gone"
     );
 
     // Second teardown must succeed silently.

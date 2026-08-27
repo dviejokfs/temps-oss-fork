@@ -88,6 +88,17 @@ pub enum NetworkError {
         reason: String,
     },
 
+    /// Docker's documented `DOCKER-USER` firewall hook could not be
+    /// reconciled. Cross-host VXLAN frames enter through the VXLAN device,
+    /// not the Docker bridge, so Docker's generated bridge rules alone do
+    /// not permit them through a default-DROP FORWARD chain.
+    #[error("iptables operation '{op}' on chain '{chain}' failed: {reason}")]
+    Iptables {
+        op: &'static str,
+        chain: String,
+        reason: String,
+    },
+
     // ----- docker -----
     /// Bollard returned an error while creating or inspecting the Docker
     /// network.

@@ -381,7 +381,11 @@ fn execute_status(cmd: NetworkStatusCommand) -> anyhow::Result<()> {
     print_docker_network(&cmd.docker_network);
 
     print_section("Routes:");
-    print_routes(&cmd.vxlan);
+    // VXLAN peer CIDRs are deliberately routed through the bridge so
+    // containers attached to the Docker bridge can use the routes directly.
+    // Showing routes on the VXLAN device therefore reports a false empty
+    // state even when reconciliation succeeded.
+    print_routes(&cmd.bridge);
 
     print_section("FDB entries:");
     print_fdb(&cmd.vxlan);

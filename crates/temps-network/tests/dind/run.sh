@@ -237,6 +237,10 @@ install_toolchain "$NODE_B"
 # ---------------------------------------------------------------------------
 log "running cross-host scenario (bootstrap both, ping across)"
 
+# Preserve a pre-existing operator policy. Temps must add its hook after this
+# rule rather than inserting at the head of DOCKER-USER.
+docker exec "$NODE_B" iptables -I DOCKER-USER 1 -s 192.0.2.1/32 -j DROP
+
 # Bootstrap node B with peer pointing to node A.
 docker exec \
   -e TEMPS_IT_LOCAL_NAME=node-b \
@@ -256,6 +260,12 @@ docker exec \
 log "signalling the still-running control plane that the worker is ready"
 docker exec "$NODE_B" touch "$WORKER_READY_FILE"
 wait "$CONTROL_PLANE_TEST_PID" || fail "live late-worker reconcile failed"
+
+NODE_B_USER_RULES="$(docker exec "$NODE_B" iptables -S DOCKER-USER)"
+OPERATOR_LINE="$(printf '%s\n' "$NODE_B_USER_RULES" | grep -n -- '-s 192.0.2.1/32 -j DROP' | cut -d: -f1)"
+TEMPS_HOOK_LINE="$(printf '%s\n' "$NODE_B_USER_RULES" | grep -n -- 'temps-overlay-forward-hook-v1' | cut -d: -f1)"
+test -n "$OPERATOR_LINE" -a -n "$TEMPS_HOOK_LINE" -a "$OPERATOR_LINE" -lt "$TEMPS_HOOK_LINE" \
+  || fail "Temps overlay hook bypassed pre-existing DOCKER-USER policy"
 
 log "proving the existing control-plane workload and custom route survived"
 docker exec "$NODE_A" docker network inspect "$EXISTING_APP_NETWORK" >/dev/null \
@@ -289,6 +299,12 @@ docker exec "$NODE_A" docker run --rm --network "$EXISTING_APP_NETWORK" \
   || fail "existing control-plane workload stopped serving traffic"
 
 log "both nodes bootstrapped — running container ping"
+
+# Mirror production Docker hosts, where FORWARD defaults to DROP. Remote
+# overlay frames enter through vxlan-temps0 rather than br-temps0; without the
+# TEMPS_OVERLAY_FORWARD hook this exact setup times out even though ARP works.
+docker exec "$NODE_A" iptables -P FORWARD DROP
+docker exec "$NODE_B" iptables -P FORWARD DROP
 
 docker exec "$NODE_A" docker run -d --rm --name nginx-a --network temps-overlay --ip 10.240.1.10 nginx:alpine >/dev/null
 docker exec "$NODE_B" docker run --rm --network temps-overlay --ip 10.240.2.10 alpine sh -ec '
