@@ -53,6 +53,12 @@ pub struct AgentCommand {
     /// auto-detecting the device carrying this host's IPv4 default route.
     #[arg(long, env = "TEMPS_AGENT_UNDERLAY_DEV")]
     pub underlay_dev: Option<String>,
+
+    /// Optional MTU ceiling for the overlay underlay. Defaults to reading the
+    /// selected interface's MTU from the kernel. Set this only when the path
+    /// MTU is lower than the interface advertises.
+    #[arg(long, env = "TEMPS_AGENT_UNDERLAY_MTU")]
+    pub underlay_mtu: Option<u32>,
 }
 
 impl AgentCommand {
@@ -314,6 +320,9 @@ impl AgentCommand {
             .underlay_dev
             .clone()
             .or_else(|| saved.as_ref().and_then(|c| c.underlay_dev.clone()));
+        let underlay_mtu = self
+            .underlay_mtu
+            .or_else(|| saved.as_ref().and_then(|c| c.underlay_mtu));
 
         Ok(temps_agent::AgentConfig {
             listen_address,
@@ -330,6 +339,7 @@ impl AgentCommand {
             tls_key_path,
             cluster_ca_path,
             underlay_dev,
+            underlay_mtu,
         })
     }
 

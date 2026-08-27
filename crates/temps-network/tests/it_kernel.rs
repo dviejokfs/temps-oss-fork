@@ -251,6 +251,21 @@ async fn detect_underlay_device_matches_default_route() {
 }
 
 #[tokio::test]
+async fn detect_underlay_mtu_matches_kernel_link() {
+    cleanup_all().await;
+    let env = Env::from_env();
+    let expected = link_mtu(&env.underlay_dev)
+        .await
+        .expect("underlay link must report an MTU");
+
+    let detected = temps_network::detect_underlay_mtu(&env.underlay_dev)
+        .await
+        .expect("detect_underlay_mtu");
+
+    assert_eq!(detected, expected);
+}
+
+#[tokio::test]
 async fn bootstrap_creates_all_kernel_state() {
     let (env, mgr, _cleanup) = fixture().await;
     let alloc = env.alloc();

@@ -120,6 +120,12 @@ pub struct AgentConfig {
     /// this field still parse.
     #[serde(default)]
     pub underlay_dev: Option<String>,
+    /// Optional MTU ceiling for the selected underlay. When absent, the
+    /// agent reads the interface MTU from the kernel. A configured value can
+    /// lower that detected ceiling for tunnels with a smaller path MTU, but
+    /// it can never raise the overlay beyond what the link supports.
+    #[serde(default)]
+    pub underlay_mtu: Option<u32>,
 }
 
 fn default_dns_data_dir() -> std::path::PathBuf {
@@ -407,11 +413,28 @@ mod tests {
             tls_key_path: None,
             cluster_ca_path: None,
             underlay_dev: None,
+            underlay_mtu: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.node_name, "worker-1");
         assert_eq!(parsed.node_id, 1);
+    }
+
+    #[test]
+    fn test_agent_config_without_underlay_mtu_remains_compatible() {
+        let json = r#"{
+            "listen_address":"0.0.0.0:3100",
+            "token":"test-token",
+            "node_name":"worker-1",
+            "control_plane_url":"https://control:3000",
+            "node_id":1,
+            "labels":{},
+            "dns_data_dir":"/tmp/temps-dns"
+        }"#;
+
+        let parsed: AgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.underlay_mtu, None);
     }
 }

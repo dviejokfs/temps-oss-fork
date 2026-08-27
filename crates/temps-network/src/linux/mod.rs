@@ -190,6 +190,20 @@ pub async fn detect_underlay_device() -> crate::Result<String> {
     route::default_route_device(&handle).await
 }
 
+/// Read the MTU advertised by the selected underlay link. The agent uses
+/// this as the upper bound for its overlay instead of assuming Ethernet's
+/// usual 1500-byte MTU; VLANs, WireGuard, and provider private networks often
+/// expose a smaller value.
+pub async fn detect_underlay_mtu(device: &str) -> crate::Result<u32> {
+    let (handle, _conn) = open_handle().await?;
+    bridge::link_mtu_by_name(&handle, device)
+        .await?
+        .ok_or_else(|| NetworkError::UnderlayMtuDetection {
+            device: device.to_string(),
+            reason: "interface does not exist or did not publish an MTU".to_string(),
+        })
+}
+
 /// Helper that opens an rtnetlink connection and spawns its background task
 /// onto the current tokio runtime, returning a usable handle.
 async fn open_handle() -> crate::Result<(rtnetlink::Handle, tokio::task::JoinHandle<()>)> {

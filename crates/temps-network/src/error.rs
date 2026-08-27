@@ -72,6 +72,13 @@ pub enum NetworkError {
     #[error("could not auto-detect underlay device from the default route: {reason}")]
     UnderlayDetection { reason: String },
 
+    /// Reading the MTU from the selected underlay device failed. Building a
+    /// VXLAN with a guessed MTU is unsafe because Linux rejects an overlay
+    /// larger than its parent and a too-large path MTU causes silent packet
+    /// loss on provider networks such as Hetzner vSwitch.
+    #[error("could not detect MTU for underlay device '{device}': {reason}")]
+    UnderlayMtuDetection { device: String, reason: String },
+
     // ----- firewall -----
     /// nftables rule installation failed.
     #[error("nftables operation '{op}' on table '{table}' failed: {reason}")]

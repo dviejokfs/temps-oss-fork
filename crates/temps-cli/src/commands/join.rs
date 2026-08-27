@@ -55,6 +55,12 @@ pub struct JoinCommand {
     /// overlay traffic (e.g. a private network on a VLAN sub-interface).
     #[arg(long)]
     pub underlay_dev: Option<String>,
+
+    /// Optional MTU ceiling for the selected underlay. Normally the agent
+    /// detects this from the interface. Set it only when the real path MTU is
+    /// lower than the interface reports.
+    #[arg(long)]
+    pub underlay_mtu: Option<u32>,
 }
 
 /// Response body from the control plane registration endpoint.
@@ -348,6 +354,7 @@ impl JoinCommand {
             tls_key_path: tls_paths.as_ref().map(|p| p.1.clone()),
             cluster_ca_path: tls_paths.as_ref().map(|p| p.2.clone()),
             underlay_dev: self.underlay_dev.clone(),
+            underlay_mtu: self.underlay_mtu,
         };
         self.save_agent_config(&config)?;
 
@@ -527,6 +534,7 @@ impl JoinCommand {
             tls_key_path: tls_paths.as_ref().map(|p| p.1.clone()),
             cluster_ca_path: tls_paths.as_ref().map(|p| p.2.clone()),
             underlay_dev: self.underlay_dev.clone(),
+            underlay_mtu: self.underlay_mtu,
         };
         self.save_agent_config(&config)?;
 

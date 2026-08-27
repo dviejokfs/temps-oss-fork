@@ -200,6 +200,14 @@ async fn run(
             }
         },
     }
+    net_config.underlay_mtu =
+        resolve_underlay_mtu(&net_config.underlay_dev, config.underlay_mtu).await?;
+    info!(
+        underlay_dev = %net_config.underlay_dev,
+        underlay_mtu = net_config.underlay_mtu,
+        overlay_mtu = net_config.transport.bridge_mtu(net_config.underlay_mtu),
+        "resolved overlay MTU from underlay device"
+    );
     let manager = match NetworkManager::new(net_config) {
         Ok(m) => m,
         Err(e) => {
@@ -251,6 +259,47 @@ async fn run(
 
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+async fn resolve_underlay_mtu(device: &str, configured_mtu: Option<u32>) -> Result<u32, SyncError> {
+    match temps_network::detect_underlay_mtu(device).await {
+        Ok(detected_mtu) => {
+            let effective_mtu = effective_underlay_mtu(detected_mtu, configured_mtu);
+            if let Some(configured_mtu) = configured_mtu {
+                if configured_mtu > detected_mtu {
+                    warn!(
+                        underlay_dev = %device,
+                        configured_mtu,
+                        detected_mtu,
+                        effective_mtu,
+                        "configured underlay MTU exceeds the device MTU; clamping to the device"
+                    );
+                }
+            }
+            Ok(effective_mtu)
+        }
+        Err(error) => match configured_mtu {
+            Some(configured_mtu) => {
+                warn!(
+                    underlay_dev = %device,
+                    configured_mtu,
+                    error = %error,
+                    "could not detect underlay MTU; using the explicit MTU ceiling"
+                );
+                Ok(configured_mtu)
+            }
+            None => Err(SyncError::UnderlayMtu {
+                device: device.to_owned(),
+                reason: error.to_string(),
+            }),
+        },
+    }
+}
+
+fn effective_underlay_mtu(detected_mtu: u32, configured_mtu: Option<u32>) -> u32 {
+    configured_mtu
+        .map(|configured_mtu| configured_mtu.min(detected_mtu))
+        .unwrap_or(detected_mtu)
 }
 
 async fn poll_once(
@@ -350,7 +399,7 @@ async fn apply(
         // created here so the deployer + service handlers can attach
         // containers to it. Without this, `compute_ip` is always None
         // and the DNS registry never gets per-container records.
-        if let Err(e) = ensure_overlay_docker_network(&alloc_for_docker).await {
+        if let Err(e) = ensure_overlay_docker_network(manager.config(), &alloc_for_docker).await {
             warn!(
                 error = %e,
                 "Failed to create overlay Docker network; containers \
@@ -661,15 +710,17 @@ fn publish_dns_health(
 /// in the agent and not in `linux::bootstrap` itself: keeping the
 /// kernel-level bootstrap pure of bollard means the integration tests in
 /// `temps-network/tests/it_kernel.rs` don't need a real Docker daemon.
-async fn ensure_overlay_docker_network(alloc: &NodeAlloc) -> Result<(), SyncError> {
+async fn ensure_overlay_docker_network(
+    config: &NetworkConfig,
+    alloc: &NodeAlloc,
+) -> Result<(), SyncError> {
     let docker = Docker::connect_with_local_defaults()
         .map_err(|e| SyncError::DockerConnect(e.to_string()))?;
-    let cfg = NetworkConfig::default();
-    temps_network::docker::ensure_network(&docker, &cfg, alloc)
+    temps_network::docker::ensure_network(&docker, config, alloc)
         .await
         .map_err(|e| SyncError::Bootstrap(format!("docker network: {}", e)))?;
     info!(
-        network = %cfg.docker_network_name,
+        network = %config.docker_network_name,
         cidr = %alloc.compute_cidr,
         "overlay Docker network ready"
     );
@@ -707,6 +758,9 @@ enum SyncError {
 
     #[error("failed to construct NetworkManager: {0}")]
     ManagerConstruct(String),
+
+    #[error("failed to resolve MTU for underlay device '{device}': {reason}")]
+    UnderlayMtu { device: String, reason: String },
 
     #[error("http error: {0}")]
     Http(String),
@@ -752,6 +806,26 @@ mod tests {
             compute_cidr: "172.20.6.0/24".into(),
             underlay_address: "10.0.0.6".into(),
         }
+    }
+
+    #[test]
+    fn detected_vlan_mtu_drives_vxlan_mtu() {
+        let underlay_mtu = effective_underlay_mtu(1400, None);
+        assert_eq!(underlay_mtu, 1400);
+        assert_eq!(
+            NetworkConfig::default().transport.bridge_mtu(underlay_mtu),
+            1350
+        );
+    }
+
+    #[test]
+    fn explicit_mtu_can_lower_detected_device_mtu() {
+        assert_eq!(effective_underlay_mtu(1500, Some(1400)), 1400);
+    }
+
+    #[test]
+    fn explicit_mtu_cannot_exceed_detected_device_mtu() {
+        assert_eq!(effective_underlay_mtu(1400, Some(1500)), 1400);
     }
 
     #[test]

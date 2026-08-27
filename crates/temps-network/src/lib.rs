@@ -61,6 +61,21 @@ pub async fn detect_underlay_device() -> Result<String> {
     linux::detect_underlay_device().await
 }
 
+/// Detect the MTU of the selected underlay interface. This must be resolved
+/// from the actual link rather than assumed to be 1500: VXLAN adds 50 bytes
+/// and Linux will reject an overlay MTU larger than the parent can carry.
+#[cfg(target_os = "linux")]
+pub async fn detect_underlay_mtu(device: &str) -> Result<u32> {
+    linux::detect_underlay_mtu(device).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn detect_underlay_mtu(_device: &str) -> Result<u32> {
+    Err(NetworkError::UnsupportedPlatform {
+        target: std::env::consts::OS,
+    })
+}
+
 #[cfg(not(target_os = "linux"))]
 pub async fn detect_underlay_device() -> Result<String> {
     Err(NetworkError::UnsupportedPlatform {
