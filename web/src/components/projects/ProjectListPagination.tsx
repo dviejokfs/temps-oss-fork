@@ -1,0 +1,159 @@
+import { type FormEvent } from 'react'
+import {
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
+} from 'lucide-react'
+
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import {
+  clampProjectPage,
+  PROJECT_PAGE_SIZE_OPTIONS,
+} from '@/lib/project-list-pagination'
+
+interface ProjectListPaginationProps {
+  page: number
+  pageSize: number
+  total: number
+  totalPages: number
+  onPageChange: (page: number) => void
+  onPageSizeChange: (pageSize: number) => void
+}
+
+export function ProjectListPagination({
+  page,
+  pageSize,
+  total,
+  totalPages,
+  onPageChange,
+  onPageSizeChange,
+}: ProjectListPaginationProps) {
+  const submitRequestedPage = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const formData = new FormData(event.currentTarget)
+    const parsed = Number(formData.get('page'))
+    const nextPage = clampProjectPage(parsed, totalPages)
+    event.currentTarget.reset()
+    if (nextPage !== page) onPageChange(nextPage)
+  }
+
+  const firstProject = (page - 1) * pageSize + 1
+  const lastProject = Math.min(page * pageSize, total)
+
+  return (
+    <nav
+      aria-label="Project list pagination"
+      className="flex flex-col gap-3 pt-2 lg:flex-row lg:items-center lg:justify-between"
+    >
+      <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
+        <span>
+          Showing {firstProject}–{lastProject} of {total} project
+          {total === 1 ? '' : 's'}
+        </span>
+        <div className="flex items-center gap-2">
+          <span>Per page</span>
+          <Select
+            value={String(pageSize)}
+            onValueChange={(value) => onPageSizeChange(Number(value))}
+          >
+            <SelectTrigger
+              className="h-9 w-[76px]"
+              aria-label="Projects per page"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {PROJECT_PAGE_SIZE_OPTIONS.map((size) => (
+                <SelectItem key={size} value={String(size)}>
+                  {size}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => onPageChange(1)}
+          disabled={page <= 1}
+          aria-label="Go to first page"
+          title="First page"
+        >
+          <ChevronsLeft />
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => onPageChange(page - 1)}
+          disabled={page <= 1}
+          aria-label="Go to previous page"
+          title="Previous page"
+        >
+          <ChevronLeft />
+        </Button>
+
+        <form
+          key={page}
+          className="flex items-center gap-2"
+          onSubmit={submitRequestedPage}
+        >
+          <label htmlFor="project-page-number" className="text-sm">
+            Page
+          </label>
+          <Input
+            id="project-page-number"
+            name="page"
+            type="number"
+            inputMode="numeric"
+            min={1}
+            max={totalPages}
+            defaultValue={page}
+            className="h-9 w-20"
+            aria-label="Page number"
+          />
+          <span className="text-sm text-muted-foreground">of {totalPages}</span>
+          <Button type="submit" variant="outline" size="sm">
+            Go
+          </Button>
+        </form>
+
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => onPageChange(page + 1)}
+          disabled={page >= totalPages}
+          aria-label="Go to next page"
+          title="Next page"
+        >
+          <ChevronRight />
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => onPageChange(totalPages)}
+          disabled={page >= totalPages}
+          aria-label="Go to last page"
+          title="Last page"
+        >
+          <ChevronsRight />
+        </Button>
+      </div>
+    </nav>
+  )
+}
