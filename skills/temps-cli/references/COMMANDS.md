@@ -70,12 +70,14 @@ Use this index or search for a top-level command heading to load only the releva
 - [`monitors`](#monitors) - Manage uptime monitors for status pages
 - [`webhooks`](#webhooks) - Manage webhooks for project events
 - [`containers`](#containers) - Manage project containers in environments
+- [`cluster`](#cluster) - Cluster-wide multi-node operations
 - [`tokens`](#tokens) - Manage deployment tokens for project API access (KV, Blob, etc.)
 - [`errors`](#errors) - Manage error tracking and error groups
 - [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
 - [`traces`](#traces) - Inspect distributed traces and operation latency
 - [`facets`](#facets) - Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
+- [`otel`](#otel) - Inspect the OTLP ingest pipeline itself — throughput, drops and failure reasons (server-wide, not project-scoped; see "temps metrics" to query ingested application metrics)
 - [`kv`](#kv) - KV store commands (coming soon)
 - [`flags`](#flags) - Manage feature flags (runtime config that changes without a redeploy)
 - [`data`](#data) - Browse the data inside a service (tables, collections, keys, objects) — read-only
@@ -101,6 +103,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`notification-preferences`](#notification-preferences) - Manage notification preferences
 - [`skills`](#skills) - Manage AI skill definitions (global or project-scoped)
 - [`mcp-servers`](#mcp-servers) - Manage MCP server definitions (global or project-scoped)
+- [`mcp`](#mcp) - Configure this Temps instance as an MCP server for AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Zed)
 - [`secrets`](#secrets) - Manage agent secrets. env-type: reference as ${TEMPS_SECRET:name} in MCP config. file-type: written to --mount-path in sandbox; reference that path.
 - [`sandbox`](#sandbox) - Manage standalone sandboxes (/v1/sandbox API)
 - [`workflow`](#workflow) - Trigger and inspect agent/workflow runs
@@ -260,7 +263,7 @@ Manage projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
-- `settings` - Update project settings (slug, attack mode, preview environments, image retention)
+- `settings` - Update project settings (name, slug, attack mode, preview environments, image retention)
 - `git` - Update git repository settings
 - `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
 - `config` - Update deployment configuration (resources, replicas)
@@ -393,13 +396,14 @@ Update project name and description
 
 ### `projects settings`
 
-Update project settings (slug, attack mode, preview environments, image retention)
+Update project settings (name, slug, attack mode, preview environments, image retention)
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
+| `--name <name>` | Project display name (does not change the URL) | - | No |
 | `--slug <slug>` | Project URL slug | - | No |
 | `--attack-mode` | Enable attack mode (CAPTCHA protection) | - | No |
 | `--no-attack-mode` | Disable attack mode | - | No |
@@ -1689,6 +1693,7 @@ Manage notification providers (Slack, Email, Webhook, etc.)
 - `show` - Show notification provider details
 - `remove` (`rm`) - Remove a notification provider
 - `test` - Send a test notification
+- `routes` - Manage severity-based notification routes (which providers receive which severities)
 
 ### `notifications list` (alias: `ls`)
 
@@ -1802,6 +1807,83 @@ Send a test notification
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Provider ID | - | Yes |
+
+### `notifications routes`
+
+Manage severity-based notification routes (which providers receive which severities)
+
+**Subcommands:**
+
+- `list` (`ls`) - List notification routes
+- `show` - Show notification route details
+- `create` - Create a notification route
+- `update` - Update a notification route
+- `remove` (`rm`) - Remove a notification route
+
+#### `notifications routes list` (alias: `ls`)
+
+List notification routes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes show`
+
+Show notification route details
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes create`
+
+Create a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | Route name | - | No |
+| `--min-severity <severity>` | Minimum severity: debug, info, warning, error, critical, emergency | - | No |
+| `--max-severity <severity>` | Maximum severity: debug, info, warning, error, critical, emergency | - | No |
+| `--provider-ids <ids>` | Comma-separated notification provider IDs | - | No |
+| `--enabled <enabled>` | Enable or disable (true/false, default: true) | - | No |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+#### `notifications routes update`
+
+Update a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `-n, --name <name>` | New route name | - | No |
+| `--min-severity <severity>` | Minimum severity: debug, info, warning, error, critical, emergency | - | No |
+| `--max-severity <severity>` | Maximum severity: debug, info, warning, error, critical, emergency | - | No |
+| `--provider-ids <ids>` | Comma-separated notification provider IDs (replaces the current set) | - | No |
+| `--enabled <enabled>` | Enable or disable (true/false) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes remove` (alias: `rm`)
+
+Remove a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ## `dns`
 
@@ -2899,6 +2981,7 @@ Manage project containers in environments
 - `start` - Start a stopped container
 - `stop` - Stop a running container
 - `restart` - Restart a container
+- `history` - List every container that has ever run in an environment, including ones replaced by a later redeploy
 - `metrics` - Get container resource metrics (all containers if no container ID specified)
 
 ### `containers list` (alias: `ls`)
@@ -2963,6 +3046,18 @@ Restart a container
 | `-e, --environment-id <id>` | Environment ID | - | Yes |
 | `-c, --container-id <id>` | Container ID | - | Yes |
 
+### `containers history`
+
+List every container that has ever run in an environment, including ones replaced by a later redeploy
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project-id <id>` | Project ID | - | Yes |
+| `-e, --environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
 ### `containers metrics`
 
 Get container resource metrics (all containers if no container ID specified)
@@ -2977,6 +3072,32 @@ Get container resource metrics (all containers if no container ID specified)
 | `--json` | Output in JSON format | - | No |
 | `-w, --watch` | Watch mode - continuously update metrics | - | No |
 | `-i, --interval <seconds>` | Refresh interval in seconds (default: 2) | `2` | No |
+
+## `cluster`
+
+Cluster-wide multi-node operations
+
+**Subcommands:**
+
+- `dns` - Cluster DNS resolver (ADR-024) operations
+
+### `cluster dns`
+
+Cluster DNS resolver (ADR-024) operations
+
+**Subcommands:**
+
+- `status` - Show whether cluster DNS is healthy across every node — resolver status, last sync, and errors — without SSHing into a node to read logs
+
+#### `cluster dns status`
+
+Show whether cluster DNS is healthy across every node — resolver status, last sync, and errors — without SSHing into a node to read logs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ## `tokens` (alias: `token`)
 
@@ -3160,6 +3281,7 @@ Get error time series data
 | `--project-id <id>` | Project ID | - | Yes |
 | `--days <days>` | Number of days to show | `7` | No |
 | `--bucket <bucket>` | Time bucket size (e.g., "1h", "15m", "1d") | `1h` | No |
+| `--environment-id <id>` | Filter chart data to a specific environment ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `errors dashboard`
@@ -3660,6 +3782,39 @@ Send a test delivery to an instance default forwarding destination
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+## `otel`
+
+Inspect the OTLP ingest pipeline itself — throughput, drops and failure reasons (server-wide, not project-scoped; see "temps metrics" to query ingested application metrics)
+
+**Subcommands:**
+
+- `ingest-errors` - Show why ingest batches were dropped, grouped by signal and failure reason
+- `pipeline-history` - Show pipeline counter trends over time (received/stored/dropped per signal)
+
+### `otel ingest-errors`
+
+Show why ingest batches were dropped, grouped by signal and failure reason
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--limit <n>` | Max failure groups to return (default: 20, server cap: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `otel pipeline-history`
+
+Show pipeline counter trends over time (received/stored/dropped per signal)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--period <period>` | Time period: 1h, 6h, 24h, 7d (server presets), or today/<n>h/<n>d resolved locally | `24h` | No |
+| `--start-time <iso>` | Explicit window start (RFC 3339) — overrides --period | - | No |
+| `--end-time <iso>` | Explicit window end (RFC 3339) — overrides --period | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `kv`
@@ -4630,7 +4785,7 @@ Create a new IP access control rule
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--ip <ip_or_cidr>` | IP address or CIDR range (e.g., "192.168.1.1" or "10.0.0.0/24") | - | No |
+| `--ip <ip_or_cidr>` | IPv4 or IPv6 address or CIDR range (e.g., "192.168.1.1", "10.0.0.0/24", or "2001:db8::/32") | - | No |
 | `--action <action>` | Action to take: "allow" or "deny" | - | No |
 | `--description <desc>` | Optional description/reason for the rule | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
@@ -5987,7 +6142,7 @@ Import a skill from a public GitHub repository (skills.sh-compatible). Source: <
 | `--project <slug>` | Install for a specific project | - | No |
 | `-f, --force` | Overwrite if a skill with the same slug already exists | - | No |
 
-## `mcp-servers` (alias: `mcp`)
+## `mcp-servers`
 
 Manage MCP server definitions (global or project-scoped)
 
@@ -6051,6 +6206,66 @@ Delete an MCP server definition
 | `--project <slug>` | Delete a project-scoped MCP server | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+## `mcp`
+
+Configure this Temps instance as an MCP server for AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Zed)
+
+**Subcommands:**
+
+- `enable` - Enable the Temps MCP server on this instance (admin, one-time per instance)
+- `disable` - Disable the Temps MCP server on this instance (admin)
+- `add` - Configure an AI client to connect to this Temps instance over MCP. Clients: claude-code, claude-desktop, codex, cursor, vscode, windsurf, zed
+- `remove` - Remove the Temps MCP server from an AI client
+- `status` - Show whether this instance has MCP enabled and which AI clients are configured
+
+### `mcp enable`
+
+Enable the Temps MCP server on this instance (admin, one-time per instance)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-u, --url <url>` | Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted. | - | No |
+
+### `mcp disable`
+
+Disable the Temps MCP server on this instance (admin)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-u, --url <url>` | Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted. | - | No |
+
+### `mcp add`
+
+Configure an AI client to connect to this Temps instance over MCP. Clients: claude-code, claude-desktop, codex, cursor, vscode, windsurf, zed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-g, --groups <groups>` | Comma-separated tool groups to enable (default: all) | - | No |
+| `-w, --write` | Enable write tools (deploy, delete, restart, etc). Default: read-only | - | No |
+| `-k, --api-key <key>` | Use this API key instead of creating or prompting for one | - | No |
+| `-u, --url <url>` | Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted. | - | No |
+| `-y, --yes` | Skip prompts and confirmation (uses defaults; requires --api-key or an existing login) | - | No |
+
+### `mcp remove`
+
+Remove the Temps MCP server from an AI client
+
+### `mcp status`
+
+Show whether this instance has MCP enabled and which AI clients are configured
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-u, --url <url>` | Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted. | - | No |
 
 ## `secrets` (alias: `secret`)
 
