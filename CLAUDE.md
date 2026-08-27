@@ -1052,7 +1052,7 @@ if (isLoading) return <Spinner />
 - **Filter bars**: `flex flex-col gap-2 sm:flex-row sm:flex-wrap`; selects use `w-full sm:w-[Npx]`
 - **Grids**: `grid-cols-1` → `md:grid-cols-2` → `lg:grid-cols-3` (or `grid-cols-2 md:grid-cols-4` for stat cards)
 - **Side panels**: `flex-col lg:flex-row`; panel uses `w-full lg:w-[Npx]`
-- **Pagination**: compact `{page} / {totalPages}` on mobile; full "Showing X–Y of Z" `hidden sm:inline`
+- **Pagination**: use the shared `ResponsivePagination` component. Below `sm`, show one row with labeled Previous and Next buttons around compact `{page} / {totalPages}` context; hide page-size, first/last, and direct-page controls. At `sm` and above, show the full "Showing X–Y of Z" and advanced controls.
 - **Headers**: `flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between`
 - **Button text**: `hidden sm:inline` for labels next to icons; icon-only on mobile
 - **Min-width**: add `min-w-[Npx]` on scrollable containers so content doesn't collapse
