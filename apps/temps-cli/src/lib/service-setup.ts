@@ -7,13 +7,17 @@
  */
 import { client, getErrorMessage } from './api-client.js'
 import { listServices, createService, getServiceTypeParameters } from '../api/sdk.gen.js'
-import type { ServiceTypeRoute } from '../api/types.gen.js'
+import type { CreatableServiceTypeRoute, ServiceTypeRoute } from '../api/types.gen.js'
 import { promptSelect, promptText, promptConfirm, promptCheckbox, type SelectOption } from '../ui/prompts.js'
 import { withSpinner, startSpinner, succeedSpinner } from '../ui/spinner.js'
 import { success, error, info, newline, colors } from '../ui/output.js'
 
 /** Service type configuration */
-export const SERVICE_TYPES: { id: ServiceTypeRoute; name: string; description: string }[] = [
+export const SERVICE_TYPES: {
+  id: CreatableServiceTypeRoute
+  name: string
+  description: string
+}[] = [
   { id: 'postgres', name: 'PostgreSQL', description: 'Reliable Relational Database' },
   { id: 'redis', name: 'Redis', description: 'In-Memory Data Store' },
   { id: 's3', name: 'S3', description: 'Object Storage (MinIO)' },
@@ -182,7 +186,7 @@ export async function selectServicesWithSuggestions(
       const id = parseInt(selection.split(':')[1]!, 10)
       selectedServiceIds.push(id)
     } else if (selection.startsWith('new:')) {
-      const type = selection.split(':')[1]! as ServiceTypeRoute
+      const type = selection.split(':')[1]! as CreatableServiceTypeRoute
       const newId = await createNewServiceOfType(type)
       if (newId) {
         selectedServiceIds.push(newId)
@@ -199,7 +203,7 @@ export async function selectServicesWithSuggestions(
 export async function createNewService(): Promise<number | null> {
   newline()
 
-  const typeChoices: SelectOption<ServiceTypeRoute>[] = SERVICE_TYPES.map((t) => ({
+  const typeChoices: SelectOption<CreatableServiceTypeRoute>[] = SERVICE_TYPES.map((t) => ({
     name: t.name,
     value: t.id,
     description: t.description,
@@ -242,7 +246,7 @@ const KNOWN_REQUIRED_FIELDS: Partial<Record<ServiceTypeRoute, string[]>> = {
  * This avoids prompting the user for values that can be derived automatically.
  */
 function autoGenerateRequiredParams(
-  serviceType: ServiceTypeRoute,
+  serviceType: CreatableServiceTypeRoute,
   serviceName: string,
   requiredFields: string[]
 ): Record<string, unknown> {
@@ -270,7 +274,9 @@ function autoGenerateRequiredParams(
  * Fetches the parameter schema to auto-populate required fields.
  * Includes retry logic if creation fails.
  */
-export async function createNewServiceOfType(serviceType: ServiceTypeRoute): Promise<number | null> {
+export async function createNewServiceOfType(
+  serviceType: CreatableServiceTypeRoute
+): Promise<number | null> {
   const typeLabel = SERVICE_TYPES.find((t) => t.id === serviceType)?.name || serviceType
 
   const serviceName = await promptText({

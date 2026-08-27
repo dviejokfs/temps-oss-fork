@@ -110,6 +110,39 @@ fn select_member_dns_endpoint(
     underlay_endpoint
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceExecutionRoute {
+    Local,
+    Remote(i32),
+}
+
+/// `external_services.node_id` is the ownership boundary: NULL means the
+/// control plane's Docker daemon, while a concrete ID means that worker's
+/// private daemon and network namespace.
+fn service_execution_route(node_id: Option<i32>) -> ServiceExecutionRoute {
+    match node_id {
+        Some(node_id) => ServiceExecutionRoute::Remote(node_id),
+        None => ServiceExecutionRoute::Local,
+    }
+}
+
+fn select_remote_container_name(
+    persisted_name: Option<&str>,
+    canonical_name: &str,
+    canonical_exists: bool,
+    legacy_name: &str,
+    legacy_exists: bool,
+) -> String {
+    if let Some(name) = persisted_name.filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+    if canonical_exists || canonical_name == legacy_name || !legacy_exists {
+        canonical_name.to_string()
+    } else {
+        legacy_name.to_string()
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum ExternalServiceError {
     #[error("Service {id} not found")]
@@ -1004,6 +1037,12 @@ pub struct ResourceLimitsUpdateResponse {
     pub applied: Vec<ResourceLimitApplyResult>,
 }
 
+/// TTL for the `<service>.temps.local` A record of a standalone managed
+/// service. Matches the Tier-2 cluster-member TTL: a standalone container's
+/// overlay IP only changes when the container is recreated, and 30s bounds
+/// how long a consumer can keep dialling a dead address after that.
+const STANDALONE_SERVICE_DNS_TTL: i32 = 30;
+
 /// Every field is `Arc`-wrapped, so `Clone` is a cheap refcount bump that
 /// shares the SAME `reconciler_shutdowns` map with the original -- unlike
 /// `ExternalServiceManager::new(...)`, which always allocates a fresh, empty
@@ -1199,13 +1238,6 @@ impl ExternalServiceManager {
                     reason: e.to_string(),
                 }
             })?;
-        backend_selection
-            .validate_for_service_create()
-            .map_err(|e| ExternalServiceError::ParameterValidationFailed {
-                service_id: 0,
-                reason: e.to_string(),
-            })?;
-
         match backend_selection.backend {
             ManagedS3BackendKind::Rustfs => Ok(self.create_service_instance(name, service_type)),
             ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
@@ -1220,7 +1252,13 @@ impl ExternalServiceManager {
                 reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services"
                     .to_string(),
             }),
-            ManagedS3BackendKind::Garage => unreachable!("Garage is rejected by validation"),
+            ManagedS3BackendKind::Garage => {
+                Err(ExternalServiceError::ParameterValidationFailed {
+                    service_id: 0,
+                    reason: "managed S3 backend 'garage' is not supported for service operations"
+                        .to_string(),
+                })
+            }
         }
     }
 
@@ -1262,6 +1300,47 @@ impl ExternalServiceManager {
             })?;
 
         RemoteServiceClient::new(node.address.clone(), token, node.name.clone())
+    }
+
+    async fn resolve_remote_container_name(
+        &self,
+        client: &RemoteServiceClient,
+        service_instance: &dyn ExternalService,
+        parameters: &HashMap<String, serde_json::Value>,
+    ) -> Result<String, ExternalServiceError> {
+        let persisted_name = parameters
+            .get("container_name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty());
+        if let Some(container_name) = persisted_name {
+            return Ok(container_name.to_string());
+        }
+
+        let canonical_name = service_instance.get_docker_container_name();
+        let canonical_exists = client
+            .service_status(&canonical_name)
+            .await?
+            .container_id
+            .is_some();
+
+        let legacy_name = service_instance.get_name();
+        let legacy_exists = if legacy_name != canonical_name && !canonical_exists {
+            client
+                .service_status(&legacy_name)
+                .await?
+                .container_id
+                .is_some()
+        } else {
+            false
+        };
+
+        Ok(select_remote_container_name(
+            persisted_name,
+            &canonical_name,
+            canonical_exists,
+            &legacy_name,
+            legacy_exists,
+        ))
     }
 
     /// Build the `RemoteServiceCreateParams` that the agent needs to create a
@@ -1482,7 +1561,7 @@ impl ExternalServiceManager {
 
         let container_name = self
             .create_service_instance(service_name.to_string(), backend_service_type)
-            .get_name();
+            .get_docker_container_name();
         let container_name_for_volume = format!("{}-{}", backend_service_type, service_name);
         let volume_name = format!("{}_data", container_name_for_volume);
 
@@ -1573,6 +1652,17 @@ impl ExternalServiceManager {
         request: CreateExternalServiceRequest,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         info!("Creating new external service");
+
+        #[allow(deprecated)]
+        if request.service_type == ServiceType::Minio {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id: 0,
+                reason:
+                    "MinIO service creation is deprecated; create an S3 or RustFS service instead"
+                        .to_string(),
+            });
+        }
+
         let service_slug = Self::generate_slug(&request.name);
 
         let backend_selection =
@@ -1914,7 +2004,19 @@ impl ExternalServiceManager {
             .await
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to recreate container: {}", e),
-            })
+            })?;
+
+        // A recreated container gets a new Docker IP, so the previously
+        // published A record now points at nothing. Re-publish it.
+        if let Err(e) = self.register_standalone_service_dns(service_id).await {
+            warn!(
+                service_id,
+                error = %e,
+                "Failed to refresh internal DNS record after recreating service container"
+            );
+        }
+
+        Ok(())
     }
 
     pub async fn list_services(&self) -> Result<Vec<ExternalServiceInfo>, ExternalServiceError> {
@@ -2470,13 +2572,14 @@ impl ExternalServiceManager {
             info!("Removing service {} container", service_id);
             if let Some(node_id) = service.node_id {
                 let client = self.get_remote_client(node_id).await?;
+                let service_instance = self.create_service_instance_for_parameters(
+                    service.name.clone(),
+                    service_type_enum,
+                    &parameters,
+                )?;
                 let container_name = self
-                    .create_service_instance_for_parameters(
-                        service.name.clone(),
-                        service_type_enum,
-                        &parameters,
-                    )?
-                    .get_name();
+                    .resolve_remote_container_name(&client, service_instance.as_ref(), &parameters)
+                    .await?;
                 client.remove_service(&container_name).await.map_err(|e| {
                     ExternalServiceError::DeletionFailed {
                         id: service_id,
@@ -4808,6 +4911,19 @@ echo "[restore] Pre-seed complete"
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
 
+        // Attach to the overlay and publish `<service>.temps.local` so apps
+        // scheduled on other nodes have an address that can actually work.
+        // Best-effort: a healthy service must not be failed because the
+        // overlay isn't bootstrapped (single-node installs never need it).
+        if let Err(e) = self.register_standalone_service_dns(service_id).await {
+            warn!(
+                service_id,
+                error = %e,
+                "Failed to publish internal DNS record for service; cross-node linking \
+                 will be refused at deploy time until this succeeds"
+            );
+        }
+
         Ok(())
     }
 
@@ -4867,6 +4983,22 @@ echo "[restore] Pre-seed complete"
         let mut inferred = HashMap::new();
         inferred.insert("port".to_string(), response.host_port.to_string());
         inferred.insert("container_id".to_string(), response.container_id.clone());
+        // The agent reports the container's `temps-overlay` IP when it
+        // attached one. That IP is the ONLY address another node can use to
+        // reach this service — the published host port binds to 127.0.0.1
+        // on the worker — so persist it and publish it as DNS below.
+        if let Some(compute_ip) = response
+            .compute_ip
+            .as_deref()
+            .map(str::trim)
+            .filter(|ip| !ip.is_empty())
+        {
+            inferred.insert("compute_ip".to_string(), compute_ip.to_string());
+        }
+        inferred.insert(
+            "container_name".to_string(),
+            response.container_name.clone(),
+        );
 
         // Persist inferred parameters
         let mut current_params = self.get_service_parameters(service_id).await?;
@@ -4892,6 +5024,18 @@ echo "[restore] Pre-seed complete"
         service_update.config = Set(Some(encrypted_config));
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
+
+        // Publish `<service>.temps.local` -> the overlay IP the agent
+        // reported. Best-effort for the same reason as the local path.
+        if let Err(e) = self.register_standalone_service_dns(service_id).await {
+            warn!(
+                service_id,
+                node_id,
+                error = %e,
+                "Failed to publish internal DNS record for remote service; cross-node \
+                 linking will be refused at deploy time until this succeeds"
+            );
+        }
 
         Ok(())
     }
@@ -7424,7 +7568,6 @@ echo "[restore] Pre-seed complete"
     ) -> Result<(String, Option<i32>, Option<String>), ExternalServiceError> {
         use bollard::models::*;
         use bollard::query_parameters::*;
-        use futures::TryStreamExt;
 
         // Ensure network exists
         crate::utils::ensure_network_exists(&self.docker)
@@ -7435,21 +7578,9 @@ echo "[restore] Pre-seed complete"
             })?;
 
         // Pull image
-        self.docker
-            .create_image(
-                Some(CreateImageOptions {
-                    from_image: Some(params.image.clone()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
+        crate::utils::pull_image_with_retry(&self.docker, &params.image, None)
             .await
-            .map_err(|e| ExternalServiceError::DockerError {
-                id: 0,
-                reason: format!("Failed to pull image {}: {}", params.image, e),
-            })?;
+            .map_err(|e| ExternalServiceError::DockerError { id: 0, reason: e })?;
 
         // Create volume
         let volume_name = format!("{}_data", container_name);
@@ -7809,6 +7940,11 @@ echo "[restore] Pre-seed complete"
                 | "inferred_port"
                 | "password"
                 | "root_password"
+                // Overlay ("temps-overlay") IP reported by the agent for a
+                // remote service container. Changes every time the container
+                // is recreated, so it must be refreshed like `port` rather
+                // than treated as user-provided config.
+                | "compute_ip"
         )
     }
 
@@ -7908,13 +8044,14 @@ echo "[restore] Pre-seed complete"
         // Remote node — delegate to agent
         if let Some(node_id) = service.node_id {
             let client = self.get_remote_client(node_id).await?;
+            let service_instance = self.create_service_instance_for_parameters(
+                service.name.clone(),
+                service_type_enum,
+                &parameters,
+            )?;
             let container_name = self
-                .create_service_instance_for_parameters(
-                    service.name.clone(),
-                    service_type_enum,
-                    &parameters,
-                )?
-                .get_name();
+                .resolve_remote_container_name(&client, service_instance.as_ref(), &parameters)
+                .await?;
 
             match client.start_service(&container_name).await {
                 Ok(()) => {}
@@ -8027,6 +8164,19 @@ echo "[restore] Pre-seed complete"
             }
         }
 
+        // Docker hands out a fresh IP whenever a container is recreated, and
+        // `start()` reconciles (and may recreate) the container. Re-publish
+        // the A record so `<service>.temps.local` never points at a dead
+        // address. Best-effort — a running service must not be reported as
+        // failed because DNS is unavailable.
+        if let Err(e) = self.register_standalone_service_dns(service_id).await {
+            warn!(
+                service_id,
+                error = %e,
+                "Failed to refresh internal DNS record after starting service"
+            );
+        }
+
         self.get_service_info(service_id).await
     }
 
@@ -8090,13 +8240,14 @@ echo "[restore] Pre-seed complete"
         // Remote node — delegate to agent
         if let Some(node_id) = service.node_id {
             let client = self.get_remote_client(node_id).await?;
+            let service_instance = self.create_service_instance_for_parameters(
+                service.name.clone(),
+                service_type_enum,
+                &parameters,
+            )?;
             let container_name = self
-                .create_service_instance_for_parameters(
-                    service.name.clone(),
-                    service_type_enum,
-                    &parameters,
-                )?
-                .get_name();
+                .resolve_remote_container_name(&client, service_instance.as_ref(), &parameters)
+                .await?;
 
             client.stop_service(&container_name).await.map_err(|e| {
                 ExternalServiceError::StopFailed {
@@ -8342,12 +8493,6 @@ echo "[restore] Pre-seed complete"
             return Ok(cluster_vars);
         }
 
-        // Standalone: delegate to the service instance's get_runtime_env_vars
-        let service_instance = self.create_service_instance_for_parameters(
-            service.name.clone(),
-            service_type,
-            &parameters,
-        )?;
         let service_config = ServiceConfig {
             name: service.name.clone(),
             service_type,
@@ -8358,6 +8503,36 @@ echo "[restore] Pre-seed complete"
                 }
             })?,
         };
+
+        if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id) {
+            info!(
+                service_id = service_id_val,
+                node_id, "Dispatching external-service runtime provisioning to owning node"
+            );
+            let client = self.get_remote_client(node_id).await?;
+            return client
+                .get_runtime_env_vars(crate::remote_service_client::RemoteRuntimeEnvRequest {
+                    service_config,
+                    project_slug: project.slug,
+                    environment_slug: environment.slug,
+                })
+                .await
+                .map(|response| response.environment)
+                .map_err(|error| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to provision runtime environment for service {} on node {}: {}",
+                        service_id_val, node_id, error
+                    ),
+                });
+        }
+
+        // Local standalone service: preserve the existing in-process provider
+        // path against the control plane's Docker daemon.
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
 
         // Initialize the service to populate its internal config
         service_instance
@@ -8377,6 +8552,57 @@ echo "[restore] Pre-seed complete"
             })
     }
 
+    /// Run a standalone service's provider-authenticated health probe in the
+    /// runtime that owns its container. The control plane retains scheduling,
+    /// history, and alerting; only node-local execution crosses the agent API.
+    pub async fn probe_service_health(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<crate::externalsvc::HealthProbeResult, ExternalServiceError> {
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service.id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let service_config = self.get_service_config(service.id).await?;
+
+        if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id) {
+            info!(
+                service_id = service.id,
+                node_id, "Dispatching external-service health probe to owning node"
+            );
+            let client = self.get_remote_client(node_id).await?;
+            return client
+                .probe_health(crate::remote_service_client::RemoteHealthProbeRequest {
+                    service_config,
+                })
+                .await
+                .map(|response| response.result)
+                .map_err(|error| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to probe service {} on node {}: {}",
+                        service.id, node_id, error
+                    ),
+                });
+        }
+
+        let service_instance = self.create_service_instance_for_parameter_value(
+            service.name.clone(),
+            service_type,
+            &service_config.parameters,
+        )?;
+        service_instance
+            .health_probe(service_config)
+            .await
+            .map_err(|error| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Local health probe failed for service {}: {}",
+                    service.id, error
+                ),
+            })
+    }
+
     /// Get the effective address components for a service.
     ///
     /// Returns `(container_name, internal_port, host_port)` where:
@@ -8384,8 +8610,10 @@ echo "[restore] Pre-seed complete"
     /// - `internal_port` is the port inside the container (e.g., 5432 for Postgres)
     /// - `host_port` is the mapped port on the host machine
     ///
-    /// Used by the workflow planner to build remote environment variables by replacing
-    /// `container_name:internal_port` with `private_address:host_port`.
+    /// `host_port` is only meaningful **on the service's own host**: managed
+    /// service ports bind to `127.0.0.1` (see `crate::utils::local_port_binding`),
+    /// so `<other node>:<host_port>` is never reachable. Cross-node addressing
+    /// goes through [`Self::get_service_cross_node_link`] instead.
     pub async fn get_service_effective_address(
         &self,
         service_id: i32,
@@ -8445,79 +8673,248 @@ echo "[restore] Pre-seed complete"
         Ok((container_name, internal_port, host_port))
     }
 
-    /// Get runtime environment variables with cross-node address resolution.
-    ///
-    /// When the consuming container runs on a different node than the service,
-    /// connection strings are rewritten to use the service node's private/WireGuard IP
-    /// and host port instead of container names or localhost.
-    ///
-    /// If `target_node_id` is None or matches the service's node, returns
-    /// standard env vars (same as `get_runtime_env_vars`).
-    pub async fn get_cross_node_runtime_env_vars(
-        &self,
-        service_id_val: i32,
-        project_id: i32,
-        environment_id: i32,
-        target_node_id: Option<i32>,
-    ) -> Result<HashMap<String, String>, ExternalServiceError> {
-        // Get the base env vars (standard same-node behavior)
-        let mut env_vars = self
-            .get_runtime_env_vars(service_id_val, project_id, environment_id)
-            .await?;
+    /// Docker name of the multi-host overlay network. Fixed in
+    /// `temps_network::NetworkConfig::default`.
+    fn overlay_network_name() -> String {
+        temps_network::NetworkConfig::default().docker_network_name
+    }
 
-        // If no target node specified, return as-is (single-node mode)
-        let target_node_id = match target_node_id {
-            Some(id) => id,
-            None => return Ok(env_vars),
+    /// Best-effort dual-attach of a locally-managed container to the
+    /// multi-host overlay, returning the IP it ended up with there.
+    ///
+    /// Managed service containers are created on `temps-app-network` only,
+    /// which is a per-host bridge — an address on it means nothing to a
+    /// container on another node. Attaching to the overlay is what gives
+    /// the container a genuinely routable cross-node IP, and therefore
+    /// something a DNS A record can usefully point at.
+    ///
+    /// Returns `None` when the overlay is not bootstrapped on this host
+    /// (single-node installs), which is not an error: single-node installs
+    /// never need a cross-node address in the first place.
+    async fn attach_container_to_overlay(&self, container_ref: &str) -> Option<String> {
+        let overlay = Self::overlay_network_name();
+
+        let overlay_exists = match self
+            .docker
+            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+            .await
+        {
+            Ok(networks) => networks
+                .iter()
+                .any(|n| n.name.as_deref() == Some(overlay.as_str())),
+            Err(e) => {
+                debug!(
+                    container = container_ref,
+                    overlay = %overlay,
+                    error = %e,
+                    "Could not list docker networks; skipping overlay attach"
+                );
+                return None;
+            }
         };
-
-        // Check if the service is on a different node
-        let service = self.get_service(service_id_val).await?;
-        let service_node_id = service.node_id;
-
-        // Same node or both local: no rewriting needed
-        if service_node_id == Some(target_node_id) || service_node_id.is_none() {
-            return Ok(env_vars);
+        if !overlay_exists {
+            debug!(
+                container = container_ref,
+                overlay = %overlay,
+                "Overlay network not present on this host; skipping attach"
+            );
+            return None;
         }
 
-        // Cross-node: resolve the service node's private address and host port
-        let service_node_id = match service_node_id {
-            Some(id) => id,
-            None => return Ok(env_vars), // Service is local, target is remote — use local address
+        let req = bollard::models::NetworkConnectRequest {
+            container: container_ref.to_string(),
+            ..Default::default()
+        };
+        match self.docker.connect_network(&overlay, req).await {
+            Ok(()) => {
+                info!(
+                    container = container_ref,
+                    overlay = %overlay,
+                    "Attached managed service container to overlay"
+                );
+            }
+            // 403 from /networks/<id>/connect means "already connected".
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 403, ..
+            }) => {
+                debug!(
+                    container = container_ref,
+                    overlay = %overlay,
+                    "Managed service container already attached to overlay"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    container = container_ref,
+                    overlay = %overlay,
+                    error = %e,
+                    "Failed to attach managed service container to overlay"
+                );
+                return None;
+            }
+        }
+
+        self.lookup_container_network_ip(container_ref, &overlay)
+            .await
+    }
+
+    /// Publish (or refresh) the `<service>.temps.local` A record for a
+    /// **standalone** managed service.
+    ///
+    /// This is the counterpart of the Tier-2/Tier-3 registration cluster
+    /// members already get. Without it a single-container Postgres has no
+    /// name at all, and the only address a cross-node consumer could be
+    /// handed is `<node private address>:<host port>` — which is
+    /// permanently unreachable because the port is bound to loopback on
+    /// the service's host.
+    ///
+    /// Cluster services are skipped: `postgres_role_reconciler` owns
+    /// `<service>.temps.local` for those and would fight this writer.
+    ///
+    /// Best-effort by design — a service that provisioned correctly must
+    /// not be failed because the overlay isn't up. When no record can be
+    /// published, [`Self::get_service_cross_node_link`] reports
+    /// `dns_record_published: false` and the deploy path refuses to hand
+    /// out a broken address instead of silently doing so.
+    pub async fn register_standalone_service_dns(
+        &self,
+        service_id: i32,
+    ) -> Result<Option<String>, ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        if service.topology == "cluster" {
+            debug!(
+                service_id,
+                "Skipping standalone DNS registration for cluster service"
+            );
+            return Ok(None);
+        }
+
+        let Some(fqdn) =
+            crate::service_dns::standalone_service_fqdn(&service.name, service.slug.as_deref())
+        else {
+            warn!(
+                service_id,
+                service_name = %service.name,
+                "Service name yields no legal DNS label; no internal record published"
+            );
+            return Ok(None);
         };
 
-        use temps_entities::nodes;
-        let service_node = nodes::Entity::find_by_id(service_node_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| ExternalServiceError::InternalError {
-                reason: format!("Service node {} not found", service_node_id),
+        let (container_name, internal_port, _host_port) =
+            self.get_service_effective_address(service_id).await?;
+
+        let overlay_ip = match service.node_id {
+            // Control plane: we own this Docker daemon, so attach + inspect.
+            None => self.attach_container_to_overlay(&container_name).await,
+            // Worker node: the agent attached the container when it created
+            // it and reported the overlay IP back; we persisted it as an
+            // inferred parameter. We cannot inspect a remote daemon here.
+            Some(_) => self
+                .get_service_parameters(service_id)
+                .await?
+                .get("compute_ip")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|ip| !ip.is_empty())
+                .map(str::to_string),
+        };
+
+        let Some(ip) = overlay_ip else {
+            warn!(
+                service_id,
+                service_name = %service.name,
+                fqdn = %fqdn,
+                node_id = ?service.node_id,
+                "No overlay address for managed service; {} will not resolve until the \
+                 overlay network is bootstrapped and the service restarted",
+                fqdn
+            );
+            return Ok(None);
+        };
+
+        let target_port = internal_port.parse::<i32>().ok();
+        let draft = temps_dns::EndpointDraft {
+            fqdn: fqdn.clone(),
+            record_type: temps_dns::InternalRecordType::A,
+            target_ip: Some(ip.clone()),
+            target_port,
+            ttl: STANDALONE_SERVICE_DNS_TTL,
+            owner_kind: temps_dns::InternalOwnerKind::ServiceRole,
+            owner_id: service_id as i64,
+            node_id: service.node_id,
+        };
+
+        self.dns_registry
+            .replace_endpoints_for_owner(
+                temps_dns::InternalOwnerKind::ServiceRole,
+                service_id as i64,
+                &[draft],
+            )
+            .await
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to publish internal DNS record {} for service {} ({}): {}",
+                    fqdn, service_id, service.name, e
+                ),
             })?;
 
-        let private_addr = &service_node.private_address;
-
-        // Get the service's host port from its container
-        use temps_entities::deployment_containers;
-        let service_container = deployment_containers::Entity::find()
-            .filter(deployment_containers::Column::DeletedAt.is_null())
-            .filter(deployment_containers::Column::ContainerName.contains(&service.name))
-            .one(self.db.as_ref())
-            .await?;
-
-        let host_port = service_container
-            .as_ref()
-            .map(|c| c.host_port.unwrap_or(c.container_port));
-        let internal_port = service_container.as_ref().map(|c| c.container_port);
-
-        rewrite_env_vars_for_cross_node(
-            &mut env_vars,
-            &service.name,
-            private_addr,
-            host_port,
-            internal_port,
+        info!(
+            service_id,
+            fqdn = %fqdn,
+            ip = %ip,
+            port = ?target_port,
+            "Published internal DNS A record for standalone managed service"
         );
+        Ok(Some(fqdn))
+    }
 
-        Ok(env_vars)
+    /// How a container running on a **different node** should address this
+    /// service, and whether that address can actually work right now.
+    ///
+    /// The caller (the deployment planner) uses `container_name` as the
+    /// needle to rewrite in already-built connection strings and `fqdn` as
+    /// the replacement. It must *not* fall back to
+    /// `<private address>:<host port>`: managed service ports bind to
+    /// `127.0.0.1` on their own host, so that form is unreachable from
+    /// anywhere else and produces a connection string that fails silently.
+    pub async fn get_service_cross_node_link(
+        &self,
+        service_id: i32,
+    ) -> Result<crate::service_dns::ServiceCrossNodeLink, ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        let (container_name, _internal_port, _host_port) =
+            self.get_service_effective_address(service_id).await?;
+
+        let fqdn =
+            crate::service_dns::standalone_service_fqdn(&service.name, service.slug.as_deref());
+
+        // A published record is what makes the name resolve. Cluster
+        // services and standalone services both own their records under
+        // `ServiceRole` + `external_services.id`, so one lookup covers both.
+        let published = match fqdn.as_deref() {
+            Some(name) => self
+                .dns_registry
+                .list_by_owner(temps_dns::InternalOwnerKind::ServiceRole, service_id as i64)
+                .await
+                .map_err(|e| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to read internal DNS records for service {} ({}): {}",
+                        service_id, service.name, e
+                    ),
+                })?
+                .iter()
+                .any(|r| r.fqdn == name),
+            None => false,
+        };
+
+        Ok(crate::service_dns::ServiceCrossNodeLink {
+            service_id,
+            service_name: service.name,
+            container_name,
+            node_id: service.node_id,
+            fqdn,
+            dns_record_published: published,
+        })
     }
 
     pub async fn get_service_docker_environment_variables(
@@ -10616,39 +11013,6 @@ async fn precreate_cluster_members(
     Ok(pre_created)
 }
 
-/// Rewrites env var values for cross-node deployments.
-///
-/// Replaces container names and localhost references with the service node's
-/// private (WireGuard) address and host port.
-fn rewrite_env_vars_for_cross_node(
-    env_vars: &mut HashMap<String, String>,
-    service_name: &str,
-    private_addr: &str,
-    host_port: Option<i32>,
-    internal_port: Option<i32>,
-) {
-    let container_name = format!("{}-service", service_name);
-    for value in env_vars.values_mut() {
-        // Replace container_name:internal_port with private_addr:host_port
-        if value.contains(&container_name) {
-            if let (Some(hp), Some(ip)) = (host_port, internal_port) {
-                *value = value
-                    .replace(
-                        &format!("{}:{}", container_name, ip),
-                        &format!("{}:{}", private_addr, hp),
-                    )
-                    .replace(&container_name, private_addr);
-            }
-        }
-        // Also replace localhost references for baremetal mode
-        if value.contains("localhost") || value.contains("127.0.0.1") {
-            *value = value
-                .replace("localhost", private_addr)
-                .replace("127.0.0.1", private_addr);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10923,6 +11287,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_create_uses_provider_canonical_container_names() {
+        let manager = mock_service_manager(vec![]);
+
+        for (service_type, expected) in [
+            (ServiceType::Postgres, "postgres-orders"),
+            (ServiceType::Mariadb, "mariadb-orders"),
+            (ServiceType::Mongodb, "temps-mongodb-orders"),
+            (ServiceType::Redis, "redis-orders"),
+            (ServiceType::Rustfs, "rustfs-orders"),
+        ] {
+            let params = manager
+                .build_remote_create_params("orders", &service_type, &HashMap::new())
+                .expect("default remote service parameters should be valid");
+            assert_eq!(params.name, expected, "wrong name for {service_type}");
+        }
+    }
+
     /// Regression for the `ExternalServiceManager::Clone` fix: background
     /// tasks (create_service's cluster-init task and its retry path) must
     /// `self.clone()` rather than `::new(...)` so a role reconciler they
@@ -10980,6 +11362,12 @@ mod tests {
             compute_cidr: None,
             architecture: None,
             underlay_address: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -11259,6 +11647,12 @@ mod tests {
             compute_cidr: None,
             architecture: None,
             underlay_address: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -13947,145 +14341,6 @@ mod tests {
         println!("   4. Verify service connectivity with both versions");
     }
 
-    // --- Cross-node env var rewriting tests ---
-
-    #[test]
-    fn test_rewrite_env_vars_docker_mode_container_name() {
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            "DATABASE_URL".to_string(),
-            "postgresql://user:pass@my-postgres-service:5432/db".to_string(),
-        );
-        env_vars.insert(
-            "REDIS_URL".to_string(),
-            "redis://my-redis-service:6379/0".to_string(),
-        );
-
-        rewrite_env_vars_for_cross_node(
-            &mut env_vars,
-            "my-postgres",
-            "10.100.0.3",
-            Some(5433),
-            Some(5432),
-        );
-
-        // DATABASE_URL should be rewritten with private addr and host port
-        assert_eq!(
-            env_vars["DATABASE_URL"],
-            "postgresql://user:pass@10.100.0.3:5433/db"
-        );
-        // REDIS_URL is for a different service, should be unchanged
-        assert_eq!(env_vars["REDIS_URL"], "redis://my-redis-service:6379/0");
-    }
-
-    #[test]
-    fn test_rewrite_env_vars_baremetal_mode_localhost() {
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            "DATABASE_URL".to_string(),
-            "postgresql://user:pass@localhost:5433/db".to_string(),
-        );
-
-        rewrite_env_vars_for_cross_node(
-            &mut env_vars,
-            "my-postgres",
-            "10.100.0.3",
-            Some(5433),
-            Some(5432),
-        );
-
-        assert_eq!(
-            env_vars["DATABASE_URL"],
-            "postgresql://user:pass@10.100.0.3:5433/db"
-        );
-    }
-
-    #[test]
-    fn test_rewrite_env_vars_baremetal_mode_127001() {
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            "DATABASE_URL".to_string(),
-            "postgresql://user:pass@127.0.0.1:5433/db".to_string(),
-        );
-
-        rewrite_env_vars_for_cross_node(
-            &mut env_vars,
-            "my-postgres",
-            "10.100.0.3",
-            Some(5433),
-            Some(5432),
-        );
-
-        assert_eq!(
-            env_vars["DATABASE_URL"],
-            "postgresql://user:pass@10.100.0.3:5433/db"
-        );
-    }
-
-    #[test]
-    fn test_rewrite_env_vars_no_matching_patterns_unchanged() {
-        let mut env_vars = HashMap::new();
-        env_vars.insert("APP_NAME".to_string(), "my-cool-app".to_string());
-        env_vars.insert("LOG_LEVEL".to_string(), "debug".to_string());
-
-        rewrite_env_vars_for_cross_node(
-            &mut env_vars,
-            "my-postgres",
-            "10.100.0.3",
-            Some(5433),
-            Some(5432),
-        );
-
-        assert_eq!(env_vars["APP_NAME"], "my-cool-app");
-        assert_eq!(env_vars["LOG_LEVEL"], "debug");
-    }
-
-    #[test]
-    fn test_rewrite_env_vars_no_ports_skips_container_name_rewrite() {
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            "DATABASE_URL".to_string(),
-            "postgresql://user:pass@my-postgres-service:5432/db".to_string(),
-        );
-
-        // When host_port/internal_port are None, container name replacement is skipped
-        rewrite_env_vars_for_cross_node(&mut env_vars, "my-postgres", "10.100.0.3", None, None);
-
-        // Container name not rewritten (no port info available)
-        assert_eq!(
-            env_vars["DATABASE_URL"],
-            "postgresql://user:pass@my-postgres-service:5432/db"
-        );
-    }
-
-    #[test]
-    fn test_rewrite_env_vars_multiple_values_rewritten() {
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            "DATABASE_URL".to_string(),
-            "postgresql://user:pass@my-pg-service:5432/db".to_string(),
-        );
-        env_vars.insert("DATABASE_HOST".to_string(), "my-pg-service".to_string());
-        env_vars.insert("DATABASE_PORT".to_string(), "5432".to_string());
-
-        rewrite_env_vars_for_cross_node(
-            &mut env_vars,
-            "my-pg",
-            "10.100.0.5",
-            Some(5433),
-            Some(5432),
-        );
-
-        assert_eq!(
-            env_vars["DATABASE_URL"],
-            "postgresql://user:pass@10.100.0.5:5433/db"
-        );
-        // Bare container name without port gets replaced with private_addr
-        assert_eq!(env_vars["DATABASE_HOST"], "10.100.0.5");
-        // Plain port string doesn't match any pattern, stays as-is
-        assert_eq!(env_vars["DATABASE_PORT"], "5432");
-    }
-
     // ── Cluster validation tests ──────────────────────────────────────
 
     #[cfg(feature = "docker-tests")]
@@ -14992,5 +15247,44 @@ mod tests {
             5432,
         );
         assert_eq!(underlay, Some(("10.52.0.11".to_string(), 6012)));
+    }
+
+    #[test]
+    fn service_execution_without_node_id_stays_local() {
+        assert_eq!(service_execution_route(None), ServiceExecutionRoute::Local);
+    }
+
+    #[test]
+    fn service_execution_with_node_id_targets_owning_worker() {
+        assert_eq!(
+            service_execution_route(Some(17)),
+            ServiceExecutionRoute::Remote(17)
+        );
+    }
+
+    #[test]
+    fn remote_container_resolution_supports_persisted_canonical_and_legacy_names() {
+        assert_eq!(
+            select_remote_container_name(
+                Some("persisted-container"),
+                "postgres-orders",
+                true,
+                "orders",
+                true,
+            ),
+            "persisted-container"
+        );
+        assert_eq!(
+            select_remote_container_name(None, "postgres-orders", true, "orders", false),
+            "postgres-orders"
+        );
+        assert_eq!(
+            select_remote_container_name(None, "postgres-orders", false, "orders", true),
+            "orders"
+        );
+        assert_eq!(
+            select_remote_container_name(None, "postgres-orders", false, "orders", false),
+            "postgres-orders"
+        );
     }
 }

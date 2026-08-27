@@ -24,6 +24,10 @@ use crate::{
     ServiceBackupRequest, ServiceBackupResponse, ServiceCreateRequest, ServiceCreateResponse,
     ServiceExecRequest, ServiceExecResponse, ServiceRestoreRequest, ServiceStatus,
 };
+use temps_providers::remote_service_client::{
+    RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
+    RemoteRuntimeEnvResponse,
+};
 
 fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
     (
@@ -42,6 +46,18 @@ fn ok_response<T: serde::Serialize>(data: T) -> Json<AgentResponse<T>> {
         data: Some(data),
         error: None,
     })
+}
+
+fn mounted_volume_names(
+    container_name: &str,
+    mounts: Vec<bollard::models::MountPoint>,
+) -> std::collections::HashSet<String> {
+    let mut names = mounts
+        .into_iter()
+        .filter_map(|mount| mount.name)
+        .collect::<std::collections::HashSet<_>>();
+    names.insert(format!("{}_data", container_name));
+    names
 }
 
 /// Create and start an external service container on this node.
@@ -502,6 +518,35 @@ pub async fn remove_service(
         }
     };
 
+    // Capture the actual named volumes before removing the container. Volume
+    // names are not always derived from the final canonical container name
+    // (notably MongoDB, managed S3, KV, and Blob).
+    let mounts = match docker
+        .inspect_container(&name, None::<InspectContainerOptions>)
+        .await
+    {
+        Ok(container) => container.mounts.unwrap_or_default(),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Vec::new(),
+        Err(error) => {
+            tracing::error!(
+                service = %name,
+                "Refusing service removal because mounted volumes could not be inspected: {}",
+                error
+            );
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Failed to inspect service '{}' before volume-safe removal: {}",
+                    name, error
+                ),
+            )
+            .into_response();
+        }
+    };
+    let volume_names = mounted_volume_names(&name, mounts);
+
     // Stop first if running
     let _ = docker
         .stop_container(&name, None::<StopContainerOptions>)
@@ -539,28 +584,29 @@ pub async fn remove_service(
     // Best-effort: a "volume in use" failure here usually means another
     // container still mounts it (shouldn't happen, but harmless to log
     // and continue).
-    let volume_name = format!("{}_data", name);
-    match docker
-        .remove_volume(
-            &volume_name,
-            None::<bollard::query_parameters::RemoveVolumeOptions>,
-        )
-        .await
-    {
-        Ok(()) => {
-            tracing::info!(volume = %volume_name, "Service data volume removed");
-        }
-        Err(bollard::errors::Error::DockerResponseServerError {
-            status_code: 404, ..
-        }) => {
-            tracing::debug!(volume = %volume_name, "Service data volume already absent");
-        }
-        Err(e) => {
-            tracing::warn!(
-                volume = %volume_name,
-                "Failed to remove service data volume; cluster may inherit stale state on re-add: {}",
-                e
-            );
+    for volume_name in volume_names {
+        match docker
+            .remove_volume(
+                &volume_name,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(volume = %volume_name, "Service data volume removed");
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                tracing::debug!(volume = %volume_name, "Service data volume already absent");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    volume = %volume_name,
+                    "Failed to remove service data volume; cluster may inherit stale state on re-add: {}",
+                    e
+                );
+            }
         }
     }
 
@@ -795,6 +841,126 @@ pub async fn service_exec(
         stderr: output.1,
     })
     .into_response()
+}
+
+/// Provision a project's logical database, bucket, or Redis allocation on
+/// the worker that owns the external-service container.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/runtime-env",
+    request_body = RemoteRuntimeEnvRequest,
+    responses(
+        (status = 200, description = "Runtime resource provisioned", body = AgentResponse<RemoteRuntimeEnvResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Provisioning failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn runtime_env(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<RemoteRuntimeEnvRequest>,
+) -> impl IntoResponse {
+    let service_name = request.service_config.name.clone();
+    let service_type = request.service_config.service_type;
+    tracing::info!(
+        service = %service_name,
+        service_type = %service_type,
+        project = %request.project_slug,
+        environment = %request.environment_slug,
+        "Provisioning external-service runtime environment"
+    );
+
+    let docker = match state.docker.as_ref() {
+        Some(docker) => Arc::new(docker.clone()),
+        None => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Docker client is unavailable while provisioning service '{}'",
+                    service_name
+                ),
+            )
+            .into_response();
+        }
+    };
+
+    match temps_providers::externalsvc::provision_runtime_environment(
+        service_name.clone(),
+        service_type,
+        request.service_config,
+        &request.project_slug,
+        &request.environment_slug,
+        docker,
+    )
+    .await
+    {
+        Ok(environment) => ok_response(RemoteRuntimeEnvResponse { environment }).into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Failed to provision runtime resource for service '{}': {}",
+                service_name, error
+            ),
+        )
+        .into_response(),
+    }
+}
+
+/// Run an authenticated, provider-specific health probe on this node.
+///
+/// This endpoint intentionally does not accept arbitrary hosts, ports,
+/// commands, or query text. Provider code derives the probe target and
+/// protocol from the service configuration supplied by the control plane.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/health-probe",
+    request_body = RemoteHealthProbeRequest,
+    responses(
+        (status = 200, description = "Health probe completed", body = AgentResponse<RemoteHealthProbeResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Health probe failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn health_probe(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<RemoteHealthProbeRequest>,
+) -> impl IntoResponse {
+    let service_name = request.service_config.name.clone();
+    let service_type = request.service_config.service_type;
+    tracing::info!(
+        service = %service_name,
+        service_type = %service_type,
+        "Running provider-authenticated external-service health probe"
+    );
+
+    let docker = match state.docker.as_ref() {
+        Some(docker) => Arc::new(docker.clone()),
+        None => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Docker client is unavailable while probing service '{}'",
+                    service_name
+                ),
+            )
+            .into_response();
+        }
+    };
+
+    match temps_providers::externalsvc::probe_service_health(request.service_config, docker).await {
+        Ok(result) => ok_response(RemoteHealthProbeResponse { result }).into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Health probe failed for service '{}': {}",
+                service_name, error
+            ),
+        )
+        .into_response(),
+    }
 }
 
 /// List all service containers on this node.
@@ -1486,5 +1652,19 @@ mod overlay_ip_tests {
     fn returns_none_when_network_settings_missing() {
         let info = ContainerInspectResponse::default();
         assert!(extract_overlay_ip(&info).is_none());
+    }
+
+    #[test]
+    fn removal_uses_actual_named_mounts_and_canonical_fallback() {
+        let names = mounted_volume_names(
+            "temps-mongodb-orders",
+            vec![bollard::models::MountPoint {
+                name: Some("mongodb-orders_data".to_string()),
+                ..Default::default()
+            }],
+        );
+
+        assert!(names.contains("mongodb-orders_data"));
+        assert!(names.contains("temps-mongodb-orders_data"));
     }
 }

@@ -53,6 +53,7 @@ import {
 } from '@/lib/domain-status'
 import { DNSConfigurationHelper } from './DNSConfigurationHelper'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { useNavigate } from 'react-router'
 
 interface DomainsManagementProps {
@@ -95,6 +96,8 @@ export function DomainsManagement({
     null
   )
   const navigate = useNavigate()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   const {
     canManageCertificates,
@@ -109,7 +112,23 @@ export function DomainsManagement({
     },
     onSuccess: () => {
       toast.success('Domain deleted successfully')
+      setDomainToDelete(null)
       reloadDomains()
+    },
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          deleteDomain.mutate(variables)
+        )
+      ) {
+        setDomainToDelete(null)
+        return
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error(
+        problem.detail || problem.message || 'Failed to delete domain'
+      )
+      setDomainToDelete(null)
     },
   })
 
@@ -120,16 +139,12 @@ export function DomainsManagement({
     },
   })
 
-  const handleDeleteDomain = async (domain: string) => {
-    try {
-      await deleteDomain.mutateAsync({
-        path: {
-          domain: domain,
-        },
-      })
-    } finally {
-      setDomainToDelete(null)
-    }
+  const handleDeleteDomain = (domain: string) => {
+    deleteDomain.mutate({
+      path: {
+        domain: domain,
+      },
+    })
   }
 
   const handleRenewDomain = async (domainName: string) => {
@@ -241,6 +256,8 @@ export function DomainsManagement({
           </div>
         )}
       </div>
+
+      {verificationDialog}
 
       <AlertDialog
         open={domainToDelete !== null}

@@ -289,6 +289,7 @@ mod tests {
                 project_id: 1,
                 source: temps_otel::error::OtelError::Storage {
                     message: "x".into(),
+                    kind: temps_otel::error::StorageErrorKind::PostgresQuery,
                 },
             },
         ];

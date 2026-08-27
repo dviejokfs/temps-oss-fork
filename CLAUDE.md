@@ -929,6 +929,15 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`
 
 `git revert` defaults to a non-conventional subject (`Revert "original message"`). Never accept that default — always pass an explicit conventional message, e.g. `git revert --no-edit` then `git commit --amend -m "test: drop temporary failing test"`, or better, pass `-m` directly on the revert itself.
 
+### DCO Sign-off
+
+**Every commit must be signed off** (`Signed-off-by: Name <email>` trailer) —
+this is the Developer Certificate of Origin required on this OSS repo. Always
+commit with `git commit -s` (or `-s` on `git commit --amend`/`git revert`).
+A PR with an unsigned commit fails the DCO check regardless of how many
+commits are on the branch — every commit in `base..HEAD` needs its own
+trailer, not just the final one.
+
 ---
 
 ## Workspace Structure
@@ -1050,7 +1059,7 @@ if (isLoading) return <Spinner />
 - **Filter bars**: `flex flex-col gap-2 sm:flex-row sm:flex-wrap`; selects use `w-full sm:w-[Npx]`
 - **Grids**: `grid-cols-1` → `md:grid-cols-2` → `lg:grid-cols-3` (or `grid-cols-2 md:grid-cols-4` for stat cards)
 - **Side panels**: `flex-col lg:flex-row`; panel uses `w-full lg:w-[Npx]`
-- **Pagination**: compact `{page} / {totalPages}` on mobile; full "Showing X–Y of Z" `hidden sm:inline`
+- **Pagination**: use the shared `ResponsivePagination` component. Below `sm`, show one row with labeled Previous and Next buttons around compact `{page} / {totalPages}` context; hide page-size, first/last, and direct-page controls. At `sm` and above, show the full "Showing X–Y of Z" and advanced controls.
 - **Headers**: `flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between`
 - **Button text**: `hidden sm:inline` for labels next to icons; icon-only on mobile
 - **Min-width**: add `min-w-[Npx]` on scrollable containers so content doesn't collapse

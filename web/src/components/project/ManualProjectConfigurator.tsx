@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { createProjectMutation, listServicesOptions } from '@/api/client/@tanstack/react-query.gen'
-import type { ExternalServiceInfo, ServiceTypeRoute, SourceType } from '@/api/client/types.gen'
+import type {
+  CreatableServiceTypeRoute,
+  ExternalServiceInfo,
+  ServiceTypeRoute,
+  SourceType,
+} from '@/api/client/types.gen'
 import { ImportEnvDialog } from '@/components/ui/import-env-dialog'
 import { CreateServiceDialog } from '@/components/storage/CreateServiceDialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -138,7 +143,8 @@ export function ManualProjectConfigurator({
   // users ending up with N duplicate projects from a single intent).
   const isSubmittingRef = useRef(false)
   const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] = useState(false)
-  const [selectedServiceType, setSelectedServiceType] = useState<ServiceTypeRoute | null>(null)
+  const [selectedServiceType, setSelectedServiceType] =
+    useState<CreatableServiceTypeRoute | null>(null)
   const [showSecrets, setShowSecrets] = useState<{ [key: number]: boolean }>({})
   const [isImportEnvOpen, setIsImportEnvOpen] = useState(false)
   const [newlyCreatedServiceIds, setNewlyCreatedServiceIds] = useState<number[]>([])

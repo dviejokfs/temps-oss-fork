@@ -265,10 +265,26 @@ pub fn dispatch(
     cli: Cli,
     extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
 ) -> anyhow::Result<()> {
+    dispatch_with_ip_gate(cli, extra_plugins, None)
+}
+
+/// `dispatch`, plus an optional project IP gate for the `proxy` subcommand.
+///
+/// A standalone `temps proxy` has no plugin lifecycle, so the extension point
+/// the console uses to install a gate does not exist there. This is the
+/// equivalent seam for that process: an embedding binary that knows how to
+/// build a gate passes one, and split-topology proxy nodes then enforce
+/// project IP rules exactly as the single-binary mode does. `dispatch`
+/// passes `None`, leaving the open gate in place.
+pub fn dispatch_with_ip_gate(
+    cli: Cli,
+    extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
+    ip_gate_builder: Option<commands::proxy::ProjectIpGateBuilder>,
+) -> anyhow::Result<()> {
     // Commands are now synchronous to be compatible with pingora
     match cli.command {
         Commands::Serve(serve_cmd) => serve_cmd.execute_with_extra_plugins(extra_plugins),
-        Commands::Proxy(proxy_cmd) => proxy_cmd.execute(),
+        Commands::Proxy(proxy_cmd) => proxy_cmd.execute_with_ip_gate(ip_gate_builder),
         Commands::Setup(setup_cmd) => setup_cmd.execute(),
         Commands::Migrate(migrate_cmd) => migrate_cmd.execute(),
         Commands::ResetAdminPassword(reset_cmd) => reset_cmd.execute(),

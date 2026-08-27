@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { CreateServiceResponse, ServiceTypeRoute } from '@/api/client'
+import {
+  CreatableServiceTypeRoute,
+  CreateServiceResponse,
+} from '@/api/client'
 import {
   Dialog,
   DialogContent,
@@ -13,7 +16,7 @@ import { CreateServiceForm } from './CreateServiceForm'
 interface CreateServiceDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-  serviceType: ServiceTypeRoute
+  serviceType: CreatableServiceTypeRoute
   onSuccess: (data: CreateServiceResponse) => void
 }
 

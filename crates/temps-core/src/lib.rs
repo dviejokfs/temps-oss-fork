@@ -24,6 +24,7 @@ pub mod openapi;
 pub mod plugin;
 pub mod problemdetails;
 pub mod project_access;
+pub mod project_ip_gate;
 pub mod public_hostname;
 pub mod public_hostname_resolver;
 pub mod retention;
@@ -31,6 +32,7 @@ pub mod retry;
 pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
+pub mod static_files;
 pub mod telemetry;
 pub mod time_window;
 pub mod tls;
@@ -80,6 +82,7 @@ pub use error_builder::*;
 pub use jobs::*;
 pub use on_demand::*;
 pub use project_access::{MembershipPermissionResolver, ProjectAccessChecker};
+pub use project_ip_gate::{OpenIpGate, ProjectIpGate, ProjectIpGateSlot};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
     match_strategy, PublicHostnameResolver, StandardHostnameResolver,
@@ -105,10 +108,10 @@ pub use app_settings::{
     AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AppSettings, BuildLimitsSettings,
     CeilingEnforcement, ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings,
     DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, ImageRetentionSettings,
-    LetsEncryptSettings, MetricsStoreKind, MonitoringSettings, MultiNodeSettings,
-    ObservabilityCompressionSettings, ObservabilityRetentionSettings, PreviewGatewaySettings,
-    ProviderConfig, RateLimitSettings, RequestTimeoutSettings, ScreenshotSettings,
-    SecurityHeadersSettings, SelfUpdateSettings, TenantResourceCeilings,
+    LetsEncryptSettings, McpServerSettings, MetricsStoreKind, MonitoringSettings,
+    MultiNodeSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
+    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, RequestTimeoutSettings,
+    ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings, TenantResourceCeilings,
 };
 pub use async_trait;
 pub use chrono;

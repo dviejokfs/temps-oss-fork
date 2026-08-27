@@ -18,6 +18,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { isSidebarMenuTooltipVisible } from '@/components/ui/sidebar-tooltip'
 import { cn } from '@/lib/utils'
 
 const SIDEBAR_COOKIE_NAME = 'sidebar:state'
@@ -584,7 +585,8 @@ const SidebarMenuButton = React.forwardRef<
     ref
   ) => {
     const Comp = asChild ? Slot : 'button'
-    const { isMobile, state } = useSidebar()
+    const { isMinimal, isMobile, state } = useSidebar()
+    const tooltipLabel = typeof tooltip === 'string' ? tooltip : undefined
 
     const button = (
       <Comp
@@ -592,6 +594,7 @@ const SidebarMenuButton = React.forwardRef<
         data-sidebar="menu-button"
         data-size={size}
         data-active={isActive}
+        aria-label={props['aria-label'] ?? tooltipLabel}
         className={cn(sidebarMenuButtonVariants({ variant, size }), className)}
         {...props}
       />
@@ -613,7 +616,7 @@ const SidebarMenuButton = React.forwardRef<
         <TooltipContent
           side="right"
           align="center"
-          hidden={state !== 'collapsed' || isMobile}
+          hidden={!isSidebarMenuTooltipVisible({ isMinimal, isMobile, state })}
           {...tooltip}
         />
       </Tooltip>

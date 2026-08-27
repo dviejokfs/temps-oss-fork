@@ -9,4 +9,7 @@ pub struct AppState {
     pub performance_service: Arc<PerformanceService>,
     pub route_table: Arc<temps_routes::CachedPeerTable>,
     pub ip_address_service: Arc<temps_geo::IpAddressService>,
+    /// Optional checker for team-based project access (human sessions only).
+    /// `None` in plain OSS (no-op); registered by EE Teams when installed.
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }

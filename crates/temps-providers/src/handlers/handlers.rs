@@ -79,7 +79,7 @@ async fn get_providers_metadata(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
 
-    let metadata = ProviderMetadata::get_all();
+    let metadata = ProviderMetadata::get_creatable();
     Ok((StatusCode::OK, Json(metadata)))
 }
 

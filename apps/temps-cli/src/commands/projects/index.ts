@@ -70,8 +70,9 @@ export function registerProjectsCommands(program: Command): void {
 
   projects
     .command('settings')
-    .description('Update project settings (slug, attack mode, preview environments, image retention)')
+    .description('Update project settings (name, slug, attack mode, preview environments, image retention)')
     .option('-p, --project <project>', 'Project slug or ID')
+    .option('--name <name>', 'Project display name (does not change the URL)')
     .option('--slug <slug>', 'Project URL slug')
     .option('--attack-mode', 'Enable attack mode (CAPTCHA protection)')
     .option('--no-attack-mode', 'Disable attack mode')

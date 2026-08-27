@@ -183,6 +183,13 @@ check. `git revert` defaults to `Revert "original message"`, which is
 not conventional. Never use `git revert --no-edit` and leave it —
 either pass an explicit conventional `-m`, or amend right after.
 
+## DCO Sign-off
+
+Every commit must be signed off (`Signed-off-by: Name <email>` trailer).
+Always use `git commit -s` (and `-s` on `--amend`/`revert`). Like the
+Changelog check, the DCO check validates every commit in `base..HEAD`,
+not just the tip.
+
 ## Per-record config columns, not env vars
 
 When adding a new runtime knob, default to a column on the relevant
@@ -268,6 +275,15 @@ This applies to the API too: prefer a capability/status endpoint that
 reports `configured: false` with a reason and a setup URL over a 404
 that leaves the client unable to distinguish "not built" from
 "not set up".
+
+## Responsive pagination is a shared UI contract
+
+Use `web/src/components/ui/responsive-pagination.tsx` for paginated web lists
+instead of rebuilding controls at each call site. Below the `sm` breakpoint,
+show one stable row with labeled Previous and Next buttons around compact
+`{page} / {totalPages}` context; hide page-size, first/last, and direct-page
+controls. At `sm` and above, show the full `Showing X–Y of Z` summary and
+advanced controls.
 
 ## Don't sweep unrelated dirty files into your commits
 

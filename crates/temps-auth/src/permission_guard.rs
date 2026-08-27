@@ -1169,6 +1169,7 @@ mod tests {
             "temps-analytics",
             "temps-analytics-events",
             "temps-analytics-funnels",
+            "temps-analytics-performance",
             "temps-analytics-session-replay",
             "temps-blob",
             "temps-deployments",
@@ -1299,6 +1300,7 @@ mod tests {
             "temps-flags",
             "temps-projects",
             "temps-proxy",
+            "temps-status-page",
         ];
 
         let mut sorted = expected_crates.to_vec();

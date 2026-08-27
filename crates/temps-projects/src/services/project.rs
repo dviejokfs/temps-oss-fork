@@ -4,12 +4,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use sea_orm::{
-    prelude::Uuid, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, Statement,
-    TransactionTrait,
+    prelude::Uuid, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
+    Statement, TransactionTrait,
 };
 use temps_core::{
     ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
@@ -20,8 +20,9 @@ use temps_git::services::public_repo::PublicRepoProviderFactory;
 use serde::Serialize;
 
 use super::types::{
-    CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectStatistics,
-    UpdateDeploymentSettingsRequest,
+    CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectRename,
+    ProjectSettingsUpdate, ProjectStatistics, UpdateDeploymentSettingsRequest,
+    UpdateProjectSettingsParams,
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::UpdateDeploymentConfigRequest;
@@ -91,6 +92,40 @@ fn would_desync_git_url(
     let url_pair = format!("{}/{}", tail[1], tail[0]);
 
     (url_pair.eq_ignore_ascii_case(&old_pair)).then_some((url_pair, new_pair))
+}
+
+/// Normalize and validate a project display name.
+///
+/// The name is not just a label: it becomes `OTEL_SERVICE_NAME` on the next
+/// deployment, and the Compose env-file renderer rejects control characters —
+/// so a name accepted here but refused there turns one bad save into every
+/// later deploy failing with an error naming a variable the operator never set.
+/// Format characters (bidi overrides, zero-width spaces) are rejected too:
+/// names are not unique and are rendered next to each other in the dashboard,
+/// alerts, and audit records, where an override can make one project display as
+/// another.
+///
+/// Shared by every path that writes `projects.name` so the three cannot drift.
+fn validate_project_name(raw: &str) -> Result<String, ProjectError> {
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() || trimmed.chars().count() > 100 {
+        return Err(ProjectError::InvalidInput(
+            "Project name must contain 1-100 characters".to_string(),
+        ));
+    }
+    if trimmed.chars().any(|c| {
+        c.is_control()
+            || matches!(c,
+                '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}')
+    }) {
+        return Err(ProjectError::InvalidInput(
+            "Project name cannot contain control or text-direction characters".to_string(),
+        ));
+    }
+    Ok(trimmed)
 }
 
 fn slugify(name: &str) -> String {
@@ -589,7 +624,8 @@ impl ProjectService {
 
         let normalized_directory = normalize_project_directory(&request.directory)?;
 
-        let project_slug = self.generate_unique_project_slug(&request.name).await?;
+        let validated_name = validate_project_name(&request.name)?;
+        let project_slug = self.generate_unique_project_slug(&validated_name).await?;
         let resolved = resolve_preset_selection(
             request.preset.as_str(),
             request.preset_config.as_ref(),
@@ -622,7 +658,7 @@ impl ProjectService {
         }
 
         let project = projects::ActiveModel {
-            name: Set(request.name),
+            name: Set(validated_name),
             repo_name: Set(request.repo_name.unwrap_or_default()),
             repo_owner: Set(request.repo_owner.unwrap_or_default()),
             directory: Set(normalized_directory),
@@ -1136,7 +1172,7 @@ impl ProjectService {
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
-        active_project.name = Set(request.name);
+        active_project.name = Set(validate_project_name(&request.name)?);
         active_project.repo_name = Set(request.repo_name.unwrap_or_else(|| "unknown".to_string()));
         active_project.repo_owner =
             Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string()));
@@ -1339,32 +1375,36 @@ impl ProjectService {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn update_project_settings(
         &self,
         project_id: i32,
-        new_slug: Option<String>,
-        git_provider_connection_id: Option<i32>,
-        main_branch: Option<String>,
-        repo_owner: Option<String>,
-        repo_name: Option<String>,
-        preset: Option<String>,
-        directory: Option<String>,
-        attack_mode: Option<bool>,
-        enable_preview_environments: Option<bool>,
-        preview_envs_on_demand: Option<bool>,
-        preview_envs_idle_timeout_seconds: Option<i32>,
-        preview_envs_wake_timeout_seconds: Option<i32>,
-        preset_config: Option<serde_json::Value>,
-        ai_alert_summaries_enabled: Option<bool>,
-        ai_debug_chat_enabled: Option<bool>,
-        ai_write_actions_enabled: Option<bool>,
-        cross_project_trace_sharing: Option<bool>,
-        error_source_context_enabled: Option<bool>,
-        error_source_root: Option<String>,
-        ai_api_traffic_summary_enabled: Option<bool>,
-        image_retention_hours: Option<Option<i32>>,
-    ) -> Result<Project, ProjectError> {
+        params: UpdateProjectSettingsParams,
+    ) -> Result<ProjectSettingsUpdate, ProjectError> {
+        let UpdateProjectSettingsParams {
+            name: new_name,
+            slug: new_slug,
+            git_provider_connection_id,
+            main_branch,
+            repo_owner,
+            repo_name,
+            preset,
+            directory,
+            attack_mode,
+            enable_preview_environments,
+            preview_envs_on_demand,
+            preview_envs_idle_timeout_seconds,
+            preview_envs_wake_timeout_seconds,
+            preset_config,
+            ai_alert_summaries_enabled,
+            ai_debug_chat_enabled,
+            ai_write_actions_enabled,
+            cross_project_trace_sharing,
+            error_source_context_enabled,
+            error_source_root,
+            ai_api_traffic_summary_enabled,
+            image_retention_hours,
+        } = params;
+
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
         // never out of range.
@@ -1392,6 +1432,14 @@ impl ProjectService {
                 )));
             }
         }
+        // Normalize the display name up-front with the other validations so an
+        // unusable name is rejected before anything is written, then persist it
+        // only at the end (see below) — a rename must not survive a request that
+        // goes on to fail on a conflicting slug or a git desync.
+        let new_name = match new_name {
+            Some(raw) => Some(validate_project_name(&raw)?),
+            None => None,
+        };
 
         // Get the current project
         let mut project = projects::Entity::find_by_id(project_id)
@@ -1762,12 +1810,44 @@ impl ProjectService {
             if let Some(dir) = directory {
                 active_project.directory = Set(normalize_project_directory(&dir)?);
             }
+            // Carry the write and the route-reload signal on one transaction.
+            // If the signal cannot be published, returning an error while the
+            // rename and the preset/directory changes stayed persisted would
+            // leave the caller unable to tell what actually happened — and on a
+            // port removal, leave a withdrawn route reachable. Dropping the
+            // transaction on the error path rolls all of it back together.
+            let txn = self.db.begin().await?;
 
-            let updated_project = active_project.update(self.db.as_ref()).await?;
-            if initial_public_ports != compose_public_ports(updated_project.preset_config.as_ref())
-            {
-                self.reload_routes_after_compose_port_change(project_id)
-                    .await?;
+            // Fold the rename into this same write so a name change submitted
+            // alongside git settings commits atomically with them. The write
+            // itself rides `active_project` below rather than a separate update.
+            let mut rename = None;
+            if let Some(ref name_value) = new_name {
+                rename = self.locked_rename(&txn, project_id, name_value).await?;
+                active_project.name = Set(name_value.clone());
+            }
+
+            let updated_project = active_project.update(&txn).await?;
+            let ports_changed = initial_public_ports
+                != compose_public_ports(updated_project.preset_config.as_ref());
+            if ports_changed {
+                // Only this transaction rolls back. Earlier steps of this same
+                // request (slug, attack mode, AI toggles, preview envs) were
+                // committed independently and survive, so do not tell the
+                // operator the whole request was discarded.
+                self.publish_route_reload(
+                    &txn,
+                    project_id,
+                    "The git settings, preset, directory and name portion of this update was \
+                     rolled back; other settings sent in the same request (slug, attack mode, \
+                     AI toggles, preview environments) commit independently and may already be \
+                     saved.",
+                )
+                .await?;
+            }
+            txn.commit().await?;
+            if ports_changed {
+                self.enqueue_route_reload(project_id).await;
             }
             // Notify before the provider lookup: past the commit, every await
             // is a point the task can be cancelled at, and losing the response
@@ -1784,17 +1864,58 @@ impl ProjectService {
                 );
             }
 
-            return Ok(self.map_written_project(updated_project).await);
+            return Ok(ProjectSettingsUpdate {
+                project: self.map_written_project(updated_project).await,
+                rename,
+            });
         }
 
-        // Always reload the final project state before returning
-        let final_project = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(ProjectError::NotFound(format!(
-                "Project {} not found",
-                project_id
-            )))?;
+        // Persist the rename last, once every other fallible step has
+        // succeeded, so a failed request never leaves a renamed project behind.
+        //
+        // Note the guarantee is one-directional and this endpoint is *not*
+        // all-or-nothing: everything above committed independently, so a failure
+        // in this block still leaves those earlier steps persisted. Ordering the
+        // rename last only ensures it is never the survivor of someone else's
+        // failure. Making the whole endpoint atomic belongs with the parked
+        // optimistic-concurrency work, not here.
+        // The locked read, the write, and the read-back of the final state all
+        // ride one transaction: committing before the read-back would let a
+        // failure there report an error over an already-persisted rename, and
+        // reading back outside the lock would let a concurrent rename supply
+        // the "after" half of a transition whose "before" half came from here.
+        let mut rename = None;
+        let final_project = if let Some(name_value) = new_name {
+            let txn = self.db.begin().await?;
+            rename = self.locked_rename(&txn, project_id, &name_value).await?;
+            if rename.is_some() {
+                let mut active_project = projects::ActiveModel {
+                    id: Set(project_id),
+                    ..Default::default()
+                };
+                active_project.name = Set(name_value);
+                active_project.update(&txn).await?;
+            }
+
+            let final_project = projects::Entity::find_by_id(project_id)
+                .one(&txn)
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+            txn.commit().await?;
+            final_project
+        } else {
+            // No mutation to lose here, so a plain read is enough.
+            projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?
+        };
 
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
             project_id: final_project.id,
@@ -1808,7 +1929,10 @@ impl ProjectService {
             );
         }
 
-        Ok(self.map_written_project(final_project).await)
+        Ok(ProjectSettingsUpdate {
+            project: self.map_written_project(final_project).await,
+            rename,
+        })
     }
 
     pub async fn update_automatic_deploy(
@@ -2190,57 +2314,158 @@ impl ProjectService {
             active_project.generic_webhook_token = Set(None);
         }
 
-        let updated_project = active_project.update(self.db.as_ref()).await?;
+        // Same rollback-together reasoning as `update_project_settings`: publish
+        // the reload on the transaction that carries the write, so a failure to
+        // signal leaves nothing persisted.
+        let txn = self.db.begin().await?;
+        let updated_project = active_project.update(&txn).await?;
 
-        if previous_public_ports != compose_public_ports(updated_project.preset_config.as_ref()) {
-            self.reload_routes_after_compose_port_change(project_id)
-                .await?;
+        let ports_changed =
+            previous_public_ports != compose_public_ports(updated_project.preset_config.as_ref());
+        if ports_changed {
+            // Every *database* write in this method rides `txn`. The provider-side
+            // webhook install/removal above does not, and nothing here undoes
+            // it — so do not claim a total rollback.
+            self.publish_route_reload(
+                &txn,
+                project_id,
+                "No database changes were saved, but any git-provider webhook this request \
+                 installed or removed has already been applied at the provider.",
+            )
+            .await?;
+        }
+        txn.commit().await?;
+        if ports_changed {
+            self.enqueue_route_reload(project_id).await;
         }
 
         Ok(self.map_written_project(updated_project).await)
     }
 
+    /// Take the row lock and report the rename `new_name` would perform against
+    /// the currently-stored name, or `None` when it matches and no write is
+    /// needed.
+    ///
+    /// Both ends of the transition come from the locked read, so the pair always
+    /// describes one real change. Callers must perform the write on the same
+    /// `conn`: reading here and writing outside this transaction would let a
+    /// concurrent rename land in between and make the reported transition
+    /// fiction.
+    /// Takes a transaction rather than a generic connection on purpose: passing
+    /// an autocommit handle would compile and silently discard the `FOR UPDATE`
+    /// guarantee this whole design rests on, so the type makes that unrepresentable.
+    async fn locked_rename(
+        &self,
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        new_name: &str,
+    ) -> Result<Option<ProjectRename>, ProjectError> {
+        let locked = projects::Entity::find_by_id(project_id)
+            .lock_exclusive()
+            .one(txn)
+            .await?
+            .ok_or(ProjectError::NotFound(format!(
+                "Project {} not found",
+                project_id
+            )))?;
+
+        Ok(if locked.name == new_name {
+            None
+        } else {
+            Some(ProjectRename {
+                from: locked.name,
+                to: new_name.to_string(),
+            })
+        })
+    }
+
     /// Public Compose ports are read directly from `projects.preset_config`
     /// when the proxy builds its route table. Updating the JSON alone leaves
     /// the in-memory table stale, because the project DB trigger deliberately
-    /// ignores generic preset-config changes. Publish both supported signals:
-    /// the queue gives this process a deterministic reload, while PostgreSQL
-    /// NOTIFY wakes other control-plane processes and remains a fallback if
-    /// the queue is unavailable.
-    async fn reload_routes_after_compose_port_change(
+    /// ignores generic preset-config changes.
+    ///
+    /// Publishes on the caller's connection rather than reaching for `self.db`,
+    /// so a caller writing inside a transaction issues the NOTIFY on that same
+    /// transaction. PostgreSQL queues notifications and delivers them at commit,
+    /// so a rolled-back update signals nothing and no listener can observe a
+    /// reload for a write that never landed.
+    ///
+    /// The in-process queue job is deliberately *not* sent here, and there is
+    /// deliberately no eager fallback to it when the NOTIFY fails. Its
+    /// subscriber reloads the route table over its own database connection, so
+    /// enqueuing before the transaction commits races that commit: the
+    /// subscriber can read the pre-update ports and latch them in with nothing
+    /// left to trigger a re-read. On a change that *removes* a public port
+    /// that fails open — the withdrawn route stays reachable indefinitely — so
+    /// the safe response to an unavailable NOTIFY is to roll the write back and
+    /// let the caller retry, not to persist it behind a signal that may never
+    /// land. The caller sends the job after committing; see
+    /// [`Self::enqueue_route_reload`].
+    async fn publish_route_reload<C: ConnectionTrait>(
         &self,
+        conn: &C,
         project_id: i32,
+        rolled_back_scope: &str,
     ) -> Result<(), ProjectError> {
-        let queue_result = self
-            .queue_service
-            .send(Job::ForceRouteReload(ForceRouteReloadJob {
-                environment_id: None,
-                deployment_id: None,
-            }))
-            .await;
-
         let payload = serde_json::json!({
             "action": "UPDATE",
             "project_id": project_id,
             "field": "preset_config.public_ports",
         })
         .to_string();
-        let notify_result = self
-            .db
-            .execute(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT pg_notify('project_route_change', $1)",
-                [payload.into()],
-            ))
-            .await;
-
-        match (queue_result, notify_result) {
-            (Ok(()), _) | (_, Ok(_)) => Ok(()),
-            (Err(queue_error), Err(database_error)) => Err(ProjectError::RouteReloadFailed {
+        conn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_notify('project_route_change', $1)",
+            [payload.into()],
+        ))
+        .await
+        .map_err(|database_error| {
+            // The driver text can name the connection target or a constraint, so
+            // it stays in the operator's logs rather than the HTTP response.
+            error!(
                 project_id,
-                queue_reason: queue_error.to_string(),
-                database_reason: database_error.to_string(),
-            }),
+                error = %database_error,
+                "Failed to publish project route-reload NOTIFY"
+            );
+            ProjectError::RouteReloadFailed {
+                project_id,
+                rolled_back_scope: rolled_back_scope.to_string(),
+            }
+        })?;
+
+        Ok(())
+    }
+
+    /// Send the in-process route-reload job. Call only *after* the transaction
+    /// carrying the port change has committed, so the subscriber cannot read
+    /// pre-commit state.
+    ///
+    /// Best-effort. NOTIFY is not durable — it reaches only sessions holding a
+    /// `LISTEN` at commit time — so a queue failure here is not automatically
+    /// harmless. What makes it recoverable is the listener itself, which
+    /// reloads the full route table on two independent triggers: after a
+    /// reconnect (catching signals missed while it was down) and after an idle
+    /// window elapses with no notification (catching a connection that died
+    /// without ever reporting an error). The second is what bounds the damage
+    /// here — without it, losing both the NOTIFY and this queue send would
+    /// leave a withdrawn public port reachable indefinitely. Do not weaken
+    /// either trigger while trusting this comment; see
+    /// `temps_routes::project_change_listener::IDLE_RECONCILE_INTERVAL`.
+    async fn enqueue_route_reload(&self, project_id: i32) {
+        if let Err(e) = self
+            .queue_service
+            .send(Job::ForceRouteReload(ForceRouteReloadJob {
+                environment_id: None,
+                deployment_id: None,
+            }))
+            .await
+        {
+            warn!(
+                project_id,
+                error = %e,
+                "Route reload job could not be enqueued after committing a public-port change; \
+                 this process will rely on the delivered NOTIFY"
+            );
         }
     }
 
@@ -4590,6 +4815,362 @@ mod tests {
         }
     }
 
+    /// Renaming must change only the display name — the slug is the routing
+    /// identifier, and a rename that silently moved a project's URL would break
+    /// every domain already pointing at it.
+    #[tokio::test]
+    async fn test_update_project_settings_renames_without_touching_slug() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Old Name".to_string()),
+            slug: Set("rename-keeps-slug".to_string()),
+            repo_name: Set("rename-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("rename-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        let updated = project_service
+            .update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    name: Some("  New Display Name  ".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rename should succeed");
+
+        // The service reports the transition it actually performed — both ends
+        // captured under one lock — so the audit never has to infer it from a
+        // racy read-before-write, nor splice two requests' renames together.
+        let rename = updated.rename.as_ref().expect("a rename was performed");
+        assert_eq!(rename.from, "Old Name");
+        assert_eq!(rename.to, "New Display Name");
+
+        let updated = updated.project;
+
+        // Trimmed, persisted, and the slug is exactly as it was.
+        assert_eq!(updated.name, "New Display Name");
+        assert_eq!(updated.slug, "rename-keeps-slug");
+
+        let reloaded = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(reloaded.name, "New Display Name");
+        assert_eq!(reloaded.slug, "rename-keeps-slug");
+    }
+
+    /// The rename can also travel inside the git-settings transaction, which is
+    /// a separate implementation from the tail path above: it mutates a
+    /// pre-lock ActiveModel and takes the row lock afterwards. Cover it, and
+    /// assert the accompanying git change commits alongside the rename.
+    #[tokio::test]
+    async fn test_update_project_settings_renames_alongside_git_settings() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Before Git Rename".to_string()),
+            slug: Set("rename-with-git".to_string()),
+            repo_name: Set("git-rename-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("git-rename-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        // `main_branch` makes `needs_git_update` true, routing the rename
+        // through the git-settings transaction rather than the tail path.
+        let updated = project_service
+            .update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    name: Some("  After Git Rename  ".to_string()),
+                    main_branch: Some("develop".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rename alongside git settings should succeed");
+
+        let rename = updated
+            .rename
+            .as_ref()
+            .expect("the git path must report the rename it performed");
+        assert_eq!(rename.from, "Before Git Rename");
+        assert_eq!(rename.to, "After Git Rename");
+        assert_eq!(updated.project.name, "After Git Rename");
+
+        // Both halves of the transaction committed together.
+        let stored = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(stored.name, "After Git Rename");
+        assert_eq!(stored.main_branch, "develop");
+        assert_eq!(stored.slug, "rename-with-git");
+    }
+
+    /// Validation of the accompanying git settings happens before the rename is
+    /// staged, so a request that renames *and* sends an unusable preset leaves
+    /// the name untouched. (Failures after the rename is staged are covered by
+    /// the slug-conflict test, which exercises the rollback itself.)
+    #[tokio::test]
+    async fn test_update_project_settings_rename_not_applied_when_preset_is_invalid() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Keep This Name".to_string()),
+            slug: Set("rename-git-rollback".to_string()),
+            repo_name: Set("git-rollback-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("git-rollback-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        let result = project_service
+            .update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    name: Some("Renamed Before Failure".to_string()),
+                    preset: Some("definitely-not-a-real-preset".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ProjectError::InvalidInput(_))),
+            "an unknown preset should fail validation, not something unrelated"
+        );
+
+        let stored = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(
+            stored.name, "Keep This Name",
+            "a request rejected during validation must not have renamed anything"
+        );
+    }
+
+    /// Re-submitting the name a project already has performs no write, so the
+    /// service must report no rename — otherwise the audit records a transition
+    /// that never happened.
+    #[tokio::test]
+    async fn test_update_project_settings_reports_no_rename_for_a_no_op() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Unchanged Name".to_string()),
+            slug: Set("rename-noop".to_string()),
+            repo_name: Set("noop-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("noop-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        // Whitespace that trims back to the stored name is still a no-op.
+        let updated = project_service
+            .update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    name: Some("  Unchanged Name  ".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("no-op rename should succeed");
+
+        assert!(
+            updated.rename.is_none(),
+            "a no-op rename must not report a transition"
+        );
+        assert_eq!(updated.project.name, "Unchanged Name");
+    }
+
+    /// A request that renames *and* fails on something else must not leave the
+    /// rename behind: the endpoint reporting an error while the project silently
+    /// kept a new name is exactly the kind of half-applied write a self-hosted
+    /// operator has no way to diagnose.
+    #[tokio::test]
+    async fn test_update_project_settings_rename_does_not_persist_when_slug_conflicts() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        // The project we will try to rename...
+        let target = temps_entities::projects::ActiveModel {
+            name: Set("Original Name".to_string()),
+            slug: Set("rename-rollback-target".to_string()),
+            repo_name: Set("rollback-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("rollback-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let target = target.insert(db.as_ref()).await.unwrap();
+
+        // ...and a second project already holding the slug we will collide with.
+        let occupier = temps_entities::projects::ActiveModel {
+            name: Set("Occupier".to_string()),
+            slug: Set("rename-rollback-taken".to_string()),
+            repo_name: Set("occupier-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("occupier-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        occupier.insert(db.as_ref()).await.unwrap();
+
+        let result = project_service
+            .update_project_settings(
+                target.id,
+                UpdateProjectSettingsParams {
+                    name: Some("Renamed Before Failure".to_string()),
+                    slug: Some("rename-rollback-taken".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ProjectError::SlugAlreadyExists(_))),
+            "conflicting slug should be rejected"
+        );
+
+        let reloaded = projects::Entity::find_by_id(target.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(
+            reloaded.name, "Original Name",
+            "rename must not survive a failed request"
+        );
+        assert_eq!(reloaded.slug, "rename-rollback-target");
+    }
+
+    #[tokio::test]
+    async fn test_update_project_settings_rejects_blank_and_overlong_names() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Keep Me".to_string()),
+            slug: Set("rename-validation".to_string()),
+            repo_name: Set("rename-validation-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("rename-validation".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        for candidate in ["   ".to_string(), "x".repeat(101)] {
+            let result = project_service
+                .update_project_settings(
+                    inserted_project.id,
+                    UpdateProjectSettingsParams {
+                        name: Some(candidate.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(ProjectError::InvalidInput(_))),
+                "name {:?} should be rejected as invalid input",
+                candidate
+            );
+        }
+
+        // A rejected rename must not have partially applied.
+        let reloaded = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(reloaded.name, "Keep Me");
+    }
+
     #[tokio::test]
     async fn test_update_project_settings_emits_event() {
         // Setup test database
@@ -4621,27 +5202,12 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 inserted_project.id,
-                Some("new-slug".to_string()),
-                None,
-                Some("develop".to_string()),
-                None,
-                None,
-                Some(Preset::Nixpacks.to_string()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // cross_project_trace_sharing
-                None, // error_source_context_enabled
-                None, // error_source_root
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    slug: Some("new-slug".to_string()),
+                    main_branch: Some("develop".to_string()),
+                    preset: Some(Preset::Nixpacks.to_string()),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -4732,6 +5298,71 @@ mod tests {
     /// `ExternalServiceManager`. When Docker isn't available locally
     /// (CI without docker-in-docker, dev machines without daemon) skip
     /// rather than failing — matches the `cargo test` discipline in CLAUDE.md.
+    /// Pins an assumption the git-settings path depends on: it builds its
+    /// `ActiveModel` from a project snapshot loaded *before* the transaction's
+    /// row lock, so if `update()` wrote back every column of that snapshot, an
+    /// unrelated concurrent change would be silently lost.
+    ///
+    /// It does not: `Model -> ActiveModel` marks columns `Unchanged`, and
+    /// `update()` emits a SET clause containing only the columns explicitly
+    /// `Set`. This test exists because that is a Sea-ORM behaviour rather than
+    /// something visible in our code — if it ever changed, the git-settings path
+    /// would start clobbering concurrent writes with no other signal.
+    #[tokio::test]
+    async fn test_partial_update_does_not_clobber_concurrent_columns() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+
+        let inserted = temps_entities::projects::ActiveModel {
+            name: Set("Probe Original".to_string()),
+            slug: Set("probe-stale-snapshot".to_string()),
+            repo_name: Set("probe-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("probe-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // A stale snapshot, taken before the "concurrent" write below.
+        let stale = projects::Entity::find_by_id(inserted.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Concurrent, unrelated update: someone else changes attack_mode.
+        let mut other: projects::ActiveModel = projects::Entity::find_by_id(inserted.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        other.attack_mode = Set(true);
+        other.update(db.as_ref()).await.unwrap();
+
+        // Now write the stale snapshot back, setting only `directory`.
+        let mut from_stale: projects::ActiveModel = stale.into();
+        from_stale.directory = Set("probe-dir-changed".to_string());
+        from_stale.update(db.as_ref()).await.unwrap();
+
+        let final_row = projects::Entity::find_by_id(inserted.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(final_row.directory, "probe-dir-changed");
+        assert!(
+            final_row.attack_mode,
+            "LOST UPDATE: the stale snapshot clobbered the concurrent attack_mode change"
+        );
+    }
+
     async fn docker_available() -> bool {
         match bollard::Docker::connect_with_local_defaults() {
             Ok(d) => d.ping().await.is_ok(),
@@ -5080,30 +5711,14 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "nixpacksConfig": toml })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "nixpacksConfig": toml })),
+                    ..Default::default()
+                },
             )
             .await
-            .expect("partial preset_config patch");
+            .expect("partial preset_config patch")
+            .project;
 
         assert_eq!(updated.preset.as_deref(), Some("nixpacks-node"));
 
@@ -5153,30 +5768,14 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "excludedServices": ["postgres"] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "excludedServices": ["postgres"] })),
+                    ..Default::default()
+                },
             )
             .await
-            .expect("partial excludedServices patch");
+            .expect("partial excludedServices patch")
+            .project;
 
         assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
 
@@ -5202,30 +5801,16 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "relaxedCapabilityServices": ["postgres"] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(
+                        serde_json::json!({ "relaxedCapabilityServices": ["postgres"] }),
+                    ),
+                    ..Default::default()
+                },
             )
             .await
-            .expect("partial relaxedCapabilityServices patch");
+            .expect("partial relaxedCapabilityServices patch")
+            .project;
         assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
 
         let row = projects::Entity::find_by_id(created.id)
@@ -5255,34 +5840,18 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({
                     "composeServices": [
                         {"name": "hub", "image": "ghcr.io/getpaseo/hub:latest", "looksLikeDatabase": false}
                     ]
                 })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                    ..Default::default()
+                },
             )
             .await
-            .expect("explicit composeServices patch, even though it strands relaxedCapabilityServices");
+            .expect("explicit composeServices patch, even though it strands relaxedCapabilityServices")
+            .project;
         assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
 
         let row = projects::Entity::find_by_id(created.id)
@@ -5312,30 +5881,14 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "excludedServices": [] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "excludedServices": [] })),
+                    ..Default::default()
+                },
             )
             .await
-            .expect("unrelated excludedServices patch");
+            .expect("unrelated excludedServices patch")
+            .project;
         assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
 
         let row = projects::Entity::find_by_id(created.id)
@@ -5386,30 +5939,16 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "relaxedCapabilityServices": ["gitea"] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(
+                        serde_json::json!({ "relaxedCapabilityServices": ["gitea"] }),
+                    ),
+                    ..Default::default()
+                },
             )
             .await
-            .expect("relaxedCapabilityServices patch for a real non-database service");
+            .expect("relaxedCapabilityServices patch for a real non-database service")
+            .project;
         assert_eq!(result.preset.as_deref(), Some("docker-compose"));
 
         let row = projects::Entity::find_by_id(created.id)
@@ -5455,27 +5994,12 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "relaxedCapabilityServices": ["does-not-exist"] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(
+                        serde_json::json!({ "relaxedCapabilityServices": ["does-not-exist"] }),
+                    ),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -5515,30 +6039,14 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "providers": [] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "providers": [] })),
+                    ..Default::default()
+                },
             )
             .await
-            .expect("explicit empty providers");
+            .expect("explicit empty providers")
+            .project;
 
         assert_eq!(updated.preset.as_deref(), Some("nixpacks"));
 
@@ -5616,27 +6124,10 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "providers": ["not-real"] })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "providers": ["not-real"] })),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -5716,27 +6207,10 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -5836,29 +6310,12 @@ mod tests {
         project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({
-                    "dockerfilePath": "Dockerfile.updated"
-                })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({
+                        "dockerfilePath": "Dockerfile.updated"
+                    })),
+                    ..Default::default()
+                },
             )
             .await
             .expect("update custom Dockerfile config");
@@ -6074,30 +6531,15 @@ mod tests {
         let updated = project_service
             .update_project_settings(
                 created.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("nixpacks-node".to_string()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(serde_json::json!({ "nixpacksConfig": toml })),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    preset: Some("nixpacks-node".to_string()),
+                    preset_config: Some(serde_json::json!({ "nixpacksConfig": toml })),
+                    ..Default::default()
+                },
             )
             .await
-            .expect("update preset and config together");
+            .expect("update preset and config together")
+            .project;
 
         assert_eq!(updated.preset.as_deref(), Some("nixpacks-node"));
         let row = projects::Entity::find_by_id(created.id)
@@ -6406,27 +6848,11 @@ mod tests {
         project_service
             .update_project_settings(
                 inserted_project.id,
-                None,
-                None,
-                Some("main".to_string()),
-                None,
-                None,
-                None,
-                Some(String::new()), // directory: blank field from the settings form
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // cross_project_trace_sharing
-                None, // error_source_context_enabled
-                None, // error_source_root
-                None, // ai_api_traffic_summary_enabled
-                None, // image_retention_hours
+                UpdateProjectSettingsParams {
+                    main_branch: Some("main".to_string()),
+                    directory: Some(String::new()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("update_project_settings should succeed");
@@ -6478,27 +6904,10 @@ mod tests {
         let update_with_hours = |hours: i32| {
             project_service.update_project_settings(
                 inserted_project.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,              // cross_project_trace_sharing
-                None,              // error_source_context_enabled
-                None,              // error_source_root
-                None,              // ai_api_traffic_summary_enabled
-                Some(Some(hours)), // image_retention_hours
+                UpdateProjectSettingsParams {
+                    image_retention_hours: Some(Some(hours)),
+                    ..Default::default()
+                },
             )
         };
 

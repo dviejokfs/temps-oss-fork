@@ -3,10 +3,13 @@
 
 use moka::future::Cache;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
+use temps_core::static_files::MAX_STATIC_ASSET_URL_PATH_BYTES;
 use temps_database::DbConnection;
 use temps_entities::static_asset_cache;
+use tokio::sync::Semaphore;
 use tracing::debug;
 
 /// Cache TTL for static-asset-store lookups (both hits and misses).
@@ -21,10 +24,48 @@ const ASSET_STORE_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Maximum number of entries held in the asset-store lookup cache.
 ///
-/// Each entry is an `(i32, String) → Option<String>` key–value pair (roughly
-/// 100 bytes). 50 000 entries ≈ 5 MiB — a reasonable ceiling for a production
-/// reverse proxy serving many projects.
+/// Each entry stores a fixed-size SHA-256 URL key plus a validated 64-byte
+/// content hash and declared size. 50 000 entries therefore remain a real,
+/// explicit memory ceiling independent of attacker-controlled URL length.
 const ASSET_STORE_CACHE_MAX_CAPACITY: u64 = 50_000;
+
+/// Maximum number of uncached CAS metadata queries admitted by this proxy.
+///
+/// Cache hits bypass this limit. Cache misses shed immediately when all slots
+/// are occupied so attacker-controlled unique paths cannot queue unbounded DB
+/// work or retain one waiting task per request.
+const MAX_CONCURRENT_ASSET_STORE_DB_LOOKUPS: usize = 32;
+
+#[derive(Debug)]
+struct AssetStoreLookupSaturated;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticAssetMetadata {
+    pub content_hash: String,
+    pub size_bytes: i64,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct StaticAssetCacheKey {
+    project_id: i32,
+    environment_id: i32,
+    deployment_id: i32,
+    url_path_digest: [u8; 32],
+}
+
+impl StaticAssetCacheKey {
+    fn new(project_id: i32, environment_id: i32, deployment_id: i32, url_path: &str) -> Self {
+        let digest = Sha256::digest(url_path.as_bytes());
+        let mut url_path_digest = [0_u8; 32];
+        url_path_digest.copy_from_slice(&digest);
+        Self {
+            project_id,
+            environment_id,
+            deployment_id,
+            url_path_digest,
+        }
+    }
+}
 
 /// In-memory cache for `static_asset_cache` DB lookups on the proxy hot path.
 ///
@@ -36,12 +77,12 @@ const ASSET_STORE_CACHE_MAX_CAPACITY: u64 = 50_000;
 ///
 /// ## Cache strategy
 ///
-/// - **Key**: `(project_id, environment_id, deployment_id, url_path)` — binds
-///   the asset to the exact route context that requested it.
-/// - **Value**: `Option<String>` — `Some(content_hash)` when a matching row
-///   was found; `None` when no row exists. **Caching `None` (the miss case) is
-///   the critical path**: container deployments serve most assets upstream, so
-///   the vast majority of lookups find nothing.
+/// - **Key**: project/environment/deployment IDs plus a fixed SHA-256 URL digest
+///   — binds the asset to the exact route context without retaining raw URLs.
+/// - **Value**: optional content hash and declared size metadata when a matching
+///   row was found; `None` when no row exists. **Caching `None` (the miss case)
+///   is the critical path**: container deployments serve most assets upstream,
+///   so the vast majority of lookups find nothing.
 /// - **TTL**: 60 seconds for both hit and miss results. New deployments insert
 ///   rows with a higher `deployment_id`; the TTL bounds staleness to an
 ///   acceptable 60 s window that aligns with the stale-chunk fallback semantics.
@@ -55,8 +96,9 @@ const ASSET_STORE_CACHE_MAX_CAPACITY: u64 = 50_000;
 /// for this PR.
 pub struct StaticAssetLookup {
     db: Arc<DbConnection>,
-    /// `(project_id, environment_id, deployment_id, url_path) → Option<content_hash>`.
-    cache: Cache<(i32, i32, i32, String), Option<String>>,
+    /// `(project_id, environment_id, deployment_id, url_path) → asset metadata`.
+    cache: Cache<StaticAssetCacheKey, Option<StaticAssetMetadata>>,
+    db_lookup_slots: Arc<Semaphore>,
 }
 
 impl StaticAssetLookup {
@@ -68,62 +110,118 @@ impl StaticAssetLookup {
     /// Internal constructor that accepts an explicit TTL. Used in tests to
     /// shorten the TTL to observable durations without long `sleep` calls.
     fn new_with_ttl(db: Arc<DbConnection>, ttl: Duration) -> Self {
+        Self::new_with_ttl_and_limit(db, ttl, MAX_CONCURRENT_ASSET_STORE_DB_LOOKUPS)
+    }
+
+    fn new_with_ttl_and_limit(
+        db: Arc<DbConnection>,
+        ttl: Duration,
+        max_concurrent_db_lookups: usize,
+    ) -> Self {
         let cache = Cache::builder()
             .max_capacity(ASSET_STORE_CACHE_MAX_CAPACITY)
             .time_to_live(ttl)
             .build();
-        Self { db, cache }
+        Self {
+            db,
+            cache,
+            db_lookup_slots: Arc::new(Semaphore::new(max_concurrent_db_lookups)),
+        }
     }
 
-    /// Return the content hash for the exact routed deployment, or `None` when
-    /// no matching row exists in `static_asset_cache`.
+    /// Return bounded-serving metadata for the exact routed deployment, or
+    /// `None` when no matching row exists in `static_asset_cache`.
     ///
     /// Results are served from the in-memory cache when available. Both
-    /// `Some(hash)` and `None` are cached so the common miss case never
+    /// Hits and `None` are cached so the common miss case never
     /// amplifies into Postgres load.
-    pub async fn get_content_hash(
+    pub async fn get_asset_metadata(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        deployment_id: i32,
+        url_path: &str,
+    ) -> Option<StaticAssetMetadata> {
+        if url_path.len() > MAX_STATIC_ASSET_URL_PATH_BYTES {
+            return None;
+        }
+        let key = StaticAssetCacheKey::new(project_id, environment_id, deployment_id, url_path);
+
+        // Fast path: a previous lookup already resolved this key (hit or miss).
+        if let Some(cached) = self.cache.get(&key).await {
+            debug!(project_id, "static-asset cache hit (skipping DB)");
+            return cached;
+        }
+
+        let db = self.db.clone();
+        let db_lookup_slots = self.db_lookup_slots.clone();
+        let bounded_url_path = url_path.to_owned();
+        let loaded = self
+            .cache
+            .try_get_with(key, async move {
+                // Never await a permit: shedding is what bounds both queued work
+                // and memory when unique cache misses arrive concurrently.
+                let _permit = db_lookup_slots
+                    .try_acquire_owned()
+                    .map_err(|_| AssetStoreLookupSaturated)?;
+
+                let result = static_asset_cache::Entity::find()
+                    .filter(static_asset_cache::Column::ProjectId.eq(project_id))
+                    .filter(static_asset_cache::Column::EnvironmentId.eq(environment_id))
+                    .filter(static_asset_cache::Column::DeploymentId.eq(deployment_id))
+                    .filter(static_asset_cache::Column::UrlPath.eq(&bounded_url_path))
+                    .one(db.as_ref())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|entry| {
+                        (entry.content_hash.len() == 64
+                            && entry
+                                .content_hash
+                                .bytes()
+                                .all(|byte| byte.is_ascii_hexdigit()))
+                        .then_some(StaticAssetMetadata {
+                            content_hash: entry.content_hash,
+                            size_bytes: entry.size_bytes,
+                        })
+                    });
+
+                Ok::<Option<StaticAssetMetadata>, AssetStoreLookupSaturated>(result)
+            })
+            .await;
+
+        match loaded {
+            Ok(result) => {
+                debug!(
+                    project_id,
+                    found = result.is_some(),
+                    "static-asset DB lookup complete; caching result (including None)"
+                );
+                result
+            }
+            Err(_) => {
+                // `try_get_with` never caches loader errors. A later request can
+                // retry once a slot is free instead of inheriting a negative TTL.
+                debug!(
+                    project_id,
+                    "static-asset DB lookup shed at concurrency limit"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn get_content_hash(
         &self,
         project_id: i32,
         environment_id: i32,
         deployment_id: i32,
         url_path: &str,
     ) -> Option<String> {
-        let key = (
-            project_id,
-            environment_id,
-            deployment_id,
-            url_path.to_string(),
-        );
-
-        // Fast path: a previous lookup already resolved this key (hit or miss).
-        if let Some(cached) = self.cache.get(&key).await {
-            debug!(project_id, url_path, "static-asset cache hit (skipping DB)");
-            return cached;
-        }
-
-        // Cache miss: query the DB (most recent deployment wins).
-        let result = static_asset_cache::Entity::find()
-            .filter(static_asset_cache::Column::ProjectId.eq(project_id))
-            .filter(static_asset_cache::Column::EnvironmentId.eq(environment_id))
-            .filter(static_asset_cache::Column::DeploymentId.eq(deployment_id))
-            .filter(static_asset_cache::Column::UrlPath.eq(url_path))
-            .one(self.db.as_ref())
+        self.get_asset_metadata(project_id, environment_id, deployment_id, url_path)
             .await
-            .ok()
-            .flatten()
-            .map(|entry| entry.content_hash);
-
-        debug!(
-            project_id,
-            url_path,
-            found = result.is_some(),
-            "static-asset DB lookup complete; caching result (including None)"
-        );
-
-        // Store the result — including None for the miss case so repeated
-        // lookups for absent assets do not re-hit Postgres within the TTL.
-        self.cache.insert(key, result.clone()).await;
-        result
+            .map(|asset| asset.content_hash)
     }
 }
 
@@ -132,6 +230,10 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase};
+
+    fn valid_hash(character: char) -> String {
+        character.to_string().repeat(64)
+    }
 
     /// Build a minimal `static_asset_cache::Model` for use in MockDatabase results.
     fn asset_model(
@@ -183,6 +285,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn concurrent_same_key_misses_are_coalesced_into_one_db_query() {
+        let expected_hash = valid_hash('c');
+        let model = asset_model(42, "assets/coalesced.js", &expected_hash, 9);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![model]])
+            .into_connection();
+        let lookup = StaticAssetLookup::new(Arc::new(db));
+
+        let (first, second) = tokio::join!(
+            lookup.get_content_hash(42, 1, 9, "assets/coalesced.js"),
+            lookup.get_content_hash(42, 1, 9, "assets/coalesced.js")
+        );
+
+        assert_eq!(first.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(second.as_deref(), Some(expected_hash.as_str()));
+    }
+
+    #[tokio::test]
+    async fn exhausted_lookup_slots_shed_without_querying_or_negative_caching() {
+        let expected_hash = valid_hash('d');
+        let model = asset_model(8, "assets/retry.js", &expected_hash, 13);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![model]])
+                .into_connection(),
+        );
+        let lookup =
+            StaticAssetLookup::new_with_ttl_and_limit(db.clone(), ASSET_STORE_CACHE_TTL, 1);
+        let permit = lookup
+            .db_lookup_slots
+            .clone()
+            .try_acquire_owned()
+            .expect("test reserves the sole DB lookup slot");
+
+        let shed = lookup.get_content_hash(8, 1, 13, "assets/retry.js").await;
+        assert!(shed.is_none());
+
+        drop(permit);
+        let retried = lookup.get_content_hash(8, 1, 13, "assets/retry.js").await;
+        assert_eq!(retried.as_deref(), Some(expected_hash.as_str()));
+
+        drop(lookup);
+        let db = Arc::try_unwrap(db).expect("lookup releases database");
+        assert_eq!(db.into_transaction_log().len(), 1);
+    }
+
     /// A hit result is cached — repeated lookups for the same key return the
     /// cached hash without a second DB query.
     ///
@@ -190,7 +339,7 @@ mod tests {
     /// would panic, proving the cache is serving the second request.
     #[tokio::test]
     async fn test_hit_path_returns_cached_hash_without_second_query() {
-        let expected_hash = "sha256:deadbeef1234567890abcdef".to_string();
+        let expected_hash = valid_hash('a');
         let model = asset_model(7, "_next/static/chunks/page-abc.js", &expected_hash, 99);
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -221,12 +370,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn asset_metadata_includes_declared_size_for_pre_read_bounding() {
+        let expected_hash = valid_hash('b');
+        let model = asset_model(7, "assets/app.js", &expected_hash, 99);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![model]])
+            .into_connection();
+        let lookup = StaticAssetLookup::new(Arc::new(db));
+
+        let metadata = lookup
+            .get_asset_metadata(7, 1, 99, "assets/app.js")
+            .await
+            .expect("asset metadata");
+        assert_eq!(metadata.content_hash, expected_hash);
+        assert_eq!(metadata.size_bytes, 1024);
+    }
+
     /// Different `(project_id, url_path)` keys are independent: caching one
     /// key does not interfere with another. Each key goes to the DB exactly once.
     #[tokio::test]
     async fn test_different_keys_are_independent() {
-        let hash_a = "hash-for-project-1".to_string();
-        let hash_b = "hash-for-project-2".to_string();
+        let hash_a = valid_hash('a');
+        let hash_b = valid_hash('b');
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![
@@ -252,9 +418,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_same_project_path_isolated_by_environment_and_deployment() {
-        let mut env_a = asset_model(1, "assets/app.js", "hash-a", 10);
+        let hash_a = valid_hash('a');
+        let hash_b = valid_hash('b');
+        let mut env_a = asset_model(1, "assets/app.js", &hash_a, 10);
         env_a.environment_id = 11;
-        let mut env_b = asset_model(1, "assets/app.js", "hash-b", 20);
+        let mut env_b = asset_model(1, "assets/app.js", &hash_b, 20);
         env_b.environment_id = 22;
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -267,14 +435,14 @@ mod tests {
                 .get_content_hash(1, 11, 10, "assets/app.js")
                 .await
                 .as_deref(),
-            Some("hash-a")
+            Some(hash_a.as_str())
         );
         assert_eq!(
             lookup
                 .get_content_hash(1, 22, 20, "assets/app.js")
                 .await
                 .as_deref(),
-            Some("hash-b")
+            Some(hash_b.as_str())
         );
     }
 
@@ -301,5 +469,32 @@ mod tests {
         // Second call: entry expired → DB queried again (consumes the second queued result).
         let second = lookup.get_content_hash(5, 2, 8, "static/vendor.js").await;
         assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_url_path_never_queries_or_enters_the_cache() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let lookup = StaticAssetLookup::new(db.clone());
+        let oversized = "a".repeat(MAX_STATIC_ASSET_URL_PATH_BYTES + 1);
+
+        assert!(lookup
+            .get_asset_metadata(1, 2, 3, &oversized)
+            .await
+            .is_none());
+        assert_eq!(lookup.cache.entry_count(), 0);
+
+        drop(lookup);
+        let db = Arc::try_unwrap(db).expect("lookup releases database");
+        assert!(db.into_transaction_log().is_empty());
+    }
+
+    #[test]
+    fn cache_key_has_fixed_size_independent_of_url_length() {
+        let short = StaticAssetCacheKey::new(1, 2, 3, "a.js");
+        let long = StaticAssetCacheKey::new(1, 2, 3, &"a".repeat(MAX_STATIC_ASSET_URL_PATH_BYTES));
+
+        assert_ne!(short.url_path_digest, long.url_path_digest);
+        assert!(std::mem::size_of::<StaticAssetCacheKey>() <= 48);
+        assert!(!std::mem::needs_drop::<StaticAssetCacheKey>());
     }
 }

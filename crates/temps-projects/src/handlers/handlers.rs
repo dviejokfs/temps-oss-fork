@@ -1151,9 +1151,11 @@ pub async fn update_project_settings(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    // Capture the pre-update retention window only when it's actually
-    // changing, so an unrelated settings save (slug, attack mode, ...)
-    // doesn't pay for an extra read.
+    // Capture the pre-update state only when a field that audits its previous
+    // value is actually changing, so an unrelated settings save (attack mode,
+    // preview envs, ...) doesn't pay for an extra read. The rename's previous
+    // value deliberately does *not* come from here — the service reports it
+    // from under the row lock, where it cannot race a concurrent rename.
     let previous_image_retention_hours = if settings.image_retention_hours.is_some() {
         match state.project_service.get_project(project_id).await {
             Ok(project) => project.image_retention_hours,
@@ -1177,32 +1179,9 @@ pub async fn update_project_settings(
         None
     };
 
-    let updated_project = state
+    let update = state
         .project_service
-        .update_project_settings(
-            project_id,
-            settings.slug.clone(),
-            settings.git_provider_connection_id,
-            settings.main_branch.clone(),
-            settings.repo_owner.clone(),
-            settings.repo_name.clone(),
-            settings.preset.clone(),
-            settings.directory.clone(),
-            settings.attack_mode,
-            settings.enable_preview_environments,
-            settings.preview_envs_on_demand,
-            settings.preview_envs_idle_timeout_seconds,
-            settings.preview_envs_wake_timeout_seconds,
-            settings.preset_config.clone(),
-            settings.ai_alert_summaries_enabled,
-            settings.ai_debug_chat_enabled,
-            settings.ai_write_actions_enabled,
-            settings.cross_project_trace_sharing,
-            settings.error_source_context_enabled,
-            settings.error_source_root.clone(),
-            settings.ai_api_traffic_summary_enabled,
-            settings.image_retention_hours,
-        )
+        .update_project_settings(project_id, settings.clone().into())
         .await
         .map_err(Problem::from)?;
 
@@ -1213,12 +1192,19 @@ pub async fn update_project_settings(
         user_agent: metadata.user_agent,
     };
 
+    // The service reports the rename it actually performed, under the row lock
+    // that carried the write. Deriving this here from a pre-read instead would
+    // race a concurrent rename and could pair one request's stale "before" with
+    // another's persisted "after" — a transition that never happened. `name`
+    // and `previous_name` are therefore set together or not at all.
     let updated_settings = ProjectSettingsUpdatedFields {
         cpu_request: None,
         cpu_limit: None,
         memory_request: None,
         memory_limit: None,
         performance_metrics_enabled: None,
+        name: update.rename.as_ref().map(|rename| rename.to.clone()),
+        previous_name: update.rename.map(|rename| rename.from),
         slug: settings.slug,
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
         image_retention_hours: settings.image_retention_hours,
@@ -1227,9 +1213,9 @@ pub async fn update_project_settings(
 
     let audit_event = ProjectSettingsUpdatedAudit {
         context: audit_context,
-        project_id: updated_project.id,
-        project_name: updated_project.name.clone(),
-        project_slug: updated_project.slug.clone(),
+        project_id: update.project.id,
+        project_name: update.project.name.clone(),
+        project_slug: update.project.slug.clone(),
         updated_settings,
     };
 
@@ -1238,7 +1224,7 @@ pub async fn update_project_settings(
         // Continue with the operation even if audit logging fails
     }
 
-    Ok(Json(ProjectResponse::map_from_project(updated_project)))
+    Ok(Json(ProjectResponse::map_from_project(update.project)))
 }
 
 /// Update automatic deployment setting for a project
