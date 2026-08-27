@@ -157,6 +157,23 @@ POSTGRES_PASSWORD="$old_postgres" REDIS_PASSWORD="$safe_redis" \
   "${compose[@]}" stop postgres >/dev/null
 POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
   "${compose[@]}" up --detach postgres >/dev/null
+
+# `docker compose up --detach` returns as soon as the container starts. The
+# credential synchronizer opens a real PostgreSQL connection, so launching it
+# while recovery is still replaying WAL intermittently fails with
+# "database system is shutting down". Wait for the database healthcheck before
+# asking the one-shot service to rotate the legacy volume credential.
+for _ in {1..90}; do
+  if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-postgres)" == "healthy" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-postgres)" != "healthy" ]]; then
+  echo "PostgreSQL did not become healthy before credential rotation" >&2
+  exit 1
+fi
+
 POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
   "${compose[@]}" run --rm --no-deps --no-TTY postgres-credential-sync >/dev/null
 
