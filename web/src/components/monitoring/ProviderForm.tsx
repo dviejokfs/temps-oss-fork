@@ -507,12 +507,13 @@ export function ProviderForm({
               name="config.channel"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Channel (Optional)</FormLabel>
+                  <FormLabel>Channel label (Optional)</FormLabel>
                   <FormControl>
                     <Input {...field} placeholder="#notifications" />
                   </FormControl>
                   <FormDescription>
-                    Override the default channel from the webhook
+                    Identifies this destination in routes. Slack incoming
+                    webhooks remain bound to the channel configured in Slack.
                   </FormDescription>
                   <FormMessage />
                 </FormItem>

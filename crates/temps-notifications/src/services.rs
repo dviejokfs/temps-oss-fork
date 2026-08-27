@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::types::{Notification, NotificationPriority, NotificationSeverity, NotificationType};
+use crate::NotificationRoutingService;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -210,7 +211,8 @@ pub struct EmailProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlackProvider {
     pub webhook_url: String,
-    pub channel: String,
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1226,7 +1228,6 @@ impl NotificationProvider for SlackProvider {
         let safe_title = slack_escape(&notification.title);
         let safe_message = slack_escape(&notification.message);
         let payload = serde_json::json!({
-            "channel": self.channel,
             "attachments": [{
                 "color": color,
                 "title": safe_title,
@@ -1235,8 +1236,12 @@ impl NotificationProvider for SlackProvider {
                 "footer": format!("Priority: {:?} | Type: {:?}", notification.priority, notification.notification_type)
             }]
         });
-
-        client.post(&self.webhook_url).json(&payload).send().await?;
+        client
+            .post(&self.webhook_url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
 
         Ok(())
     }
@@ -1244,10 +1249,7 @@ impl NotificationProvider for SlackProvider {
     async fn health_check(&self) -> Result<bool> {
         let client = reqwest::Client::new();
 
-        let test_payload = serde_json::json!({
-            "channel": self.channel,
-            "text": "Health check"
-        });
+        let test_payload = serde_json::json!({ "text": "Health check" });
 
         match client
             .post(&self.webhook_url)
@@ -1376,6 +1378,7 @@ impl NotificationProvider for WebhookProvider {
 pub struct NotificationService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    routing_service: NotificationRoutingService,
 }
 
 impl NotificationService {
@@ -1384,6 +1387,7 @@ impl NotificationService {
         encryption_service: Arc<temps_core::EncryptionService>,
     ) -> Self {
         Self {
+            routing_service: NotificationRoutingService::new(db.clone()),
             db,
             encryption_service,
         }
@@ -1396,19 +1400,22 @@ impl NotificationService {
         )
     }
 
-    async fn get_enabled_providers(&self) -> Result<Vec<Box<dyn NotificationProvider>>> {
-        let db_providers = notification_providers::Entity::find()
-            .filter(notification_providers::Column::Enabled.eq(true))
-            .all(self.db.as_ref())
+    async fn get_enabled_providers(
+        &self,
+        notification: &Notification,
+    ) -> Result<Vec<Box<dyn NotificationProvider>>> {
+        let db_providers = self
+            .routing_service
+            .resolve_provider_models(notification.effective_severity())
             .await?;
         let mut providers = vec![];
-        for provider_record in db_providers {
-            match self.load_provider(&provider_record).await {
+        for db_provider in db_providers {
+            match self.load_provider(&db_provider).await {
                 Ok(provider) => {
                     providers.push(provider);
                 }
                 Err(e) => {
-                    error!("Failed to load provider {}: {}", provider_record.name, e);
+                    error!("Failed to load provider {}: {}", db_provider.name, e);
                 }
             }
         }
@@ -1583,9 +1590,9 @@ impl NotificationService {
             );
         }
 
-        // Send through all configured providers
+        // Resolve routes and deliver once to each matching provider.
         let providers = self
-            .get_enabled_providers()
+            .get_enabled_providers(&notification)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get providers {}", e))?;
         for provider in &providers {
@@ -1598,17 +1605,10 @@ impl NotificationService {
     }
 
     pub async fn is_configured(&self) -> Result<bool> {
-        let count = notification_providers::Entity::find()
-            .filter(notification_providers::Column::Enabled.eq(true))
-            .paginate(self.db.as_ref(), 1)
-            .num_items()
+        self.routing_service
+            .has_routable_provider()
             .await
-            .map_err(|e| {
-                error!("Failed to check notification providers: {}", e);
-                anyhow::anyhow!("Failed to check notification providers: {}", e)
-            })?;
-
-        Ok(count > 0)
+            .map_err(|error| anyhow::anyhow!(error))
     }
 
     pub async fn list_providers(&self) -> Result<Vec<notification_providers::Model>> {
@@ -1851,6 +1851,7 @@ impl NotificationService {
         p_name: String,
         p_provider_type: String,
         p_config: T,
+        p_enabled: bool,
     ) -> Result<notification_providers::Model> {
         let config_json = serde_json::to_string(&p_config)?;
 
@@ -1864,7 +1865,7 @@ impl NotificationService {
             name: Set(p_name),
             provider_type: Set(p_provider_type),
             config: Set(encrypted_config),
-            enabled: Set(true),
+            enabled: Set(p_enabled),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -3637,6 +3638,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_slack_send_uses_webhook_default_when_channel_is_absent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: None,
+        };
+        provider
+            .send(&Notification::new("Default route", "Use webhook channel"))
+            .await
+            .expect("Slack delivery should succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request capture should succeed");
+        assert_eq!(requests.len(), 1);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("Slack payload should be JSON");
+        assert!(
+            payload.get("channel").is_none(),
+            "an absent channel must let Slack use the webhook default"
+        );
+    }
+
+    #[tokio::test]
     async fn test_slack_send_excludes_action_url_metadata_and_html() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3651,7 +3686,7 @@ mod tests {
 
         let provider = SlackProvider {
             webhook_url: server.uri(),
-            channel: "#alerts".to_string(),
+            channel: Some("#alerts".to_string()),
         };
 
         // Mirrors what the error-tracking plugin attaches for the email's CTA
@@ -3674,6 +3709,11 @@ mod tests {
         let body = String::from_utf8(requests[0].body.clone()).unwrap();
 
         assert!(
+            !body.contains("\"channel\"") && !body.contains("#alerts"),
+            "incoming webhooks must use their Slack-configured channel: {body}"
+        );
+
+        assert!(
             !body.contains("_action_url") && !body.contains("temps.example"),
             "reserved _action_url metadata must never be sent to Slack: {body}"
         );
@@ -3693,6 +3733,30 @@ mod tests {
             body.contains("&lt;!channel&gt;"),
             "mrkdwn @channel mention must be escaped to literal entities: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_slack_send_returns_an_error_for_rejected_webhooks() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(410).set_body_string("invalid_token"))
+            .mount(&server)
+            .await;
+
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: Some("#incidents".to_string()),
+        };
+        let error = provider
+            .send(&Notification::new("Critical", "Webhook rejected"))
+            .await
+            .expect_err("Slack HTTP failures must not be reported as successful deliveries");
+
+        assert!(error.to_string().contains("410 Gone"));
     }
 
     #[test]

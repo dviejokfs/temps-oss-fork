@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
@@ -8,14 +5,18 @@ use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
-#[sea_orm(table_name = "notification_providers")]
+#[sea_orm(table_name = "notification_routes")]
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub name: String,
-    pub provider_type: String,
-    pub config: String,
     pub enabled: bool,
+    /// Lowest notification severity matched by this route.
+    /// Stored as a lowercase `NotificationSeverity` name.
+    pub min_severity: String,
+    /// Highest notification severity matched by this route.
+    /// Stored as a lowercase `NotificationSeverity` name.
+    pub max_severity: String,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

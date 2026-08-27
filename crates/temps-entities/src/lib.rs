@@ -75,6 +75,8 @@ pub mod node_route_state;
 pub mod nodes;
 pub mod notification_preferences;
 pub mod notification_providers;
+pub mod notification_route_providers;
+pub mod notification_routes;
 pub mod notifications;
 pub mod oauth_states;
 pub mod oidc_login_states;

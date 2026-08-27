@@ -2682,6 +2682,26 @@ export type ClusterDnsSettings = {
 };
 
 /**
+ * Response from `GET /api/cluster/dns/status`.
+ */
+export type ClusterDnsStatusResponse = {
+    /**
+     * Whether cluster DNS is currently enabled cluster-wide
+     * (`AppSettings.cluster_dns.enabled`). When `false`, every node's
+     * per-node values below are expected to show `dns_resolver_running:
+     * Some(false)` (or `None` if a node has never reported).
+     */
+    cluster_dns_enabled: boolean;
+    nodes: Array<NodeDnsStatusEntry>;
+    /**
+     * Total `*.temps.local` records currently registered across the whole
+     * cluster (`service_endpoints` row count), independent of any single
+     * node's resolver health.
+     */
+    total_record_count: number;
+};
+
+/**
  * Response body for `GET /external-services/{id}/cluster-health`.
  */
 export type ClusterHealthReportResponse = {
@@ -4169,6 +4189,14 @@ export type CreateNotificationEmailProviderRequest = {
     config: EmailConfig;
     enabled?: boolean | null;
     name: string;
+};
+
+export type CreateNotificationRouteRequest = {
+    enabled?: boolean | null;
+    max_severity: string;
+    min_severity: string;
+    name: string;
+    provider_ids: Array<number>;
 };
 
 export type CreateOidcProviderRequest = {
@@ -6143,6 +6171,36 @@ export type DnsRecordSetupResult = {
  * DNS record verification status
  */
 export type DnsRecordStatusResponse = 'unknown' | 'verified' | 'pending' | 'failed';
+
+/**
+ * Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
+ * `temps_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
+ * declared separately rather than shared: the agent and control-plane
+ * crates don't depend on each other (the agent avoids pulling in
+ * `temps-deployments`' sea-orm dependency tree), matching the existing
+ * `WirePeerListResponse` pattern in `temps-agent::network_sync`.
+ */
+export type DnsResolverHeartbeat = {
+    consecutive_sync_failures?: number;
+    /**
+     * Most recent resolver-related error: a sync tick failure, or (when the
+     * resolver never started at all) the startup error itself.
+     */
+    last_sync_error?: string | null;
+    last_sync_success_at?: string | null;
+    record_count?: number;
+    /**
+     * `false` when cluster DNS is disabled on the control plane, the
+     * resolver failed to start, or it was shut down. `true` only while a
+     * resolver handle currently exists and cluster DNS is enabled.
+     */
+    running?: boolean;
+    /**
+     * `false` means the resolver's sync or DNS server task crashed. Only
+     * meaningful when `running`.
+     */
+    tasks_alive?: boolean;
+};
 
 /**
  * A DNS zone (domain managed by the provider)
@@ -9095,6 +9153,7 @@ export type HeartbeatApiRequest = {
      * Each entry has `container_id` and `container_name` of temps-managed containers.
      */
     containers?: Array<ContainerInventoryItem> | null;
+    dns_resolver?: null | DnsResolverHeartbeat;
     /**
      * Updated node labels for scheduling (allows runtime label changes).
      */
@@ -11304,6 +11363,38 @@ export type NodeCostInfo = {
     region?: string | null;
 };
 
+/**
+ * Per-node DNS resolver health, as last reported by that node's heartbeat.
+ * Part of `GET /api/cluster/dns/status`.
+ */
+export type NodeDnsStatusEntry = {
+    dns_resolver_consecutive_failures: number;
+    dns_resolver_last_error?: string | null;
+    dns_resolver_last_sync_at?: string | null;
+    dns_resolver_record_count?: number | null;
+    /**
+     * `None` = never reported (older agent, or a single-host node that
+     * never allocates a `compute_cidr` and so never touches cluster DNS).
+     */
+    dns_resolver_running?: boolean | null;
+    dns_resolver_tasks_alive?: boolean | null;
+    node_id: number;
+    node_name: string;
+    /**
+     * The node's own status field (`active`, `offline`, `draining`, …) —
+     * included so an operator can tell "resolver down" apart from "node
+     * down" at a glance, without a second request.
+     */
+    node_status: string;
+    /**
+     * Computed from `dns_resolver_last_sync_at` against "now" server-side —
+     * a raw timestamp makes an operator do the subtraction themselves for
+     * every node; a staleness age is what actually answers "is this
+     * healthy right now". `None` when `dns_resolver_last_sync_at` is `None`.
+     */
+    seconds_since_last_sync?: number | null;
+};
+
 export type NodeInfoResponse = {
     address: string;
     /**
@@ -11364,6 +11455,24 @@ export type NotificationProviderResponse = {
     name: string;
     provider_type: string;
     updated_at: number;
+};
+
+export type NotificationRoute = {
+    created_at: number;
+    enabled: boolean;
+    id: number;
+    max_severity: string;
+    min_severity: string;
+    name: string;
+    provider_ids: Array<number>;
+    updated_at: number;
+};
+
+export type NotificationRoutePage = {
+    items: Array<NotificationRoute>;
+    page: number;
+    page_size: number;
+    total: number;
 };
 
 /**
@@ -19962,6 +20071,14 @@ export type UpdateNotificationEmailProviderRequest = {
     name?: string | null;
 };
 
+export type UpdateNotificationRouteRequest = {
+    enabled?: boolean | null;
+    max_severity?: string | null;
+    min_severity?: string | null;
+    name?: string | null;
+    provider_ids?: Array<number> | null;
+};
+
 export type UpdateOidcProviderRequest = {
     client_id?: string | null;
     client_secret?: string | null;
@@ -27020,6 +27137,37 @@ export type BlobHeadResponses = {
      */
     200: unknown;
 };
+
+export type ClusterDnsStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cluster/dns/status';
+};
+
+export type ClusterDnsStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ClusterDnsStatusResponses = {
+    /**
+     * Cluster DNS resolver health
+     */
+    200: ClusterDnsStatusResponse;
+};
+
+export type ClusterDnsStatusResponse2 = ClusterDnsStatusResponses[keyof ClusterDnsStatusResponses];
 
 export type GetDashboardProjectsAnalyticsData = {
     body?: never;
@@ -36359,6 +36507,10 @@ export type UpdateCloudflareProviderData = {
 
 export type UpdateCloudflareProviderErrors = {
     /**
+     * Invalid minimum severity or provider configuration
+     */
+    400: unknown;
+    /**
      * Provider not found
      */
     404: unknown;
@@ -36417,6 +36569,10 @@ export type UpdateNotificationEmailProviderData = {
 };
 
 export type UpdateNotificationEmailProviderErrors = {
+    /**
+     * Invalid minimum severity or provider configuration
+     */
+    400: unknown;
     /**
      * Provider not found
      */
@@ -36477,6 +36633,10 @@ export type UpdateSlackProviderData = {
 
 export type UpdateSlackProviderErrors = {
     /**
+     * Invalid minimum severity or provider configuration
+     */
+    400: unknown;
+    /**
      * Provider not found
      */
     404: unknown;
@@ -36535,6 +36695,10 @@ export type UpdateWebhookProviderData = {
 };
 
 export type UpdateWebhookProviderErrors = {
+    /**
+     * Invalid minimum severity or provider configuration
+     */
+    400: unknown;
     /**
      * Provider not found
      */
@@ -36632,7 +36796,7 @@ export type UpdateNotificationProviderData = {
 
 export type UpdateNotificationProviderErrors = {
     /**
-     * Invalid masked provider configuration
+     * Invalid minimum severity or masked provider configuration
      */
     400: unknown;
     /**
@@ -36729,6 +36893,175 @@ export type TestNotificationProviderResponses = {
 };
 
 export type TestNotificationProviderResponse = TestNotificationProviderResponses[keyof TestNotificationProviderResponses];
+
+export type ListNotificationRoutesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number | null;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number | null;
+        sort_by?: string | null;
+        sort_order?: string | null;
+    };
+    url: '/notification-routes';
+};
+
+export type ListNotificationRoutesErrors = {
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListNotificationRoutesResponses = {
+    /**
+     * Notification routes
+     */
+    200: NotificationRoutePage;
+};
+
+export type ListNotificationRoutesResponse = ListNotificationRoutesResponses[keyof ListNotificationRoutesResponses];
+
+export type CreateNotificationRouteData = {
+    body: CreateNotificationRouteRequest;
+    path?: never;
+    query?: never;
+    url: '/notification-routes';
+};
+
+export type CreateNotificationRouteErrors = {
+    /**
+     * Invalid route
+     */
+    400: unknown;
+    /**
+     * Route name already exists
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateNotificationRouteResponses = {
+    /**
+     * Route created
+     */
+    201: NotificationRoute;
+};
+
+export type CreateNotificationRouteResponse = CreateNotificationRouteResponses[keyof CreateNotificationRouteResponses];
+
+export type DeleteNotificationRouteData = {
+    body?: never;
+    path: {
+        /**
+         * Route ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/notification-routes/{id}';
+};
+
+export type DeleteNotificationRouteErrors = {
+    /**
+     * Route not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteNotificationRouteResponses = {
+    /**
+     * Route deleted
+     */
+    204: void;
+};
+
+export type DeleteNotificationRouteResponse = DeleteNotificationRouteResponses[keyof DeleteNotificationRouteResponses];
+
+export type GetNotificationRouteData = {
+    body?: never;
+    path: {
+        /**
+         * Route ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/notification-routes/{id}';
+};
+
+export type GetNotificationRouteErrors = {
+    /**
+     * Route not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetNotificationRouteResponses = {
+    /**
+     * Notification route
+     */
+    200: NotificationRoute;
+};
+
+export type GetNotificationRouteResponse = GetNotificationRouteResponses[keyof GetNotificationRouteResponses];
+
+export type UpdateNotificationRouteData = {
+    body: UpdateNotificationRouteRequest;
+    path: {
+        /**
+         * Route ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/notification-routes/{id}';
+};
+
+export type UpdateNotificationRouteErrors = {
+    /**
+     * Invalid route
+     */
+    400: unknown;
+    /**
+     * Route not found
+     */
+    404: unknown;
+    /**
+     * Route name already exists
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateNotificationRouteResponses = {
+    /**
+     * Route updated
+     */
+    200: NotificationRoute;
+};
+
+export type UpdateNotificationRouteResponse = UpdateNotificationRouteResponses[keyof UpdateNotificationRouteResponses];
 
 export type ListOrdersData = {
     body?: never;

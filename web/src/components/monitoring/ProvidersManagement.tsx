@@ -339,7 +339,8 @@ export function ProvidersManagement() {
             Notification Providers
           </h2>
           <p className="text-muted-foreground">
-            Manage your notification providers for alerts and updates.
+            Configure where notifications can be delivered. Routes decide which
+            alerts reach each destination.
           </p>
         </div>
 
