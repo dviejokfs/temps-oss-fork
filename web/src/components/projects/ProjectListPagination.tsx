@@ -55,9 +55,12 @@ export function ProjectListPagination({
       className="flex flex-col gap-3 pt-2 lg:flex-row lg:items-center lg:justify-between"
     >
       <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
-        <span>
+        <span className="hidden sm:inline">
           Showing {firstProject}–{lastProject} of {total} project
           {total === 1 ? '' : 's'}
+        </span>
+        <span className="sm:hidden">
+          {page} / {totalPages}
         </span>
         <div className="flex items-center gap-2">
           <span>Per page</span>

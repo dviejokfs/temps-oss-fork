@@ -16,7 +16,10 @@ describe('ProjectListPagination', () => {
       />
     )
 
-    expect(markup).toContain('Showing 37–54 of 100 projects')
+    expect(markup).toContain(
+      '<span class="hidden sm:inline">Showing 37–54 of 100 projects</span>'
+    )
+    expect(markup).toContain('<span class="sm:hidden">3 / 6</span>')
     expect(markup).toContain('aria-label="Projects per page"')
     expect(markup).toContain('aria-label="Page number"')
     expect(markup).toContain('aria-label="Go to first page"')
