@@ -8,7 +8,7 @@ use crate::routing::{
 };
 use crate::services::{
     NotificationPreferences, NotificationPreferencesService, NotificationProviderConfigMergeError,
-    NotificationProviderRevealError, NotificationService, TlsMode,
+    NotificationProviderCreateError, NotificationProviderRevealError, NotificationService, TlsMode,
 };
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -696,13 +696,10 @@ async fn create_notification_provider(
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(e) => {
-            error!("Failed to create notification provider: {}", e);
-            Err(notification_provider_write_problem(
-                &e,
-                "Failed to create notification provider",
-            ))
-        }
+        Err(e) => Err(notification_provider_create_problem(
+            &e,
+            "Failed to create notification provider",
+        )),
     }
 }
 impl From<UpdateProviderRequest> for crate::services::UpdateProviderRequest {
@@ -726,6 +723,17 @@ fn notification_provider_write_problem(error: &anyhow::Error, title: &'static st
     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
         .title(title)
         .detail("The notification provider could not be updated")
+        .build()
+}
+
+fn notification_provider_create_problem(
+    error: &NotificationProviderCreateError,
+    title: &'static str,
+) -> Problem {
+    tracing::error!(error = %error, "Notification provider creation failed");
+    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+        .title(title)
+        .detail("The notification provider and its catch-all route could not be created")
         .build()
 }
 
@@ -990,13 +998,10 @@ async fn create_slack_provider(
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(e) => {
-            error!("Failed to create Slack notification provider: {}", e);
-            Err(notification_provider_write_problem(
-                &e,
-                "Failed to create Slack notification provider",
-            ))
-        }
+        Err(e) => Err(notification_provider_create_problem(
+            &e,
+            "Failed to create Slack notification provider",
+        )),
     }
 }
 
@@ -1062,13 +1067,10 @@ async fn create_notification_email_provider(
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(e) => {
-            error!("Failed to create Email notification provider: {}", e);
-            Err(notification_provider_write_problem(
-                &e,
-                "Failed to create Email notification provider",
-            ))
-        }
+        Err(e) => Err(notification_provider_create_problem(
+            &e,
+            "Failed to create Email notification provider",
+        )),
     }
 }
 
@@ -1327,13 +1329,10 @@ async fn create_webhook_provider(
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(e) => {
-            error!("Failed to create Webhook notification provider: {}", e);
-            Err(notification_provider_write_problem(
-                &e,
-                "Failed to create Webhook notification provider",
-            ))
-        }
+        Err(e) => Err(notification_provider_create_problem(
+            &e,
+            "Failed to create Webhook notification provider",
+        )),
     }
 }
 
@@ -1508,13 +1507,10 @@ async fn create_cloudflare_provider(
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(e) => {
-            error!("Failed to create Cloudflare notification provider: {}", e);
-            Err(notification_provider_write_problem(
-                &e,
-                "Failed to create Cloudflare notification provider",
-            ))
-        }
+        Err(e) => Err(notification_provider_create_problem(
+            &e,
+            "Failed to create Cloudflare notification provider",
+        )),
     }
 }
 
@@ -1987,12 +1983,17 @@ fn notification_route_problem(error: NotificationRouteError) -> Problem {
         NotificationRouteError::DuplicateName { .. } => {
             (StatusCode::CONFLICT, "Notification route already exists")
         }
-        NotificationRouteError::Database { .. } => (
+        NotificationRouteError::Database { .. }
+        | NotificationRouteError::CatchAllRouteDatabase { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Notification route operation failed",
         ),
     };
-    let detail = if matches!(error, NotificationRouteError::Database { .. }) {
+    let detail = if matches!(
+        error,
+        NotificationRouteError::Database { .. }
+            | NotificationRouteError::CatchAllRouteDatabase { .. }
+    ) {
         tracing::error!(error = %error, "Notification route database operation failed");
         "The notification route operation could not be completed".to_string()
     } else {

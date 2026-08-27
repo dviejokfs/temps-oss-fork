@@ -2,8 +2,9 @@
 //!
 //! Routes deliberately sit between notifications and providers: providers
 //! describe destinations, while routes decide which destinations receive an
-//! event. Existing installations get one permissive default route so the
-//! upgrade preserves their previous fan-out behavior.
+//! event. Existing installations get one permissive catch-all route per
+//! provider so the upgrade preserves their previous fan-out behavior while
+//! keeping each destination independently configurable.
 
 use sea_orm_migration::prelude::*;
 
@@ -52,17 +53,26 @@ CREATE INDEX idx_notification_route_providers_provider_id
 
 DO $$
 DECLARE
-    default_route_id INTEGER;
+    existing_provider RECORD;
+    catch_all_route_id INTEGER;
 BEGIN
-    IF EXISTS (SELECT 1 FROM notification_providers) THEN
+    FOR existing_provider IN
+        SELECT id, name
+        FROM notification_providers
+        ORDER BY id
+    LOOP
         INSERT INTO notification_routes (name, enabled, min_severity, max_severity)
-        VALUES ('Default route', TRUE, 'debug', 'emergency')
-        RETURNING id INTO default_route_id;
+        VALUES (
+            'All notifications - ' || existing_provider.name || ' (provider ' || existing_provider.id || ')',
+            TRUE,
+            'debug',
+            'emergency'
+        )
+        RETURNING id INTO catch_all_route_id;
 
         INSERT INTO notification_route_providers (route_id, provider_id)
-        SELECT default_route_id, id
-        FROM notification_providers;
-    END IF;
+        VALUES (catch_all_route_id, existing_provider.id);
+    END LOOP;
 END $$;
 "#,
             )
@@ -83,5 +93,40 @@ DROP TABLE IF EXISTS notification_routes;
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    #[tokio::test]
+    async fn migration_backfills_one_catch_all_route_per_existing_provider() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+
+        Migration
+            .up(&SchemaManager::new(&db))
+            .await
+            .expect("notification routing migration should succeed");
+
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(
+            log.contains("FOR existing_provider IN"),
+            "migration must iterate over every existing provider"
+        );
+        assert!(
+            log.contains("VALUES (catch_all_route_id, existing_provider.id)"),
+            "each generated route must be assigned only to its provider"
+        );
+        assert!(
+            log.contains("'debug'") && log.contains("'emergency'"),
+            "backfilled routes must cover the complete severity range"
+        );
     }
 }

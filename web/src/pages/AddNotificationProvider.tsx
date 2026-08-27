@@ -154,9 +154,7 @@ export function AddNotificationProvider() {
     },
     onSuccess: () => {
       setCurrentStep('complete')
-      toast.success(
-        'Email provider added. Add it to a route to receive alerts.'
-      )
+      toast.success('Email provider added with a route for all notifications.')
       setTimeout(() => {
         navigate('/settings/notifications?tab=routes')
       }, 2000)
@@ -170,9 +168,7 @@ export function AddNotificationProvider() {
     },
     onSuccess: () => {
       setCurrentStep('complete')
-      toast.success(
-        'Slack provider added. Add it to a route to receive alerts.'
-      )
+      toast.success('Slack provider added with a route for all notifications.')
       setTimeout(() => {
         navigate('/settings/notifications?tab=routes')
       }, 2000)
@@ -187,7 +183,7 @@ export function AddNotificationProvider() {
     onSuccess: () => {
       setCurrentStep('complete')
       toast.success(
-        'Webhook provider added. Add it to a route to receive alerts.'
+        'Webhook provider added with a route for all notifications.'
       )
       setTimeout(() => {
         navigate('/settings/notifications?tab=routes')
@@ -205,7 +201,7 @@ export function AddNotificationProvider() {
     onSuccess: () => {
       setCurrentStep('complete')
       toast.success(
-        'Cloudflare provider added. Add it to a route to receive alerts.'
+        'Cloudflare provider added with a route for all notifications.'
       )
       setTimeout(() => {
         navigate('/settings/notifications?tab=routes')

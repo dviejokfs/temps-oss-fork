@@ -77,6 +77,15 @@ pub enum NotificationRouteError {
         #[source]
         source: DbErr,
     },
+    #[error(
+        "Failed to {operation} catch-all notification route for provider {provider_id}: {source}"
+    )]
+    CatchAllRouteDatabase {
+        provider_id: i32,
+        operation: &'static str,
+        #[source]
+        source: DbErr,
+    },
 }
 
 #[derive(Clone)]
@@ -87,6 +96,52 @@ pub struct NotificationRoutingService {
 impl NotificationRoutingService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
+    }
+
+    pub(crate) fn catch_all_route_name(provider_id: i32, provider_name: &str) -> String {
+        format!("All notifications - {provider_name} (provider {provider_id})")
+    }
+
+    pub(crate) async fn create_catch_all_route_for_provider<C>(
+        db: &C,
+        provider_id: i32,
+        provider_name: &str,
+    ) -> Result<(), NotificationRouteError>
+    where
+        C: sea_orm::ConnectionTrait,
+    {
+        let now = Utc::now();
+        let route = notification_routes::ActiveModel {
+            name: Set(Self::catch_all_route_name(provider_id, provider_name)),
+            enabled: Set(true),
+            min_severity: Set(NotificationSeverity::Debug.as_str().to_string()),
+            max_severity: Set(NotificationSeverity::Emergency.as_str().to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .map_err(|source| NotificationRouteError::CatchAllRouteDatabase {
+            provider_id,
+            operation: "create",
+            source,
+        })?;
+
+        notification_route_providers::ActiveModel {
+            route_id: Set(route.id),
+            provider_id: Set(provider_id),
+            created_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .map_err(|source| NotificationRouteError::CatchAllRouteDatabase {
+            provider_id,
+            operation: "assign provider to",
+            source,
+        })?;
+
+        Ok(())
     }
 
     fn normalize_name(name: String) -> Result<String, NotificationRouteError> {
@@ -586,7 +641,27 @@ impl NotificationRoutingService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm_migration::MigratorTrait;
     use temps_database::test_utils::TestDatabase;
+    use temps_migrations::Migrator;
+
+    macro_rules! routing_test_database_or_skip {
+        () => {
+            match TestDatabase::with_migrations().await {
+                Ok(test_db) => test_db,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if temps_database::test_utils::is_container_runtime_unavailable(&message)
+                        || message.contains("Docker Desktop is unable to start")
+                    {
+                        eprintln!("Skipping Docker-dependent routing test: {message}");
+                        return;
+                    }
+                    panic!("Failed to create routing test database: {message}");
+                }
+            }
+        };
+    }
 
     #[test]
     fn severity_range_is_inclusive() {
@@ -596,6 +671,18 @@ mod tests {
         assert!(NotificationSeverity::Error <= maximum);
         assert!(NotificationSeverity::Info < minimum);
         assert!(NotificationSeverity::Critical > maximum);
+    }
+
+    #[test]
+    fn catch_all_route_names_are_stable_and_provider_specific() {
+        assert_eq!(
+            NotificationRoutingService::catch_all_route_name(42, "Slack alerts"),
+            "All notifications - Slack alerts (provider 42)"
+        );
+        assert_ne!(
+            NotificationRoutingService::catch_all_route_name(42, "Slack alerts"),
+            NotificationRoutingService::catch_all_route_name(43, "Slack alerts")
+        );
     }
 
     #[test]
@@ -632,19 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_crud_filters_severity_ranges_and_providers() {
-        let test_db = match TestDatabase::with_migrations().await {
-            Ok(test_db) => test_db,
-            Err(error) => {
-                let message = format!("{error:#}");
-                if temps_database::test_utils::is_container_runtime_unavailable(&message)
-                    || message.contains("Docker Desktop is unable to start")
-                {
-                    eprintln!("Skipping Docker-dependent routing test: {message}");
-                    return;
-                }
-                panic!("Failed to create routing test database: {message}");
-            }
-        };
+        let test_db = routing_test_database_or_skip!();
         let now = Utc::now();
         let primary = notification_providers::ActiveModel {
             name: Set("Slack team alerts".to_string()),
@@ -797,5 +872,139 @@ mod tests {
             .cleanup_all_tables()
             .await
             .expect("routing test data should clean up");
+    }
+
+    #[tokio::test]
+    async fn migration_backfills_and_reverses_provider_specific_routes() {
+        let mut test_db = routing_test_database_or_skip!();
+        let migrations = Migrator::migrations();
+        let migration_index = migrations
+            .iter()
+            .position(|migration| migration.name() == "m20260827_000001_create_notification_routes")
+            .expect("notification routes migration must be registered");
+        let migrations_to_remove = (migrations.len() - migration_index) as u32;
+
+        Migrator::down(test_db.db.as_ref(), Some(migrations_to_remove))
+            .await
+            .expect("notification routes migration should roll down before legacy data is seeded");
+
+        let now = Utc::now();
+        let slack = notification_providers::ActiveModel {
+            name: Set("Existing Slack".to_string()),
+            provider_type: Set("slack".to_string()),
+            config: Set("encrypted-slack-config".to_string()),
+            enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .expect("legacy Slack provider should insert");
+        let email = notification_providers::ActiveModel {
+            name: Set("Existing email".to_string()),
+            provider_type: Set("email".to_string()),
+            config: Set("encrypted-email-config".to_string()),
+            enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .expect("legacy email provider should insert");
+        let disabled_webhook = notification_providers::ActiveModel {
+            name: Set("Disabled webhook".to_string()),
+            provider_type: Set("webhook".to_string()),
+            config: Set("encrypted-webhook-config".to_string()),
+            enabled: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .expect("disabled legacy webhook provider should insert");
+
+        Migrator::up(test_db.db.as_ref(), Some(1))
+            .await
+            .expect("notification routes migration should apply to legacy providers");
+
+        let routing = NotificationRoutingService::new(test_db.connection_arc());
+        let routes = routing
+            .list(1, 20)
+            .await
+            .expect("backfilled routes should be readable");
+        assert_eq!(routes.total, 3);
+        let provider_assignments: HashSet<Vec<i32>> = routes
+            .items
+            .iter()
+            .map(|route| {
+                assert!(route.enabled);
+                assert_eq!(route.min_severity, "debug");
+                assert_eq!(route.max_severity, "emergency");
+                route.provider_ids.clone()
+            })
+            .collect();
+        assert_eq!(
+            provider_assignments,
+            HashSet::from([vec![slack.id], vec![email.id], vec![disabled_webhook.id],])
+        );
+        let resolved = routing
+            .resolve_provider_models(NotificationSeverity::Debug)
+            .await
+            .expect("backfilled routes should resolve enabled providers");
+        assert_eq!(
+            resolved
+                .into_iter()
+                .map(|provider| provider.id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([slack.id, email.id]),
+            "disabled providers keep their route for later re-enabling but do not receive alerts"
+        );
+
+        let mut disabled_webhook_active: notification_providers::ActiveModel =
+            disabled_webhook.clone().into();
+        disabled_webhook_active.enabled = Set(true);
+        disabled_webhook_active
+            .update(test_db.db.as_ref())
+            .await
+            .expect("legacy disabled provider should be enableable");
+        let resolved_after_enabling = routing
+            .resolve_provider_models(NotificationSeverity::Debug)
+            .await
+            .expect("backfilled route should activate when its provider is enabled");
+        assert_eq!(
+            resolved_after_enabling
+                .into_iter()
+                .map(|provider| provider.id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([slack.id, email.id, disabled_webhook.id])
+        );
+
+        Migrator::down(test_db.db.as_ref(), Some(1))
+            .await
+            .expect("notification routes migration should reverse cleanly");
+        let down_error = notification_routes::Entity::find()
+            .one(test_db.db.as_ref())
+            .await
+            .expect_err("notification_routes table must be removed by down migration");
+        assert!(down_error.to_string().contains("notification_routes"));
+        let join_down_error = notification_route_providers::Entity::find()
+            .one(test_db.db.as_ref())
+            .await
+            .expect_err("notification_route_providers table must be removed by down migration");
+        assert!(join_down_error
+            .to_string()
+            .contains("notification_route_providers"));
+        assert_eq!(
+            notification_providers::Entity::find()
+                .count(test_db.db.as_ref())
+                .await
+                .expect("legacy providers must remain after route migration rollback"),
+            3
+        );
+
+        test_db.cleanup().await;
     }
 }
