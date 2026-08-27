@@ -1970,6 +1970,7 @@ pub struct UpdateNotificationRouteRequest {
 fn notification_route_problem(error: NotificationRouteError) -> Problem {
     let (status, title) = match error {
         NotificationRouteError::InvalidName
+        | NotificationRouteError::NameTooLong { .. }
         | NotificationRouteError::InvalidMinimumSeverity { .. }
         | NotificationRouteError::InvalidMaximumSeverity { .. }
         | NotificationRouteError::InvalidSeverityRange { .. }

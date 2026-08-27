@@ -24,7 +24,8 @@ use temps_core::notifications::{
 use temps_core::url_validation::{resolve_and_validate_domain, validate_external_url};
 use temps_entities::types::RoleType;
 use temps_entities::{
-    notification_preferences, notification_providers, notifications, roles, user_roles, users,
+    notification_preferences, notification_providers, notification_routes, notifications, roles,
+    user_roles, users,
 };
 use tracing::{error, info};
 use utoipa::ToSchema;
@@ -543,7 +544,10 @@ impl NotificationProvider for CloudflareProvider {
         match client.get(url).bearer_auth(&self.api_token).send().await {
             Ok(response) => Ok(response.status().is_success()),
             Err(e) => {
-                error!("Cloudflare provider health check failed: {}", e);
+                error!(
+                    "Cloudflare provider health check failed: {}",
+                    e.without_url()
+                );
                 Ok(false)
             }
         }
@@ -565,6 +569,16 @@ fn html_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Drop the request URL from a reqwest error before it is logged or
+/// propagated. `reqwest::Error`'s `Display` embeds the full request URL
+/// (`" for url (...)"`) whenever one is attached — for webhook-style
+/// destinations (Slack incoming webhooks, Discord-style webhook URLs) that
+/// URL IS the credential, so leaving it in triggers CWE-532 (secrets in
+/// logs) the moment a delivery or health check fails.
+fn webhook_request_error(prefix: &str, error: reqwest::Error) -> anyhow::Error {
+    anyhow::anyhow!("{prefix}: {}", error.without_url())
 }
 
 /// Escape Slack mrkdwn special characters so user-controlled text cannot inject
@@ -1276,8 +1290,10 @@ impl NotificationProvider for SlackProvider {
             .post(&self.webhook_url)
             .json(&payload)
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .map_err(|e| webhook_request_error("Slack webhook request failed", e))?
+            .error_for_status()
+            .map_err(|e| webhook_request_error("Slack webhook rejected the request", e))?;
 
         Ok(())
     }
@@ -1295,7 +1311,7 @@ impl NotificationProvider for SlackProvider {
         {
             Ok(response) => Ok(response.status().is_success()),
             Err(e) => {
-                error!("Slack provider health check failed: {}", e);
+                error!("Slack provider health check failed: {}", e.without_url());
                 Ok(false)
             }
         }
@@ -1359,7 +1375,10 @@ impl NotificationProvider for WebhookProvider {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| webhook_request_error("Webhook request failed", e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1404,7 +1423,7 @@ impl NotificationProvider for WebhookProvider {
         match request.send().await {
             Ok(response) => Ok(response.status().is_success()),
             Err(e) => {
-                error!("Webhook provider health check failed: {}", e);
+                error!("Webhook provider health check failed: {}", e.without_url());
                 Ok(false)
             }
         }
@@ -1972,6 +1991,11 @@ impl NotificationService {
 
         if let Some(provider) = provider {
             let existing_config = provider.config.clone();
+            let renamed_to = update
+                .name
+                .as_ref()
+                .filter(|new_name| *new_name != &provider.name)
+                .cloned();
             let mut active_model: notification_providers::ActiveModel = provider.into();
 
             // Update fields if provided
@@ -1994,8 +2018,36 @@ impl NotificationService {
             }
             active_model.updated_at = Set(Utc::now());
 
+            let transaction = self.db.begin().await?;
+
             // Update the provider in the database
-            let updated_provider = active_model.update(self.db.as_ref()).await?;
+            let updated_provider = active_model.update(&transaction).await?;
+
+            // Keep the auto-generated catch-all route's display name (baked
+            // in at creation time from the provider's name) in sync with a
+            // rename, so the Routes list doesn't keep showing a stale name
+            // for the provider it belongs to.
+            if let Some(new_name) = renamed_to {
+                notification_routes::Entity::update_many()
+                    .col_expr(
+                        notification_routes::Column::Name,
+                        sea_orm::sea_query::Expr::value(
+                            NotificationRoutingService::catch_all_route_name(
+                                provider_id,
+                                &new_name,
+                            ),
+                        ),
+                    )
+                    .col_expr(
+                        notification_routes::Column::UpdatedAt,
+                        sea_orm::sea_query::Expr::value(Utc::now()),
+                    )
+                    .filter(notification_routes::Column::CatchAllProviderId.eq(provider_id))
+                    .exec(&transaction)
+                    .await?;
+            }
+
+            transaction.commit().await?;
 
             Ok(Some(updated_provider))
         } else {
@@ -2009,6 +2061,10 @@ impl NotificationService {
             .await?;
 
         if let Some(provider) = provider {
+            // The provider's auto-generated catch-all route (if any) is
+            // removed automatically via the `catch_all_provider_id` FK's
+            // ON DELETE CASCADE — no orphaned "All notifications - <name>
+            // (provider <id>)" route is left behind.
             provider.delete(self.db.as_ref()).await?;
             Ok(true)
         } else {
@@ -4212,6 +4268,100 @@ mod tests {
             .cleanup_all_tables()
             .await
             .expect("notification route test data should clean up");
+    }
+
+    #[tokio::test]
+    async fn provider_rename_and_delete_keep_the_catch_all_route_in_sync() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-lifecycle-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        let routing = NotificationRoutingService::new(test_db.connection_arc());
+
+        let provider = service
+            .add_provider(
+                "Slack team alerts".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.com/services/TEST/TEST/TEST",
+                    "channel": "#alerts"
+                }),
+                true,
+            )
+            .await
+            .expect("provider and its catch-all route should be created");
+
+        // Renaming the provider must rename its catch-all route to match,
+        // not leave the route showing the provider's old name.
+        service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: Some("Slack team alerts (renamed)".to_string()),
+                    config: None,
+                    enabled: None,
+                },
+            )
+            .await
+            .expect("provider rename should succeed")
+            .expect("renamed provider should still exist");
+        let routes_after_rename = routing
+            .list(1, 20)
+            .await
+            .expect("routes should list after rename");
+        assert_eq!(routes_after_rename.total, 1);
+        assert_eq!(
+            routes_after_rename.items[0].name,
+            NotificationRoutingService::catch_all_route_name(
+                provider.id,
+                "Slack team alerts (renamed)"
+            ),
+            "the catch-all route's name must track the provider rename"
+        );
+
+        // An unrelated update (no name change) must not touch the route.
+        service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: None,
+                    config: None,
+                    enabled: Some(false),
+                },
+            )
+            .await
+            .expect("disabling the provider should succeed")
+            .expect("provider should still exist");
+        let routes_after_unrelated_update = routing
+            .list(1, 20)
+            .await
+            .expect("routes should list after an unrelated update");
+        assert_eq!(
+            routes_after_unrelated_update.items[0].name, routes_after_rename.items[0].name,
+            "a config/enabled-only update must not rename the catch-all route"
+        );
+
+        // Deleting the provider must remove its catch-all route too — no
+        // orphaned, permanently-empty route left behind.
+        let deleted = service
+            .delete_provider(provider.id)
+            .await
+            .expect("provider delete should succeed");
+        assert!(deleted);
+        let routes_after_delete = routing
+            .list(1, 20)
+            .await
+            .expect("routes should list after delete");
+        assert_eq!(
+            routes_after_delete.total, 0,
+            "the catch-all route must be cascade-deleted with its provider"
+        );
+
+        test_db
+            .cleanup_all_tables()
+            .await
+            .expect("notification provider lifecycle test data should clean up");
     }
 
     #[tokio::test]

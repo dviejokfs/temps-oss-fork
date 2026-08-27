@@ -27,6 +27,15 @@ CREATE TABLE notification_routes (
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     min_severity VARCHAR NOT NULL DEFAULT 'debug',
     max_severity VARCHAR NOT NULL DEFAULT 'emergency',
+    -- Set only for the auto-generated catch-all route created alongside a
+    -- provider (see the backfill below and NotificationRoutingService::
+    -- create_catch_all_route_for_provider). NULL for routes an operator
+    -- created explicitly. The FK cascade deletes the catch-all route when
+    -- its provider is deleted, so no orphaned "All notifications - <name>
+    -- (provider <id>)" route can be left behind; the service layer uses
+    -- this column (not name parsing) to keep the route's display name in
+    -- sync when the provider is renamed.
+    catch_all_provider_id INTEGER REFERENCES notification_providers(id) ON DELETE CASCADE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT notification_routes_name_unique UNIQUE (name),
@@ -43,6 +52,11 @@ CREATE TABLE notification_routes (
 
 CREATE INDEX idx_notification_routes_enabled
     ON notification_routes (enabled);
+
+-- At most one catch-all route per provider.
+CREATE UNIQUE INDEX idx_notification_routes_catch_all_provider_id
+    ON notification_routes (catch_all_provider_id)
+    WHERE catch_all_provider_id IS NOT NULL;
 
 CREATE TABLE notification_route_providers (
     route_id INTEGER NOT NULL REFERENCES notification_routes(id) ON DELETE CASCADE,
@@ -64,12 +78,13 @@ BEGIN
         FROM notification_providers
         ORDER BY id
     LOOP
-        INSERT INTO notification_routes (name, enabled, min_severity, max_severity)
+        INSERT INTO notification_routes (name, enabled, min_severity, max_severity, catch_all_provider_id)
         VALUES (
             'All notifications - ' || existing_provider.name || ' (provider ' || existing_provider.id || ')',
             TRUE,
             'debug',
-            'emergency'
+            'emergency',
+            existing_provider.id
         )
         RETURNING id INTO catch_all_route_id;
 
@@ -130,6 +145,10 @@ mod tests {
         assert!(
             log.contains("'debug'") && log.contains("'emergency'"),
             "backfilled routes must cover the complete severity range"
+        );
+        assert!(
+            log.contains("catch_all_provider_id") && log.contains("existing_provider.id"),
+            "each generated route must record which provider it is a catch-all for"
         );
     }
 }

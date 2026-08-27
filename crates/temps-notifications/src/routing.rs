@@ -55,6 +55,8 @@ pub struct NotificationRoutePage {
 pub enum NotificationRouteError {
     #[error("Notification route name must not be empty")]
     InvalidName,
+    #[error("Notification route name is {length} characters; the maximum is {max}")]
+    NameTooLong { length: usize, max: usize },
     #[error(
         "Minimum severity '{value}' is invalid; expected one of: debug, info, warning, error, critical, emergency"
     )]
@@ -102,7 +104,25 @@ impl NotificationRoutingService {
     }
 
     pub(crate) fn catch_all_route_name(provider_id: i32, provider_name: &str) -> String {
-        format!("All notifications - {provider_name} (provider {provider_id})")
+        // Provider names aren't length-validated on creation (unlike route
+        // names — see `normalize_name`/`MAX_NAME_LENGTH`), so truncate the
+        // embedded name defensively to keep the generated route name within
+        // the same display bound rather than letting an unusually long
+        // provider name make the routes list unreadable.
+        let suffix = format!(" (provider {provider_id})");
+        let budget = Self::MAX_NAME_LENGTH
+            .saturating_sub("All notifications - ".len())
+            .saturating_sub(suffix.len());
+        let truncated_name: String = if provider_name.chars().count() > budget {
+            provider_name
+                .chars()
+                .take(budget.saturating_sub(1))
+                .collect::<String>()
+                + "…"
+        } else {
+            provider_name.to_string()
+        };
+        format!("All notifications - {truncated_name}{suffix}")
     }
 
     pub(crate) async fn create_catch_all_route_for_provider<C>(
@@ -119,6 +139,7 @@ impl NotificationRoutingService {
             enabled: Set(true),
             min_severity: Set(NotificationSeverity::Debug.as_str().to_string()),
             max_severity: Set(NotificationSeverity::Emergency.as_str().to_string()),
+            catch_all_provider_id: Set(Some(provider_id)),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
@@ -147,10 +168,22 @@ impl NotificationRoutingService {
         Ok(())
     }
 
+    /// Keeps route names (and the provider-name-derived catch-all names) to
+    /// a sane display length. Postgres itself has no practical limit on an
+    /// unbounded `VARCHAR`, but an unbounded name would render badly in the
+    /// routes list and in the unique-name error message.
+    const MAX_NAME_LENGTH: usize = 255;
+
     fn normalize_name(name: String) -> Result<String, NotificationRouteError> {
         let name = name.trim().to_string();
         if name.is_empty() {
             return Err(NotificationRouteError::InvalidName);
+        }
+        if name.chars().count() > Self::MAX_NAME_LENGTH {
+            return Err(NotificationRouteError::NameTooLong {
+                length: name.chars().count(),
+                max: Self::MAX_NAME_LENGTH,
+            });
         }
         Ok(name)
     }
@@ -689,6 +722,28 @@ mod tests {
     }
 
     #[test]
+    fn catch_all_route_name_truncates_unusually_long_provider_names() {
+        let long_name = "x".repeat(500);
+        let name = NotificationRoutingService::catch_all_route_name(1, &long_name);
+        assert!(
+            name.chars().count() <= NotificationRoutingService::MAX_NAME_LENGTH,
+            "generated catch-all route name must stay within the display bound: {} chars",
+            name.chars().count()
+        );
+        assert!(name.starts_with("All notifications - "));
+        assert!(name.ends_with("(provider 1)"));
+    }
+
+    #[test]
+    fn route_name_longer_than_the_limit_is_rejected() {
+        let long_name = "x".repeat(NotificationRoutingService::MAX_NAME_LENGTH + 1);
+        assert!(matches!(
+            NotificationRoutingService::normalize_name(long_name),
+            Err(NotificationRouteError::NameTooLong { .. })
+        ));
+    }
+
+    #[test]
     fn provider_ids_are_deduplicated_and_sorted() {
         let provider_ids = NotificationRoutingService::normalize_provider_ids(vec![3, 1, 3, 2])
             .expect("valid provider IDs should normalize");
@@ -1009,5 +1064,93 @@ mod tests {
         );
 
         test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn overlapping_routes_fan_out_and_deduplicate_providers() {
+        let test_db = routing_test_database_or_skip!();
+        let now = Utc::now();
+        let general = notification_providers::ActiveModel {
+            name: Set("Slack general".to_string()),
+            provider_type: Set("slack".to_string()),
+            config: Set("test-config".to_string()),
+            enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .expect("general provider should insert");
+        let incidents = notification_providers::ActiveModel {
+            name: Set("Slack incidents".to_string()),
+            provider_type: Set("slack".to_string()),
+            config: Set("test-config".to_string()),
+            enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .expect("incidents provider should insert");
+        let service = NotificationRoutingService::new(test_db.connection_arc());
+
+        // "Default route" matches everything and points at #general.
+        service
+            .create(CreateNotificationRoute {
+                name: "Default route".to_string(),
+                enabled: true,
+                min_severity: "debug".to_string(),
+                max_severity: "emergency".to_string(),
+                provider_ids: vec![general.id],
+            })
+            .await
+            .expect("default route should create");
+        // "Critical incidents" overlaps Default's range for Critical/Emergency
+        // and points at #incidents — both routes must fire, once each, for a
+        // Critical event.
+        service
+            .create(CreateNotificationRoute {
+                name: "Critical incidents".to_string(),
+                enabled: true,
+                min_severity: "critical".to_string(),
+                max_severity: "emergency".to_string(),
+                provider_ids: vec![incidents.id, general.id],
+            })
+            .await
+            .expect("critical incidents route should create");
+
+        let warning = service
+            .resolve_provider_models(NotificationSeverity::Warning)
+            .await
+            .expect("warning routing should resolve");
+        assert_eq!(
+            warning.iter().map(|p| p.id).collect::<HashSet<_>>(),
+            HashSet::from([general.id]),
+            "only the non-overlapping Default route matches a Warning event"
+        );
+
+        let critical = service
+            .resolve_provider_models(NotificationSeverity::Critical)
+            .await
+            .expect("critical routing should resolve");
+        let critical_ids: Vec<i32> = critical.iter().map(|p| p.id).collect();
+        assert_eq!(
+            critical_ids.len(),
+            2,
+            "a Critical event matched by both overlapping routes must still \
+             deliver once per distinct provider, not once per matching route: {critical_ids:?}"
+        );
+        assert_eq!(
+            critical.into_iter().map(|p| p.id).collect::<HashSet<_>>(),
+            HashSet::from([general.id, incidents.id]),
+            "fan-out must include every provider from every matching route, deduplicated"
+        );
+
+        test_db
+            .cleanup_all_tables()
+            .await
+            .expect("overlapping route test data should clean up");
     }
 }
