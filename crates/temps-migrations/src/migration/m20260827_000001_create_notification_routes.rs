@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Create severity-based notification routes.
 //!
 //! Routes deliberately sit between notifications and providers: providers

@@ -36,6 +36,9 @@ Guidance for Claude Code when working with the Temps codebase.
   `SPDX-FileCopyrightText: 2024-2026 Temps Contributors` and
   `SPDX-License-Identifier: MIT OR Apache-2.0`. Run
   `python3 scripts/source_attribution.py annotate path/to/file` to apply it.
+  Before every commit that adds or regenerates source files, run
+  `python3 scripts/source_attribution.py check`; attribution failures are
+  blocking and must be fixed before committing.
   Generated files must receive the header from their generator or generation
   command. Never replace or misattribute third-party copyright notices.
 - Run `cargo check --lib` after every modification

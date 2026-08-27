@@ -21,6 +21,13 @@ Apply it with:
 python3 scripts/source_attribution.py annotate path/to/file
 ```
 
+Before every commit that adds or regenerates source files, run the repository-wide
+check and treat any failure as blocking:
+
+```bash
+python3 scripts/source_attribution.py check
+```
+
 Generated files must receive the same header from their generator or generation
 command so regeneration cannot remove it. Do not replace, remove, or
 misattribute copyright and license notices in third-party files.
