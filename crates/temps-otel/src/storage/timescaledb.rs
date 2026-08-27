@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! TimescaleDB storage backend for OTel data.
 //!
 //! Stores metrics, traces, and logs in TimescaleDB hypertables with

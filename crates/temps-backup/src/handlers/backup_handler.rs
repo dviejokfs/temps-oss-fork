@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::engines::dispatch::{resolve_engine_key, ResolveEngineError};
 use crate::handlers::audit::{
     AuditContext, BackupDeletedAudit, BackupRetentionCleanupAudit, BackupRunAudit,

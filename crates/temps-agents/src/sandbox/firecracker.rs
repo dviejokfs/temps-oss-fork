@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Firecracker microVM sandbox backend (ADR-029).
 //!
 //! Each sandbox is a KVM microVM: pinned guest kernel, an ext4 rootfs

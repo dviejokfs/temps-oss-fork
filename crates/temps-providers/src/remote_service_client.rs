@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP client for calling the agent's service management API on remote nodes.
 //!
 //! Used by `ExternalServiceManager` to route service operations (create, start,

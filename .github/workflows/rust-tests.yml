@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 name: Rust Tests
 
 on:
@@ -47,6 +50,14 @@ jobs:
 
       - name: Verify nextest target seed contracts
         run: python3 .github/scripts/test-nextest-cache-seed.py
+
+      - name: Test source attribution tooling
+        run: |
+          python3 scripts/test_source_attribution.py
+          python3 scripts/test_release_attribution.py
+
+      - name: Verify source attribution headers
+        run: python3 scripts/source_attribution.py check
 
   # ---------------------------------------------------------------------------
   # One `temps` binary, two consumers.

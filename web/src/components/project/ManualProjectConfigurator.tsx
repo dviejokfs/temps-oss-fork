@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { createProjectMutation, listServicesOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ExternalServiceInfo, ServiceTypeRoute, SourceType } from '@/api/client/types.gen'
 import { ImportEnvDialog } from '@/components/ui/import-env-dialog'

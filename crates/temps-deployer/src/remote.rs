@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Remote node deployer — implements `ContainerDeployer` and `ImageBuilder`
 //! by calling the agent's HTTP API on a remote worker node.
 //!

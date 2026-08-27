@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Deploy Static Files Job
 //!
 //! Deploys static files (Vite, React, etc.) to the filesystem instead of containers

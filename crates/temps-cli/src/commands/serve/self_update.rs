@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Applies a published release to the running install, on request from the API.
 //!
 //! This is the implementation behind `temps_core::SelfUpdater`; the HTTP surface

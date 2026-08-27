@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Coolify importer — WorkloadImporter implementation
 //!
 //! The Coolify *environment* (inside a Coolify project) is the project

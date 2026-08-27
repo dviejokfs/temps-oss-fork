@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! [`TeamProjectAccessChecker`] — the implementation of
 //! [`temps_core::ProjectAccessChecker`] that makes the platform's
 //! project-scoped enforcement seam real.

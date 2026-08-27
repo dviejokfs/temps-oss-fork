@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 name: Dependency & Container Scan
 
 # Supply-chain scanning for Temps' own code (tracked as bherila/temps#23).

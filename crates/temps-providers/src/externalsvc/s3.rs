@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_s3::config::Region;

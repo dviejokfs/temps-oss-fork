@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Portainer importer — WorkloadImporter implementation
 //!
 //! A Portainer **stack** is the project boundary: its compose services become

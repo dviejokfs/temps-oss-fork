@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Static File Deployer
 //!
 //! Handles deployment of static files (Vite, React, etc.) to organized filesystem storage

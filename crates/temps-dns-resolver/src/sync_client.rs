@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Long-poll sync loop against the control plane's
 //! `GET /api/internal/nodes/{id}/dns/changes` and `POST .../dns/ack`
 //! endpoints.

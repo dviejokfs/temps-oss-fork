@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Periodic job that checks node health, marks stale nodes as offline,
 //! and triggers failover redeployment for affected environments.
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! CLI device-authorization flow (OAuth 2.0 RFC 8628-style).
 //!
 //! This is the only interactive login path the CLI exposes — credentials are

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use bollard::{models::NetworkCreateRequest, query_parameters::ListNetworksOptions, Docker};
 use std::collections::HashMap;
 use tracing::{error, info};

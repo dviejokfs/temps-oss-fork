@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Node scheduler — selects which nodes each replica deploys to.
 //!
 //! **Single-node invariant:** if `nodes` table has zero active rows,

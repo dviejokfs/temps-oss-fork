@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Capture Source Maps Job
 //!
 //! Extracts source map files (.map) from the built Docker image and uploads them
