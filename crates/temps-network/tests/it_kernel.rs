@@ -180,6 +180,18 @@ async fn docker_network_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+async fn docker_container_running(name: &str) -> bool {
+    let output = Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}", name])
+        .output()
+        .await;
+    matches!(
+        output,
+        Ok(output) if output.status.success()
+            && String::from_utf8_lossy(&output.stdout).trim() == "true"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Per-test fixture: ensure clean state before AND after each test
 // ---------------------------------------------------------------------------
@@ -673,10 +685,21 @@ async fn control_plane_stays_running_and_reconciles_worker_later() {
     let pool: Ipv4Net = parse_env("TEMPS_IT_CLUSTER_POOL");
     let ready_file = parse_env::<String>("TEMPS_IT_CONTROL_PLANE_READY_FILE");
     let worker_file = parse_env::<String>("TEMPS_IT_WORKER_READY_FILE");
+    let existing_app_network = parse_env::<String>("TEMPS_IT_EXISTING_APP_NETWORK");
+    let existing_app_cidr = parse_env::<String>("TEMPS_IT_EXISTING_APP_CIDR");
+    let existing_app_container = parse_env::<String>("TEMPS_IT_EXISTING_APP_CONTAINER");
+    let existing_custom_route = parse_env::<String>("TEMPS_IT_EXISTING_CUSTOM_ROUTE");
     cleanup_all().await;
     let _ = tokio::fs::remove_file(&ready_file).await;
     let _ = tokio::fs::remove_file(&worker_file).await;
     let cfg = env.config();
+    assert!(
+        docker_network_exists(&existing_app_network).await,
+        "the pre-existing control-plane app network must exist before setup"
+    );
+    assert!(route_exists(&existing_app_cidr).await);
+    assert!(route_exists(&existing_custom_route).await);
+    assert!(docker_container_running(&existing_app_container).await);
     temps_network::preflight_compute_pool_routes(&cfg, pool)
         .await
         .expect("safe cluster pool must not overlap host routes");
@@ -690,6 +713,10 @@ async fn control_plane_stays_running_and_reconciles_worker_later() {
         .await
         .expect("ensure control-plane Docker overlay");
     assert!(!route_exists(&env.peer_cidr.to_string()).await);
+    assert!(docker_network_exists(&existing_app_network).await);
+    assert!(route_exists(&existing_app_cidr).await);
+    assert!(route_exists(&existing_custom_route).await);
+    assert!(docker_container_running(&existing_app_container).await);
     tokio::fs::write(&ready_file, b"ready\n")
         .await
         .expect("publish control-plane ready marker");
@@ -724,4 +751,8 @@ async fn control_plane_stays_running_and_reconciles_worker_later() {
     assert!(changed);
     assert!(route_exists(&peer.compute_cidr.to_string()).await);
     assert!(fdb_has_entry("vxlan-temps0", &peer.underlay_address.to_string()).await);
+    assert!(docker_network_exists(&existing_app_network).await);
+    assert!(route_exists(&existing_app_cidr).await);
+    assert!(route_exists(&existing_custom_route).await);
+    assert!(docker_container_running(&existing_app_container).await);
 }

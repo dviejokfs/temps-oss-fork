@@ -27,6 +27,11 @@ DIND_IMAGE="docker:27-dind"
 RUST_IMAGE="rust:1.85-bookworm"
 CONTROL_PLANE_READY_FILE="/workspace/.temps-it-control-plane-ready"
 WORKER_READY_FILE="/workspace/.temps-it-worker-ready"
+EXISTING_APP_NETWORK="temps-app-network"
+EXISTING_APP_CIDR="172.31.0.0/16"
+EXISTING_APP_CONTAINER="existing-control-plane-app"
+EXISTING_CUSTOM_ROUTE="192.168.240.0/24"
+EXISTING_CUSTOM_ROUTE_DEV="temps-existing0"
 
 log() { printf '\033[1;36m[it]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[it]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -169,6 +174,22 @@ docker exec \
     cargo test -p temps-network --features integration_kernel,control_plane --test it_kernel full_pool_collision_is_rejected_without_partial_kernel_state -- --exact --test-threads=1 --nocapture
   ' || fail "existing CIDR preflight regression failed"
 
+# Model an established single-node installation before multi-node networking
+# is enabled. The application network, a running workload, and an unrelated
+# operator-managed host route must all survive control-plane overlay setup and
+# the later arrival of a worker.
+log "creating an existing control-plane app network, workload, and custom route"
+docker exec "$NODE_A" sh -ec "
+  docker network rm '$EXISTING_APP_NETWORK' >/dev/null 2>&1 || true
+  ip link del '$EXISTING_CUSTOM_ROUTE_DEV' >/dev/null 2>&1 || true
+  docker network create --driver bridge --subnet '$EXISTING_APP_CIDR' '$EXISTING_APP_NETWORK' >/dev/null
+  docker run -d --rm --name '$EXISTING_APP_CONTAINER' \
+    --network '$EXISTING_APP_NETWORK' nginx:alpine >/dev/null
+  ip link add '$EXISTING_CUSTOM_ROUTE_DEV' type dummy
+  ip link set '$EXISTING_CUSTOM_ROUTE_DEV' up
+  ip route add '$EXISTING_CUSTOM_ROUTE' dev '$EXISTING_CUSTOM_ROUTE_DEV'
+"
+
 log "starting the control plane alone and keeping its manager alive"
 docker exec \
   -e TEMPS_IT_LOCAL_NAME=node-a \
@@ -181,6 +202,10 @@ docker exec \
   -e TEMPS_IT_PHASE_TESTS=1 \
   -e TEMPS_IT_CONTROL_PLANE_READY_FILE="$CONTROL_PLANE_READY_FILE" \
   -e TEMPS_IT_WORKER_READY_FILE="$WORKER_READY_FILE" \
+  -e TEMPS_IT_EXISTING_APP_NETWORK="$EXISTING_APP_NETWORK" \
+  -e TEMPS_IT_EXISTING_APP_CIDR="$EXISTING_APP_CIDR" \
+  -e TEMPS_IT_EXISTING_APP_CONTAINER="$EXISTING_APP_CONTAINER" \
+  -e TEMPS_IT_EXISTING_CUSTOM_ROUTE="$EXISTING_CUSTOM_ROUTE" \
   -e TEMPS_RUN_DIND_TESTS=1 \
   "$NODE_A" sh -c '
     cd /workspace
@@ -231,6 +256,37 @@ docker exec \
 log "signalling the still-running control plane that the worker is ready"
 docker exec "$NODE_B" touch "$WORKER_READY_FILE"
 wait "$CONTROL_PLANE_TEST_PID" || fail "live late-worker reconcile failed"
+
+log "proving the existing control-plane workload and custom route survived"
+docker exec "$NODE_A" docker network inspect "$EXISTING_APP_NETWORK" >/dev/null \
+  || fail "existing control-plane app network was removed"
+
+docker exec "$NODE_A" ip -4 route show "$EXISTING_APP_CIDR" \
+  | grep -q "$EXISTING_APP_CIDR" \
+  || fail "existing control-plane app-network route was removed"
+
+docker exec "$NODE_A" ip -4 route show "$EXISTING_CUSTOM_ROUTE" \
+  | grep -q "$EXISTING_CUSTOM_ROUTE" \
+  || fail "existing operator-managed custom route was removed"
+
+EXISTING_APP_RUNNING="$(
+  docker exec "$NODE_A" docker inspect -f '{{.State.Running}}' "$EXISTING_APP_CONTAINER"
+)"
+test "$EXISTING_APP_RUNNING" = true \
+  || fail "existing control-plane workload stopped during multi-node setup"
+
+EXISTING_APP_IP="$(
+  docker exec "$NODE_A" docker inspect \
+    -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+    "$EXISTING_APP_CONTAINER"
+)"
+test -n "$EXISTING_APP_IP" \
+  || fail "existing control-plane workload lost its app-network address"
+
+docker exec "$NODE_A" docker run --rm --network "$EXISTING_APP_NETWORK" \
+  alpine wget -q -T 3 -O - "http://$EXISTING_APP_IP/" \
+  | grep -q "Welcome to nginx" \
+  || fail "existing control-plane workload stopped serving traffic"
 
 log "both nodes bootstrapped — running container ping"
 
