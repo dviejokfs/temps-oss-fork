@@ -40,7 +40,7 @@ use crate::commands::upgrade::{
     check_write_permission, create_upgrade_temp_file, current_version_tag, download_asset_text,
     download_asset_to_file, extract_binary_from_tarball_file, fetch_latest_release_in_channel,
     fetch_specific_release, finalize_staged_binary, is_newer_version, platform_target,
-    verify_computed_checksum, GitHubRelease, UpgradeChannel,
+    seal_staged_binary, verify_computed_checksum, GitHubRelease, UpgradeChannel,
 };
 
 /// Grace period between accepting the update and exiting the process. Long
@@ -928,15 +928,18 @@ impl UpdateJob {
             &staged_path,
         )?;
 
-        // Preflight against the staged file itself rather than writing a
-        // second full copy just to exec it.
-        preflight_staged_binary(&staged_path, staged_file.as_file())?;
+        // Finish and close the writable handle before preflight. Unix refuses
+        // to execute a file that is still open for writing (ETXTBSY on Linux;
+        // macOS may terminate it), which made every streamed self-update fail
+        // here before the live binary was swapped.
+        let staged_path = seal_staged_binary(staged_file)?;
+        preflight_staged_binary(staged_path.as_ref())?;
 
         self.set_phase(SelfUpdatePhase::Installing, None);
         // Keep the outgoing binary next to the new one so a release that boots
         // but misbehaves can be reverted with a single `mv`, without network.
         let backup_path = backup_current_binary(&self.binary_path)?;
-        finalize_staged_binary(&self.binary_path, staged_file)?;
+        finalize_staged_binary(&self.binary_path, staged_path)?;
 
         Ok((to_version, backup_path))
     }
@@ -1240,15 +1243,7 @@ fn running_under_systemd_service() -> bool {
 /// copy just to exec it — that second copy is exactly the kind of extra
 /// in-memory/on-disk buffering the streaming rewrite of this flow removed
 /// everywhere else.
-fn preflight_staged_binary(staged_path: &Path, staged_file: &std::fs::File) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        staged_file
-            .set_permissions(std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| anyhow::anyhow!("Failed to make the staged binary executable: {}", e))?;
-    }
-
+fn preflight_staged_binary(staged_path: &Path) -> anyhow::Result<()> {
     let output = std::process::Command::new(staged_path)
         .arg("--version")
         .output();
@@ -1765,12 +1760,31 @@ mod tests {
         let dir = temp_dir("preflight");
         let staged_path = dir.join("staged");
         std::fs::write(&staged_path, b"definitely not an executable").unwrap();
-        let staged_file = std::fs::File::open(&staged_path).unwrap();
-
         // Not a valid executable — exec must fail, and the error must say the
         // running version is untouched.
-        let err = preflight_staged_binary(&staged_path, &staged_file).expect_err("must reject");
+        let err = preflight_staged_binary(&staged_path).expect_err("must reject");
         assert!(err.to_string().contains("left untouched"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_preflight_accepts_valid_binary_after_staging_handle_is_closed() {
+        use std::io::Write;
+
+        let dir = temp_dir("preflight-valid");
+        let mut staged = create_upgrade_temp_file(&dir, ".temps-selfupdate-bin.")
+            .expect("create staged executable");
+        staged
+            .as_file_mut()
+            .write_all(b"#!/bin/sh\n[ \"$1\" = \"--version\" ] && exit 0\nexit 1\n")
+            .expect("write staged executable");
+
+        let staged_path = seal_staged_binary(staged).expect("seal staged executable");
+        preflight_staged_binary(staged_path.as_ref())
+            .expect("a valid staged binary must execute after its write handle is closed");
+
+        drop(staged_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
