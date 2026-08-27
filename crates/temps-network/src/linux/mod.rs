@@ -257,6 +257,62 @@ pub async fn detect_device_for_address(address: IpAddr) -> crate::Result<String>
     })
 }
 
+/// Reject an overlay pool that would shadow an existing host/VLAN/VPN route.
+/// Routes owned by the configured Temps bridge/VXLAN are accepted so an
+/// idempotent restart can reconcile an already-running overlay.
+pub async fn preflight_compute_pool_routes(
+    config: &NetworkConfig,
+    pool: ipnet::Ipv4Net,
+) -> crate::Result<()> {
+    use std::str::FromStr;
+
+    let output = tokio::process::Command::new("ip")
+        .args(["-4", "route", "show", "table", "all"])
+        .output()
+        .await
+        .map_err(|error| NetworkError::Io {
+            op: "ip -4 route show table all",
+            path: "ip".into(),
+            reason: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(NetworkError::UnderlayDetection {
+            reason: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let Some(destination) = fields.first() else {
+            continue;
+        };
+        let Ok(existing) = ipnet::Ipv4Net::from_str(destination) else {
+            // `default`, `local`, `broadcast`, and `unreachable` entries do
+            // not put a CIDR in the first field and are not connected routes.
+            continue;
+        };
+        let device = fields
+            .windows(2)
+            .find_map(|pair| (pair[0] == "dev").then_some(pair[1]))
+            .unwrap_or("unknown");
+        if device == config.bridge_name || device == config.vxlan_dev_name {
+            continue;
+        }
+        if pool.contains(&existing.network())
+            || pool.contains(&existing.broadcast())
+            || existing.contains(&pool.network())
+            || existing.contains(&pool.broadcast())
+        {
+            return Err(NetworkError::HostRouteCollision {
+                pool,
+                existing_cidr: existing,
+                device: device.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Helper that opens an rtnetlink connection and spawns its background task
 /// onto the current tokio runtime, returning a usable handle.
 async fn open_handle() -> crate::Result<(rtnetlink::Handle, tokio::task::JoinHandle<()>)> {

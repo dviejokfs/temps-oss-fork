@@ -65,6 +65,16 @@ pub struct SetupMultiNodeCommand {
     #[arg(long, env = "TEMPS_UNDERLAY_DEV")]
     pub underlay_dev: Option<String>,
 
+    /// Cluster-wide private pool carved into one Docker overlay subnet per
+    /// node. It may only be changed before any node has an allocation.
+    #[arg(long, env = "TEMPS_COMPUTE_POOL_CIDR")]
+    pub compute_pool_cidr: Option<String>,
+
+    /// Prefix allocated to each node (for example 24 gives 254 container
+    /// addresses per node). It may only be changed with an unused pool.
+    #[arg(long, env = "TEMPS_COMPUTE_SUBNET_PREFIX_LEN")]
+    pub node_prefix_len: Option<u8>,
+
     /// Temps data directory containing the existing encryption_key.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
@@ -72,6 +82,9 @@ pub struct SetupMultiNodeCommand {
 
 #[derive(Args)]
 pub struct NetworkStatusCommand {
+    /// Docker overlay network name (default: temps0)
+    #[arg(long, default_value = "temps0")]
+    pub docker_network: String,
     /// Bridge name (default: br-temps0)
     #[arg(long, default_value = "br-temps0")]
     pub bridge: String,
@@ -119,9 +132,17 @@ pub struct NetworkDiagCommand {
 #[derive(Debug, Clone, Deserialize)]
 struct WirePeerListResponse {
     #[serde(default)]
+    network: Option<WireNetworkPool>,
+    #[serde(default)]
     alloc: Option<WireAlloc>,
     #[serde(default)]
     peers: Vec<WirePeer>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WireNetworkPool {
+    compute_pool_cidr: String,
+    subnet_prefix_len: u8,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,6 +243,26 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         .await
         .map_err(|error| anyhow::anyhow!("could not connect to the Temps database: {error}"))?;
 
+    let allocator = temps_network::allocator::PostgresAllocator::new(db.clone());
+    let current_network = allocator
+        .cluster_config()
+        .await
+        .map_err(|error| anyhow::anyhow!("could not load cluster network config: {error}"))?;
+    let requested_pool = cmd
+        .compute_pool_cidr
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --compute-pool-cidr: {error}"))?
+        .unwrap_or(current_network.compute_pool_cidr);
+    let requested_prefix = cmd
+        .node_prefix_len
+        .unwrap_or(current_network.subnet_prefix_len);
+    let cluster_network = allocator
+        .configure_pool(requested_pool, requested_prefix)
+        .await
+        .map_err(|error| anyhow::anyhow!("cluster network configuration refused: {error}"))?;
+
     let private_address = match cmd.private_address {
         Some(value) if !value.trim().is_empty() => value,
         _ => {
@@ -304,6 +345,10 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         "  {} Multi-node control-plane networking is ready",
         "PASS".bright_green().bold()
     );
+    println!(
+        "  Cluster pool: {} (one /{} Docker subnet per node)",
+        cluster_network.compute_pool_cidr, cluster_network.subnet_prefix_len
+    );
     println!("  Overlay CIDR: {}", overlay.alloc.compute_cidr);
     println!("  Bridge: {}", overlay.alloc.bridge_address);
     println!(
@@ -332,6 +377,9 @@ fn execute_status(cmd: NetworkStatusCommand) -> anyhow::Result<()> {
     print_link("bridge", &cmd.bridge);
     print_link("vxlan", &cmd.vxlan);
 
+    print_section("Docker overlay allocation:");
+    print_docker_network(&cmd.docker_network);
+
     print_section("Routes:");
     print_routes(&cmd.vxlan);
 
@@ -343,6 +391,34 @@ fn execute_status(cmd: NetworkStatusCommand) -> anyhow::Result<()> {
 
     println!();
     Ok(())
+}
+
+fn print_docker_network(network: &str) {
+    let output = ProcCommand::new("docker")
+        .args([
+            "network",
+            "inspect",
+            network,
+            "--format",
+            "{{range .IPAM.Config}}{{.Subnet}} gateway={{.Gateway}}{{end}}",
+        ])
+        .output();
+    match output {
+        Ok(result) if result.status.success() => {
+            let allocation = String::from_utf8_lossy(&result.stdout);
+            println!("    {}: {}", network, allocation.trim().bright_green());
+        }
+        Ok(result) => println!(
+            "    {}",
+            format!(
+                "{} not found or unreadable: {}",
+                network,
+                String::from_utf8_lossy(&result.stderr).trim()
+            )
+            .bright_black()
+        ),
+        Err(error) => println!("    could not run docker network inspect: {error}"),
+    }
 }
 
 fn print_link(label: &str, name: &str) {
@@ -440,6 +516,23 @@ async fn execute_peers(cmd: NetworkPeersCommand) -> anyhow::Result<()> {
     let resp = fetch_peers(&auth).await?;
 
     println!();
+    if let Some(network) = &resp.network {
+        println!(
+            "  {}",
+            "Authoritative cluster network".bright_white().bold()
+        );
+        println!(
+            "    {} {}",
+            "compute_pool:".bright_white(),
+            network.compute_pool_cidr.bright_green()
+        );
+        println!(
+            "    {} /{} per node",
+            "allocation:".bright_white(),
+            network.subnet_prefix_len
+        );
+        println!();
+    }
     if let Some(a) = &resp.alloc {
         println!("  {}", "Local allocation".bright_white().bold());
         println!("    {} {}", "node_id:".bright_white(), a.node_id);
@@ -613,6 +706,10 @@ mod tests {
             "setup-multi-node",
             "--private-address",
             "10.200.4.1",
+            "--compute-pool-cidr",
+            "10.240.0.0/16",
+            "--node-prefix-len",
+            "24",
         ])
         .expect("multi-node setup arguments should parse");
         assert!(matches!(
@@ -620,9 +717,11 @@ mod tests {
             crate::Commands::Network(NetworkCommand {
                 command: NetworkSubcommand::SetupMultiNode(SetupMultiNodeCommand {
                     private_address: Some(ref address),
+                    compute_pool_cidr: Some(ref pool),
+                    node_prefix_len: Some(24),
                     ..
                 }),
-            }) if address == "10.200.4.1"
+            }) if address == "10.200.4.1" && pool == "10.240.0.0/16"
         ));
     }
 

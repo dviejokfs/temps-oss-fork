@@ -37,6 +37,9 @@ pub struct Model {
     pub control_plane_underlay_address: Option<String>,
     /// Set only after kernel and Docker overlay setup completes successfully.
     pub control_plane_overlay_ready: bool,
+    /// Monotonic fencing token for control-plane setup attempts. A stale
+    /// attempt may only publish or withdraw the exact generation it reserved.
+    pub control_plane_setup_generation: i64,
     pub updated_at: DBDateTime,
 }
 

@@ -324,6 +324,43 @@ async fn bootstrap_is_idempotent() {
 }
 
 #[tokio::test]
+async fn bootstrap_rejects_existing_vxlan_with_incompatible_topology() {
+    let (env, mgr, _cleanup) = fixture().await;
+    let output = Command::new("ip")
+        .args([
+            "link",
+            "add",
+            "vxlan-temps0",
+            "type",
+            "vxlan",
+            "id",
+            "99",
+            "dev",
+            &env.underlay_dev,
+            "dstport",
+            "4789",
+            "nolearning",
+        ])
+        .output()
+        .await
+        .expect("create incompatible VXLAN device");
+    assert!(
+        output.status.success(),
+        "create incompatible VXLAN device: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let error = mgr
+        .bootstrap(env.alloc(), vec![])
+        .await
+        .expect_err("bootstrap must not adopt an incompatible VXLAN device");
+    let message = error.to_string();
+    assert!(message.contains("existing VXLAN topology does not match"));
+    assert!(message.contains("vni=42"));
+    assert!(message.contains("id 99"));
+}
+
+#[tokio::test]
 async fn reconcile_peers_adds_new_peer() {
     let (env, mgr, _cleanup) = fixture().await;
     // Original peer must be the SAME object across bootstrap + reconcile so
@@ -529,6 +566,62 @@ async fn bridge_address_outside_cidr_rejected() {
     ));
 }
 
+#[tokio::test]
+async fn full_pool_collision_is_rejected_without_partial_kernel_state() {
+    if std::env::var("TEMPS_IT_PHASE_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    cleanup_all().await;
+    let env = Env::from_env();
+    let pool: Ipv4Net = parse_env("TEMPS_IT_CLUSTER_POOL");
+    let existing_cidr =
+        std::env::var("TEMPS_IT_EXISTING_CIDR").unwrap_or_else(|_| "10.240.99.0/24".into());
+    let existing = "temps-it-existing-cidr";
+    let _ = Command::new("docker")
+        .args(["network", "rm", existing])
+        .output()
+        .await;
+    let output = Command::new("docker")
+        .args([
+            "network",
+            "create",
+            "--driver",
+            "bridge",
+            "--subnet",
+            &existing_cidr,
+            existing,
+        ])
+        .output()
+        .await
+        .expect("create pre-existing Docker CIDR");
+    assert!(
+        output.status.success(),
+        "create pre-existing CIDR: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let docker = bollard::Docker::connect_with_local_defaults().expect("docker connect");
+    let error = temps_network::docker::preflight_network_for_pool(
+        &docker,
+        &env.config(),
+        &env.alloc(),
+        pool,
+    )
+    .await
+    .expect_err("the full cluster pool must reject an occupied future peer subnet");
+    assert!(error.to_string().contains(existing));
+    assert!(!link_exists("br-temps0").await);
+    assert!(!link_exists("vxlan-temps0").await);
+    assert!(!docker_network_exists("temps-overlay").await);
+    assert!(!nft_table_exists("inet", "temps_network").await);
+    assert!(!route_exists(&env.peer_cidr.to_string()).await);
+
+    let _ = Command::new("docker")
+        .args(["network", "rm", existing])
+        .output()
+        .await;
+}
+
 // ---------------------------------------------------------------------------
 // Cross-host scenario: a "bootstrap_only" test the DinD runner triggers
 // once per node so each side ends up bootstrapped with its peer pointing
@@ -562,4 +655,73 @@ async fn bootstrap_only() {
     temps_network::docker::ensure_network(&docker, &cfg, &alloc)
         .await
         .expect("ensure docker network");
+}
+
+/// Production-shaped lifecycle regression: the control plane starts alone,
+/// remains alive, and reconciles a worker which physically starts later.
+///
+/// The DinD runner coordinates the two nodes with marker files in the shared
+/// workspace. Keeping this test process alive is intentional: constructing a
+/// second manager after the worker joins would only prove restart recovery,
+/// not live late-worker reconciliation.
+#[tokio::test]
+async fn control_plane_stays_running_and_reconciles_worker_later() {
+    if std::env::var("TEMPS_IT_PHASE_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let env = Env::from_env();
+    let pool: Ipv4Net = parse_env("TEMPS_IT_CLUSTER_POOL");
+    let ready_file = parse_env::<String>("TEMPS_IT_CONTROL_PLANE_READY_FILE");
+    let worker_file = parse_env::<String>("TEMPS_IT_WORKER_READY_FILE");
+    cleanup_all().await;
+    let _ = tokio::fs::remove_file(&ready_file).await;
+    let _ = tokio::fs::remove_file(&worker_file).await;
+    let cfg = env.config();
+    temps_network::preflight_compute_pool_routes(&cfg, pool)
+        .await
+        .expect("safe cluster pool must not overlap host routes");
+    let alloc = env.alloc();
+    let mgr = NetworkManager::new(cfg.clone()).expect("manager new");
+    mgr.bootstrap(alloc.clone(), vec![])
+        .await
+        .expect("bootstrap control plane without workers");
+    let docker = bollard::Docker::connect_with_local_defaults().expect("docker connect");
+    temps_network::docker::ensure_network(&docker, &cfg, &alloc)
+        .await
+        .expect("ensure control-plane Docker overlay");
+    assert!(!route_exists(&env.peer_cidr.to_string()).await);
+    tokio::fs::write(&ready_file, b"ready\n")
+        .await
+        .expect("publish control-plane ready marker");
+
+    // Node B is created only after this marker. A cold CI runner may need to
+    // install and compile Rust in that new container, which is not a network
+    // convergence failure and must not make this lifecycle test flaky.
+    let worker_ready_timeout = std::env::var("TEMPS_IT_WORKER_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(900);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(worker_ready_timeout);
+    while tokio::fs::metadata(&worker_file).await.is_err() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "worker did not become ready before the lifecycle-test deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let peer = env.peer();
+    let changed = temps_network::control_plane::reconcile_peer_snapshot(
+        &mgr,
+        &docker,
+        &cfg,
+        &alloc,
+        pool,
+        vec![peer.clone()],
+    )
+    .await
+    .expect("reconcile late worker");
+    assert!(changed);
+    assert!(route_exists(&peer.compute_cidr.to_string()).await);
+    assert!(fdb_has_entry("vxlan-temps0", &peer.underlay_address.to_string()).await);
 }

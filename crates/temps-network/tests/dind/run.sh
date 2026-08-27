@@ -25,6 +25,8 @@ NODE_B="temps-it-node-b"
 NODE_B_IP="10.123.0.3"
 DIND_IMAGE="docker:27-dind"
 RUST_IMAGE="rust:1.85-bookworm"
+CONTROL_PLANE_READY_FILE="/workspace/.temps-it-control-plane-ready"
+WORKER_READY_FILE="/workspace/.temps-it-worker-ready"
 
 log() { printf '\033[1;36m[it]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[it]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -37,6 +39,7 @@ cleanup() {
   log "cleaning up"
   docker rm -f "$NODE_A" "$NODE_B" >/dev/null 2>&1 || true
   docker network rm "$UNDERLAY_NET" >/dev/null 2>&1 || true
+  rm -f "$REPO_ROOT/.temps-it-control-plane-ready" "$REPO_ROOT/.temps-it-worker-ready"
 }
 trap cleanup EXIT
 
@@ -44,6 +47,9 @@ trap cleanup EXIT
 # 0. Preflight
 # ---------------------------------------------------------------------------
 docker version >/dev/null 2>&1 || fail "docker daemon not available on host"
+# A prior KEEP=1 run must not make the worker exist before the control plane.
+docker rm -f "$NODE_A" "$NODE_B" >/dev/null 2>&1 || true
+rm -f "$REPO_ROOT/.temps-it-control-plane-ready" "$REPO_ROOT/.temps-it-worker-ready"
 
 # ---------------------------------------------------------------------------
 # 1. Underlay network — plays the role of "the cloud private network"
@@ -79,7 +85,6 @@ start_node() {
 }
 
 start_node "$NODE_A" "$NODE_A_IP"
-start_node "$NODE_B" "$NODE_B_IP"
 
 # Wait for inner docker daemons to be ready.
 wait_for_dind() {
@@ -91,8 +96,7 @@ wait_for_dind() {
   fail "$name: inner docker daemon never came up"
 }
 wait_for_dind "$NODE_A"
-wait_for_dind "$NODE_B"
-log "both inner docker daemons ready"
+log "control-plane inner docker daemon ready (worker intentionally absent)"
 
 # ---------------------------------------------------------------------------
 # 3. Install Rust + test deps inside each DinD
@@ -113,7 +117,6 @@ install_toolchain() {
 }
 
 install_toolchain "$NODE_A"
-install_toolchain "$NODE_B"
 
 # ---------------------------------------------------------------------------
 # 4. Run the kernel-touching tests inside node A
@@ -132,34 +135,77 @@ install_toolchain "$NODE_B"
 log "running kernel integration tests in $NODE_A"
 docker exec \
   -e TEMPS_IT_LOCAL_NAME=node-a \
-  -e TEMPS_IT_LOCAL_CIDR=172.20.1.0/24 \
-  -e TEMPS_IT_LOCAL_BRIDGE_IP=172.20.1.1 \
+  -e TEMPS_IT_LOCAL_CIDR=10.240.1.0/24 \
+  -e TEMPS_IT_LOCAL_BRIDGE_IP=10.240.1.1 \
   -e TEMPS_IT_LOCAL_UNDERLAY="$NODE_A_IP" \
-  -e TEMPS_IT_PEER_CIDR=172.20.2.0/24 \
+  -e TEMPS_IT_PEER_CIDR=10.240.2.0/24 \
   -e TEMPS_IT_PEER_UNDERLAY="$NODE_B_IP" \
+  -e TEMPS_IT_CLUSTER_POOL=10.240.0.0/16 \
+  -e TEMPS_IT_EXISTING_CIDR=10.240.99.0/24 \
   -e TEMPS_RUN_DIND_TESTS=1 \
   "$NODE_A" sh -c '
     cd /workspace
     export PATH=/root/.cargo/bin:$PATH
-    cargo test -p temps-network --features integration_kernel --test it_kernel -- --skip bootstrap_only --test-threads=1 --nocapture
+    cargo test -p temps-network --features integration_kernel,control_plane --test it_kernel -- --skip bootstrap_only --test-threads=1 --nocapture
   ' || fail "kernel tests failed in $NODE_A"
 
 log "kernel integration tests passed in $NODE_A"
 
-log "bootstrapping $NODE_A for the cross-host scenario (must run last: see comment above)"
+log "proving an existing CIDR is rejected before any control-plane state is created"
 docker exec \
   -e TEMPS_IT_LOCAL_NAME=node-a \
-  -e TEMPS_IT_LOCAL_CIDR=172.20.1.0/24 \
-  -e TEMPS_IT_LOCAL_BRIDGE_IP=172.20.1.1 \
+  -e TEMPS_IT_LOCAL_CIDR=10.240.1.0/24 \
+  -e TEMPS_IT_LOCAL_BRIDGE_IP=10.240.1.1 \
   -e TEMPS_IT_LOCAL_UNDERLAY="$NODE_A_IP" \
-  -e TEMPS_IT_PEER_CIDR=172.20.2.0/24 \
+  -e TEMPS_IT_PEER_CIDR=10.240.2.0/24 \
   -e TEMPS_IT_PEER_UNDERLAY="$NODE_B_IP" \
+  -e TEMPS_IT_CLUSTER_POOL=10.240.0.0/16 \
+  -e TEMPS_IT_PHASE_TESTS=1 \
+  -e TEMPS_IT_EXISTING_CIDR=10.240.99.0/24 \
   -e TEMPS_RUN_DIND_TESTS=1 \
   "$NODE_A" sh -c '
     cd /workspace
     export PATH=/root/.cargo/bin:$PATH
-    cargo test -p temps-network --features integration_kernel --test it_kernel bootstrap_only -- --test-threads=1 --nocapture
-  ' || fail "node-a bootstrap failed"
+    cargo test -p temps-network --features integration_kernel,control_plane --test it_kernel full_pool_collision_is_rejected_without_partial_kernel_state -- --exact --test-threads=1 --nocapture
+  ' || fail "existing CIDR preflight regression failed"
+
+log "starting the control plane alone and keeping its manager alive"
+docker exec \
+  -e TEMPS_IT_LOCAL_NAME=node-a \
+  -e TEMPS_IT_LOCAL_CIDR=10.240.1.0/24 \
+  -e TEMPS_IT_LOCAL_BRIDGE_IP=10.240.1.1 \
+  -e TEMPS_IT_LOCAL_UNDERLAY="$NODE_A_IP" \
+  -e TEMPS_IT_PEER_CIDR=10.240.2.0/24 \
+  -e TEMPS_IT_PEER_UNDERLAY="$NODE_B_IP" \
+  -e TEMPS_IT_CLUSTER_POOL=10.240.0.0/16 \
+  -e TEMPS_IT_PHASE_TESTS=1 \
+  -e TEMPS_IT_CONTROL_PLANE_READY_FILE="$CONTROL_PLANE_READY_FILE" \
+  -e TEMPS_IT_WORKER_READY_FILE="$WORKER_READY_FILE" \
+  -e TEMPS_RUN_DIND_TESTS=1 \
+  "$NODE_A" sh -c '
+    cd /workspace
+    export PATH=/root/.cargo/bin:$PATH
+    cargo test -p temps-network --features integration_kernel,control_plane --test it_kernel control_plane_stays_running_and_reconciles_worker_later -- --exact --test-threads=1 --nocapture
+  ' &
+CONTROL_PLANE_TEST_PID=$!
+
+for _ in $(seq 1 1800); do
+  if [[ -f "$REPO_ROOT/.temps-it-control-plane-ready" ]]; then
+    break
+  fi
+  if ! kill -0 "$CONTROL_PLANE_TEST_PID" >/dev/null 2>&1; then
+    wait "$CONTROL_PLANE_TEST_PID" || true
+    fail "control-plane lifecycle test exited before publishing readiness"
+  fi
+  sleep 0.1
+done
+[[ -f "$REPO_ROOT/.temps-it-control-plane-ready" ]] \
+  || fail "control plane did not become ready before the worker-start deadline"
+
+log "starting the worker after the control plane is already healthy"
+start_node "$NODE_B" "$NODE_B_IP"
+wait_for_dind "$NODE_B"
+install_toolchain "$NODE_B"
 
 # ---------------------------------------------------------------------------
 # 5. Two-node cross-host ping scenario
@@ -169,23 +215,38 @@ log "running cross-host scenario (bootstrap both, ping across)"
 # Bootstrap node B with peer pointing to node A.
 docker exec \
   -e TEMPS_IT_LOCAL_NAME=node-b \
-  -e TEMPS_IT_LOCAL_CIDR=172.20.2.0/24 \
-  -e TEMPS_IT_LOCAL_BRIDGE_IP=172.20.2.1 \
+  -e TEMPS_IT_LOCAL_CIDR=10.240.2.0/24 \
+  -e TEMPS_IT_LOCAL_BRIDGE_IP=10.240.2.1 \
   -e TEMPS_IT_LOCAL_UNDERLAY="$NODE_B_IP" \
-  -e TEMPS_IT_PEER_CIDR=172.20.1.0/24 \
+  -e TEMPS_IT_PEER_CIDR=10.240.1.0/24 \
   -e TEMPS_IT_PEER_UNDERLAY="$NODE_A_IP" \
+  -e TEMPS_IT_CLUSTER_POOL=10.240.0.0/16 \
   -e TEMPS_RUN_DIND_TESTS=1 \
   "$NODE_B" sh -c '
     cd /workspace
     export PATH=/root/.cargo/bin:$PATH
-    cargo test -p temps-network --features integration_kernel --test it_kernel bootstrap_only -- --test-threads=1 --nocapture
+    cargo test -p temps-network --features integration_kernel,control_plane --test it_kernel bootstrap_only -- --test-threads=1 --nocapture
   ' || fail "node-b bootstrap failed"
+
+log "signalling the still-running control plane that the worker is ready"
+docker exec "$NODE_B" touch "$WORKER_READY_FILE"
+wait "$CONTROL_PLANE_TEST_PID" || fail "live late-worker reconcile failed"
 
 log "both nodes bootstrapped — running container ping"
 
-docker exec "$NODE_A" docker run -d --rm --name nginx-a --network temps-overlay --ip 172.20.1.10 nginx:alpine >/dev/null
-docker exec "$NODE_B" docker run --rm --network temps-overlay --ip 172.20.2.10 alpine sh -c \
-    'apk add --no-cache curl >/dev/null && curl -sf -m 5 http://172.20.1.10/ | head -c 100' \
-    || fail "node-b -> node-a HTTP failed"
+docker exec "$NODE_A" docker run -d --rm --name nginx-a --network temps-overlay --ip 10.240.1.10 nginx:alpine >/dev/null
+docker exec "$NODE_B" docker run --rm --network temps-overlay --ip 10.240.2.10 alpine sh -ec '
+  attempts=0
+  while [ "$attempts" -lt 30 ]; do
+    if wget -q -T 2 -O /tmp/nginx-response http://10.240.1.10/ \
+      && grep -q "Welcome to nginx" /tmp/nginx-response; then
+      exit 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 1
+  done
+  echo "expected nginx response was not received after 30 attempts" >&2
+  exit 1
+' || fail "node-b -> node-a HTTP failed"
 
 log "✅ cross-host overlay verified"

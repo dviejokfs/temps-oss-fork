@@ -101,13 +101,23 @@ pub enum NetworkError {
     /// The CIDR we were asked to use for our Docker network is already in use
     /// by a different Docker network on this host.
     #[error(
-        "cidr {cidr} is already used by docker network '{existing_network}'; \
+        "requested cidr {cidr} overlaps {existing_cidr} used by docker network '{existing_network}'; \
          refusing to create '{desired_network}' to avoid corruption"
     )]
     DockerCidrCollision {
         cidr: Ipv4Net,
+        existing_cidr: Ipv4Net,
         existing_network: String,
         desired_network: String,
+    },
+
+    #[error(
+        "compute pool {pool} overlaps host route {existing_cidr} on device '{device}'; choose a different cluster pool before enabling the overlay"
+    )]
+    HostRouteCollision {
+        pool: Ipv4Net,
+        existing_cidr: Ipv4Net,
+        device: String,
     },
 
     // ----- config / validation -----

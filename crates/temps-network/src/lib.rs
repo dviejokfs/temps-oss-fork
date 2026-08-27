@@ -63,6 +63,22 @@ pub async fn detect_underlay_device() -> Result<String> {
     linux::detect_underlay_device().await
 }
 
+#[cfg(target_os = "linux")]
+pub async fn preflight_compute_pool_routes(
+    config: &NetworkConfig,
+    pool: ipnet::Ipv4Net,
+) -> Result<()> {
+    linux::preflight_compute_pool_routes(config, pool).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn preflight_compute_pool_routes(
+    _config: &NetworkConfig,
+    _pool: ipnet::Ipv4Net,
+) -> Result<()> {
+    Ok(())
+}
+
 /// Detect the MTU of the selected underlay interface. This must be resolved
 /// from the actual link rather than assumed to be 1500: VXLAN adds 50 bytes
 /// and Linux will reject an overlay MTU larger than the parent can carry.
