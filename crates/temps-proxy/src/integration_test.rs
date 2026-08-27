@@ -180,6 +180,7 @@ mod integration_tests {
             "GET",
             browser_accept,
             document,
+            None,
         ));
         assert!(!LoadBalancer::should_track_page(
             "/api/_temps/health",
@@ -187,6 +188,7 @@ mod integration_tests {
             "GET",
             browser_accept,
             document,
+            None,
         ));
         assert!(!LoadBalancer::should_track_page(
             "/assets/style.css",
@@ -194,6 +196,7 @@ mod integration_tests {
             "GET",
             Some("text/css,*/*;q=0.1"),
             Some("style"),
+            None,
         ));
         assert!(LoadBalancer::should_track_page(
             "/some-page",
@@ -201,6 +204,7 @@ mod integration_tests {
             "GET",
             browser_accept,
             document,
+            None,
         ));
         assert!(!LoadBalancer::should_track_page(
             "/graphql",
@@ -208,6 +212,7 @@ mod integration_tests {
             "POST",
             Some("application/json"),
             Some("empty"),
+            None,
         ));
         assert!(!LoadBalancer::should_track_page(
             "/v1/users",
@@ -215,6 +220,7 @@ mod integration_tests {
             "GET",
             Some("application/json"),
             Some("empty"),
+            None,
         ));
         assert!(!LoadBalancer::should_track_page(
             "/missing-content-type",
@@ -222,6 +228,28 @@ mod integration_tests {
             "GET",
             browser_accept,
             document,
+            None,
+        ));
+
+        // HTTP-origin navigation: no Fetch Metadata, browser Accept, and
+        // Upgrade-Insecure-Requests: 1 → track.
+        assert!(LoadBalancer::should_track_page(
+            "/",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            None,
+            Some("1"),
+        ));
+        // HTTP-origin scraper: browser Accept, no Upgrade-Insecure-Requests
+        // → not tracked.
+        assert!(!LoadBalancer::should_track_page(
+            "/",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            None,
+            None,
         ));
         Ok(())
     }
