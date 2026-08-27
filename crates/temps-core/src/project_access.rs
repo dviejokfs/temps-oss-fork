@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Extension point for team-based project access enforcement.
 //!
 //! See ADR 028 for the full design rationale.

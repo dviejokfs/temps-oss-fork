@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Multi-stage build for Temps with embedded MaxMind GeoLite2 database
 #
 # Builds the Rust binary, WASM, and Web UI inside Linux/Alpine so the runtime
@@ -145,6 +148,10 @@ WORKDIR /app
 
 # Copy binary from the selected artifacts stage
 COPY --from=artifacts /temps /app/temps
+
+# Keep the project attribution and both available license choices in every
+# distributed runtime image.
+COPY LICENSE LICENSE-MIT NOTICE /usr/share/licenses/temps/
 
 # The city database is tracked in the repository and required by the proxy.
 # Keep it outside /app/data so an existing persistent volume cannot mask it

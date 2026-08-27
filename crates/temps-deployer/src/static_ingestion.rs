@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared resource limits for static artifact ingestion.
 //!
 //! These bounds cover both filesystem deployments and Docker archive

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Generic retry utility for async operations with exponential backoff.
 //!
 //! Provides a configurable retry mechanism for transient failures when calling

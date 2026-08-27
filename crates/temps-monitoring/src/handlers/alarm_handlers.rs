@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP handlers for the unified alarms API (Phase 1 of ADR-025).
 //!
 //! Exposes the EXISTING `AlarmService` query methods over HTTP.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::repositories::{
     check_commit_exists, get_branches_by_repository_id, get_repository_branches,
     get_repository_tags, get_tags_by_repository_id, list_commits_by_repository_id,

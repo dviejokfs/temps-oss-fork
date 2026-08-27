@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { createApiKey, getSettings, updateSettings } from '../../api/sdk.gen.js'
 import type { AppSettings } from '../../api/types.gen.js'

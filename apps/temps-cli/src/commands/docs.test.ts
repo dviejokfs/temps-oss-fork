@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { afterEach, describe, expect, test } from 'bun:test'
 import { execFile } from 'node:child_process'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared service-level authorization for the backup/restore/upgrade handlers.
 //!
 //! `RequireAuth` proves a caller is authenticated and `permission_guard!`

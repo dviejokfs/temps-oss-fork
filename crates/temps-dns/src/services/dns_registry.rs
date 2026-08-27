@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Internal DNS registry — authoritative store for `*.temps.local` records.
 //!
 //! See ADR-011. This service is the **only** writer to `service_endpoints`

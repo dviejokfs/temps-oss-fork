@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Internal-zone naming for managed external services (ADR-011).
 //!
 //! ## Why this module exists

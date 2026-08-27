@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Axum handlers for teams, project access, and custom roles.
 //!
 //! Managing teams and grants is an instance-administration surface: the

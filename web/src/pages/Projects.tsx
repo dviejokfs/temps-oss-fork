@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Concrete job implementations for deployment workflows
 //!
 //! This module provides ready-to-use job implementations for common deployment tasks.

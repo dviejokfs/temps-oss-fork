@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! External service health monitor.
 //!
 //! Periodically probes every `external_services` row where `status = 'running'`

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Entity for the `sandbox_snapshots` table (ADR-037).
 //!
 //! A snapshot is a committed image layer derived from a sandbox container,

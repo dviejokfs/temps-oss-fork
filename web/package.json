@@ -16,7 +16,7 @@
     "./api/react-query": "./src/api/client/@tanstack/react-query.gen.ts"
   },
   "scripts": {
-    "openapi-ts": "openapi-ts",
+    "openapi-ts": "openapi-ts && python3 ../scripts/source_attribution.py annotate web/src/api/client",
     "dev": "rsbuild dev",
     "build": "rsbuild build",
     "start": "rsbuild preview",

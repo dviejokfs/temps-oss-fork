@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Tool-group taxonomy for the Temps MCP server, per ADR-039. Mirrors the
 // server's `?groups=` query param (crates/temps-mcp-server) — keep in sync
 // if the server-side grouping changes.

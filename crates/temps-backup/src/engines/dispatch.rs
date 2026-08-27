@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Engine-key resolution for external service backups (ADR-014 Phase 2–4).
 //!
 //! [`resolve_engine_key`] maps a `external_services` row to the correct engine

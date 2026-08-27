@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Kamal importer — WorkloadImporter implementation
 //!
 //! Reads `config/deploy.yml` (supplied per-request) and turns it into a

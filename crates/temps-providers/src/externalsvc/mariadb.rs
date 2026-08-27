@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::utils::ensure_network_exists;
 
 use super::port_util::{find_available_port, find_available_port_async};

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Docker Compose deployment executor.
 //!
 //! Manages multi-container deployments using `docker compose` CLI commands.

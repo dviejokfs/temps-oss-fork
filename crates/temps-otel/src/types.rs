@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Domain types for the OTel subsystem.
 //!
 //! These types are the internal representation of OTel data after it has been
