@@ -5,6 +5,26 @@ Codex, aider, etc.). The detailed engineering rules live in
 [`CLAUDE.md`](./CLAUDE.md); this file is the short list of process
 conventions that go *around* the code. Read both.
 
+## Add attribution to every new source file
+
+Every new first-party source or commentable configuration file must carry the
+Temps SPDX attribution header, written with the file's comment syntax:
+
+```text
+SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+SPDX-License-Identifier: MIT OR Apache-2.0
+```
+
+Apply it with:
+
+```bash
+python3 scripts/source_attribution.py annotate path/to/file
+```
+
+Generated files must receive the same header from their generator or generation
+command so regeneration cannot remove it. Do not replace, remove, or
+misattribute copyright and license notices in third-party files.
+
 ## Do not hand-edit `CHANGELOG.md`
 
 `CHANGELOG.md` is generated from Conventional Commits by
