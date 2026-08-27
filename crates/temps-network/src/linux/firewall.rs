@@ -147,7 +147,7 @@ add rule inet {table} forward oifname \"{bridge}\" accept
 add chain inet {table} input {{ type filter hook input priority -100; policy accept; }}
 {vxlan_ingress}
 # Marker used by the reconciler to detect a flushed or stale owned table.
-add rule inet {table} input counter comment "{marker}"
+add rule inet {table} input counter comment \"{marker}\"
 
 add chain inet {table} postrouting {{ type nat hook postrouting priority 100; policy accept; }}
 add rule inet {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masquerade
