@@ -42,6 +42,8 @@ pub mod linux;
 /// sea-orm into their build.
 #[cfg(feature = "control_plane")]
 pub mod allocator;
+#[cfg(feature = "control_plane")]
+pub mod control_plane;
 
 pub use config::{NetworkConfig, NodeAlloc, Peer, Transport};
 pub use diff::{PeerDiff, RouteDiff};
@@ -67,6 +69,21 @@ pub async fn detect_underlay_device() -> Result<String> {
 #[cfg(target_os = "linux")]
 pub async fn detect_underlay_mtu(device: &str) -> Result<u32> {
     linux::detect_underlay_mtu(device).await
+}
+
+/// Find the interface that owns an operator-provided private/underlay IP.
+/// This is more reliable than the default-route device for VLAN and
+/// WireGuard based clusters.
+#[cfg(target_os = "linux")]
+pub async fn detect_device_for_address(address: std::net::IpAddr) -> Result<String> {
+    linux::detect_device_for_address(address).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn detect_device_for_address(_address: std::net::IpAddr) -> Result<String> {
+    Err(NetworkError::UnsupportedPlatform {
+        target: std::env::consts::OS,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]

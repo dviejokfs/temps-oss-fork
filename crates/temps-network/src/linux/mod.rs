@@ -8,6 +8,7 @@
 use crate::config::{NetworkConfig, NodeAlloc, Peer, Transport};
 use crate::diff::{PeerDiff, RouteDiff};
 use crate::error::NetworkError;
+use std::net::IpAddr;
 use tracing::{debug, info};
 
 pub mod bridge;
@@ -78,7 +79,7 @@ pub async fn bootstrap(
         }
     }
 
-    firewall::install_baseline(config, alloc).await?;
+    firewall::install_baseline(config, alloc, peers).await?;
 
     info!(
         bridge = %config.bridge_name,
@@ -99,8 +100,17 @@ pub async fn reconcile_peers(
 ) -> crate::Result<bool> {
     let peer_diff = PeerDiff::compute(current, desired);
     let route_diff = RouteDiff::compute(current, desired);
+
     if peer_diff.is_noop() && route_diff.is_noop() {
-        debug!("reconcile_peers: nothing to do");
+        // Do not rewrite nftables every five seconds in production. The
+        // generation marker lets us cheaply detect a flushed/replaced owned
+        // table and atomically restore it only when drift occurred.
+        if !firewall::baseline_is_current(config, alloc, desired).await? {
+            firewall::install_baseline(config, alloc, desired).await?;
+            info!("reconcile_peers repaired firewall drift");
+        } else {
+            debug!("reconcile_peers: nothing to do");
+        }
         return Ok(false);
     }
 
@@ -152,6 +162,8 @@ pub async fn reconcile_peers(
         }
     }
 
+    firewall::install_baseline(config, alloc, desired).await?;
+
     info!(
         added = peer_diff.to_add.len(),
         removed = peer_diff.fdb_to_remove.len(),
@@ -202,6 +214,47 @@ pub async fn detect_underlay_mtu(device: &str) -> crate::Result<u32> {
             device: device.to_string(),
             reason: "interface does not exist or did not publish an MTU".to_string(),
         })
+}
+
+/// Resolve the Linux interface that owns `address`. `ip -o addr` is used
+/// deliberately: it handles VLAN, bond and WireGuard interfaces uniformly,
+/// while default-route discovery selects the public NIC on many hosts.
+pub async fn detect_device_for_address(address: IpAddr) -> crate::Result<String> {
+    let output = tokio::process::Command::new("ip")
+        .args(["-o", "addr", "show"])
+        .output()
+        .await
+        .map_err(|error| NetworkError::Io {
+            op: "ip -o addr show",
+            path: "ip".into(),
+            reason: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(NetworkError::UnderlayDetection {
+            reason: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let needle = address.to_string();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 4 {
+            continue;
+        }
+        let owns_address = fields
+            .iter()
+            .any(|field| field.split('/').next() == Some(needle.as_str()));
+        if owns_address {
+            return Ok(fields[1]
+                .trim_end_matches(':')
+                .split('@')
+                .next()
+                .unwrap_or(fields[1])
+                .to_owned());
+        }
+    }
+    Err(NetworkError::UnderlayDetection {
+        reason: format!("no interface owns configured address {address}"),
+    })
 }
 
 /// Helper that opens an rtnetlink connection and spawns its background task

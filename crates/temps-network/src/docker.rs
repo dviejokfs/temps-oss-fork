@@ -13,6 +13,57 @@ use bollard::Docker;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
+const NETWORK_OWNER_LABEL: &str = "sh.temps.network";
+const NETWORK_OWNER_VALUE: &str = "multi-node-overlay";
+
+/// Verify that a pre-existing Docker network is the overlay created and
+/// owned by Temps before privileged code attaches a container to it.
+///
+/// A network name is not an ownership boundary: another local actor can
+/// create `temps0` first. Callers which do not know this node's allocation
+/// can still verify the immutable ownership label and bridge mapping; the
+/// setup path below additionally verifies subnet and gateway.
+pub async fn validate_owned_network(docker: &Docker, config: &NetworkConfig) -> crate::Result<()> {
+    let inspect = docker
+        .inspect_network(&config.docker_network_name, None::<InspectNetworkOptions>)
+        .await
+        .map_err(|error| NetworkError::Docker {
+            op: "inspect_network",
+            network: config.docker_network_name.clone(),
+            reason: error.to_string(),
+        })?;
+    let owned = inspect
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(NETWORK_OWNER_LABEL))
+        .is_some_and(|value| value == NETWORK_OWNER_VALUE);
+    let bridge_matches = inspect
+        .options
+        .as_ref()
+        .and_then(|options| options.get("com.docker.network.bridge.name"))
+        .is_some_and(|value| value == &config.bridge_name);
+    let masquerade_disabled = inspect
+        .options
+        .as_ref()
+        .and_then(|options| options.get("com.docker.network.bridge.enable_ip_masquerade"))
+        .is_some_and(|value| value == "false");
+
+    if inspect.driver.as_deref() != Some("bridge")
+        || !owned
+        || !bridge_matches
+        || !masquerade_disabled
+    {
+        return Err(NetworkError::InterfaceConflict {
+            name: config.docker_network_name.clone(),
+            reason: format!(
+                "existing network is not the Temps-owned bridge (driver={:?}, owned={owned}, bridge_matches={bridge_matches}, masquerade_disabled={masquerade_disabled})",
+                inspect.driver
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Ensure that a Docker network exists on this host with the right name,
 /// driver, subnet, and bridge mapping. Idempotent.
 ///
@@ -63,6 +114,7 @@ pub async fn ensure_network(
 
     if let Some(id) = existing_id {
         // Network already exists. Inspect it to confirm the subnet matches.
+        validate_owned_network(docker, config).await?;
         let inspect = docker
             .inspect_network(&config.docker_network_name, None::<InspectNetworkOptions>)
             .await
@@ -73,6 +125,7 @@ pub async fn ensure_network(
             })?;
 
         let want_subnet = alloc.compute_cidr.to_string();
+        let want_gateway = alloc.bridge_address.to_string();
         let got_subnet = inspect
             .ipam
             .as_ref()
@@ -80,12 +133,19 @@ pub async fn ensure_network(
             .and_then(|cfgs| cfgs.first())
             .and_then(|c| c.subnet.clone());
 
-        if got_subnet.as_deref() != Some(want_subnet.as_str()) {
+        let got_gateway = inspect
+            .ipam
+            .as_ref()
+            .and_then(|ipam| ipam.config.as_ref())
+            .and_then(|cfgs| cfgs.first())
+            .and_then(|config| config.gateway.as_deref());
+        if got_subnet.as_deref() != Some(want_subnet.as_str())
+            || got_gateway != Some(want_gateway.as_str())
+        {
             return Err(NetworkError::InterfaceConflict {
                 name: config.docker_network_name.clone(),
                 reason: format!(
-                    "existing docker network has subnet {:?}, want {}",
-                    got_subnet, want_subnet
+                    "existing Temps-owned network allocation differs (subnet={got_subnet:?}, gateway={got_gateway:?})"
                 ),
             });
         }
@@ -126,6 +186,10 @@ pub async fn ensure_network(
             ..Default::default()
         }),
         options: Some(driver_opts),
+        labels: Some(HashMap::from([(
+            NETWORK_OWNER_LABEL.to_string(),
+            NETWORK_OWNER_VALUE.to_string(),
+        )])),
         ..Default::default()
     };
 

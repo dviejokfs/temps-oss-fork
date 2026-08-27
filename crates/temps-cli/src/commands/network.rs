@@ -1,11 +1,12 @@
 //! `temps network` — operator visibility into the multi-host overlay.
 //!
-//! This command is purely additive. `temps join` is unchanged; the only
-//! way the overlay gets enabled on a node is when the control plane
-//! allocates a `compute_cidr` for it. These subcommands let an operator
-//! inspect the resulting state.
+//! `temps join` remains the worker enrollment path. These subcommands let an
+//! operator configure/repair the control-plane side and inspect the resulting
+//! state.
 //!
 //! Subcommands:
+//!   - `temps network setup-multi-node` — idempotently join the control plane
+//!     to the overlay and republish managed-service DNS without a restart
 //!   - `temps network status` — local kernel data plane (bridge, vxlan,
 //!     route table, FDB count, nftables table)
 //!   - `temps network peers`  — peer list as fetched from the control
@@ -13,10 +14,13 @@
 //!   - `temps network diag`   — ICMP/UDP reachability check against each
 //!     peer's bridge_address
 
+use std::path::PathBuf;
 use std::process::Command as ProcCommand;
+use std::sync::Arc;
 
 use clap::{Args, Subcommand};
 use colored::Colorize;
+use sea_orm::EntityTrait;
 use serde::Deserialize;
 
 /// Inspect the multi-host overlay on this node and across the cluster.
@@ -28,6 +32,11 @@ pub struct NetworkCommand {
 
 #[derive(Subcommand)]
 pub enum NetworkSubcommand {
+    /// Configure or repair the control-plane side of multi-node networking.
+    /// Existing services are attached and their internal DNS records are
+    /// republished without restarting `temps serve`.
+    #[command(alias = "setup-control-plane-network")]
+    SetupMultiNode(SetupMultiNodeCommand),
     /// Show the local overlay state: bridge, vxlan device, routes, fdb,
     /// nftables baseline. Run on a worker node.
     Status(NetworkStatusCommand),
@@ -36,6 +45,29 @@ pub enum NetworkSubcommand {
     Peers(NetworkPeersCommand),
     /// Diagnose connectivity to each peer (ICMP echo to peer bridge IP).
     Diag(NetworkDiagCommand),
+}
+
+#[derive(Args)]
+pub struct SetupMultiNodeCommand {
+    /// Database URL. Environment-only so credentials do not leak through the
+    /// process list.
+    #[arg(skip)]
+    pub database_url: Option<String>,
+
+    /// Private address of this control plane on the multi-node underlay.
+    /// When omitted, the value saved by `temps serve --private-address` is
+    /// used.
+    #[arg(long, env = "TEMPS_PRIVATE_ADDRESS")]
+    pub private_address: Option<String>,
+
+    /// Interface carrying the private address (for example enp6s0.4000 or
+    /// wg0). Normally detected from the address.
+    #[arg(long, env = "TEMPS_UNDERLAY_DEV")]
+    pub underlay_dev: Option<String>,
+
+    /// Temps data directory containing the existing encryption_key.
+    #[arg(long, env = "TEMPS_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -169,12 +201,118 @@ impl NetworkCommand {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
             match self.command {
+                NetworkSubcommand::SetupMultiNode(c) => execute_setup_multi_node(c).await,
                 NetworkSubcommand::Status(c) => execute_status(c),
                 NetworkSubcommand::Peers(c) => execute_peers(c).await,
                 NetworkSubcommand::Diag(c) => execute_diag(c).await,
             }
         })
     }
+}
+
+async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<()> {
+    let database_url = cmd
+        .database_url
+        .or_else(|| std::env::var("TEMPS_DATABASE_URL").ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("TEMPS_DATABASE_URL must be set in the protected process environment")
+        })?;
+    let db = temps_database::establish_connection(&database_url)
+        .await
+        .map_err(|error| anyhow::anyhow!("could not connect to the Temps database: {error}"))?;
+
+    let private_address = match cmd.private_address {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => {
+            let settings = temps_entities::settings::Entity::find_by_id(1)
+                .one(db.as_ref())
+                .await
+                .map_err(|error| anyhow::anyhow!("could not load multi-node settings: {error}"))?
+                .map(|model| temps_core::AppSettings::from_json(model.data))
+                .unwrap_or_default();
+            settings.multi_node.private_address.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the control-plane private address is not configured; pass \
+                     --private-address <IP> or start once with \
+                     `temps serve --private-address <IP>`"
+                )
+            })?
+        }
+    };
+
+    let docker = Arc::new(
+        bollard::Docker::connect_with_defaults()
+            .map_err(|error| anyhow::anyhow!("could not connect to Docker: {error}"))?,
+    );
+    let overlay = temps_network::control_plane::setup(
+        db.clone(),
+        docker.as_ref(),
+        private_address.trim(),
+        cmd.underlay_dev.as_deref(),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("multi-node control-plane setup failed: {error}"))?;
+
+    let data_dir = cmd
+        .data_dir
+        .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from))
+        .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
+        .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?;
+    let key_path = data_dir.join("encryption_key");
+    let encryption_key = std::fs::read_to_string(&key_path).map_err(|error| {
+        anyhow::anyhow!(
+            "could not read the existing encryption key at {}: {error}; pass the same \
+             --data-dir used by `temps serve`",
+            key_path.display()
+        )
+    })?;
+    let encryption = Arc::new(
+        temps_core::EncryptionService::new(encryption_key.trim())
+            .map_err(|error| anyhow::anyhow!("invalid Temps encryption key: {error}"))?,
+    );
+    let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+    let services =
+        temps_providers::ExternalServiceManager::new(db.clone(), encryption, docker, dns_registry);
+    let existing = services
+        .list_services()
+        .await
+        .map_err(|error| anyhow::anyhow!("could not list managed services: {error}"))?;
+
+    let mut published = 0usize;
+    let mut skipped = 0usize;
+    for service in existing {
+        match services.register_standalone_service_dns(service.id).await {
+            Ok(Some(fqdn)) => {
+                published += 1;
+                println!("  {} {} -> {}", "DNS".bright_green(), service.name, fqdn);
+            }
+            Ok(None) => skipped += 1,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "overlay is ready, but DNS reconciliation failed for service {} (id {}): {}",
+                    service.name,
+                    service.id,
+                    error
+                ));
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "  {} Multi-node control-plane networking is ready",
+        "PASS".bright_green().bold()
+    );
+    println!("  Overlay CIDR: {}", overlay.alloc.compute_cidr);
+    println!("  Bridge: {}", overlay.alloc.bridge_address);
+    println!(
+        "  Underlay: {} via {}",
+        overlay.alloc.underlay_address, overlay.config.underlay_dev
+    );
+    println!("  Managed-service DNS: {published} published, {skipped} skipped");
+    println!("  No `temps serve` restart is required.");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +603,28 @@ async fn fetch_peers(auth: &ResolvedAuth) -> anyhow::Result<WirePeerListResponse
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn setup_multi_node_command_is_explicitly_scoped() {
+        let cli = crate::Cli::try_parse_from([
+            "temps",
+            "network",
+            "setup-multi-node",
+            "--private-address",
+            "10.200.4.1",
+        ])
+        .expect("multi-node setup arguments should parse");
+        assert!(matches!(
+            cli.command,
+            crate::Commands::Network(NetworkCommand {
+                command: NetworkSubcommand::SetupMultiNode(SetupMultiNodeCommand {
+                    private_address: Some(ref address),
+                    ..
+                }),
+            }) if address == "10.200.4.1"
+        ));
+    }
 
     #[test]
     fn first_usable_host_basic() {

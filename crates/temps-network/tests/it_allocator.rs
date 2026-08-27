@@ -16,7 +16,7 @@ use sea_orm::{ActiveModelTrait, ConnectionTrait, Database, DatabaseConnection, E
 use sea_orm_migration::MigratorTrait;
 use std::str::FromStr;
 use std::sync::Arc;
-use temps_entities::nodes;
+use temps_entities::{network_config, nodes};
 use temps_migrations::Migrator;
 use temps_network::allocator::{AllocatorError, ComputeNetworkAllocator, PostgresAllocator};
 use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
@@ -156,6 +156,86 @@ async fn second_allocation_picks_next_subnet() {
 }
 
 #[tokio::test]
+async fn legacy_public_underlay_remains_compatible_without_control_plane_peer() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let node_id = insert_node(&fx.db, "public-node", Some("203.0.113.10")).await;
+
+    let allocation = allocator.allocate_for_node(node_id).await.unwrap();
+    assert_eq!(allocation.underlay_address.to_string(), "203.0.113.10");
+}
+
+#[tokio::test]
+async fn public_underlay_is_rejected_after_control_plane_overlay_is_ready() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    allocator
+        .ensure_control_plane_alloc("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+    allocator.set_control_plane_ready(true).await.unwrap();
+
+    let node_id = insert_node(&fx.db, "public-node", Some("203.0.113.10")).await;
+    let error = allocator.allocate_for_node(node_id).await.unwrap_err();
+    assert!(matches!(
+        error,
+        AllocatorError::PublicUnderlayAddress { node_id: rejected, .. }
+            if rejected == node_id
+    ));
+}
+
+#[tokio::test]
+async fn control_plane_allocation_is_stable_and_visible_to_workers() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+
+    let control_plane = allocator
+        .ensure_control_plane_alloc("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(control_plane.compute_cidr.to_string(), "172.20.255.0/24");
+    assert_eq!(control_plane.bridge_address.to_string(), "172.20.255.1");
+
+    let worker_id = insert_node(&fx.db, "node-a", Some("10.200.4.2")).await;
+    let worker = allocator.allocate_for_node(worker_id).await.unwrap();
+    assert_eq!(worker.compute_cidr.to_string(), "172.20.0.0/24");
+
+    let peers = allocator.peer_list(worker_id).await.unwrap();
+    assert!(
+        peers.is_empty(),
+        "an unready reservation must not be advertised"
+    );
+
+    allocator.set_control_plane_ready(true).await.unwrap();
+    let peers = allocator.peer_list(worker_id).await.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].compute_cidr, control_plane.compute_cidr);
+    assert_eq!(peers[0].underlay_address.to_string(), "10.200.4.1");
+
+    let refreshed = allocator
+        .ensure_control_plane_alloc("10.200.4.9".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(refreshed.compute_cidr, control_plane.compute_cidr);
+    assert_eq!(refreshed.underlay_address.to_string(), "10.200.4.9");
+    assert!(allocator.peer_list(worker_id).await.unwrap().is_empty());
+
+    let persisted = network_config::Entity::find_by_id(1)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.control_plane_compute_cidr.as_deref(),
+        Some("172.20.255.0/24")
+    );
+    assert_eq!(
+        persisted.control_plane_underlay_address.as_deref(),
+        Some("10.200.4.9")
+    );
+}
+
+#[tokio::test]
 async fn allocate_twice_returns_already_allocated() {
     let Some(fx) = fixture().await else { return };
     let alloc = PostgresAllocator::new(fx.db.clone());
@@ -285,22 +365,25 @@ async fn external_id_is_stable_across_calls() {
 async fn pool_exhaustion_returns_typed_error() {
     let Some(fx) = fixture().await else { return };
 
-    // Shrink the pool to a single /30 to force exhaustion fast.
+    // Shrink the pool to two /30s to force exhaustion fast while preserving
+    // the production invariant that a pool contains more than one node CIDR.
     fx.db
         .execute_unprepared(
-            "UPDATE network_config SET compute_pool_cidr = '172.30.0.0/30', \
+            "UPDATE network_config SET compute_pool_cidr = '172.30.0.0/29', \
              subnet_prefix_len = 30 WHERE id = 1",
         )
         .await
         .unwrap();
 
     let alloc = PostgresAllocator::new(fx.db.clone());
-    // /30 within /30 = exactly 1 subnet.
+    // /30 within /29 = exactly 2 subnets.
     let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
     let b = insert_node(&fx.db, "node-b", Some("10.0.0.2")).await;
+    let c = insert_node(&fx.db, "node-c", Some("10.0.0.3")).await;
 
     alloc.allocate_for_node(a).await.unwrap();
-    let err = alloc.allocate_for_node(b).await.unwrap_err();
+    alloc.allocate_for_node(b).await.unwrap();
+    let err = alloc.allocate_for_node(c).await.unwrap_err();
     assert!(
         matches!(err, AllocatorError::PoolExhausted { .. }),
         "got {:?}",

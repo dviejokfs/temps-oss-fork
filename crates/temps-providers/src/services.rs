@@ -8700,30 +8700,15 @@ echo "[restore] Pre-seed complete"
     /// never need a cross-node address in the first place.
     async fn attach_container_to_overlay(&self, container_ref: &str) -> Option<String> {
         let overlay = Self::overlay_network_name();
-
-        let overlay_exists = match self
-            .docker
-            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
-            .await
+        let network_config = temps_network::NetworkConfig::default();
+        if let Err(error) =
+            temps_network::docker::validate_owned_network(&self.docker, &network_config).await
         {
-            Ok(networks) => networks
-                .iter()
-                .any(|n| n.name.as_deref() == Some(overlay.as_str())),
-            Err(e) => {
-                debug!(
-                    container = container_ref,
-                    overlay = %overlay,
-                    error = %e,
-                    "Could not list docker networks; skipping overlay attach"
-                );
-                return None;
-            }
-        };
-        if !overlay_exists {
             debug!(
                 container = container_ref,
                 overlay = %overlay,
-                "Overlay network not present on this host; skipping attach"
+                error = %error,
+                "Temps-owned overlay network is unavailable; skipping attach"
             );
             return None;
         }

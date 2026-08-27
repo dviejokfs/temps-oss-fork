@@ -31,7 +31,7 @@ num_cpus = "1.16"
 sea-orm = { workspace = true }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
-temps-network = { path = "../temps-network" }
+temps-network = { path = "../temps-network", features = ["control_plane"] }
 # ADR-024: control-plane DNS resolver bootstrap (CP-only path; workers wire DNS
 # via `temps agent`).
 temps-dns = { path = "../temps-dns" }
