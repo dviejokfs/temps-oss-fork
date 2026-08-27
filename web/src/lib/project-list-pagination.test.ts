@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
-  clampProjectPage,
   DEFAULT_PROJECT_PAGE_SIZE,
   projectPageCount,
   readProjectPagination,
@@ -24,13 +23,10 @@ describe('project list pagination', () => {
     ).toEqual({ page: 1, pageSize: DEFAULT_PROJECT_PAGE_SIZE })
   })
 
-  test('calculates and clamps page bounds', () => {
+  test('calculates page bounds', () => {
     expect(projectPageCount(73, 18)).toBe(5)
     expect(projectPageCount(0, 18)).toBe(1)
     expect(projectPageCount(10, Number.NaN)).toBe(1)
-    expect(clampProjectPage(20, 5)).toBe(5)
-    expect(clampProjectPage(0, 5)).toBe(1)
-    expect(clampProjectPage(2, Number.NaN)).toBe(1)
   })
 
   test('updates pagination without dropping unrelated query parameters', () => {

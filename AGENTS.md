@@ -256,6 +256,15 @@ reports `configured: false` with a reason and a setup URL over a 404
 that leaves the client unable to distinguish "not built" from
 "not set up".
 
+## Responsive pagination is a shared UI contract
+
+Use `web/src/components/ui/responsive-pagination.tsx` for paginated web lists
+instead of rebuilding controls at each call site. Below the `sm` breakpoint,
+show one stable row with labeled Previous and Next buttons around compact
+`{page} / {totalPages}` context; hide page-size, first/last, and direct-page
+controls. At `sm` and above, show the full `Showing X–Y of Z` summary and
+advanced controls.
+
 ## Don't sweep unrelated dirty files into your commits
 
 If you arrive at a working tree that's already dirty (because a

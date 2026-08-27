@@ -41,13 +41,6 @@ export function projectPageCount(total: number, pageSize: number): number {
   return Math.max(1, Math.ceil(total / pageSize))
 }
 
-export function clampProjectPage(page: number, totalPages: number): number {
-  if (!Number.isFinite(page) || !Number.isFinite(totalPages)) {
-    return DEFAULT_PROJECT_PAGE
-  }
-  return Math.min(Math.max(Math.trunc(page), 1), Math.max(totalPages, 1))
-}
-
 export function withProjectPagination(
   current: URLSearchParams,
   pagination: ProjectPagination

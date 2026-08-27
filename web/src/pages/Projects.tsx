@@ -9,11 +9,11 @@ import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboa
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
 import { OnboardingNextStepCard } from '@/components/dashboard/OnboardingNextStepCard'
-import { ProjectListPagination } from '@/components/projects/ProjectListPagination'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Input } from '@/components/ui/input'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import {
   getProjectsOptions,
   listGitProvidersOptions,
@@ -28,6 +28,7 @@ import {
   importHref,
 } from '@/components/imports/migration-sources'
 import {
+  PROJECT_PAGE_SIZE_OPTIONS,
   projectPageCount,
   readProjectPagination,
   withProjectPagination,
@@ -221,11 +222,15 @@ export function Projects() {
         projectsData.total > 0 &&
         !normalizedProjectSearch &&
         !isPageOutOfRange && (
-          <ProjectListPagination
+          <ResponsivePagination
             page={page}
             pageSize={pageSize}
             total={projectsData.total}
             totalPages={totalPages}
+            pageSizeOptions={PROJECT_PAGE_SIZE_OPTIONS}
+            ariaLabel="Project list pagination"
+            pageSizeAriaLabel="Projects per page"
+            className="pt-2"
             onPageChange={(nextPage) => setPagination(nextPage)}
             onPageSizeChange={(nextPageSize) => setPagination(1, nextPageSize)}
           />
