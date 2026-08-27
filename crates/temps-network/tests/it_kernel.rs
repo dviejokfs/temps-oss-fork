@@ -364,12 +364,16 @@ async fn bootstrap_creates_all_kernel_state() {
             "TEMPS_OVERLAY_FORWARD",
             &[
                 "-i vxlan-temps0",
-                "-o vxlan-temps0",
-                &env.peer_cidr.to_string()
+                &env.peer_cidr.to_string(),
+                &env.local_cidr.to_string(),
             ]
         )
         .await,
-        "Docker's default-DROP FORWARD chain must permit scoped VXLAN traffic"
+        "Docker's default-DROP FORWARD chain must permit scoped VXLAN ingress"
+    );
+    assert!(
+        !iptables_chain_contains("TEMPS_OVERLAY_FORWARD", &["-o vxlan-temps0"]).await,
+        "Temps must not bypass Docker isolation for locally spoofed VXLAN egress"
     );
 }
 

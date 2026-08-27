@@ -45,18 +45,14 @@ impl OverlayForwardRule {
     fn ingress(config: &NetworkConfig, alloc: &NodeAlloc, peer: &Peer) -> Self {
         Self {
             input: Some(config.vxlan_dev_name.clone()),
-            output: Some(config.bridge_name.clone()),
+            // A frame received from VXLAN and forwarded to a Docker
+            // container leaves through the container's veth, not through
+            // the bridge device itself. Keep the trusted ingress interface
+            // and both CIDRs scoped, but do not require an output interface
+            // that Linux never reports for this forwarding path.
+            output: None,
             source: peer.compute_cidr.to_string(),
             destination: alloc.compute_cidr.to_string(),
-        }
-    }
-
-    fn egress(config: &NetworkConfig, alloc: &NodeAlloc, peer: &Peer) -> Self {
-        Self {
-            input: Some(config.bridge_name.clone()),
-            output: Some(config.vxlan_dev_name.clone()),
-            source: alloc.compute_cidr.to_string(),
-            destination: peer.compute_cidr.to_string(),
         }
     }
 
@@ -162,14 +158,15 @@ fn desired_overlay_rules(
     if !matches!(config.transport, Transport::Vxlan { .. }) {
         return HashSet::new();
     }
+    // Docker already owns local bridge egress and established return traffic
+    // in FORWARD. The only missing allowance is a new connection arriving
+    // from a trusted VXLAN peer for a local overlay container. Do not add an
+    // egress exception here: accepting solely by source/destination CIDRs and
+    // VXLAN output would let an unrelated local bridge spoof an overlay source
+    // and bypass Docker's isolation policy.
     peers
         .iter()
-        .flat_map(|peer| {
-            [
-                OverlayForwardRule::ingress(config, alloc, peer),
-                OverlayForwardRule::egress(config, alloc, peer),
-            ]
-        })
+        .map(|peer| OverlayForwardRule::ingress(config, alloc, peer))
         .collect()
 }
 
@@ -473,8 +470,8 @@ fn parse_overlay_rule(tokens: &[String]) -> Option<OverlayForwardRule> {
         return None;
     }
     Some(OverlayForwardRule {
-        input: Some(input?),
-        output: Some(output?),
+        input,
+        output,
         source: source?,
         destination: destination?,
     })
@@ -790,21 +787,16 @@ mod tests {
         let rules = desired_overlay_rules(&cfg, &alloc, &[peer]);
         assert!(rules.contains(&OverlayForwardRule {
             input: Some("vxlan-temps0".into()),
-            output: Some("br-temps0".into()),
+            output: None,
             source: "172.20.0.0/24".into(),
             destination: "172.20.255.0/24".into(),
         }));
-        assert!(rules.contains(&OverlayForwardRule {
-            input: Some("br-temps0".into()),
-            output: Some("vxlan-temps0".into()),
-            source: "172.20.255.0/24".into(),
-            destination: "172.20.0.0/24".into(),
-        }));
+        assert_eq!(rules.len(), 1, "local egress remains owned by Docker");
     }
 
     #[test]
     fn parses_owned_iptables_rule_semantically() {
-        let tokens = "-A TEMPS_OVERLAY_FORWARD -s 172.20.0.0/24 -d 172.20.255.0/24 -i vxlan-temps0 -o br-temps0 -m comment --comment temps-overlay-forward-rule-v1 -j ACCEPT"
+        let tokens = "-A TEMPS_OVERLAY_FORWARD -s 172.20.0.0/24 -d 172.20.255.0/24 -i vxlan-temps0 -m comment --comment temps-overlay-forward-rule-v1 -j ACCEPT"
             .split_ascii_whitespace()
             .map(str::to_string)
             .collect::<Vec<_>>();
@@ -812,7 +804,7 @@ mod tests {
             parse_overlay_rule(&tokens),
             Some(OverlayForwardRule {
                 input: Some("vxlan-temps0".into()),
-                output: Some("br-temps0".into()),
+                output: None,
                 source: "172.20.0.0/24".into(),
                 destination: "172.20.255.0/24".into(),
             })
