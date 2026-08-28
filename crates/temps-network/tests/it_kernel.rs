@@ -157,6 +157,17 @@ async fn nft_table_exists(family: &str, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+async fn nft_table_contains(family: &str, name: &str, fragments: &[&str]) -> bool {
+    let output = Command::new("nft")
+        .args(["list", "table", family, name])
+        .output()
+        .await;
+    matches!(output, Ok(output) if output.status.success() && {
+        let rules = String::from_utf8_lossy(&output.stdout);
+        fragments.iter().all(|fragment| rules.contains(fragment))
+    })
+}
+
 async fn iptables_chain_contains(chain: &str, fragments: &[&str]) -> bool {
     let output = Command::new("iptables").args(["-S", chain]).output().await;
     matches!(output, Ok(output) if output.status.success() && {
@@ -363,6 +374,20 @@ async fn bootstrap_creates_all_kernel_state() {
         "nftables table must exist"
     );
     assert!(
+        nft_table_contains(
+            "inet",
+            "temps_network",
+            &[
+                &env.peer_cidr.to_string(),
+                &env.local_cidr.to_string(),
+                &env.local_bridge_ip.to_string(),
+                "snat",
+            ]
+        )
+        .await,
+        "remote overlay traffic must be SNATed to the local bridge so a dual-network service replies over VXLAN"
+    );
+    assert!(
         iptables_chain_contains(
             "TEMPS_OVERLAY_FORWARD",
             &[
@@ -515,6 +540,81 @@ async fn reconcile_peers_noop_on_unchanged() {
         !changed,
         "reconcile with identical peer list must be a no-op"
     );
+}
+
+#[tokio::test]
+async fn bootstrap_migrates_the_exact_legacy_forwarding_rule() {
+    let (env, mgr, _cleanup) = fixture().await;
+    let alloc = env.alloc();
+    let peer = env.peer();
+    mgr.bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect("initial bootstrap");
+
+    let peer_cidr = peer.compute_cidr.to_string();
+    let local_cidr = alloc.compute_cidr.to_string();
+    let current_rule = [
+        "-D",
+        "TEMPS_OVERLAY_FORWARD",
+        "-m",
+        "physdev",
+        "--physdev-is-bridged",
+        "--physdev-in",
+        "vxlan-temps0",
+        "-s",
+        &peer_cidr,
+        "-d",
+        &local_cidr,
+        "-m",
+        "comment",
+        "--comment",
+        "temps-overlay-forward-rule-v1",
+        "-j",
+        "ACCEPT",
+    ];
+    let deleted = Command::new("iptables")
+        .args(current_rule)
+        .output()
+        .await
+        .expect("delete current forwarding rule");
+    assert!(deleted.status.success());
+
+    let legacy_rule = [
+        "-A",
+        "TEMPS_OVERLAY_FORWARD",
+        "-i",
+        "vxlan-temps0",
+        "-s",
+        &peer_cidr,
+        "-d",
+        &local_cidr,
+        "-m",
+        "comment",
+        "--comment",
+        "temps-overlay-forward-rule-v1",
+        "-j",
+        "ACCEPT",
+    ];
+    let appended = Command::new("iptables")
+        .args(legacy_rule)
+        .output()
+        .await
+        .expect("append legacy forwarding rule");
+    assert!(appended.status.success());
+
+    mgr.bootstrap(alloc, vec![peer])
+        .await
+        .expect("upgrade bootstrap must migrate the owned legacy rule");
+
+    let output = Command::new("iptables")
+        .args(["-S", "TEMPS_OVERLAY_FORWARD"])
+        .output()
+        .await
+        .expect("inspect migrated forwarding rules");
+    assert!(output.status.success());
+    let rules = String::from_utf8_lossy(&output.stdout);
+    assert!(rules.contains("--physdev-in vxlan-temps0"));
+    assert!(!rules.contains(" -i vxlan-temps0"));
 }
 
 #[tokio::test]

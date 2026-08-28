@@ -301,6 +301,18 @@ docker exec "$NODE_A" docker run --rm --network "$EXISTING_APP_NETWORK" \
   | grep -q "Welcome to nginx" \
   || fail "existing control-plane workload stopped serving traffic"
 
+# Production database services are attached to temps-app-network first and to
+# the multi-node overlay second. Their default route therefore remains on the
+# app network. Without the scoped cross-node SNAT rule their reply to a worker
+# leaves through that wrong default route and the connection times out.
+docker exec "$NODE_A" docker network connect \
+  --ip 10.240.1.20 temps-overlay "$EXISTING_APP_CONTAINER"
+
+docker exec "$NODE_A" docker exec "$EXISTING_APP_CONTAINER" \
+  awk '$2 == "00000000" { print $1 }' /proc/net/route \
+  | grep -q '^eth0$' \
+  || fail "dual-network fixture no longer reproduces app-network default routing"
+
 log "both nodes bootstrapped — running container ping"
 
 # Mirror production Docker hosts, where FORWARD defaults to DROP. Remote
@@ -323,5 +335,19 @@ docker exec "$NODE_B" docker run --rm --network temps-overlay --ip 10.240.2.10 a
   echo "expected nginx response was not received after 30 attempts" >&2
   exit 1
 ' || fail "node-b -> node-a HTTP failed"
+
+docker exec "$NODE_B" docker run --rm --network temps-overlay --ip 10.240.2.20 alpine sh -ec '
+  attempts=0
+  while [ "$attempts" -lt 30 ]; do
+    if wget -q -T 2 -O /tmp/nginx-response http://10.240.1.20/ \
+      && grep -q "Welcome to nginx" /tmp/nginx-response; then
+      exit 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 1
+  done
+  echo "expected dual-network nginx response was not received after 30 attempts" >&2
+  exit 1
+' || fail "worker could not reach dual-network control-plane service"
 
 log "✅ cross-host overlay verified"

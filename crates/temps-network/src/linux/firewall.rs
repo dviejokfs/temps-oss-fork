@@ -13,8 +13,9 @@
 //!   an nftables ACCEPT in an earlier base chain does not terminate traversal
 //!   of later base chains.
 //! * `postrouting` (priority 100, type nat, hook postrouting) — masquerades
-//!   compute CIDR traffic that egresses on a non-bridge interface. This is what
-//!   lets containers reach the internet.
+//!   compute CIDR traffic that egresses on a non-bridge interface and gives
+//!   cross-node traffic a symmetric return path when the destination container
+//!   is also attached to another Docker network.
 //!
 //! We shell out to `nft` because it is the canonical tool, every modern
 //! distro ships it, and the rule set we need is small enough that an
@@ -421,7 +422,8 @@ async fn list_overlay_rules() -> crate::Result<Vec<(Option<OverlayForwardRule>, 
             continue;
         }
         let parsed = parse_overlay_rule(&tokens);
-        if parsed.is_none() {
+        let legacy_owned = parsed.is_none() && parse_legacy_overlay_rule(&tokens).is_some();
+        if parsed.is_none() && !legacy_owned {
             return Err(NetworkError::Iptables {
                 op: "inspect_overlay_chain",
                 chain: OVERLAY_FORWARD_CHAIN.into(),
@@ -433,6 +435,60 @@ async fn list_overlay_rules() -> crate::Result<Vec<(Option<OverlayForwardRule>, 
         rules.push((parsed, delete_args));
     }
     Ok(rules)
+}
+
+/// Parse the exact forwarding rule emitted before Temps switched from the
+/// logical `-i vxlan-temps0` match to bridge-aware `physdev` matching. These
+/// rules carry our ownership comment, but no longer match bridged packets on
+/// production Docker hosts. Recognizing only this narrow shape lets the
+/// reconciler install the replacement first and then safely delete the stale
+/// rule during an in-place upgrade.
+fn parse_legacy_overlay_rule(tokens: &[String]) -> Option<OverlayForwardRule> {
+    if tokens.first().map(String::as_str) != Some("-A")
+        || tokens.get(1).map(String::as_str) != Some(OVERLAY_FORWARD_CHAIN)
+    {
+        return None;
+    }
+    let mut input = None;
+    let mut source = None;
+    let mut destination = None;
+    let mut comment_module = false;
+    let mut comment = None;
+    let mut jump = None;
+    let mut index = 2;
+    while index < tokens.len() {
+        if tokens[index] == "-m"
+            && tokens.get(index + 1).map(String::as_str) == Some("comment")
+            && !comment_module
+        {
+            comment_module = true;
+            index += 2;
+            continue;
+        }
+        let value = tokens.get(index + 1)?.clone();
+        let slot = match tokens[index].as_str() {
+            "-i" if input.is_none() => &mut input,
+            "-s" if source.is_none() => &mut source,
+            "-d" if destination.is_none() => &mut destination,
+            "--comment" if comment.is_none() => &mut comment,
+            "-j" if jump.is_none() => &mut jump,
+            _ => return None,
+        };
+        *slot = Some(value);
+        index += 2;
+    }
+    if !comment_module
+        || comment.as_deref() != Some(RULE_COMMENT)
+        || jump.as_deref() != Some("ACCEPT")
+    {
+        return None;
+    }
+    Some(OverlayForwardRule {
+        physical_input: input,
+        output: None,
+        source: source?,
+        destination: destination?,
+    })
 }
 
 fn parse_overlay_rule(tokens: &[String]) -> Option<OverlayForwardRule> {
@@ -614,6 +670,19 @@ fn render_baseline(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) ->
         }
         Transport::Native => String::new(),
     };
+    // A service may already be attached to `temps-app-network` before it is
+    // attached to the overlay. Linux then keeps that first network as the
+    // container's default route, so replies to a remote overlay CIDR leave via
+    // the wrong interface and never traverse VXLAN. SNAT remote-node traffic
+    // to this node's overlay gateway. Conntrack reverses it on return, while
+    // local same-node traffic keeps its original source address.
+    let mut cross_node_snat = String::new();
+    for peer in peers {
+        cross_node_snat.push_str(&format!(
+            "add rule inet {TABLE} postrouting ip saddr {} ip daddr {cidr} snat to {}\n",
+            peer.compute_cidr, alloc.bridge_address
+        ));
+    }
     let marker = baseline_marker(config, alloc, peers);
     format!(
         "
@@ -641,12 +710,14 @@ add chain inet {table} input {{ type filter hook input priority -100; policy acc
 add rule inet {table} input counter comment \"{marker}\"
 
 add chain inet {table} postrouting {{ type nat hook postrouting priority 100; policy accept; }}
+{cross_node_snat}
 add rule inet {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masquerade
 ",
         table = TABLE,
         bridge = bridge,
         cidr = cidr,
         vxlan_ingress = vxlan_ingress,
+        cross_node_snat = cross_node_snat,
         marker = marker,
     )
 }
@@ -806,6 +877,27 @@ mod tests {
     }
 
     #[test]
+    fn baseline_snat_gives_dual_network_services_a_symmetric_return_path() {
+        let cfg = NetworkConfig::default();
+        let alloc = NodeAlloc {
+            node_id: Uuid::nil(),
+            compute_cidr: "172.20.255.0/24".parse().unwrap(),
+            bridge_address: "172.20.255.1".parse().unwrap(),
+            underlay_address: "10.200.4.1".parse().unwrap(),
+        };
+        let peer = Peer {
+            node_id: Uuid::from_u128(1),
+            compute_cidr: "172.20.0.0/24".parse().unwrap(),
+            underlay_address: "10.200.4.2".parse().unwrap(),
+        };
+
+        let script = render_baseline(&cfg, &alloc, &[peer]);
+        assert!(script.contains(
+            "postrouting ip saddr 172.20.0.0/24 ip daddr 172.20.255.0/24 snat to 172.20.255.1"
+        ));
+    }
+
+    #[test]
     fn overlay_forward_rules_are_scoped_to_local_and_peer_cidrs() {
         let cfg = NetworkConfig::default();
         let alloc = NodeAlloc {
@@ -844,6 +936,38 @@ mod tests {
                 destination: "172.20.255.0/24".into(),
             })
         );
+    }
+
+    #[test]
+    fn recognizes_exact_legacy_overlay_rule_for_safe_migration() {
+        let tokens = "-A TEMPS_OVERLAY_FORWARD -s 172.20.0.0/24 -d 172.20.255.0/24 -i vxlan-temps0 -m comment --comment temps-overlay-forward-rule-v1 -j ACCEPT"
+            .split_ascii_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_legacy_overlay_rule(&tokens),
+            Some(OverlayForwardRule {
+                physical_input: Some("vxlan-temps0".into()),
+                output: None,
+                source: "172.20.0.0/24".into(),
+                destination: "172.20.255.0/24".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_broader_rules_as_legacy_migrations() {
+        for rule in [
+            "-A TEMPS_OVERLAY_FORWARD ! -i vxlan-temps0 -s 172.20.0.0/24 -d 172.20.255.0/24 -m comment --comment temps-overlay-forward-rule-v1 -j ACCEPT",
+            "-A TEMPS_OVERLAY_FORWARD -i vxlan-temps0 -s 172.20.0.0/24 -d 172.20.255.0/24 -m comment --comment broader -j ACCEPT",
+            "-A TEMPS_OVERLAY_FORWARD -i vxlan-temps0 -s 172.20.0.0/24 -d 172.20.255.0/24 -p tcp -m comment --comment temps-overlay-forward-rule-v1 -j ACCEPT",
+        ] {
+            let tokens = rule
+                .split_ascii_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert_eq!(parse_legacy_overlay_rule(&tokens), None);
+        }
     }
 
     #[test]
