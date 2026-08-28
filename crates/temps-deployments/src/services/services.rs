@@ -3271,17 +3271,30 @@ impl DeploymentService {
         // "running" (see `route_table::load_routes`), so a stopped-but-not-
         // removed container is just as inert from the outside as a removed
         // one, without sacrificing resumability.
+        // Best-effort like the `stop_container` call above: the deployment
+        // row is already committed as "paused", so aborting this loop on a
+        // single container's DB write failure would strand the *remaining*
+        // containers untouched (still "running" in the DB, never even
+        // asked to stop) and skip the route-table reload below, while the
+        // deployment stays paused indefinitely. Warn and keep going so one
+        // failure can't silently drop the rest of the pause.
         for container in containers {
-            if let Err(e) = self.deployer.stop_container(&container.container_id).await {
+            let container_id = container.container_id.clone();
+            if let Err(e) = self.deployer.stop_container(&container_id).await {
                 warn!(
                     "Failed to stop container {} during deployment pause: {}",
-                    container.container_id, e
+                    container_id, e
                 );
             }
 
             let mut active_container: deployment_containers::ActiveModel = container.into();
             active_container.status = Set(Some("stopped".to_string()));
-            active_container.update(self.db.as_ref()).await?;
+            if let Err(e) = active_container.update(self.db.as_ref()).await {
+                warn!(
+                    "Failed to persist stopped status for container {} during deployment pause: {}",
+                    container_id, e
+                );
+            }
         }
 
         // Force an in-process route-table reload (same mechanism
