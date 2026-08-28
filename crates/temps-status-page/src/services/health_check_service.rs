@@ -3,6 +3,7 @@
 
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_config::ConfigService;
@@ -87,10 +88,51 @@ impl HealthCheckService {
         let total_monitors = monitors_with_envs.len();
         debug!("Found {} active monitors to check", total_monitors);
 
-        let filtered_monitors: Vec<_> = Self::filter_on_demand_monitors(monitors_with_envs);
+        // Batch-load the current deployment for every monitored environment so
+        // we can skip monitors whose deployment was intentionally paused by
+        // the user (`pause_deployment` stops the containers on purpose, so a
+        // connection-refused here is expected, not an outage). Record each
+        // monitor's current_deployment_id before filter_on_demand_monitors
+        // drops the environment from the tuple.
+        let monitor_deployment_ids: HashMap<i32, i32> = monitors_with_envs
+            .iter()
+            .filter_map(|(monitor, env)| {
+                env.as_ref()
+                    .and_then(|e| e.current_deployment_id)
+                    .map(|deployment_id| (monitor.id, deployment_id))
+            })
+            .collect();
+
+        let current_deployment_ids: Vec<i32> = monitor_deployment_ids
+            .values()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let paused_deployment_ids: std::collections::HashSet<i32> =
+            if current_deployment_ids.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                deployments::Entity::find()
+                    .filter(deployments::Column::Id.is_in(current_deployment_ids))
+                    .filter(deployments::Column::State.eq("paused"))
+                    .all(self.db.as_ref())
+                    .await?
+                    .into_iter()
+                    .map(|d| d.id)
+                    .collect()
+            };
+
+        let after_on_demand = Self::filter_on_demand_monitors(monitors_with_envs);
+        let filtered_monitors: Vec<_> = Self::filter_paused_deployment_monitors(
+            after_on_demand,
+            &monitor_deployment_ids,
+            &paused_deployment_ids,
+        );
 
         debug!(
-            "Running checks for {} monitors ({} skipped as on-demand)",
+            "Running checks for {} monitors ({} skipped as on-demand or paused)",
             filtered_monitors.len(),
             total_monitors - filtered_monitors.len()
         );
@@ -639,6 +681,34 @@ impl HealthCheckService {
             .collect()
     }
 
+    /// Filter out monitors whose environment's current deployment was
+    /// intentionally paused by the user. `pause_deployment` stops the
+    /// containers on purpose, so a health check against it would report a
+    /// false "down" — this keeps that expected state from generating a
+    /// downtime alert.
+    fn filter_paused_deployment_monitors(
+        monitors: Vec<status_monitors::Model>,
+        monitor_deployment_ids: &HashMap<i32, i32>,
+        paused_deployment_ids: &std::collections::HashSet<i32>,
+    ) -> Vec<status_monitors::Model> {
+        monitors
+            .into_iter()
+            .filter(|monitor| {
+                let Some(deployment_id) = monitor_deployment_ids.get(&monitor.id) else {
+                    return true;
+                };
+                if paused_deployment_ids.contains(deployment_id) {
+                    debug!(
+                        "Skipping monitor {} for paused deployment {}",
+                        monitor.id, deployment_id
+                    );
+                    return false;
+                }
+                true
+            })
+            .collect()
+    }
+
     /// Check a specific environment using its deployment URL
     pub async fn check_environment(
         &self,
@@ -841,6 +911,43 @@ mod tests {
         assert_eq!(result[0].id, 2);
         assert_eq!(result[1].id, 3);
         assert_eq!(result[2].id, 5);
+    }
+
+    #[test]
+    fn test_filter_paused_deployment_skips_paused() {
+        let monitors = vec![make_monitor(1, Some(10)), make_monitor(2, Some(20))];
+        let monitor_deployment_ids = HashMap::from([(1, 100), (2, 200)]);
+        let paused_deployment_ids = std::collections::HashSet::from([100]);
+
+        let result = HealthCheckService::filter_paused_deployment_monitors(
+            monitors,
+            &monitor_deployment_ids,
+            &paused_deployment_ids,
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, 2);
+    }
+
+    #[test]
+    fn test_filter_paused_deployment_keeps_unpaused_and_unmapped() {
+        let monitors = vec![
+            make_monitor(1, Some(10)), // paused -> skip
+            make_monitor(2, Some(20)), // not paused -> keep
+            make_monitor(3, None),     // no environment/deployment -> keep
+        ];
+        let monitor_deployment_ids = HashMap::from([(1, 100), (2, 200)]);
+        let paused_deployment_ids = std::collections::HashSet::from([100]);
+
+        let result = HealthCheckService::filter_paused_deployment_monitors(
+            monitors,
+            &monitor_deployment_ids,
+            &paused_deployment_ids,
+        );
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].id, 2);
+        assert_eq!(result[1].id, 3);
     }
 
     #[test]

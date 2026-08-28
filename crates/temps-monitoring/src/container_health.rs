@@ -367,6 +367,17 @@ impl ContainerHealthMonitor {
                     return;
                 }
 
+                // Skip alarm if the deployment was intentionally paused by the
+                // user — `pause_deployment` stops containers on purpose, so
+                // this exit is expected, not a crash.
+                if deployment.state == "paused" {
+                    debug!(
+                        "Container {} ({}) is {} but deployment {} is paused, skipping alarm",
+                        container.id, container.container_name, status_str, deployment.id
+                    );
+                    return;
+                }
+
                 warn!(
                     "Container {} ({}) is in '{}' state (reason: {})",
                     container.id,
@@ -1219,6 +1230,35 @@ mod tests {
 
         let info = deployer.get_container_info("abc123").await.unwrap();
         // Should fire alarm for exited container
+        monitor
+            .check_container_status(&container, &deployment, &info)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_check_container_status_exited_skips_alarm_when_paused() {
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Exited));
+        let container = make_container_model(1);
+        let deployment = deployments::Model {
+            state: "paused".to_string(),
+            ..make_deployment_model()
+        };
+
+        // No alarm-related DB calls (cooldown check / insert) should happen —
+        // if the paused check is skipped, the monitor will try to query for
+        // them and this MockDatabase (with no results queued) will surface it.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let db = Arc::new(db);
+        let alarm_service = make_alarm_service(db.clone());
+
+        let monitor = ContainerHealthMonitor::new(
+            db,
+            deployer.clone(),
+            alarm_service,
+            ContainerHealthConfig::default(),
+        );
+
+        let info = deployer.get_container_info("abc123").await.unwrap();
         monitor
             .check_container_status(&container, &deployment, &info)
             .await;
