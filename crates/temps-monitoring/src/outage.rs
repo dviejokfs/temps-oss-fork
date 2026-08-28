@@ -19,7 +19,7 @@ use temps_core::notifications::{
     NotificationData, NotificationPriority, NotificationService, NotificationType,
 };
 use temps_core::{AutopilotTriggerJob, Job, JobQueue, JobReceiver};
-use temps_entities::{environments, status_checks, status_incidents, status_monitors};
+use temps_entities::{deployments, environments, status_checks, status_incidents, status_monitors};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -181,6 +181,32 @@ impl OutageDetectionService {
         self
     }
 
+    /// Check if the environment's current deployment is paused. Always a
+    /// live read: this gates whether a status check gets to create an
+    /// incident/notification at all, so it must reflect `pause_deployment`'s
+    /// state at the moment this specific check is processed.
+    async fn is_deployment_paused(&self, environment_id: Option<i32>) -> bool {
+        let Some(environment_id) = environment_id else {
+            return false;
+        };
+        let Some(current_deployment_id) = environments::Entity::find_by_id(environment_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|e| e.current_deployment_id)
+        else {
+            return false;
+        };
+        deployments::Entity::find_by_id(current_deployment_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|d| d.state == "paused")
+            .unwrap_or(false)
+    }
+
     /// Process a new status check and detect state transitions
     pub async fn process_check(
         &self,
@@ -195,6 +221,25 @@ impl OutageDetectionService {
             .one(self.db.as_ref())
             .await?
             .ok_or(OutageError::MonitorNotFound(monitor_id))?;
+
+        // Final gate before anything reaches a user: `record_check`'s own
+        // paused guard (in temps-status-page) and this one are two separate
+        // reads with an unavoidable gap between them — a pause committing in
+        // that narrow window could still get this far. This job is
+        // dispatched async after that check (queue send + receive), which
+        // only shrinks the reachable window further, but re-checking live
+        // here — right before an incident/notification would actually be
+        // created — is what makes an intentional pause never actually
+        // produce a downtime alert, regardless of timing upstream. Treat a
+        // check for a now-paused deployment as if it never happened: no
+        // state transition, no incident, no notification.
+        if self.is_deployment_paused(monitor.environment_id).await {
+            debug!(
+                "Monitor {} - deployment is paused, ignoring status check",
+                monitor_id
+            );
+            return Ok(None);
+        }
 
         let mut states = self.monitor_states.write().await;
         let previous_state = states.get(&monitor_id).cloned();
@@ -1131,6 +1176,51 @@ mod tests {
         }
     }
 
+    fn make_deployment_model(id: i32, state: &str) -> temps_entities::deployments::Model {
+        temps_entities::deployments::Model {
+            id,
+            project_id: 1,
+            environment_id: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            slug: format!("deploy-{id}"),
+            state: state.to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            context_vars: None,
+            branch_ref: None,
+            tag_ref: None,
+            commit_sha: None,
+            commit_message: None,
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: None,
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: None,
+        }
+    }
+
+    fn make_status_monitor_model(id: i32, environment_id: Option<i32>) -> status_monitors::Model {
+        status_monitors::Model {
+            id,
+            project_id: 1,
+            environment_id,
+            name: "API Health".to_string(),
+            monitor_type: "web".to_string(),
+            check_path: None,
+            check_interval_seconds: 60,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
     fn make_alarm_model(id: i32, alarm_type: &str, status: &str) -> temps_entities::alarms::Model {
         temps_entities::alarms::Model {
             id,
@@ -1391,6 +1481,60 @@ mod tests {
             notification_service.send_count(),
             0,
             "No notifications when no alarms to resolve"
+        );
+        assert_eq!(job_queue.send_count(), 0);
+    }
+
+    /// Final-gate regression test: `process_check` is what `StatusCheckCompleted`
+    /// jobs are dispatched to (async, after `record_check`'s own paused
+    /// guard already ran) and it's the layer that actually creates an
+    /// incident and sends a notification. Even if a pause commits in the
+    /// narrow gap between that upstream guard and its DB insert, this must
+    /// still refuse to turn a "down" status check for a paused deployment
+    /// into a real incident/notification.
+    #[tokio::test]
+    async fn test_process_check_skips_paused_deployment() {
+        let monitor = make_status_monitor_model(1, Some(1));
+
+        // Query order: monitor lookup, then is_deployment_paused's
+        // environment lookup, then its deployment lookup (paused). No
+        // further queries (no incident creation, no alarm/notification
+        // machinery) should happen after that.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![monitor]])
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "paused")]])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            notification_service.clone(),
+            job_queue.clone(),
+        ));
+
+        let service = OutageDetectionService::new(db, notification_service.clone(), alarm_service);
+
+        let result = service
+            .process_check(
+                1,
+                MonitorStatus::Down,
+                Some("Connection refused".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "a status check for a paused deployment must not produce an outage event"
+        );
+        assert_eq!(
+            notification_service.send_count(),
+            0,
+            "no notification for an intentional pause"
         );
         assert_eq!(job_queue.send_count(), 0);
     }
