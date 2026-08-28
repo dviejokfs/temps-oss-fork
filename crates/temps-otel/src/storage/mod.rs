@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pluggable storage backend for OTel data.
 //!
 //! The [`OtelStorage`] trait defines the contract for storing and querying

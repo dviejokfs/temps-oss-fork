@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `MongodbEngine`: direct-to-S3 WAL-G stream backups for managed MongoDB
 //! images, with a logical `mongodump` fallback for arbitrary OSS images.
 //!

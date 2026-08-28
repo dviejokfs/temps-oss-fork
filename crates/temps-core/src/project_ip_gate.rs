@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Extension point for per-project/environment IP allow/restrict rules on
 //! the proxy hot path.
 //!
@@ -51,7 +54,7 @@ pub trait ProjectIpGate: Send + Sync {
     /// [`Self::is_allowed`] for this project/environment).
     ///
     /// This exists for exactly one caller: the proxy's client-IP resolution
-    /// can fail (e.g. a non-INET socket, an unparseable forwarded-for value),
+    /// can fail (e.g. a non-INET socket, an unparsable forwarded-for value),
     /// leaving no `IpAddr` to hand to `is_allowed` at all. In that situation
     /// the proxy must fail closed (deny) only when this project/environment
     /// actually has a restriction configured — denying every request with an

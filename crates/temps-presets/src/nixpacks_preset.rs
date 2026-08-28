@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The legacy `nixpacks*` preset slugs, now built by autopack.
 //!
 //! The Nixpacks library is gone; these slugs remain. Projects created before

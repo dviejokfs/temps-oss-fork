@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::handlers::{configure_public_routes, configure_routes, AppState};
 use crate::services::service::PerformanceService;
 use std::future::Future;

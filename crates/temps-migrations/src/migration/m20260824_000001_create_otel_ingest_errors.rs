@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration: durable record of *why* OTel ingest batches were dropped.
 //!
 //! The pipeline-stats counters answer "how many spans were dropped?"; this

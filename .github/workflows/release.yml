@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 name: Release
 
 # Actions cache is read-only here (`cache-from` without `cache-to`, explicit
@@ -175,7 +178,7 @@ jobs:
 
       - name: Create tarball
         run: |
-          tar -czf temps-linux-amd64.tar.gz temps
+          tar -czf temps-linux-amd64.tar.gz temps LICENSE LICENSE-MIT NOTICE
           ls -lh temps-linux-amd64.tar.gz
 
       - name: Generate checksum
@@ -247,7 +250,7 @@ jobs:
 
       - name: Create tarball
         run: |
-          tar -czf temps-linux-arm64.tar.gz temps
+          tar -czf temps-linux-arm64.tar.gz temps LICENSE LICENSE-MIT NOTICE
           ls -lh temps-linux-arm64.tar.gz
 
       - name: Generate checksum
@@ -323,7 +326,7 @@ jobs:
 
       - name: Create tarball
         run: |
-          tar -czf temps-darwin-amd64.tar.gz temps
+          tar -czf temps-darwin-amd64.tar.gz temps LICENSE LICENSE-MIT NOTICE
           ls -lh temps-darwin-amd64.tar.gz
 
       - name: Generate checksum
@@ -390,7 +393,7 @@ jobs:
 
       - name: Create tarball
         run: |
-          tar -czf temps-darwin-arm64.tar.gz temps
+          tar -czf temps-darwin-arm64.tar.gz temps LICENSE LICENSE-MIT NOTICE
           ls -lh temps-darwin-arm64.tar.gz
 
       - name: Generate checksum

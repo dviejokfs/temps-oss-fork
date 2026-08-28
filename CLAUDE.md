@@ -31,6 +31,16 @@ Guidance for Claude Code when working with the Temps codebase.
 - Add new runtime configuration as environment variables -- environment variables for configuration are forbidden. ALWAYS model it as a column on the relevant entity row (e.g. `oidc_providers.trust_idp_email`, not `TEMPS_OIDC_SKIP_EMAIL_VERIFIED`) so the admin can change it per-record at runtime via the API/UI, gets audit logging for free, and operators don't have to restart the binary to change a single tenant's behaviour. If the value is sensitive (credentials, tokens, private keys), the column MUST be encrypted at rest via `EncryptionService`, never stored as plaintext -- this applies even where env vars might otherwise seem tempting for secrets (e.g. a Vault CA bundle or auth token: store it encrypted on the provider row, not as `TEMPS_VAULT_CA_BUNDLE`). The only legitimate exception is bootstrap-time config needed before a database connection exists (e.g. `DATABASE_URL`, `TEMPS_DATA_DIR`, `--license-path`)
 
 ### ALWAYS
+- Add the Temps SPDX attribution header to every new first-party source or
+  commentable configuration file, using the file's comment syntax:
+  `SPDX-FileCopyrightText: 2024-2026 Temps Contributors` and
+  `SPDX-License-Identifier: MIT OR Apache-2.0`. Run
+  `python3 scripts/source_attribution.py annotate path/to/file` to apply it.
+  Before every commit that adds or regenerates source files, run
+  `python3 scripts/source_attribution.py check`; attribution failures are
+  blocking and must be fixed before committing.
+  Generated files must receive the header from their generator or generation
+  command. Never replace or misattribute third-party copyright notices.
 - Run `cargo check --lib` after every modification
 - New functionality must compile without warnings
 - Write tests for all new functionality AND verify they run successfully
@@ -1052,7 +1062,7 @@ if (isLoading) return <Spinner />
 - **Filter bars**: `flex flex-col gap-2 sm:flex-row sm:flex-wrap`; selects use `w-full sm:w-[Npx]`
 - **Grids**: `grid-cols-1` → `md:grid-cols-2` → `lg:grid-cols-3` (or `grid-cols-2 md:grid-cols-4` for stat cards)
 - **Side panels**: `flex-col lg:flex-row`; panel uses `w-full lg:w-[Npx]`
-- **Pagination**: compact `{page} / {totalPages}` on mobile; full "Showing X–Y of Z" `hidden sm:inline`
+- **Pagination**: use the shared `ResponsivePagination` component. Below `sm`, show one row with labeled Previous and Next buttons around compact `{page} / {totalPages}` context; hide page-size, first/last, and direct-page controls. At `sm` and above, show the full "Showing X–Y of Z" and advanced controls.
 - **Headers**: `flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between`
 - **Button text**: `hidden sm:inline` for labels next to icons; icon-only on mobile
 - **Min-width**: add `min-w-[Npx]` on scrollable containers so content doesn't collapse

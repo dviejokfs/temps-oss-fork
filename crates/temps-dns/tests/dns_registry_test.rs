@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for [`DnsRegistry`] (ADR-011).
 //!
 //! These run against a real TimescaleDB container — the schema invariants

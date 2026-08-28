@@ -5,6 +5,33 @@ Codex, aider, etc.). The detailed engineering rules live in
 [`CLAUDE.md`](./CLAUDE.md); this file is the short list of process
 conventions that go *around* the code. Read both.
 
+## Add attribution to every new source file
+
+Every new first-party source or commentable configuration file must carry the
+Temps SPDX attribution header, written with the file's comment syntax:
+
+```text
+SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+SPDX-License-Identifier: MIT OR Apache-2.0
+```
+
+Apply it with:
+
+```bash
+python3 scripts/source_attribution.py annotate path/to/file
+```
+
+Before every commit that adds or regenerates source files, run the repository-wide
+check and treat any failure as blocking:
+
+```bash
+python3 scripts/source_attribution.py check
+```
+
+Generated files must receive the same header from their generator or generation
+command so regeneration cannot remove it. Do not replace, remove, or
+misattribute copyright and license notices in third-party files.
+
 ## Do not hand-edit `CHANGELOG.md`
 
 `CHANGELOG.md` is generated from Conventional Commits by
@@ -255,6 +282,15 @@ This applies to the API too: prefer a capability/status endpoint that
 reports `configured: false` with a reason and a setup URL over a 404
 that leaves the client unable to distinguish "not built" from
 "not set up".
+
+## Responsive pagination is a shared UI contract
+
+Use `web/src/components/ui/responsive-pagination.tsx` for paginated web lists
+instead of rebuilding controls at each call site. Below the `sm` breakpoint,
+show one stable row with labeled Previous and Next buttons around compact
+`{page} / {totalPages}` context; hide page-size, first/last, and direct-page
+controls. At `sm` and above, show the full `Showing X–Y of Z` summary and
+advanced controls.
 
 ## Don't sweep unrelated dirty files into your commits
 

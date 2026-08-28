@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-node DNS resolver for the internal `*.temps.local` zone (ADR-011).
 //!
 //! Embedded in `temps-agent`. Listens only on the bridge gateway IP so every

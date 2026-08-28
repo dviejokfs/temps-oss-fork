@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add per-node DNS resolver health columns to the `nodes` table (ADR-024).
 //!
 //! Mirrors the health-tracking pattern already used on `external_services`

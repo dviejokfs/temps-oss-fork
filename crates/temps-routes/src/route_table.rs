@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Route table with O(1) lookup and automatic PostgreSQL LISTEN/NOTIFY synchronization
 //!
 //! This module provides a cached routing table that maps hostnames to backend addresses

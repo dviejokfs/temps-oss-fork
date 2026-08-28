@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::avatar::generate_avatar_data_url;
 use base64::Engine;
 use chrono::Utc;

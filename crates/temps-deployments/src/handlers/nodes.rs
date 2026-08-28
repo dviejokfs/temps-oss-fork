@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Node Registration Handlers
 //!
 //! Internal API endpoints for worker nodes to register with the control plane

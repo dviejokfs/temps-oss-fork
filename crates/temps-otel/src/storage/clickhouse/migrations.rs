@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ClickHouse migration runner for the OTel storage backend.
 //!
 //! Mirrors the pattern from `temps-analytics-backend/src/migrations.rs`:

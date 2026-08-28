@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Workflow Planner
 //!
 //! Determines which jobs to create for a deployment based on project configuration

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Mark Deployment Complete Job
 //!
 //! A synthetic job that marks the deployment as complete and updates the environment.

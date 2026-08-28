@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Public repository endpoints for accessing public repositories without authentication
 //!
 //! These endpoints allow fetching branches and detecting presets for public repositories

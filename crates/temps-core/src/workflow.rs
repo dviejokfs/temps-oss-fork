@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! GitHub Actions-style workflow system
 //!
 //! This module provides a builder-based API for creating deployment pipelines

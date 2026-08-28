@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Background evaluator for first-class metric alert rules.
 //!
 //! On a fixed interval (~30s) the evaluator scans every enabled rule, queries the

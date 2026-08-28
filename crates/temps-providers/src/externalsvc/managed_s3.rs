@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Managed S3-compatible backend protocol.
 //!
 //! This module defines the backend selector for managed S3-compatible services.

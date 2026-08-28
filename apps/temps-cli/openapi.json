@@ -3245,7 +3245,6 @@
         "required": [
           "preview_domain",
           "proxy_port",
-          "cloud",
           "screenshots",
           "letsencrypt",
           "dns_provider",
@@ -5609,6 +5608,32 @@
             "type": "boolean"
           }
         },
+        "type": "object"
+      },
+      "ClusterDnsStatusResponse": {
+        "description": "Response from `GET /api/cluster/dns/status`.",
+        "properties": {
+          "cluster_dns_enabled": {
+            "description": "Whether cluster DNS is currently enabled cluster-wide\n(`AppSettings.cluster_dns.enabled`). When `false`, every node's\nper-node values below are expected to show `dns_resolver_running:\nSome(false)` (or `None` if a node has never reported).",
+            "type": "boolean"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/NodeDnsStatusEntry"
+            },
+            "type": "array"
+          },
+          "total_record_count": {
+            "description": "Total `*.temps.local` records currently registered across the whole\ncluster (`service_endpoints` row count), independent of any single\nnode's resolver health.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cluster_dns_enabled",
+          "total_record_count",
+          "nodes"
+        ],
         "type": "object"
       },
       "ClusterHealthReportResponse": {
@@ -8734,6 +8759,39 @@
         "required": [
           "name",
           "config"
+        ],
+        "type": "object"
+      },
+      "CreateNotificationRouteRequest": {
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "max_severity": {
+            "type": "string"
+          },
+          "min_severity": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "min_severity",
+          "max_severity",
+          "provider_ids"
         ],
         "type": "object"
       },
@@ -12875,6 +12933,43 @@
           "failed"
         ],
         "type": "string"
+      },
+      "DnsResolverHeartbeat": {
+        "description": "Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors\n`temps_agent::network_sync::DnsResolverHeartbeat` field-for-field, but\ndeclared separately rather than shared: the agent and control-plane\ncrates don't depend on each other (the agent avoids pulling in\n`temps-deployments`' sea-orm dependency tree), matching the existing\n`WirePeerListResponse` pattern in `temps-agent::network_sync`.",
+        "properties": {
+          "consecutive_sync_failures": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_sync_error": {
+            "description": "Most recent resolver-related error: a sync tick failure, or (when the\nresolver never started at all) the startup error itself.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_sync_success_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "running": {
+            "description": "`false` when cluster DNS is disabled on the control plane, the\nresolver failed to start, or it was shut down. `true` only while a\nresolver handle currently exists and cluster DNS is enabled.",
+            "type": "boolean"
+          },
+          "tasks_alive": {
+            "description": "`false` means the resolver's sync or DNS server task crashed. Only\nmeaningful when `running`.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
       },
       "DnsZone": {
         "description": "A DNS zone (domain managed by the provider)",
@@ -19813,6 +19908,17 @@
               "null"
             ]
           },
+          "dns_resolver": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DnsResolverHeartbeat",
+                "description": "Per-node DNS resolver health (ADR-024), reported by agents new enough\nto have it. `None` means either an older agent binary, or a\nheartbeat that raced before the agent's network-sync loop first\nran — a true single-host node with no `compute_cidr` allocation\nnever touches cluster DNS and always reports `None` here, which is\nexpected, not stale data. The stored columns are left untouched when\n`None`, same treatment as `architecture` above."
+              }
+            ]
+          },
           "labels": {
             "description": "Updated node labels for scheduling (allows runtime label changes)."
           }
@@ -24753,6 +24859,73 @@
         ],
         "type": "object"
       },
+      "NodeDnsStatusEntry": {
+        "description": "Per-node DNS resolver health, as last reported by that node's heartbeat.\nPart of `GET /api/cluster/dns/status`.",
+        "properties": {
+          "dns_resolver_consecutive_failures": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "dns_resolver_last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dns_resolver_last_sync_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dns_resolver_record_count": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "dns_resolver_running": {
+            "description": "`None` = never reported (older agent, or a single-host node that\nnever allocates a `compute_cidr` and so never touches cluster DNS).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "dns_resolver_tasks_alive": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "node_status": {
+            "description": "The node's own status field (`active`, `offline`, `draining`, …) —\nincluded so an operator can tell \"resolver down\" apart from \"node\ndown\" at a glance, without a second request.",
+            "type": "string"
+          },
+          "seconds_since_last_sync": {
+            "description": "Computed from `dns_resolver_last_sync_at` against \"now\" server-side —\na raw timestamp makes an operator do the subtraction themselves for\nevery node; a staleness age is what actually answers \"is this\nhealthy right now\". `None` when `dns_resolver_last_sync_at` is `None`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "node_name",
+          "node_status",
+          "dns_resolver_consecutive_failures"
+        ],
+        "type": "object"
+      },
       "NodeInfoResponse": {
         "properties": {
           "address": {
@@ -24962,6 +25135,84 @@
           "enabled",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "NotificationRoute": {
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "max_severity": {
+            "type": "string"
+          },
+          "min_severity": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "updated_at": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "enabled",
+          "min_severity",
+          "max_severity",
+          "provider_ids",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "NotificationRoutePage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/NotificationRoute"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -43590,6 +43841,45 @@
         ],
         "type": "object"
       },
+      "UpdateNotificationRouteRequest": {
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "max_severity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "min_severity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateOidcProviderRequest": {
         "properties": {
           "client_id": {
@@ -56976,6 +57266,42 @@
         ],
         "tags": [
           "Cloud"
+        ]
+      }
+    },
+    "/cluster/dns/status": {
+      "get": {
+        "description": "Same permission as the other node visibility endpoints in this file\n(`admin_list_nodes`, `admin_get_node`) — this is operational/infra\nvisibility, not a new privilege tier.",
+        "operationId": "cluster_dns_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterDnsStatusResponse"
+                }
+              }
+            },
+            "description": "Cluster DNS resolver health"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Cluster-wide DNS resolver health (ADR-024): whether cluster DNS is\nenabled, the total record count, and per-node resolver status as last\nreported by each node's heartbeat. Lets an operator answer \"is cluster\nDNS actually healthy right now\" without SSHing into a node to read logs.",
+        "tags": [
+          "Nodes"
         ]
       }
     },
@@ -70548,6 +70874,9 @@
             },
             "description": "Successfully updated Cloudflare provider"
           },
+          "400": {
+            "description": "Invalid minimum severity or provider configuration"
+          },
           "404": {
             "description": "Provider not found"
           },
@@ -70645,6 +70974,9 @@
               }
             },
             "description": "Successfully updated Email provider"
+          },
+          "400": {
+            "description": "Invalid minimum severity or provider configuration"
           },
           "404": {
             "description": "Provider not found"
@@ -70744,6 +71076,9 @@
             },
             "description": "Successfully updated Slack provider"
           },
+          "400": {
+            "description": "Invalid minimum severity or provider configuration"
+          },
           "404": {
             "description": "Provider not found"
           },
@@ -70842,6 +71177,9 @@
               }
             },
             "description": "Successfully updated Webhook provider"
+          },
+          "400": {
+            "description": "Invalid minimum severity or provider configuration"
           },
           "404": {
             "description": "Provider not found"
@@ -70978,7 +71316,7 @@
             "description": "Successfully updated provider"
           },
           "400": {
-            "description": "Invalid masked provider configuration"
+            "description": "Invalid minimum severity or masked provider configuration"
           },
           "404": {
             "description": "Provider not found"
@@ -71099,6 +71437,269 @@
         "summary": "Test a notification provider",
         "tags": [
           "Notification Providers"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/notification-routes": {
+      "get": {
+        "operationId": "list_notification_routes",
+        "parameters": [
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Number of items per page (max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationRoutePage"
+                }
+              }
+            },
+            "description": "Notification routes"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Notification Routes"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "create_notification_route",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateNotificationRouteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationRoute"
+                }
+              }
+            },
+            "description": "Route created"
+          },
+          "400": {
+            "description": "Invalid route"
+          },
+          "409": {
+            "description": "Route name already exists"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Notification Routes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/notification-routes/{id}": {
+      "delete": {
+        "operationId": "delete_notification_route",
+        "parameters": [
+          {
+            "description": "Route ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Route deleted"
+          },
+          "404": {
+            "description": "Route not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Notification Routes"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "operationId": "get_notification_route",
+        "parameters": [
+          {
+            "description": "Route ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationRoute"
+                }
+              }
+            },
+            "description": "Notification route"
+          },
+          "404": {
+            "description": "Route not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Notification Routes"
+        ],
+        "x-maturity": "beta"
+      },
+      "put": {
+        "operationId": "update_notification_route",
+        "parameters": [
+          {
+            "description": "Route ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateNotificationRouteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationRoute"
+                }
+              }
+            },
+            "description": "Route updated"
+          },
+          "400": {
+            "description": "Invalid route"
+          },
+          "404": {
+            "description": "Route not found"
+          },
+          "409": {
+            "description": "Route name already exists"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Notification Routes"
         ],
         "x-maturity": "beta"
       }
@@ -101197,6 +101798,10 @@
     {
       "description": "Notification provider management endpoints",
       "name": "Notification Providers"
+    },
+    {
+      "description": "Severity routing from notifications to providers",
+      "name": "Notification Routes"
     },
     {
       "description": "User notification preferences and settings",

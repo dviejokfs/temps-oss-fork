@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Multi-host network sync — polls the control plane for our compute_cidr
 //! allocation and the peer list, then drives `temps_network::NetworkManager`
 //! accordingly.

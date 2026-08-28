@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Generic restore orchestrator.
 //!
 //! Takes a restore request (backup id + mode), writes a `restore_runs` row,

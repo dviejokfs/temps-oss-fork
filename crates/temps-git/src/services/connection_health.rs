@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Daily git-connection health checks.
 //!
 //! Pings each active connection's upstream (GitHub App installation, PAT, or

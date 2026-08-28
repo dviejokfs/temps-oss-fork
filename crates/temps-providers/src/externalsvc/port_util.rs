@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared host-port selection helpers for Docker-backed services.
 //!
 //! Picking a free host port for a container is inherently racy: we can check

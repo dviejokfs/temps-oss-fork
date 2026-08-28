@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The read-only `temps` virtual-CLI tool for the OSS debugging chat (ADR-024).
 //!
 //! Exposes a single [`temps_ai::ChatTool`] — `temps` — backed by

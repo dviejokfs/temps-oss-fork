@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `RedisEngine`: direct-to-S3 WAL-G stream backups for managed Redis
 //! images, with a logical `redis-cli --rdb` fallback for arbitrary OSS images.
 //!
