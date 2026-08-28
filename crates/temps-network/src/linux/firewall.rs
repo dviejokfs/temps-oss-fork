@@ -723,11 +723,13 @@ add rule inet {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masque
 }
 
 fn baseline_marker(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) -> String {
+    const BASELINE_SCHEMA_VERSION: &str = "v2";
+
     let mut peers = peers.to_vec();
     peers.sort_by_key(|peer| (peer.compute_cidr, peer.underlay_address, peer.node_id));
-    let signature = format!("{config:?}|{alloc:?}|{peers:?}");
+    let signature = format!("{BASELINE_SCHEMA_VERSION}|{config:?}|{alloc:?}|{peers:?}");
     format!(
-        "temps-baseline-{}",
+        "temps-baseline-{BASELINE_SCHEMA_VERSION}-{}",
         Uuid::new_v5(&Uuid::NAMESPACE_OID, signature.as_bytes())
     )
 }
@@ -874,6 +876,7 @@ mod tests {
             baseline_marker(&cfg, &alloc, &[a.clone(), b.clone()]),
             baseline_marker(&cfg, &alloc, &[b, a])
         );
+        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v2-"));
     }
 
     #[test]
