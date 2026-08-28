@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The background task that drains the spool.
 //!
 //! Runs beside the instance's own work, so it is written to be a bad citizen of

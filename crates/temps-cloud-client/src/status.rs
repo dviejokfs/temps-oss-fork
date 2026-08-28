@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The link state the console and CLI show the operator.
 //!
 //! A self-hosted operator debugs alone. Every state here is either "fine" or a

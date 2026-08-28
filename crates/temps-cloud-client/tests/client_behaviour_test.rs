@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The client against a live HTTP backend.
 //!
 //! A stub server stands in for the managed backend so this suite can assert the

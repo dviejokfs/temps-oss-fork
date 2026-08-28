@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Control-plane participation in the multi-host overlay.
 //!
 //! The control plane is deliberately not a schedulable `nodes` row. Its

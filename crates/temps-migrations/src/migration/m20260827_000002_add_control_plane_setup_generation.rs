@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add a monotonic fencing token for control-plane overlay setup attempts.
 //!
 //! Setup performs privileged host and Docker mutations after reserving an

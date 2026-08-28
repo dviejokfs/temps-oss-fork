@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Persist the control plane's overlay allocation in the cluster network
 //! singleton. The control plane intentionally is not a row in `nodes` because
 //! node_id = NULL is the long-standing marker for locally managed workloads.

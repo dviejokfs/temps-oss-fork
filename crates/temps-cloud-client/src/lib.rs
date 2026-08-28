@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Optional client linking a self-hosted Temps instance to a managed backend.
 //!
 //! # The rule this crate exists to keep

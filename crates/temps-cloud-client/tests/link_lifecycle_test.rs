@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The link as an instance actually uses it, against a live stub backend.
 //!
 //! The property under test throughout: **an instance is never worse off for
