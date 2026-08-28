@@ -3238,6 +3238,22 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
 
+        let environment_id = deployment.environment_id;
+
+        // Persist "paused" BEFORE touching any container. Monitoring (the
+        // container-health poller and the uptime health checker) treats
+        // `state == "paused"` as "stopped on purpose, don't alert" — if we
+        // stopped containers first and updated this row last, a poll that
+        // lands in between would see an exited container against a
+        // not-yet-paused deployment and fire a false crash/downtime alert.
+        // Flipping the state first closes that window: any concurrent read
+        // of this deployment either sees the old state with all containers
+        // still running (nothing exited yet to alert on) or sees "paused"
+        // once anything might be mid-stop.
+        let mut active_deployment: deployments::ActiveModel = deployment.into();
+        active_deployment.state = Set("paused".to_string());
+        active_deployment.update(self.db.as_ref()).await?;
+
         // Stop and remove all containers for this deployment
         let containers = deployment_containers::Entity::find()
             .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
@@ -3267,13 +3283,6 @@ impl DeploymentService {
             active_container.status = Set(Some("stopped".to_string()));
             active_container.update(self.db.as_ref()).await?;
         }
-
-        let environment_id = deployment.environment_id;
-
-        // Update deployment state to "paused"
-        let mut active_deployment: deployments::ActiveModel = deployment.into();
-        active_deployment.state = Set("paused".to_string());
-        active_deployment.update(self.db.as_ref()).await?;
 
         // Force an in-process route-table reload (same mechanism
         // `mark_deployment_complete.rs` uses after a normal deploy — see its
