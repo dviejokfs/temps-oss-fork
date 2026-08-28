@@ -345,6 +345,20 @@ impl OutageDetectionService {
     /// Handle an outage event: create/resolve incidents, fire/resolve alarms, and send notifications
     async fn handle_outage_event(&self, event: &OutageEvent) -> Result<(), OutageError> {
         if event.current_status.is_outage() {
+            // Re-check right here, immediately before the incident row and
+            // notification actually go out — the process_check guard above
+            // still leaves the in-memory state-transition logic and a lock
+            // acquisition between it and this call, which is enough of a
+            // window for a pause to land in. This is the last possible point
+            // to catch it before a user-visible side effect happens.
+            if self.is_deployment_paused(event.environment_id).await {
+                debug!(
+                    "Monitor {} - deployment paused just before incident creation, dropping outage event",
+                    event.monitor_id
+                );
+                return Ok(());
+            }
+
             // New outage - create incident
             let incident_id = self.create_incident(event).await?;
             self.send_outage_notification(event, incident_id).await?;
@@ -1535,6 +1549,59 @@ mod tests {
             notification_service.send_count(),
             0,
             "no notification for an intentional pause"
+        );
+        assert_eq!(job_queue.send_count(), 0);
+    }
+
+    /// Even narrower window than `test_process_check_skips_paused_deployment`:
+    /// the deployment is still unpaused when `process_check`'s own guard
+    /// runs, and only becomes paused afterward — while the in-memory
+    /// state-transition logic and lock acquisition run. The
+    /// `handle_outage_event` guard is what has to catch this, right before
+    /// the incident row would otherwise be inserted.
+    #[tokio::test]
+    async fn test_handle_outage_event_skips_deployment_paused_after_process_check_guard() {
+        let monitor = make_status_monitor_model(1, Some(1));
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![monitor]])
+            // process_check's guard: still unpaused.
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            // handle_outage_event's guard: paused by now.
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "paused")]])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            notification_service.clone(),
+            job_queue.clone(),
+        ));
+
+        let service = OutageDetectionService::new(db, notification_service.clone(), alarm_service);
+
+        // process_check itself still reports the computed transition (the
+        // pause hadn't landed yet when it ran) — the guarantee under test is
+        // that handle_outage_event, which owns the actual incident row and
+        // notification, refuses to act on it once the deployment is paused.
+        service
+            .process_check(
+                1,
+                MonitorStatus::Down,
+                Some("Connection refused".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            notification_service.send_count(),
+            0,
+            "no notification when the pause lands right before incident creation"
         );
         assert_eq!(job_queue.send_count(), 0);
     }
