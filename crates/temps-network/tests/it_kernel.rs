@@ -366,7 +366,9 @@ async fn bootstrap_creates_all_kernel_state() {
         iptables_chain_contains(
             "TEMPS_OVERLAY_FORWARD",
             &[
-                "-i vxlan-temps0",
+                "-m physdev",
+                "--physdev-is-bridged",
+                "--physdev-in vxlan-temps0",
                 &env.peer_cidr.to_string(),
                 &env.local_cidr.to_string(),
             ]

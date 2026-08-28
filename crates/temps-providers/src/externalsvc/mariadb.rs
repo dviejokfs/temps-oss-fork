@@ -2319,7 +2319,7 @@ impl MariaDbService {
         s3_credentials: &super::S3Credentials,
         repository: &str,
         target_user_data: Option<&str>,
-    ) -> Result<MariaDbBinlogCoordinate> {
+    ) -> Result<Option<MariaDbBinlogCoordinate>> {
         use bollard::models::{ContainerCreateBody, HostConfig};
 
         let container_name = self.get_live_container_name(config);
@@ -2507,7 +2507,7 @@ impl MariaDbService {
             }
             match wait {
                 Some(Ok(response)) if response.status_code == 0 => {
-                    Self::parse_walg_restore_coordinate(&logs)
+                    Self::parse_optional_walg_restore_coordinate(&logs)
                 }
                 Some(Ok(response)) => Err(anyhow::anyhow!(
                     "MariaDB WAL-G restore helper for '{}' exited with code {}: {}",
@@ -2576,7 +2576,9 @@ impl MariaDbService {
         Ok(coordinate)
     }
 
-    fn parse_walg_restore_coordinate(logs: &str) -> Result<MariaDbBinlogCoordinate> {
+    fn parse_optional_walg_restore_coordinate(
+        logs: &str,
+    ) -> Result<Option<MariaDbBinlogCoordinate>> {
         if let Some(line) = logs.lines().find_map(|line| {
             line.split_once("TEMPS_BINLOG_COORD=")
                 .map(|(_, value)| value)
@@ -2590,11 +2592,11 @@ impl MariaDbService {
                 .next()
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("xtrabackup_binlog_info has no position"))?;
-            return Ok(MariaDbBinlogCoordinate {
+            return Ok(Some(MariaDbBinlogCoordinate {
                 file: Self::normalize_binlog_filename(file)?,
                 position: Self::parse_binlog_position(position, "xtrabackup_binlog_info")?,
                 gtid: fields.next().unwrap_or_default().to_string(),
-            });
+            }));
         }
 
         for line in logs.lines() {
@@ -2606,17 +2608,22 @@ impl MariaDbService {
             };
             let position = position.split_whitespace().next().unwrap_or_default();
             if !file.is_empty() && !position.is_empty() {
-                return Ok(MariaDbBinlogCoordinate {
+                return Ok(Some(MariaDbBinlogCoordinate {
                     file: Self::normalize_binlog_filename(file)?,
                     position: Self::parse_binlog_position(position, "WAL-G prepare log")?,
                     gtid: String::new(),
-                });
+                }));
             }
         }
 
-        Err(anyhow::anyhow!(
-            "WAL-G restore did not emit a MariaDB binlog coordinate"
-        ))
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    fn parse_walg_restore_coordinate(logs: &str) -> Result<MariaDbBinlogCoordinate> {
+        Self::parse_optional_walg_restore_coordinate(logs)?.ok_or_else(|| {
+            anyhow::anyhow!("WAL-G restore did not emit a MariaDB binlog coordinate")
+        })
     }
 
     /// Create (don't start) the helper, upload the mbstream onto its writable
@@ -3950,6 +3957,32 @@ impl ExternalService for MariaDbService {
         Ok(())
     }
 
+    async fn restore_in_place(&self, ctx: super::RestoreContext<'_>) -> Result<()> {
+        let bucket = &ctx.s3_source.bucket_name;
+        let backup_key = Self::backup_key_from_location(ctx.backup_location, bucket);
+        if Self::is_walg_repository_location(&backup_key) {
+            let config = self.get_mariadb_config(ctx.source_config)?;
+            let target_user_data = walg_target_user_data(ctx.backup)?;
+            self.restore_walg_repository_into_container(
+                &config,
+                ctx.s3_credentials,
+                ctx.backup_location,
+                target_user_data.as_deref(),
+            )
+            .await?;
+            Ok(())
+        } else {
+            self.restore_from_s3(
+                ctx.s3_client,
+                ctx.s3_credentials,
+                ctx.backup_location,
+                ctx.s3_source,
+                ctx.source_config,
+            )
+            .await
+        }
+    }
+
     /// MariaDB supports in-place restore, restore-to-new-service, and PITR.
     /// PITR requires a physical (`mariadb-backup`) base plus archived binlogs;
     /// logical-only backups are rejected at execute time by `restore_pitr`.
@@ -4121,6 +4154,9 @@ impl ExternalService for MariaDbService {
                     target_user_data.as_deref(),
                 )
                 .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("MariaDB WAL-G PITR restore did not emit a binlog coordinate")
+                })?
         } else {
             let temp_dir = tempfile::tempdir()?;
             let mbstream_path = temp_dir.path().join("base.mbstream");
@@ -4864,6 +4900,14 @@ mod tests {
         assert!(error
             .to_string()
             .contains("did not emit a MariaDB binlog coordinate"));
+    }
+
+    #[test]
+    fn ordinary_walg_restore_allows_backup_without_binlog_coordinate() {
+        let coordinate = MariaDbService::parse_optional_walg_restore_coordinate("restore complete")
+            .expect("ordinary restore should accept a prepared base without binlog metadata");
+
+        assert_eq!(coordinate, None);
     }
 
     #[test]

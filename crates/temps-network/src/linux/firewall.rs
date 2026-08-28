@@ -38,7 +38,7 @@ const HOOK_COMMENT: &str = "temps-overlay-forward-hook-v1";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct OverlayForwardRule {
-    input: Option<String>,
+    physical_input: Option<String>,
     output: Option<String>,
     source: String,
     destination: String,
@@ -47,12 +47,12 @@ struct OverlayForwardRule {
 impl OverlayForwardRule {
     fn ingress(config: &NetworkConfig, alloc: &NodeAlloc, peer: &Peer) -> Self {
         Self {
-            input: Some(config.vxlan_dev_name.clone()),
-            // A frame received from VXLAN and forwarded to a Docker
-            // container leaves through the container's veth, not through
-            // the bridge device itself. Keep the trusted ingress interface
-            // and both CIDRs scoped, but do not require an output interface
-            // that Linux never reports for this forwarding path.
+            // Once a VXLAN frame is admitted to the Linux bridge, the IPv4
+            // FORWARD hook reports the logical bridge as its input device.
+            // `-i vxlan-temps0` therefore never matches on production Docker
+            // hosts. physdev preserves the actual ingress bridge port and
+            // lets us keep this exception restricted to trusted VXLAN input.
+            physical_input: Some(config.vxlan_dev_name.clone()),
             output: None,
             source: peer.compute_cidr.to_string(),
             destination: alloc.compute_cidr.to_string(),
@@ -61,8 +61,14 @@ impl OverlayForwardRule {
 
     fn args(&self, operation: &str) -> Vec<String> {
         let mut args = vec![operation.to_string(), OVERLAY_FORWARD_CHAIN.to_string()];
-        if let Some(input) = &self.input {
-            args.extend(["-i".to_string(), input.clone()]);
+        if let Some(input) = &self.physical_input {
+            args.extend([
+                "-m".to_string(),
+                "physdev".to_string(),
+                "--physdev-is-bridged".to_string(),
+                "--physdev-in".to_string(),
+                input.clone(),
+            ]);
         }
         if let Some(output) = &self.output {
             args.extend(["-o".to_string(), output.clone()]);
@@ -435,28 +441,51 @@ fn parse_overlay_rule(tokens: &[String]) -> Option<OverlayForwardRule> {
     {
         return None;
     }
-    let mut input = None;
+    let mut physical_input = None;
     let mut output = None;
     let mut source = None;
     let mut destination = None;
+    let mut physdev_module = false;
+    let mut physdev_is_bridged = false;
     let mut comment_module = false;
     let mut comment = None;
     let mut jump = None;
     let mut index = 2;
     while index < tokens.len() {
+        match tokens[index].as_str() {
+            "--physdev-is-bridged" if !physdev_is_bridged => {
+                physdev_is_bridged = true;
+                index += 1;
+                continue;
+            }
+            "--physdev-in" if physical_input.is_none() => {
+                physical_input = Some(tokens.get(index + 1)?.clone());
+                index += 2;
+                continue;
+            }
+            "-m" if tokens.get(index + 1).map(String::as_str) == Some("physdev")
+                && !physdev_module =>
+            {
+                physdev_module = true;
+                index += 2;
+                continue;
+            }
+            "-m" if tokens.get(index + 1).map(String::as_str) == Some("comment")
+                && !comment_module =>
+            {
+                comment_module = true;
+                index += 2;
+                continue;
+            }
+            _ => {}
+        }
         let value = tokens.get(index + 1)?.clone();
         let slot = match tokens[index].as_str() {
-            "-i" if input.is_none() => &mut input,
             "-o" if output.is_none() => &mut output,
             "-s" if source.is_none() => &mut source,
             "-d" if destination.is_none() => &mut destination,
             "--comment" if comment.is_none() => &mut comment,
             "-j" if jump.is_none() => &mut jump,
-            "-m" if value == "comment" && !comment_module => {
-                comment_module = true;
-                index += 2;
-                continue;
-            }
             // Reject negation, duplicate clauses, comments, and any other
             // extension. The chain is exclusively owned by Temps; retaining
             // a broader rule because it merely resembles a desired rule
@@ -466,14 +495,17 @@ fn parse_overlay_rule(tokens: &[String]) -> Option<OverlayForwardRule> {
         *slot = Some(value);
         index += 2;
     }
-    if !comment_module
+    if !physdev_module
+        || !physdev_is_bridged
+        || physical_input.is_none()
+        || !comment_module
         || comment.as_deref() != Some(RULE_COMMENT)
         || jump.as_deref() != Some("ACCEPT")
     {
         return None;
     }
     Some(OverlayForwardRule {
-        input,
+        physical_input,
         output,
         source: source?,
         destination: destination?,
@@ -789,7 +821,7 @@ mod tests {
         };
         let rules = desired_overlay_rules(&cfg, &alloc, &[peer]);
         assert!(rules.contains(&OverlayForwardRule {
-            input: Some("vxlan-temps0".into()),
+            physical_input: Some("vxlan-temps0".into()),
             output: None,
             source: "172.20.0.0/24".into(),
             destination: "172.20.255.0/24".into(),
@@ -799,14 +831,14 @@ mod tests {
 
     #[test]
     fn parses_owned_iptables_rule_semantically() {
-        let tokens = "-A TEMPS_OVERLAY_FORWARD -s 172.20.0.0/24 -d 172.20.255.0/24 -i vxlan-temps0 -m comment --comment temps-overlay-forward-rule-v1 -j ACCEPT"
+        let tokens = "-A TEMPS_OVERLAY_FORWARD -m physdev --physdev-is-bridged --physdev-in vxlan-temps0 -s 172.20.0.0/24 -d 172.20.255.0/24 -m comment --comment temps-overlay-forward-rule-v1 -j ACCEPT"
             .split_ascii_whitespace()
             .map(str::to_string)
             .collect::<Vec<_>>();
         assert_eq!(
             parse_overlay_rule(&tokens),
             Some(OverlayForwardRule {
-                input: Some("vxlan-temps0".into()),
+                physical_input: Some("vxlan-temps0".into()),
                 output: None,
                 source: "172.20.0.0/24".into(),
                 destination: "172.20.255.0/24".into(),
