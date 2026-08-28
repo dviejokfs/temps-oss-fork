@@ -3287,11 +3287,30 @@ impl DeploymentService {
                 );
             }
 
-            let mut active_container: deployment_containers::ActiveModel = container.into();
-            active_container.status = Set(Some("stopped".to_string()));
-            if let Err(e) = active_container.update(self.db.as_ref()).await {
+            // Retry the DB write: a container whose status never makes it to
+            // "stopped" keeps being treated as routable by
+            // `route_table::load_routes` even though we just told Docker to
+            // stop it — retrying absorbs the transient connection blips that
+            // are the realistic cause of a single UPDATE failing right after
+            // the read and the deployment-state write above it both
+            // succeeded, so routes don't go stale on something recoverable.
+            let retry = temps_core::retry::RetryConfig::new(3)
+                .with_base_delay(std::time::Duration::from_millis(100))
+                .with_max_delay(std::time::Duration::from_secs(2));
+            let update_result = retry
+                .retry(|| async {
+                    let active_container = deployment_containers::ActiveModel {
+                        status: Set(Some("stopped".to_string())),
+                        ..deployment_containers::ActiveModel::from(container.clone())
+                    };
+                    active_container.update(self.db.as_ref()).await
+                })
+                .await;
+            if let Err(e) = update_result {
                 warn!(
-                    "Failed to persist stopped status for container {} during deployment pause: {}",
+                    "Failed to persist stopped status for container {} during deployment pause \
+                     after retrying: {} — the route table may still treat it as routable until \
+                     the next successful status update",
                     container_id, e
                 );
             }
