@@ -745,6 +745,7 @@ async fn bootstrap_only() {
 /// second manager after the worker joins would only prove restart recovery,
 /// not live late-worker reconciliation.
 #[tokio::test]
+#[cfg(feature = "control_plane")]
 async fn control_plane_stays_running_and_reconciles_worker_later() {
     if std::env::var("TEMPS_IT_PHASE_TESTS").as_deref() != Ok("1") {
         return;
