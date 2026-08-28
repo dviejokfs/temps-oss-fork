@@ -468,7 +468,7 @@ impl OutageDetectionService {
         };
 
         let request = FireAlarmRequest {
-            project_id: event.project_id,
+            project_id: Some(event.project_id),
             environment_id: Some(environment_id),
             deployment_id: Some(deployment_id),
             container_id: None,
@@ -1238,7 +1238,7 @@ mod tests {
     fn make_alarm_model(id: i32, alarm_type: &str, status: &str) -> temps_entities::alarms::Model {
         temps_entities::alarms::Model {
             id,
-            project_id: 1,
+            project_id: Some(1),
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: None,
@@ -1253,6 +1253,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             resolved_at: None,
+            silenced_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

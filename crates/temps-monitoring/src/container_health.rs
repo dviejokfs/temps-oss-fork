@@ -307,7 +307,7 @@ impl ContainerHealthMonitor {
         };
 
         let request = FireAlarmRequest {
-            project_id: deployment.project_id,
+            project_id: Some(deployment.project_id),
             environment_id: Some(deployment.environment_id),
             deployment_id: Some(deployment.id),
             container_id: Some(container.id),
@@ -407,7 +407,7 @@ impl ContainerHealthMonitor {
                     .unwrap_or_else(|| status_str.clone());
 
                 let request = FireAlarmRequest {
-                    project_id: deployment.project_id,
+                    project_id: Some(deployment.project_id),
                     environment_id: Some(deployment.environment_id),
                     deployment_id: Some(deployment.id),
                     container_id: Some(container.id),
@@ -806,7 +806,7 @@ impl ContainerHealthMonitor {
         }
 
         let request = FireAlarmRequest {
-            project_id: deployment.project_id,
+            project_id: Some(deployment.project_id),
             environment_id: Some(deployment.environment_id),
             deployment_id: Some(deployment.id),
             container_id: Some(container.id),
@@ -1116,7 +1116,7 @@ mod tests {
         // DB calls: cooldown check (count=0) + insert alarm
         let alarm_model = temps_entities::alarms::Model {
             id: 1,
-            project_id: 1,
+            project_id: Some(1),
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: Some(1),
@@ -1131,6 +1131,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             resolved_at: None,
+            silenced_until: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1213,7 +1214,7 @@ mod tests {
 
         let alarm_model = temps_entities::alarms::Model {
             id: 1,
-            project_id: 1,
+            project_id: Some(1),
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: Some(1),
@@ -1228,6 +1229,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             resolved_at: None,
+            silenced_until: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
