@@ -9,8 +9,8 @@ use crate::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequ
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Order, QueryFilter, QueryOrder,
-    Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    EntityTrait, Order, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -186,11 +186,25 @@ impl OutageDetectionService {
     /// incident/notification at all, so it must reflect `pause_deployment`'s
     /// state at the moment this specific check is processed.
     async fn is_deployment_paused(&self, environment_id: Option<i32>) -> bool {
+        Self::is_deployment_paused_conn(self.db.as_ref(), environment_id).await
+    }
+
+    /// Same check as [`Self::is_deployment_paused`], but against a caller-supplied
+    /// connection/transaction rather than always `self.db`. Used by
+    /// [`Self::handle_outage_event`] to re-check pause state and create the
+    /// incident inside the SAME transaction, holding a Postgres advisory lock
+    /// keyed on the environment for the whole thing — see that function's
+    /// comment for why a plain re-check (a separate read followed later by a
+    /// separate write) isn't actually enough to close the race.
+    async fn is_deployment_paused_conn<C: ConnectionTrait>(
+        conn: &C,
+        environment_id: Option<i32>,
+    ) -> bool {
         let Some(environment_id) = environment_id else {
             return false;
         };
         let Some(current_deployment_id) = environments::Entity::find_by_id(environment_id)
-            .one(self.db.as_ref())
+            .one(conn)
             .await
             .ok()
             .flatten()
@@ -199,7 +213,7 @@ impl OutageDetectionService {
             return false;
         };
         deployments::Entity::find_by_id(current_deployment_id)
-            .one(self.db.as_ref())
+            .one(conn)
             .await
             .ok()
             .flatten()
@@ -345,13 +359,51 @@ impl OutageDetectionService {
     /// Handle an outage event: create/resolve incidents, fire/resolve alarms, and send notifications
     async fn handle_outage_event(&self, event: &OutageEvent) -> Result<(), OutageError> {
         if event.current_status.is_outage() {
-            // Re-check right here, immediately before the incident row and
-            // notification actually go out — the process_check guard above
-            // still leaves the in-memory state-transition logic and a lock
-            // acquisition between it and this call, which is enough of a
-            // window for a pause to land in. This is the last possible point
-            // to catch it before a user-visible side effect happens.
-            if self.is_deployment_paused(event.environment_id).await {
+            // A plain re-check-then-insert still races: the read and the
+            // write are two separate round-trips, and `pause_deployment`
+            // could commit its state flip in the gap between them no matter
+            // how close together they're placed in this function. Closing
+            // that for real means the check and the incident insert have to
+            // happen inside one transaction that also holds a Postgres
+            // advisory lock keyed on the environment — `pause_deployment`
+            // takes the SAME lock before flipping `deployments.state` to
+            // "paused" (see its comment), so the two paths serialize: either
+            // this transaction observes "paused" (because pause_deployment's
+            // lock-holding write already committed) and drops the event, or
+            // it runs first and pause_deployment blocks until this commits,
+            // meaning the incident was correctly created for a deployment
+            // that was genuinely still unpaused at that instant.
+            let Some(environment_id) = event.environment_id else {
+                // No environment to lock on — fall back to a live read; this
+                // only affects monitors with no environment association.
+                if self.is_deployment_paused(event.environment_id).await {
+                    debug!(
+                        "Monitor {} - deployment paused just before incident creation, dropping outage event",
+                        event.monitor_id
+                    );
+                    return Ok(());
+                }
+                let incident_id = self.create_incident(event).await?;
+                self.send_outage_notification(event, incident_id).await?;
+                self.fire_outage_alarm(event).await;
+                self.trigger_downtime_workflows(event).await;
+                let mut states = self.monitor_states.write().await;
+                if let Some(state) = states.get_mut(&event.monitor_id) {
+                    state.active_incident_id = Some(incident_id);
+                }
+                return Ok(());
+            };
+
+            let txn = self.db.begin().await?;
+            txn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock($1)",
+                [sea_orm::Value::BigInt(Some(environment_id as i64))],
+            ))
+            .await?;
+
+            if Self::is_deployment_paused_conn(&txn, event.environment_id).await {
+                txn.rollback().await?;
                 debug!(
                     "Monitor {} - deployment paused just before incident creation, dropping outage event",
                     event.monitor_id
@@ -359,8 +411,11 @@ impl OutageDetectionService {
                 return Ok(());
             }
 
-            // New outage - create incident
-            let incident_id = self.create_incident(event).await?;
+            // New outage - create incident, still holding the lock so no
+            // pause can commit between the check above and this insert.
+            let incident_id = Self::create_incident_conn(&txn, event).await?;
+            txn.commit().await?;
+
             self.send_outage_notification(event, incident_id).await?;
 
             // Fire alarm for the outage
@@ -541,6 +596,16 @@ impl OutageDetectionService {
 
     /// Create a new incident for an outage
     async fn create_incident(&self, event: &OutageEvent) -> Result<i32, OutageError> {
+        Self::create_incident_conn(self.db.as_ref(), event).await
+    }
+
+    /// Same insert as [`Self::create_incident`], parameterized over the
+    /// connection so [`Self::handle_outage_event`] can run it inside the same
+    /// locked transaction as its pause re-check.
+    async fn create_incident_conn<C: ConnectionTrait>(
+        conn: &C,
+        event: &OutageEvent,
+    ) -> Result<i32, OutageError> {
         let severity = IncidentSeverity::from_status(event.current_status);
 
         let incident = status_incidents::ActiveModel {
@@ -559,7 +624,7 @@ impl OutageDetectionService {
             ..Default::default()
         };
 
-        let result = incident.insert(self.db.as_ref()).await?;
+        let result = incident.insert(conn).await?;
         info!(
             "Created incident {} for monitor {} ({})",
             result.id, event.monitor_id, event.monitor_name
@@ -1569,7 +1634,13 @@ mod tests {
             // process_check's guard: still unpaused.
             .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
             .append_query_results(vec![vec![make_deployment_model(10, "running")]])
-            // handle_outage_event's guard: paused by now.
+            // handle_outage_event's guard runs inside a transaction that
+            // first takes an advisory lock (an exec, not a query) before
+            // re-reading pause state: paused by now.
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
             .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
             .append_query_results(vec![vec![make_deployment_model(10, "paused")]])
             .into_connection();

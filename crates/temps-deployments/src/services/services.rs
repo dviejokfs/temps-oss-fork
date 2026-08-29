@@ -3,8 +3,8 @@
 
 use futures::Stream;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -3250,9 +3250,30 @@ impl DeploymentService {
         // of this deployment either sees the old state with all containers
         // still running (nothing exited yet to alert on) or sees "paused"
         // once anything might be mid-stop.
+        //
+        // That alone still leaves a plain check-then-write race against a
+        // concurrent outage check in flight: it can read "not paused" a
+        // moment before this write commits, then create an incident for a
+        // deployment that's paused by the time the incident actually lands.
+        // Closing that requires more than moving this write earlier — the
+        // check and the write need to serialize. Take the same Postgres
+        // advisory lock, keyed on the environment, that
+        // `OutageDetectionService::handle_outage_event` takes around its
+        // final live pause re-check + incident insert: whichever side gets
+        // the lock first commits (or observes "paused" and bails) before the
+        // other proceeds, so no unpaused-read can ever precede this write
+        // without the write also being visible to it.
+        let txn = self.db.begin().await?;
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1)",
+            [sea_orm::Value::BigInt(Some(environment_id as i64))],
+        ))
+        .await?;
         let mut active_deployment: deployments::ActiveModel = deployment.into();
         active_deployment.state = Set("paused".to_string());
-        active_deployment.update(self.db.as_ref()).await?;
+        active_deployment.update(&txn).await?;
+        txn.commit().await?;
 
         // Stop and remove all containers for this deployment
         let containers = deployment_containers::Entity::find()
