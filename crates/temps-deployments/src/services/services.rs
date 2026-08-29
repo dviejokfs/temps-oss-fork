@@ -3,8 +3,8 @@
 
 use futures::Stream;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -3229,7 +3229,7 @@ impl DeploymentService {
         deployment_id: i32,
     ) -> Result<(), DeploymentError> {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_entities::{deployment_containers, deployments};
+        use temps_entities::{deployment_containers, deployments, status_incidents};
 
         // First verify the deployment exists and belongs to the project
         let deployment = deployments::Entity::find_by_id(deployment_id)
@@ -3237,6 +3237,73 @@ impl DeploymentService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+
+        let environment_id = deployment.environment_id;
+
+        // Persist "paused" BEFORE touching any container. Monitoring (the
+        // container-health poller and the uptime health checker) treats
+        // `state == "paused"` as "stopped on purpose, don't alert" — if we
+        // stopped containers first and updated this row last, a poll that
+        // lands in between would see an exited container against a
+        // not-yet-paused deployment and fire a false crash/downtime alert.
+        // Flipping the state first closes that window: any concurrent read
+        // of this deployment either sees the old state with all containers
+        // still running (nothing exited yet to alert on) or sees "paused"
+        // once anything might be mid-stop.
+        //
+        // That alone still leaves a plain check-then-write race against a
+        // concurrent outage check in flight: it can read "not paused" a
+        // moment before this write commits, then create an incident for a
+        // deployment that's paused by the time the incident actually lands.
+        // Closing that requires more than moving this write earlier — the
+        // check and the write need to serialize. Take the same Postgres
+        // advisory lock, keyed on the environment, that
+        // `OutageDetectionService::handle_outage_event` takes around its
+        // final live pause re-check + incident insert: whichever side gets
+        // the lock first commits (or observes "paused" and bails) before the
+        // other proceeds, so no unpaused-read can ever precede this write
+        // without the write also being visible to it.
+        let txn = self.db.begin().await?;
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1)",
+            [sea_orm::Value::BigInt(Some(environment_id as i64))],
+        ))
+        .await?;
+        let mut active_deployment: deployments::ActiveModel = deployment.into();
+        active_deployment.state = Set("paused".to_string());
+        active_deployment.update(&txn).await?;
+
+        // The lock above only serializes the incident *insert* against this
+        // write — `OutageDetectionService` still sends the notification,
+        // fires the alarm, and dispatches the workflow AFTER releasing the
+        // lock, since those are external I/O (webhook/email delivery, job
+        // queue send) that can't reasonably sit inside a DB transaction. A
+        // pause landing in that specific gap would otherwise still produce
+        // an alert for an incident that's already stale by the time it goes
+        // out. Rather than trying to also lock out external I/O (which a DB
+        // lock structurally can't do), make this side of the race
+        // proactive: while still holding the lock, resolve any incident for
+        // this environment that's still open. `handle_outage_event`
+        // re-reads the incident's own status immediately before each side
+        // effect (see its comment), so a resolve that lands here — even a
+        // moment after that incident was created — is what that re-read is
+        // watching for.
+        status_incidents::Entity::update_many()
+            .col_expr(
+                status_incidents::Column::Status,
+                sea_orm::sea_query::Expr::value("resolved"),
+            )
+            .col_expr(
+                status_incidents::Column::ResolvedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now()),
+            )
+            .filter(status_incidents::Column::EnvironmentId.eq(environment_id))
+            .filter(status_incidents::Column::Status.ne("resolved"))
+            .exec(&txn)
+            .await?;
+
+        txn.commit().await?;
 
         // Stop and remove all containers for this deployment
         let containers = deployment_containers::Entity::find()
@@ -3255,25 +3322,50 @@ impl DeploymentService {
         // "running" (see `route_table::load_routes`), so a stopped-but-not-
         // removed container is just as inert from the outside as a removed
         // one, without sacrificing resumability.
+        // Best-effort like the `stop_container` call above: the deployment
+        // row is already committed as "paused", so aborting this loop on a
+        // single container's DB write failure would strand the *remaining*
+        // containers untouched (still "running" in the DB, never even
+        // asked to stop) and skip the route-table reload below, while the
+        // deployment stays paused indefinitely. Warn and keep going so one
+        // failure can't silently drop the rest of the pause.
         for container in containers {
-            if let Err(e) = self.deployer.stop_container(&container.container_id).await {
+            let container_id = container.container_id.clone();
+            if let Err(e) = self.deployer.stop_container(&container_id).await {
                 warn!(
                     "Failed to stop container {} during deployment pause: {}",
-                    container.container_id, e
+                    container_id, e
                 );
             }
 
-            let mut active_container: deployment_containers::ActiveModel = container.into();
-            active_container.status = Set(Some("stopped".to_string()));
-            active_container.update(self.db.as_ref()).await?;
+            // Retry the DB write: a container whose status never makes it to
+            // "stopped" keeps being treated as routable by
+            // `route_table::load_routes` even though we just told Docker to
+            // stop it — retrying absorbs the transient connection blips that
+            // are the realistic cause of a single UPDATE failing right after
+            // the read and the deployment-state write above it both
+            // succeeded, so routes don't go stale on something recoverable.
+            let retry = temps_core::retry::RetryConfig::new(3)
+                .with_base_delay(std::time::Duration::from_millis(100))
+                .with_max_delay(std::time::Duration::from_secs(2));
+            let update_result = retry
+                .retry(|| async {
+                    let active_container = deployment_containers::ActiveModel {
+                        status: Set(Some("stopped".to_string())),
+                        ..deployment_containers::ActiveModel::from(container.clone())
+                    };
+                    active_container.update(self.db.as_ref()).await
+                })
+                .await;
+            if let Err(e) = update_result {
+                warn!(
+                    "Failed to persist stopped status for container {} during deployment pause \
+                     after retrying: {} — the route table may still treat it as routable until \
+                     the next successful status update",
+                    container_id, e
+                );
+            }
         }
-
-        let environment_id = deployment.environment_id;
-
-        // Update deployment state to "paused"
-        let mut active_deployment: deployments::ActiveModel = deployment.into();
-        active_deployment.state = Set("paused".to_string());
-        active_deployment.update(self.db.as_ref()).await?;
 
         // Force an in-process route-table reload (same mechanism
         // `mark_deployment_complete.rs` uses after a normal deploy — see its

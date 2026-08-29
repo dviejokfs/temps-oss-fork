@@ -27,8 +27,9 @@ use urlencoding;
 use uuid::Uuid;
 
 use cron::Schedule;
-use temps_core::notifications::{BackupFailureData, NotificationService};
+use temps_core::notifications::BackupFailureData;
 use temps_entities::{backup_schedules::Model as BackupSchedule, s3_sources::Model as S3Source};
+use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use temps_providers::ExternalServiceManager;
 use tokio_stream::StreamExt;
 
@@ -1134,7 +1135,7 @@ pub struct BackupAlertEntry {
 pub struct BackupService {
     db: Arc<DatabaseConnection>,
     external_service_manager: Arc<ExternalServiceManager>,
-    notification_dispatcher: Arc<dyn NotificationService>,
+    alarm_service: Arc<AlarmService>,
     config_service: Arc<temps_config::ConfigService>,
     encryption_service: Arc<temps_core::EncryptionService>,
     /// Shared workspace `JobQueue` (typically backed by the in-memory
@@ -1148,14 +1149,14 @@ impl BackupService {
     pub fn new(
         db: Arc<DatabaseConnection>,
         external_service_manager: Arc<ExternalServiceManager>,
-        notification_dispatcher: Arc<dyn NotificationService>,
+        alarm_service: Arc<AlarmService>,
         serve_config: Arc<temps_config::ConfigService>,
         encryption_service: Arc<temps_core::EncryptionService>,
     ) -> Self {
         Self {
             db,
             external_service_manager,
-            notification_dispatcher,
+            alarm_service,
             config_service: serve_config,
             encryption_service,
             queue: std::sync::OnceLock::new(),
@@ -1208,26 +1209,14 @@ impl BackupService {
         &self,
         backup_failure_data: BackupFailureData,
     ) -> Result<(), BackupError> {
-        use std::collections::HashMap;
-        use temps_core::notifications::{NotificationData, NotificationPriority, NotificationType};
-
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            "schedule_id".to_string(),
-            backup_failure_data.schedule_id.to_string(),
-        );
-        metadata.insert(
-            "schedule_name".to_string(),
-            backup_failure_data.schedule_name.clone(),
-        );
-        metadata.insert(
-            "backup_type".to_string(),
-            backup_failure_data.backup_type.clone(),
-        );
-        metadata.insert("timestamp".to_string(), Utc::now().to_rfc3339());
-
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
+        let request = FireAlarmRequest {
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: None,
+            alarm_type: AlarmType::BackupFailed,
+            severity: AlarmSeverity::Critical,
             title: format!("Backup Failed: {}", backup_failure_data.schedule_name),
             message: format!(
                 "Backup failed for {} ({}): {}",
@@ -1235,16 +1224,16 @@ impl BackupService {
                 backup_failure_data.backup_type,
                 backup_failure_data.error
             ),
-            notification_type: NotificationType::Error,
-            priority: NotificationPriority::High,
-            severity: Some("error".to_string()),
-            timestamp: Utc::now(),
-            metadata,
-            bypass_throttling: false,
+            metadata: Some(json!({
+                "schedule_id": backup_failure_data.schedule_id,
+                "schedule_name": backup_failure_data.schedule_name,
+                "backup_type": backup_failure_data.backup_type,
+                "timestamp": Utc::now().to_rfc3339(),
+            })),
         };
 
-        self.notification_dispatcher
-            .send_notification(notification)
+        self.alarm_service
+            .fire_alarm(request)
             .await
             .map_err(|e| BackupError::NotificationError(e.to_string()))?;
 
@@ -8804,7 +8793,9 @@ mod tests {
     use super::*;
     use bollard::Docker;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
-    use temps_core::notifications::{EmailMessage, NotificationData, NotificationError};
+    use temps_core::notifications::{
+        EmailMessage, NotificationData, NotificationError, NotificationService,
+    };
     use temps_core::EncryptionService;
     use temps_entities::{backup_schedules, s3_sources};
 
@@ -8835,7 +8826,7 @@ mod tests {
         BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         )
@@ -9679,8 +9670,26 @@ mod tests {
         ))
     }
 
-    fn create_mock_notification_service() -> Arc<dyn NotificationService> {
-        Arc::new(TestNotificationService)
+    struct NoopJobQueue;
+
+    #[async_trait::async_trait]
+    impl temps_core::JobQueue for NoopJobQueue {
+        async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("NoopJobQueue does not support subscribing in tests")
+        }
+    }
+
+    fn create_mock_alarm_service() -> Arc<AlarmService> {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        Arc::new(AlarmService::new(
+            db,
+            Arc::new(TestNotificationService),
+            Arc::new(NoopJobQueue),
+        ))
     }
 
     fn create_mock_external_service_manager(
@@ -9708,7 +9717,7 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -9720,7 +9729,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9749,14 +9758,14 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9775,7 +9784,7 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -9783,7 +9792,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9808,14 +9817,14 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9834,14 +9843,14 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9880,14 +9889,14 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9916,14 +9925,14 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9959,14 +9968,14 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9985,14 +9994,14 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -10014,14 +10023,14 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -10100,7 +10109,7 @@ mod tests {
 
         // Setup backup service
         let external_service_manager = create_mock_external_service_manager(test_db.db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
 
         // Create proper config service with test database
         let server_config = temps_config::ServerConfig::new(
@@ -10121,7 +10130,7 @@ mod tests {
         let backup_service = BackupService::new(
             test_db.db.clone(),
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -10423,7 +10432,7 @@ mod tests {
 
         // Setup backup service for source database
         let external_service_manager = create_mock_external_service_manager(source_db.db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let source_config = temps_config::ServerConfig::new(
@@ -10442,7 +10451,7 @@ mod tests {
         let source_backup_service = BackupService::new(
             source_db.db.clone(),
             external_service_manager.clone(),
-            notification_service.clone(),
+            alarm_service.clone(),
             source_config_service,
             encryption_service,
         );
@@ -10570,7 +10579,7 @@ mod tests {
         let target_backup_service = BackupService::new(
             target_db.db.clone(),
             external_service_manager,
-            notification_service,
+            alarm_service,
             target_config_service,
             encryption_service,
         );
@@ -10761,7 +10770,7 @@ mod tests {
     async fn test_create_s3_client_from_request_valid() {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -10769,7 +10778,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -10798,7 +10807,7 @@ mod tests {
     async fn test_create_s3_source_with_bucket_creation() {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -10806,7 +10815,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -10845,7 +10854,7 @@ mod tests {
     async fn test_create_s3_source_request_validation() {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -10853,7 +10862,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -10961,7 +10970,7 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -10969,7 +10978,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -11018,7 +11027,7 @@ mod tests {
         BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         )
@@ -11115,7 +11124,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11168,7 +11177,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11220,7 +11229,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11264,7 +11273,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11361,7 +11370,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11402,7 +11411,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11436,7 +11445,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11463,7 +11472,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11524,7 +11533,7 @@ mod tests {
         let service = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db.clone()),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11563,7 +11572,7 @@ mod tests {
         let service = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11591,7 +11600,7 @@ mod tests {
         let service = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11670,7 +11679,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11707,7 +11716,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11734,7 +11743,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11781,7 +11790,7 @@ mod tests {
         Ok(BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         ))
@@ -12024,7 +12033,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db.clone()),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -12194,7 +12203,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db.clone()),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -12302,7 +12311,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -12380,7 +12389,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -12463,7 +12472,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db.clone()),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -12629,7 +12638,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db.clone()),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
