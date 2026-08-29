@@ -416,6 +416,28 @@ impl OutageDetectionService {
             let incident_id = Self::create_incident_conn(&txn, event).await?;
             txn.commit().await?;
 
+            // The lock only covers the incident insert — releasing it before
+            // sending the notification, firing the alarm, and triggering
+            // workflows leaves a gap those calls don't revalidate. Rather
+            // than extending the lock across those (they're independent I/O
+            // — notification delivery, alarm dedup/cooldown, job dispatch —
+            // and holding a DB-level lock across them would tie up a
+            // connection for no good reason), do one more live check right
+            // here. If a pause landed in that gap, the incident above was
+            // still correctly created (the deployment genuinely was down and
+            // unpaused at that instant) — resolve it immediately instead of
+            // leaving it open with no alert ever sent, and skip the
+            // now-stale side effects.
+            if self.is_deployment_paused(event.environment_id).await {
+                debug!(
+                    "Monitor {} - deployment paused right after incident {} was created; \
+                     auto-resolving instead of alerting",
+                    event.monitor_id, incident_id
+                );
+                self.resolve_incident(incident_id).await?;
+                return Ok(());
+            }
+
             self.send_outage_notification(event, incident_id).await?;
 
             // Fire alarm for the outage
@@ -1674,6 +1696,83 @@ mod tests {
             notification_service.send_count(),
             0,
             "no notification when the pause lands right before incident creation"
+        );
+        assert_eq!(job_queue.send_count(), 0);
+    }
+
+    /// Narrower still: the deployment is genuinely unpaused for the whole
+    /// locked check-and-insert (so the incident is correctly created), and
+    /// only becomes paused in the small gap between the transaction
+    /// committing and the notification/alarm/workflow side effects that
+    /// follow it — the one window the advisory lock can't cover, since it
+    /// only wraps the DB write, not delivery to external systems. The
+    /// live re-check right after commit has to catch this and auto-resolve
+    /// the incident rather than leaving it open with no alert ever sent.
+    #[tokio::test]
+    async fn test_handle_outage_event_auto_resolves_when_paused_right_after_incident_created() {
+        let monitor = make_status_monitor_model(1, Some(1));
+        let incident = status_incidents::Model {
+            id: 42,
+            project_id: 1,
+            environment_id: Some(1),
+            monitor_id: Some(1),
+            title: "API Health is down".to_string(),
+            description: Some("Connection refused".to_string()),
+            severity: "critical".to_string(),
+            status: "investigating".to_string(),
+            started_at: Utc::now(),
+            resolved_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![monitor]])
+            // process_check's guard: still unpaused.
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            // handle_outage_event's locked guard: still unpaused.
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            // create_incident_conn's insert.
+            .append_query_results(vec![vec![incident.clone()]])
+            // Live re-check right after commit: paused now.
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "paused")]])
+            // resolve_incident: find_by_id, then update.
+            .append_query_results(vec![vec![incident.clone()]])
+            .append_query_results(vec![vec![incident]])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            notification_service.clone(),
+            job_queue.clone(),
+        ));
+
+        let service = OutageDetectionService::new(db, notification_service.clone(), alarm_service);
+
+        service
+            .process_check(
+                1,
+                MonitorStatus::Down,
+                Some("Connection refused".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            notification_service.send_count(),
+            0,
+            "no notification once the post-commit re-check sees the deployment paused"
         );
         assert_eq!(job_queue.send_count(), 0);
     }
