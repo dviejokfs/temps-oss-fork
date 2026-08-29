@@ -416,34 +416,52 @@ impl OutageDetectionService {
             let incident_id = Self::create_incident_conn(&txn, event).await?;
             txn.commit().await?;
 
-            // The lock only covers the incident insert — releasing it before
-            // sending the notification, firing the alarm, and triggering
-            // workflows leaves a gap those calls don't revalidate. Rather
-            // than extending the lock across those (they're independent I/O
-            // — notification delivery, alarm dedup/cooldown, job dispatch —
-            // and holding a DB-level lock across them would tie up a
-            // connection for no good reason), do one more live check right
-            // here. If a pause landed in that gap, the incident above was
-            // still correctly created (the deployment genuinely was down and
-            // unpaused at that instant) — resolve it immediately instead of
-            // leaving it open with no alert ever sent, and skip the
-            // now-stale side effects.
-            if self.is_deployment_paused(event.environment_id).await {
+            // The lock only covers the incident insert — sending the
+            // notification, firing the alarm, and triggering workflows all
+            // happen after releasing it, since those are external I/O
+            // (webhook/email delivery, job queue send) that can't
+            // reasonably sit inside a DB transaction, so there's no way to
+            // hold this lock across them.
+            //
+            // Rather than re-guessing "is the deployment paused right now"
+            // before each of those three calls (still just as racy a
+            // read-then-act, only repeated three times), key off the
+            // incident row itself: `pause_deployment` resolves every open
+            // incident for the environment as part of its own locked
+            // transaction (see its comment), so this incident's `status` is
+            // the canonical, actively-maintained signal for "did a pause
+            // land after I was created." Re-checking it live, right before
+            // each side effect, is what actually catches a pause landing
+            // mid-sequence (e.g. between the notification and the alarm),
+            // not just one landing before the first of the three.
+            if !self.incident_is_open(incident_id).await {
                 debug!(
-                    "Monitor {} - deployment paused right after incident {} was created; \
-                     auto-resolving instead of alerting",
+                    "Monitor {} - incident {} was resolved (deployment paused) before the \
+                     notification could be sent; skipping",
                     event.monitor_id, incident_id
                 );
-                self.resolve_incident(incident_id).await?;
                 return Ok(());
             }
-
             self.send_outage_notification(event, incident_id).await?;
 
-            // Fire alarm for the outage
+            if !self.incident_is_open(incident_id).await {
+                debug!(
+                    "Monitor {} - incident {} was resolved (deployment paused) after the \
+                     notification but before the alarm; skipping",
+                    event.monitor_id, incident_id
+                );
+                return Ok(());
+            }
             self.fire_outage_alarm(event).await;
 
-            // Trigger any workflows configured to run on monitoring.downtime
+            if !self.incident_is_open(incident_id).await {
+                debug!(
+                    "Monitor {} - incident {} was resolved (deployment paused) after the alarm \
+                     but before the workflow trigger; skipping",
+                    event.monitor_id, incident_id
+                );
+                return Ok(());
+            }
             self.trigger_downtime_workflows(event).await;
 
             // Update cached state with incident ID
@@ -656,6 +674,23 @@ impl OutageDetectionService {
     }
 
     /// Resolve an existing incident
+    /// Live check of whether an incident is still open (not `resolved`).
+    /// `pause_deployment` resolves every open incident for an environment as
+    /// part of its own locked transaction (see its comment), so this is the
+    /// canonical way for `handle_outage_event` to notice a pause that landed
+    /// after the incident was created, without re-guessing deployment pause
+    /// state on every call. Missing incidents are treated as not-open —
+    /// there's nothing left to alert about either way.
+    async fn incident_is_open(&self, incident_id: i32) -> bool {
+        status_incidents::Entity::find_by_id(incident_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|i| i.status != "resolved")
+            .unwrap_or(false)
+    }
+
     async fn resolve_incident(&self, incident_id: i32) -> Result<(), OutageError> {
         let incident = status_incidents::Entity::find_by_id(incident_id)
             .one(self.db.as_ref())
@@ -1705,13 +1740,17 @@ mod tests {
     /// only becomes paused in the small gap between the transaction
     /// committing and the notification/alarm/workflow side effects that
     /// follow it — the one window the advisory lock can't cover, since it
-    /// only wraps the DB write, not delivery to external systems. The
-    /// live re-check right after commit has to catch this and auto-resolve
-    /// the incident rather than leaving it open with no alert ever sent.
+    /// only wraps the DB write, not delivery to external systems.
+    /// `pause_deployment` resolves the incident as part of ITS locked
+    /// transaction (see its comment); this asserts that
+    /// `handle_outage_event`'s live re-read of the incident's own status —
+    /// not a fresh deployment-pause guess — is what catches that and skips
+    /// the now-stale notification.
     #[tokio::test]
-    async fn test_handle_outage_event_auto_resolves_when_paused_right_after_incident_created() {
+    async fn test_handle_outage_event_skips_notification_when_incident_resolved_right_after_creation(
+    ) {
         let monitor = make_status_monitor_model(1, Some(1));
-        let incident = status_incidents::Model {
+        let open_incident = status_incidents::Model {
             id: 42,
             project_id: 1,
             environment_id: Some(1),
@@ -1724,6 +1763,11 @@ mod tests {
             resolved_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        };
+        let resolved_incident = status_incidents::Model {
+            status: "resolved".to_string(),
+            resolved_at: Some(Utc::now()),
+            ..open_incident.clone()
         };
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -1739,13 +1783,10 @@ mod tests {
             .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
             .append_query_results(vec![vec![make_deployment_model(10, "running")]])
             // create_incident_conn's insert.
-            .append_query_results(vec![vec![incident.clone()]])
-            // Live re-check right after commit: paused now.
-            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
-            .append_query_results(vec![vec![make_deployment_model(10, "paused")]])
-            // resolve_incident: find_by_id, then update.
-            .append_query_results(vec![vec![incident.clone()]])
-            .append_query_results(vec![vec![incident]])
+            .append_query_results(vec![vec![open_incident]])
+            // incident_is_open, right before the notification: `pause_deployment`
+            // resolved it in the meantime.
+            .append_query_results(vec![vec![resolved_incident]])
             .into_connection();
 
         let db = Arc::new(db);
@@ -1772,7 +1813,7 @@ mod tests {
         assert_eq!(
             notification_service.send_count(),
             0,
-            "no notification once the post-commit re-check sees the deployment paused"
+            "no notification once the incident's own status shows it was resolved"
         );
         assert_eq!(job_queue.send_count(), 0);
     }

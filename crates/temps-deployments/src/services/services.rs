@@ -3229,7 +3229,7 @@ impl DeploymentService {
         deployment_id: i32,
     ) -> Result<(), DeploymentError> {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_entities::{deployment_containers, deployments};
+        use temps_entities::{deployment_containers, deployments, status_incidents};
 
         // First verify the deployment exists and belongs to the project
         let deployment = deployments::Entity::find_by_id(deployment_id)
@@ -3273,6 +3273,36 @@ impl DeploymentService {
         let mut active_deployment: deployments::ActiveModel = deployment.into();
         active_deployment.state = Set("paused".to_string());
         active_deployment.update(&txn).await?;
+
+        // The lock above only serializes the incident *insert* against this
+        // write — `OutageDetectionService` still sends the notification,
+        // fires the alarm, and dispatches the workflow AFTER releasing the
+        // lock, since those are external I/O (webhook/email delivery, job
+        // queue send) that can't reasonably sit inside a DB transaction. A
+        // pause landing in that specific gap would otherwise still produce
+        // an alert for an incident that's already stale by the time it goes
+        // out. Rather than trying to also lock out external I/O (which a DB
+        // lock structurally can't do), make this side of the race
+        // proactive: while still holding the lock, resolve any incident for
+        // this environment that's still open. `handle_outage_event`
+        // re-reads the incident's own status immediately before each side
+        // effect (see its comment), so a resolve that lands here — even a
+        // moment after that incident was created — is what that re-read is
+        // watching for.
+        status_incidents::Entity::update_many()
+            .col_expr(
+                status_incidents::Column::Status,
+                sea_orm::sea_query::Expr::value("resolved"),
+            )
+            .col_expr(
+                status_incidents::Column::ResolvedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now()),
+            )
+            .filter(status_incidents::Column::EnvironmentId.eq(environment_id))
+            .filter(status_incidents::Column::Status.ne("resolved"))
+            .exec(&txn)
+            .await?;
+
         txn.commit().await?;
 
         // Stop and remove all containers for this deployment
