@@ -10,7 +10,6 @@ import {
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
   listPresetsOptions,
-  listServicesOptions,
   revealServiceEnvironmentVariablesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -25,6 +24,7 @@ import { ImportEnvDialog } from '@/components/ui/import-env-dialog'
 import { CreateServiceDialog } from '@/components/storage/CreateServiceDialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -86,7 +86,11 @@ import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import * as z from 'zod/v4'
-import { ServiceEnvPreview } from './ServiceEnvPreview'
+import {
+  ProvidedEnvironmentVariables,
+  ProvidedEnvironmentVariableWarning,
+} from './ProvidedEnvironmentVariables'
+import type { ProvidedEnvironmentVariableCollision } from '@/lib/provided-environment-variables'
 import { repositoryFilePath } from '@/lib/repository-file-path'
 import { FrameworkSelector } from './FrameworkSelector'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
@@ -101,6 +105,16 @@ import {
   resolveDeploymentUrlBase,
 } from '@/components/templates/envVarGenerators'
 import { useSettings } from '@/hooks/useSettings'
+import {
+  isLikelySecretProjectEnvironmentVariable,
+  isTempsManagedProjectEnvironmentVariable,
+  projectEnvironmentVariablesSchema,
+} from '@/lib/project-environment-variables'
+import {
+  normalizeTemplateServiceType,
+  toggleDatabaseSelection,
+} from '@/lib/template-service-requirements'
+import { useAllServices } from '@/hooks/useAllServices'
 
 // Derives a browsable repo URL from whatever the API gave us. clone_url is an
 // HTTPS URL (possibly `.git`-suffixed) for connected providers, but for the
@@ -185,20 +199,7 @@ const formSchema = z.object({
   autoDeploy: z.boolean(),
   rootDirectory: z.string(),
   branch: z.string().min(1, 'Branch is required'),
-  environmentVariables: z.array(
-    z
-      .object({
-        key: z.string(),
-        value: z.string(),
-        isSecret: z.boolean(),
-      })
-      // A secret is write-only once saved, so an empty one could never be
-      // filled in afterwards — the server rejects it too.
-      .refine((v) => !v.isSecret || v.value.length > 0, {
-        message: 'A secret needs a value — it cannot be filled in later',
-        path: ['value'],
-      })
-  ),
+  environmentVariables: projectEnvironmentVariablesSchema,
   storageServices: z.array(z.number()),
   dockerfilePath: z.string().optional(),
   composePath: z.string().optional(),
@@ -644,8 +645,10 @@ export function ProjectConfigurator({
     useState<CreatableServiceTypeRoute | null>(null)
   const [showSecrets, setShowSecrets] = useState<{ [key: number]: boolean }>({})
   const [isImportEnvOpen, setIsImportEnvOpen] = useState(false)
-  const [newlyCreatedServiceIds, setNewlyCreatedServiceIds] = useState<
-    number[]
+  const [providedEnvironmentVariables, setProvidedEnvironmentVariables] =
+    useState<ProvidedEnvironmentVariableCollision[]>([])
+  const [newlyCreatedServices, setNewlyCreatedServices] = useState<
+    ExternalServiceInfo[]
   >([])
   const [allowDirectoryOverride, setAllowDirectoryOverride] = useState(false)
 
@@ -669,9 +672,17 @@ export function ProjectConfigurator({
   })
 
   // Fetch existing services
-  const { data: existingServices, refetch: refetchServices } = useQuery({
-    ...listServicesOptions({}),
-  })
+  const { data: existingServices, refetch: refetchServices } = useAllServices()
+  const availableServices = useMemo(() => {
+    const servicesById = new Map<number, ExternalServiceInfo>()
+    existingServices?.forEach((service) =>
+      servicesById.set(service.id, service)
+    )
+    newlyCreatedServices.forEach((service) =>
+      servicesById.set(service.id, service)
+    )
+    return Array.from(servicesById.values())
+  }, [existingServices, newlyCreatedServices])
 
   // Platform settings provide `preview_domain` / `external_url`, which drive
   // the suggested "this project's URL" option offered for *_URL vars in the
@@ -827,7 +838,7 @@ export function ProjectConfigurator({
       : fetchedPublicEnvExampleData
         ? fetchedPublicEnvExampleData.path
         : (providedEnvExampleData?.path ?? null)
-  const envExampleVariables = useMemo(() => {
+  const detectedEnvExampleVariables = useMemo(() => {
     if (isFetchingEnvExample) return []
     if (fetchedEnvExampleData) return fetchedEnvExampleData.variables
     if (fetchedPublicEnvExampleData) {
@@ -844,6 +855,13 @@ export function ProjectConfigurator({
     fetchedPublicEnvExampleData,
     isFetchingEnvExample,
   ])
+  const envExampleVariables = useMemo(
+    () =>
+      detectedEnvExampleVariables.filter(
+        (variable) => !isTempsManagedProjectEnvironmentVariable(variable.key)
+      ),
+    [detectedEnvExampleVariables]
+  )
 
   const [envExampleDismissed, setEnvExampleDismissed] = useState(false)
   const [selectedEnvExampleKeys, setSelectedEnvExampleKeys] = useState<
@@ -969,7 +987,6 @@ export function ProjectConfigurator({
     control: form.control,
     name: 'preset',
   })
-
   // Auto-update port based on selected preset
   useEffect(() => {
     if (!selectedPreset || !allPresetsData?.presets) {
@@ -1025,7 +1042,7 @@ export function ProjectConfigurator({
       .map((v) => ({
         key: v.key,
         value: envExampleValueDrafts[v.key] ?? v.defaultValue,
-        isSecret: false,
+        isSecret: isLikelySecretProjectEnvironmentVariable(v.key),
       }))
     if (newVars.length === 0) return
     form.setValue('environmentVariables', [...currentVars, ...newVars])
@@ -1110,13 +1127,20 @@ export function ProjectConfigurator({
   const handleServiceToggle = useCallback(
     (serviceId: number) => {
       const currentServices = form.getValues('storageServices') || []
-      const isSelected = currentServices.includes(serviceId)
-      const newValues = isSelected
-        ? currentServices.filter((id) => id !== serviceId)
-        : [...currentServices, serviceId]
-      form.setValue('storageServices', newValues)
+      const result = toggleDatabaseSelection(
+        currentServices,
+        serviceId,
+        availableServices
+      )
+      if (result.conflictingService) {
+        toast.error('A compatible database is already selected', {
+          description: `${result.conflictingService.name} already provides this database variable namespace. Deselect it first.`,
+        })
+        return
+      }
+      form.setValue('storageServices', result.selectedServiceIds)
     },
-    [form]
+    [form, availableServices]
   )
 
   // Handle form submission
@@ -1126,18 +1150,15 @@ export function ProjectConfigurator({
     try {
       setIsSubmitting(true)
 
-      // Remove duplicates from service IDs (newly created services are already in data.storageServices)
-      const allServiceIds = Array.from(
-        new Set([...(data.storageServices || []), ...newlyCreatedServiceIds])
-      )
-
       // Extract just the preset name from "preset::path" format for backend
       const [presetName] = data.preset.split('::')
 
       const finalData = {
         ...data,
         preset: presetName, // Use only the preset name, not the full "preset::path"
-        storageServices: allServiceIds,
+        // The visible selection is authoritative. A newly created database
+        // can be deselected before project submission.
+        storageServices: Array.from(new Set(data.storageServices || [])),
       }
 
       if (onSubmit) {
@@ -1500,64 +1521,86 @@ export function ProjectConfigurator({
     </div>
   )
 
-  // Render services step
-  const renderServices = () => {
+  const renderAddDatabaseMenu = () => (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button type="button" variant="outline" size="sm">
+          <Plus className="h-4 w-4 mr-2" />
+          Add Database
+          <ChevronDown className="h-4 w-4 ml-1" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-64">
+        {ADD_SERVICE_TYPES.map((type) => {
+          const selectedIds = form.getValues('storageServices') || []
+          const isTypeAlreadySelected = availableServices.some(
+            (service) =>
+              selectedIds.includes(service.id) &&
+              normalizeTemplateServiceType(service.service_type) === type.id
+          )
+          return (
+            <DropdownMenuItem
+              key={type.id}
+              onClick={() => {
+                if (isTypeAlreadySelected) {
+                  toast.error(`A ${type.name} database is already selected`, {
+                    description:
+                      'Deselect it before creating another database of this type.',
+                  })
+                  return
+                }
+                setSelectedServiceType(type.id)
+                setIsCreateServiceDialogOpen(true)
+              }}
+              className={cn(
+                'flex items-center gap-3 py-2.5',
+                isTypeAlreadySelected && 'cursor-not-allowed opacity-50'
+              )}
+            >
+              <ServiceLogo service={type.id} className="h-6 w-6" />
+              <div className="flex flex-col">
+                <span className="font-medium">{type.name}</span>
+                <span className="text-xs text-muted-foreground">
+                  {type.description}
+                </span>
+              </div>
+            </DropdownMenuItem>
+          )
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+
+  // Render databases step. The API still calls these storage services, but
+  // "Databases" is the user-facing concept in project creation.
+  const renderDatabases = () => {
     const watchedServices = form.watch('storageServices') || []
 
     return (
       <div className="space-y-4">
-        <div className="flex items-center justify-between">
+        {availableServices.length > 0 && (
           <div>
-            <h3 className="font-medium">Services</h3>
-            <p className="text-sm text-muted-foreground">
-              Link existing services or create new ones
-            </p>
-          </div>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button type="button" variant="outline" size="sm">
-                <Plus className="h-4 w-4 mr-2" />
-                Add Service
-                <ChevronDown className="h-4 w-4 ml-1" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-64">
-              {ADD_SERVICE_TYPES.map((type) => (
-                <DropdownMenuItem
-                  key={type.id}
-                  onClick={() => {
-                    setSelectedServiceType(type.id)
-                    setIsCreateServiceDialogOpen(true)
-                  }}
-                  className="flex items-center gap-3 py-2.5"
-                >
-                  <ServiceLogo service={type.id} className="h-6 w-6" />
-                  <div className="flex flex-col">
-                    <span className="font-medium">{type.name}</span>
-                    <span className="text-xs text-muted-foreground">
-                      {type.description}
-                    </span>
-                  </div>
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-
-        {existingServices && existingServices.length > 0 && (
-          <div>
-            <h4 className="text-sm font-medium mb-3">Existing Services</h4>
+            <h4 className="text-sm font-medium mb-3">Existing Databases</h4>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {existingServices.map((service) => {
+              {availableServices.map((service) => {
                 const isSelected = watchedServices.includes(service.id)
                 return (
                   <Card
                     key={service.id}
+                    role="checkbox"
+                    tabIndex={0}
+                    aria-checked={isSelected}
                     className={cn(
-                      'cursor-pointer transition-colors hover:bg-muted/50',
+                      'cursor-pointer transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
                       isSelected && 'ring-2 ring-primary'
                     )}
                     onClick={() => handleServiceToggle(service.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        handleServiceToggle(service.id)
+                      }
+                    }}
                   >
                     <CardHeader className="pb-3">
                       <div className="flex items-center justify-between">
@@ -1585,58 +1628,37 @@ export function ProjectConfigurator({
           </div>
         )}
 
-        {newlyCreatedServiceIds.length > 0 && (
+        {newlyCreatedServices.some((service) =>
+          watchedServices.includes(service.id)
+        ) && (
           <Alert>
             <AlertCircle className="h-4 w-4" />
             <AlertDescription>
-              {newlyCreatedServiceIds.length} new service
-              {newlyCreatedServiceIds.length > 1 ? 's' : ''} will be created
-              with this project
+              {
+                newlyCreatedServices.filter((service) =>
+                  watchedServices.includes(service.id)
+                ).length
+              }{' '}
+              new database
+              {newlyCreatedServices.filter((service) =>
+                watchedServices.includes(service.id)
+              ).length > 1
+                ? 's'
+                : ''}{' '}
+              will be linked to this project
             </AlertDescription>
           </Alert>
         )}
 
-        {/* Environment Variables Preview for Selected Services */}
-        {watchedServices.length > 0 && (
-          <div>
-            <h4 className="text-sm font-medium mb-3">
-              Service Environment Variables Preview
-            </h4>
-            <p className="text-xs text-muted-foreground mb-4">
-              Selected services will provide these environment variables to your
-              project.
-              <span className="text-primary">
-                Click &quot;Preview Variables&quot;
-              </span>{' '}
-              on any service to see what will be available.
-            </p>
-            <div className="space-y-3">
-              {watchedServices.map((serviceId) => {
-                const service = existingServices?.find(
-                  (s: ExternalServiceInfo) => s.id === serviceId
-                )
-                if (!service) return null
-                return (
-                  <ServiceEnvPreview
-                    key={service.id}
-                    serviceId={service.id}
-                    serviceName={service.name}
-                    serviceType={service.service_type}
-                  />
-                )
-              })}
-            </div>
-          </div>
-        )}
-
-        {!existingServices?.length && newlyCreatedServiceIds.length === 0 && (
+        {availableServices.length === 0 && (
           <div className="text-center py-8">
             <Database className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
             <p className="text-sm text-muted-foreground">
-              No services configured yet
+              No databases configured yet
             </p>
             <p className="text-xs text-muted-foreground mt-1">
-              Create services to enhance your project
+              Add PostgreSQL, Redis, MongoDB, or object storage when your app
+              needs it
             </p>
           </div>
         )}
@@ -1647,37 +1669,24 @@ export function ProjectConfigurator({
   // Render environment variables step
   const renderEnvVars = () => {
     const watchedEnvVars = form.watch('environmentVariables') || []
+    const selectedDatabases = (form.watch('storageServices') || [])
+      .map((serviceId) =>
+        availableServices.find((service) => service.id === serviceId)
+      )
+      .filter((service): service is ExternalServiceInfo => Boolean(service))
+      .map((service) => ({
+        id: service.id,
+        name: service.name,
+        serviceType: service.service_type,
+      }))
 
     return (
       <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="font-medium">Environment Variables</h3>
-            <p className="text-sm text-muted-foreground">
-              Configure environment variables for your project
-            </p>
-          </div>
-          <div className="flex gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => setIsImportEnvOpen(true)}
-            >
-              <Upload className="h-4 w-4 mr-2" />
-              Import .env
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={addEnvironmentVariable}
-            >
-              <Plus className="h-4 w-4 mr-2" />
-              Add Variable
-            </Button>
-          </div>
-        </div>
+        <ProvidedEnvironmentVariables
+          preset={selectedPreset || 'dockerfile'}
+          databases={selectedDatabases}
+          onVariablesChange={setProvidedEnvironmentVariables}
+        />
 
         {envExampleVariables.length > 0 && !envExampleDismissed && (
           <Card className="border-primary/30 bg-primary/5">
@@ -1817,10 +1826,10 @@ export function ProjectConfigurator({
                                 variant="outline"
                                 size="sm"
                                 className="h-8 w-8 p-0 shrink-0"
-                                title="Fill from a service's connection URL"
+                                title="Fill from a database connection URL"
                                 disabled={
                                   fillingEnvExampleKey === v.key ||
-                                  (!existingServices?.length &&
+                                  (availableServices.length === 0 &&
                                     !suggestedAppUrl)
                                 }
                               >
@@ -1848,13 +1857,13 @@ export function ProjectConfigurator({
                                       </span>
                                     </div>
                                   </DropdownMenuItem>
-                                  {!!existingServices?.length && (
+                                  {availableServices.length > 0 && (
                                     <DropdownMenuSeparator />
                                   )}
                                 </>
                               )}
-                              {existingServices?.length ? (
-                                existingServices.map((service) => (
+                              {availableServices.length ? (
+                                availableServices.map((service) => (
                                   <DropdownMenuItem
                                     key={service.id}
                                     onClick={() =>
@@ -1876,8 +1885,8 @@ export function ProjectConfigurator({
                                 ))
                               ) : !suggestedAppUrl ? (
                                 <div className="px-2 py-1.5 text-xs text-muted-foreground">
-                                  No services yet — add one in the Services step
-                                  first
+                                  No databases yet — add one in the Databases
+                                  section first
                                 </div>
                               ) : null}
                             </DropdownMenuContent>
@@ -1911,187 +1920,231 @@ export function ProjectConfigurator({
           showEnvironmentSelection={false}
           onImport={async (variables) => {
             const currentVars = form.getValues('environmentVariables') || []
-            const newVars = variables.map((v) => ({
+            const configurableVariables = variables.filter(
+              (variable) =>
+                !isTempsManagedProjectEnvironmentVariable(variable.key)
+            )
+            const skippedCount = variables.length - configurableVariables.length
+            const newVars = configurableVariables.map((v) => ({
               key: v.key,
               value: v.value,
-              isSecret: false,
+              isSecret: isLikelySecretProjectEnvironmentVariable(v.key),
             }))
             form.setValue('environmentVariables', [...currentVars, ...newVars])
+            if (skippedCount > 0) {
+              toast.info(
+                `Skipped ${skippedCount} variable${skippedCount === 1 ? '' : 's'} provided automatically by Temps`
+              )
+            }
           }}
         />
 
         {watchedEnvVars.length > 0 ? (
           <div className="space-y-3">
             {watchedEnvVars.map((_, index) => (
-              <Card key={index} className="border-dashed">
-                <CardContent className="p-4">
-                  <div className="flex items-start gap-3">
-                    <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-3">
-                      <FormField
-                        control={form.control}
-                        name={`environmentVariables.${index}.key`}
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel className="text-sm">Key</FormLabel>
+              <Card key={index} className="border-border/70 bg-muted/15">
+                <CardContent className="space-y-4 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <Badge variant="outline" className="font-normal">
+                      Variable {index + 1}
+                    </Badge>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => removeEnvironmentVariable(index)}
+                      className="text-destructive hover:text-destructive h-8 w-8 p-0"
+                      aria-label={`Remove environment variable ${index + 1}`}
+                      title="Remove variable"
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <FormField
+                      control={form.control}
+                      name={`environmentVariables.${index}.key`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-sm">Key</FormLabel>
+                          <FormControl>
+                            <Input
+                              {...field}
+                              className="font-mono"
+                              placeholder="DATABASE_URL"
+                              autoCapitalize="none"
+                              autoCorrect="off"
+                              spellCheck={false}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                          <ProvidedEnvironmentVariableWarning
+                            variableName={watchedEnvVars[index]?.key ?? ''}
+                            providedVariables={providedEnvironmentVariables}
+                          />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name={`environmentVariables.${index}.value`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-sm">Value</FormLabel>
+                          <div className="flex items-center gap-1">
                             <FormControl>
-                              <Input {...field} placeholder="DATABASE_URL" />
+                              <Input
+                                {...field}
+                                type={
+                                  watchedEnvVars[index]?.isSecret &&
+                                  !showSecrets[index]
+                                    ? 'password'
+                                    : 'text'
+                                }
+                                className="font-mono"
+                                placeholder="Enter value"
+                              />
                             </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={form.control}
-                        name={`environmentVariables.${index}.value`}
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel className="text-sm">Value</FormLabel>
-                            <div className="relative">
-                              <FormControl>
-                                <Input
-                                  {...field}
-                                  type={
-                                    showSecrets[index] ? 'text' : 'password'
-                                  }
-                                  placeholder="Enter value"
-                                />
-                              </FormControl>
-                              {getGeneratedSecretSpec(
-                                watchedEnvVars[index]?.key ?? ''
-                              ) && (
+                            {getGeneratedSecretSpec(
+                              watchedEnvVars[index]?.key ?? ''
+                            ) && (
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-9 w-9 shrink-0 p-0"
+                                    title="Generate a random secret"
+                                    aria-label="Generate a random secret"
+                                  >
+                                    <Wand2 className="h-4 w-4" />
+                                  </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent
+                                  align="end"
+                                  className="w-64"
+                                >
+                                  {SECRET_LENGTH_OPTIONS.map((option) => (
+                                    <DropdownMenuItem
+                                      key={option.bytes}
+                                      onClick={() => {
+                                        const spec = getGeneratedSecretSpec(
+                                          watchedEnvVars[index]?.key ?? ''
+                                        )
+                                        if (!spec) return
+                                        form.setValue(
+                                          `environmentVariables.${index}.value`,
+                                          generateSecretValue({
+                                            ...spec,
+                                            bytes: option.bytes,
+                                          })
+                                        )
+                                        form.setValue(
+                                          `environmentVariables.${index}.isSecret`,
+                                          true
+                                        )
+                                      }}
+                                      className="flex flex-col items-start gap-0.5"
+                                    >
+                                      <span className="font-medium">
+                                        {option.label} ({option.bytes} bytes)
+                                      </span>
+                                      <span className="text-xs text-muted-foreground">
+                                        {option.description}
+                                      </span>
+                                    </DropdownMenuItem>
+                                  ))}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            )}
+                            {isConnectionStringKey(
+                              watchedEnvVars[index]?.key ?? ''
+                            ) &&
+                              (availableServices.length > 0 ||
+                                !!suggestedAppUrl) && (
                                 <DropdownMenu>
                                   <DropdownMenuTrigger asChild>
                                     <Button
                                       type="button"
-                                      variant="ghost"
+                                      variant="outline"
                                       size="sm"
-                                      className="absolute right-9 top-0 h-full px-2"
-                                      title="Generate a random secret"
+                                      className="h-9 w-9 shrink-0 p-0"
+                                      title="Fill from a database connection URL"
+                                      aria-label="Fill from a database connection URL"
+                                      disabled={fillingManualVarIndex === index}
                                     >
-                                      <Wand2 className="h-4 w-4" />
+                                      {fillingManualVarIndex === index ? (
+                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                      ) : (
+                                        <Link2 className="h-4 w-4" />
+                                      )}
                                     </Button>
                                   </DropdownMenuTrigger>
                                   <DropdownMenuContent
                                     align="end"
                                     className="w-64"
                                   >
-                                    {SECRET_LENGTH_OPTIONS.map((option) => (
+                                    {suggestedAppUrl && (
+                                      <>
+                                        <DropdownMenuItem
+                                          onClick={() =>
+                                            fillManualEnvVarWithAppUrl(index)
+                                          }
+                                          className="flex items-center gap-2"
+                                        >
+                                          <Globe className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                          <div className="flex flex-col min-w-0">
+                                            <span>This project&apos;s URL</span>
+                                            <span className="text-xs text-muted-foreground truncate">
+                                              {suggestedAppUrl}
+                                            </span>
+                                          </div>
+                                        </DropdownMenuItem>
+                                        {availableServices.length > 0 && (
+                                          <DropdownMenuSeparator />
+                                        )}
+                                      </>
+                                    )}
+                                    {availableServices.map((service) => (
                                       <DropdownMenuItem
-                                        key={option.bytes}
-                                        onClick={() => {
-                                          const spec = getGeneratedSecretSpec(
-                                            watchedEnvVars[index]?.key ?? ''
+                                        key={service.id}
+                                        onClick={() =>
+                                          fillManualEnvVarFromService(
+                                            index,
+                                            service
                                           )
-                                          if (!spec) return
-                                          form.setValue(
-                                            `environmentVariables.${index}.value`,
-                                            generateSecretValue({
-                                              ...spec,
-                                              bytes: option.bytes,
-                                            })
-                                          )
-                                          form.setValue(
-                                            `environmentVariables.${index}.isSecret`,
-                                            true
-                                          )
-                                        }}
-                                        className="flex flex-col items-start gap-0.5"
+                                        }
+                                        className="flex items-center gap-2"
                                       >
-                                        <span className="font-medium">
-                                          {option.label} ({option.bytes} bytes)
-                                        </span>
-                                        <span className="text-xs text-muted-foreground">
-                                          {option.description}
+                                        <ServiceLogo
+                                          service={service.service_type}
+                                          className="h-4 w-4 shrink-0"
+                                        />
+                                        <span className="truncate">
+                                          {service.name}
                                         </span>
                                       </DropdownMenuItem>
                                     ))}
                                   </DropdownMenuContent>
                                 </DropdownMenu>
                               )}
-                              {isConnectionStringKey(
-                                watchedEnvVars[index]?.key ?? ''
-                              ) &&
-                                (!!existingServices?.length ||
-                                  !!suggestedAppUrl) && (
-                                  <DropdownMenu>
-                                    <DropdownMenuTrigger asChild>
-                                      <Button
-                                        type="button"
-                                        variant="ghost"
-                                        size="sm"
-                                        className="absolute right-9 top-0 h-full px-2"
-                                        title="Fill from a service's connection URL"
-                                        disabled={
-                                          fillingManualVarIndex === index
-                                        }
-                                      >
-                                        {fillingManualVarIndex === index ? (
-                                          <Loader2 className="h-4 w-4 animate-spin" />
-                                        ) : (
-                                          <Link2 className="h-4 w-4" />
-                                        )}
-                                      </Button>
-                                    </DropdownMenuTrigger>
-                                    <DropdownMenuContent
-                                      align="end"
-                                      className="w-64"
-                                    >
-                                      {suggestedAppUrl && (
-                                        <>
-                                          <DropdownMenuItem
-                                            onClick={() =>
-                                              fillManualEnvVarWithAppUrl(index)
-                                            }
-                                            className="flex items-center gap-2"
-                                          >
-                                            <Globe className="h-4 w-4 shrink-0 text-muted-foreground" />
-                                            <div className="flex flex-col min-w-0">
-                                              <span>
-                                                This project&apos;s URL
-                                              </span>
-                                              <span className="text-xs text-muted-foreground truncate">
-                                                {suggestedAppUrl}
-                                              </span>
-                                            </div>
-                                          </DropdownMenuItem>
-                                          {!!existingServices?.length && (
-                                            <DropdownMenuSeparator />
-                                          )}
-                                        </>
-                                      )}
-                                      {existingServices?.map((service) => (
-                                        <DropdownMenuItem
-                                          key={service.id}
-                                          onClick={() =>
-                                            fillManualEnvVarFromService(
-                                              index,
-                                              service
-                                            )
-                                          }
-                                          className="flex items-center gap-2"
-                                        >
-                                          <ServiceLogo
-                                            service={service.service_type}
-                                            className="h-4 w-4 shrink-0"
-                                          />
-                                          <span className="truncate">
-                                            {service.name}
-                                          </span>
-                                        </DropdownMenuItem>
-                                      ))}
-                                    </DropdownMenuContent>
-                                  </DropdownMenu>
-                                )}
+                            {watchedEnvVars[index]?.isSecret && (
                               <Button
                                 type="button"
-                                variant="ghost"
+                                variant="outline"
                                 size="sm"
-                                className="absolute right-0 top-0 h-full px-3"
+                                className="h-9 w-9 shrink-0 p-0"
                                 onClick={() =>
                                   setShowSecrets((prev) => ({
                                     ...prev,
                                     [index]: !prev[index],
                                   }))
+                                }
+                                aria-label={
+                                  showSecrets[index]
+                                    ? 'Hide secret value'
+                                    : 'Show secret value'
                                 }
                               >
                                 {showSecrets[index] ? (
@@ -2100,50 +2153,41 @@ export function ProjectConfigurator({
                                   <Eye className="h-4 w-4" />
                                 )}
                               </Button>
-                            </div>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={form.control}
-                        name={`environmentVariables.${index}.isSecret`}
-                        render={({ field }) => (
-                          <FormItem className="flex items-start space-x-2 space-y-0 md:col-span-2">
-                            <FormControl>
-                              <Checkbox
-                                id={`env-var-secret-${index}`}
-                                checked={field.value}
-                                onCheckedChange={field.onChange}
-                              />
-                            </FormControl>
-                            <div className="space-y-0.5 leading-none">
-                              <FormLabel
-                                htmlFor={`env-var-secret-${index}`}
-                                className="text-xs font-medium"
-                              >
-                                Secret
-                              </FormLabel>
-                              <p className="text-muted-foreground text-xs">
-                                Write-only. The value is stored encrypted and
-                                can be replaced but never shown again.
-                              </p>
-                            </div>
-                          </FormItem>
-                        )}
-                      />
-                    </div>
-                    <div className="flex flex-col gap-2">
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => removeEnvironmentVariable(index)}
-                        className="text-destructive hover:text-destructive h-8 w-8 p-0"
-                      >
-                        <X className="h-4 w-4" />
-                      </Button>
-                    </div>
+                            )}
+                          </div>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name={`environmentVariables.${index}.isSecret`}
+                      render={({ field }) => (
+                        <FormItem className="flex items-start gap-3 space-y-0 rounded-md border bg-background/70 p-3 md:col-span-2">
+                          <FormControl>
+                            <Checkbox
+                              id={`env-var-secret-${index}`}
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                              className="mt-0.5"
+                            />
+                          </FormControl>
+                          <div className="space-y-1 leading-none">
+                            <FormLabel
+                              htmlFor={`env-var-secret-${index}`}
+                              className="text-sm font-medium"
+                            >
+                              Encrypt as secret
+                            </FormLabel>
+                            <p className="text-muted-foreground text-xs">
+                              Secret values are write-only after creation. Use
+                              this for passwords, tokens, and private connection
+                              strings.
+                            </p>
+                          </div>
+                        </FormItem>
+                      )}
+                    />
                   </div>
                 </CardContent>
               </Card>
@@ -2156,8 +2200,19 @@ export function ProjectConfigurator({
               No environment variables configured
             </p>
             <p className="text-xs text-muted-foreground mt-1">
-              Add variables that your application needs
+              Add one manually, import an existing .env file, or use the
+              variables detected from your repository
             </p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="mt-4"
+              onClick={addEnvironmentVariable}
+            >
+              <Plus className="h-4 w-4 mr-2" />
+              Add your first variable
+            </Button>
           </div>
         )}
       </div>
@@ -2186,19 +2241,48 @@ export function ProjectConfigurator({
           </Card>
 
           <Card>
-            <CardHeader>
-              <CardTitle>Services</CardTitle>
-              <CardDescription>
-                Select storage and database services
-              </CardDescription>
+            <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="space-y-1.5">
+                <CardTitle>Databases</CardTitle>
+                <CardDescription>
+                  Link a managed database or storage resource. Connection
+                  variables are injected automatically.
+                </CardDescription>
+              </div>
+              {renderAddDatabaseMenu()}
             </CardHeader>
-            <CardContent>{renderServices()}</CardContent>
+            <CardContent>{renderDatabases()}</CardContent>
           </Card>
 
           <Card>
-            <CardHeader>
-              <CardTitle>Environment Variables</CardTitle>
-              <CardDescription>Configure environment variables</CardDescription>
+            <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="space-y-1.5">
+                <CardTitle>Environment Variables</CardTitle>
+                <CardDescription>
+                  Add app configuration and credentials. Database connection
+                  variables above are included automatically.
+                </CardDescription>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setIsImportEnvOpen(true)}
+                >
+                  <Upload className="h-4 w-4 mr-2" />
+                  Import .env
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={addEnvironmentVariable}
+                >
+                  <Plus className="h-4 w-4 mr-2" />
+                  Add Variable
+                </Button>
+              </div>
             </CardHeader>
             <CardContent>{renderEnvVars()}</CardContent>
           </Card>
@@ -2245,14 +2329,19 @@ export function ProjectConfigurator({
           onSuccess={(service: ExternalServiceInfo) => {
             setIsCreateServiceDialogOpen(false)
             setSelectedServiceType(null)
-            setNewlyCreatedServiceIds((prev) => [...prev, service.id])
+            setNewlyCreatedServices((previousServices) =>
+              previousServices.some((item) => item.id === service.id)
+                ? previousServices
+                : [...previousServices, service]
+            )
             // Automatically add the newly created service to the form selection
             const currentServices = form.getValues('storageServices') || []
-            form.setValue('storageServices', [...currentServices, service.id])
-            setTimeout(() => {
-              refetchServices()
-            }, 100)
-            toast.success(`Service "${service.name}" created successfully!`)
+            form.setValue(
+              'storageServices',
+              Array.from(new Set([...currentServices, service.id]))
+            )
+            void refetchServices()
+            toast.success(`Database "${service.name}" created successfully!`)
           }}
         />
       )}
