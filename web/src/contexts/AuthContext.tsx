@@ -7,7 +7,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { UserResponse } from '@/api/client/types.gen'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { createContext, useContext, useState, ReactNode } from 'react'
+import { createContext, useContext, ReactNode } from 'react'
 
 interface AuthContextType {
   user: UserResponse | null
@@ -24,6 +24,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     data: user,
     isLoading: userLoading,
     error: userError,
+    dataUpdatedAt,
+    errorUpdatedAt,
     refetch: refetchUser,
   } = useQuery({
     ...getCurrentUserOptions({}),
@@ -56,19 +58,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // -- wiping any in-progress email/password input. Only the very FIRST
   // resolution (success or error) should count as "loading"; every
   // subsequent refetch should be invisible to consumers already showing the
-  // login screen. `hasResolvedOnce` latches true the first time the query
-  // leaves its loading state and never resets — set during render (React's
-  // documented "adjusting state during rendering" pattern) rather than in an
-  // effect, so the latch applies to the very render that needs it instead of
-  // one tick later.
-  const [prevUserLoading, setPrevUserLoading] = useState(userLoading)
-  const [hasResolvedOnce, setHasResolvedOnce] = useState(false)
-  if (userLoading !== prevUserLoading) {
-    setPrevUserLoading(userLoading)
-    if (!userLoading) {
-      setHasResolvedOnce(true)
-    }
-  }
+  // login screen. `dataUpdatedAt`/`errorUpdatedAt` are timestamps TanStack
+  // Query itself maintains on the query (0 until it has settled once), so
+  // this is a plain derivation of query state every render rather than a
+  // second state machine that has to be kept in sync with it.
+  const hasResolvedOnce = dataUpdatedAt > 0 || errorUpdatedAt > 0
 
   const { mutateAsync: logout } = useMutation({
     ...logoutMutation({}),
