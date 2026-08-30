@@ -44738,10 +44738,11 @@ export type ListContainerHistoryData = {
          */
         deployment_id?: number | null;
         /**
-         * Maximum number of container rows to return, most recently deployed
-         * first (default 20, max 100). Use together with `deployment_id` to
-         * page through a specific deployment's containers, or alone to see the
-         * most recent history across all deployments.
+         * Maximum number of *replaced* container rows to return, most recently
+         * replaced first (default 20, max 100). Every currently-running
+         * container is always included and does not count against this limit —
+         * it only bounds how much historical (replaced-by-redeploy) context
+         * comes back alongside them.
          */
         limit?: number | null;
     };
@@ -44763,7 +44764,7 @@ export type ListContainerHistoryError = ListContainerHistoryErrors[keyof ListCon
 
 export type ListContainerHistoryResponses = {
     /**
-     * Containers that have run for this environment, current and replaced, newest first
+     * Containers that have run for this environment: every currently-running one first (uncapped), then the newest replaced ones up to `limit`
      */
     200: ContainerHistoryListResponse;
 };

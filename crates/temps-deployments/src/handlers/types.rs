@@ -986,10 +986,11 @@ pub struct ContainerHistoryQuery {
     /// Only return containers belonging to this deployment. Omit to list
     /// containers across every deployment the environment has ever had.
     pub deployment_id: Option<i32>,
-    /// Maximum number of container rows to return, most recently deployed
-    /// first (default 20, max 100). Use together with `deployment_id` to
-    /// page through a specific deployment's containers, or alone to see the
-    /// most recent history across all deployments.
+    /// Maximum number of *replaced* container rows to return, most recently
+    /// replaced first (default 20, max 100). Every currently-running
+    /// container is always included and does not count against this limit —
+    /// it only bounds how much historical (replaced-by-redeploy) context
+    /// comes back alongside them.
     pub limit: Option<u64>,
 }
 

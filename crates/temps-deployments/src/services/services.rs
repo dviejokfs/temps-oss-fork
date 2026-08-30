@@ -4277,12 +4277,17 @@ impl DeploymentService {
     /// available for metrics lookups.
     ///
     /// `deployment_id` narrows the result to one deployment's containers
-    /// (must belong to this environment). `limit` caps how many rows are
-    /// returned, most recently deployed first (default 20, max 100) — an
+    /// (must belong to this environment). `limit` caps how many *replaced*
+    /// rows are returned on top of the currently-running ones — an
     /// environment can accumulate hundreds of replaced containers over its
     /// lifetime and returning them all would fan out into that many
-    /// concurrent metrics-history requests on the frontend. Returns the
-    /// capped rows plus the total count before the cap was applied.
+    /// concurrent metrics-history requests on the frontend. Currently
+    /// running containers (`deleted_at IS NULL`) are never subject to this
+    /// cap: a limit truncating a live container would silently drop it from
+    /// both the "running" count and its metrics, the exact debugging
+    /// scenario this endpoint exists for. Returns all current containers
+    /// first (newest first), then the newest `limit` replaced containers,
+    /// plus the total count across both groups before the cap was applied.
     pub async fn list_environment_container_history(
         &self,
         project_id: i32,
@@ -4331,12 +4336,23 @@ impl DeploymentService {
             .await?;
 
         let mut containers = deployment_containers::Entity::find()
+            .filter(filter.clone())
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .order_by_desc(deployment_containers::Column::DeployedAt)
+            .all(self.db.as_ref())
+            .await?;
+
+        // `limit` bounds only the replaced containers -- it is not a shared
+        // budget with the uncapped current ones above, so a small `limit`
+        // can never squeeze out an already-included running container.
+        let replaced = deployment_containers::Entity::find()
             .filter(filter)
+            .filter(deployment_containers::Column::DeletedAt.is_not_null())
             .order_by_desc(deployment_containers::Column::DeployedAt)
             .limit(limit)
             .all(self.db.as_ref())
             .await?;
-        containers.sort_by_key(|a| a.deployed_at);
+        containers.extend(replaced);
 
         Ok((containers, total_count))
     }
@@ -6949,8 +6965,9 @@ mod tests {
         let (project, environment, deployment_one, container_one) =
             setup_test_deployment(&db).await?;
 
-        // A second deployment on the SAME environment, with two containers —
-        // simulates a redeploy that replaced one container and added another.
+        // A second deployment on the SAME environment, with three containers
+        // that have all since been superseded by a later redeploy (deleted_at
+        // set) — simulates an environment with a lot of replaced history.
         let deployment_two = deployments::ActiveModel {
             project_id: Set(project.id),
             environment_id: Set(environment.id),
@@ -6964,16 +6981,20 @@ mod tests {
         let deployment_two = deployment_two.insert(db.as_ref()).await?;
 
         let now = Utc::now();
-        for (idx, container_id) in ["container-456", "container-789"].iter().enumerate() {
+        for (idx, container_id) in ["container-456", "container-789", "container-999"]
+            .iter()
+            .enumerate()
+        {
             let container = deployment_containers::ActiveModel {
                 deployment_id: Set(deployment_two.id),
                 container_id: Set(container_id.to_string()),
                 container_name: Set(format!("test-container-{}", idx + 2)),
                 container_port: Set(8080),
                 image_name: Set(Some("nginx:latest".to_string())),
-                status: Set(Some("running".to_string())),
+                status: Set(Some("stopped".to_string())),
                 created_at: Set(now + chrono::Duration::seconds(idx as i64 + 1)),
                 deployed_at: Set(now + chrono::Duration::seconds(idx as i64 + 1)),
+                deleted_at: Set(Some(now + chrono::Duration::seconds(idx as i64 + 10))),
                 ..Default::default()
             };
             container.insert(db.as_ref()).await?;
@@ -6982,15 +7003,15 @@ mod tests {
         let deployment_service = create_deployment_service_for_test(db.clone());
 
         // No filter, no limit override: sees every container across both
-        // deployments, and total_count matches the returned rows.
+        // deployments (1 current + 3 replaced), and total_count matches.
         let (all, all_total) = deployment_service
             .list_environment_container_history(project.id, environment.id, None, None)
             .await?;
-        assert_eq!(all.len(), 3);
-        assert_eq!(all_total, 3);
+        assert_eq!(all.len(), 4);
+        assert_eq!(all_total, 4);
 
-        // Filtered to deployment_two: only its two containers come back,
-        // deployment_one's container is excluded.
+        // Filtered to deployment_two: only its three (replaced) containers
+        // come back, deployment_one's current container is excluded.
         let (filtered, filtered_total) = deployment_service
             .list_environment_container_history(
                 project.id,
@@ -6999,19 +7020,30 @@ mod tests {
                 None,
             )
             .await?;
-        assert_eq!(filtered_total, 2);
+        assert_eq!(filtered_total, 3);
         assert!(filtered
             .iter()
             .all(|c| c.deployment_id == deployment_two.id));
         assert!(!filtered.iter().any(|c| c.id == container_one.id));
 
-        // limit=1 across all deployments: total_count still reports the
-        // unfiltered total (3), but only 1 row is returned.
+        // limit=1 across all deployments: the single currently-running
+        // container (container_one) is NEVER subject to the cap -- only
+        // replaced containers are capped, so exactly 1 (of 3) replaced rows
+        // joins it. total_count still reports the unfiltered total (4).
         let (limited, limited_total) = deployment_service
             .list_environment_container_history(project.id, environment.id, None, Some(1))
             .await?;
-        assert_eq!(limited.len(), 1);
-        assert_eq!(limited_total, 3);
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited_total, 4);
+        assert!(
+            limited.iter().any(|c| c.id == container_one.id),
+            "the running container must never be dropped by `limit`"
+        );
+        assert_eq!(
+            limited.iter().filter(|c| c.deleted_at.is_some()).count(),
+            1,
+            "limit=1 should cap replaced containers to exactly 1"
+        );
 
         // Filtering by a deployment ID from a different environment 404s
         // rather than silently returning nothing.

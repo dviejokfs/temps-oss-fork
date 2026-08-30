@@ -71,11 +71,11 @@ export function registerContainersCommands(program: Command): void {
 
   containers
     .command('history')
-    .description('List containers that have run in an environment, including ones replaced by a later redeploy, newest first')
+    .description('List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included')
     .requiredOption('-p, --project-id <id>', 'Project ID')
     .requiredOption('-e, --environment-id <id>', 'Environment ID')
     .option('-d, --deployment-id <id>', 'Only list containers belonging to this deployment')
-    .option('-l, --limit <count>', 'Max container rows to return, newest first (default 20, max 100)')
+    .option('-l, --limit <count>', 'Max REPLACED container rows to return on top of the running ones, newest first (default 20, max 100)')
     .option('--json', 'Output in JSON format')
     .action(listContainerHistoryAction)
 

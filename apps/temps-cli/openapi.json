@@ -83926,7 +83926,7 @@
             }
           },
           {
-            "description": "Maximum number of container rows to return, most recently deployed\nfirst (default 20, max 100). Use together with `deployment_id` to\npage through a specific deployment's containers, or alone to see the\nmost recent history across all deployments.",
+            "description": "Maximum number of *replaced* container rows to return, most recently\nreplaced first (default 20, max 100). Every currently-running\ncontainer is always included and does not count against this limit —\nit only bounds how much historical (replaced-by-redeploy) context\ncomes back alongside them.",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -83949,7 +83949,7 @@
                 }
               }
             },
-            "description": "Containers that have run for this environment, current and replaced, newest first"
+            "description": "Containers that have run for this environment: every currently-running one first (uncapped), then the newest replaced ones up to `limit`"
           },
           "404": {
             "content": {

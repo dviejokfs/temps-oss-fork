@@ -2328,7 +2328,7 @@ pub async fn get_container_metrics_history(
         ContainerHistoryQuery,
     ),
     responses(
-        (status = 200, description = "Containers that have run for this environment, current and replaced, newest first", body = ContainerHistoryListResponse),
+        (status = 200, description = "Containers that have run for this environment: every currently-running one first (uncapped), then the newest replaced ones up to `limit`", body = ContainerHistoryListResponse),
         (status = 404, description = "Environment or deployment not found", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
     ),

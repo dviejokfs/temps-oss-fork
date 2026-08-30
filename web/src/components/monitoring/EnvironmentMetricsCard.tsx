@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useMemo, useState } from 'react'
-import { useQueries, useQuery } from '@tanstack/react-query'
+import { useInfiniteQuery, useQueries, useQuery } from '@tanstack/react-query'
 import {
   containerMetricsGetHistoryOptions,
-  getProjectDeploymentsOptions,
+  getProjectDeploymentsInfiniteOptions,
   listContainerHistoryOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -144,9 +144,10 @@ export function EnvironmentMetricsCharts({
   // (one line + label per replaced container). Default to the current
   // container(s) only, with an explicit toggle to bring the rest back.
   const [showReplaced, setShowReplaced] = useState(false)
-  // How many container rows (most recent first) to fetch/chart at once — an
-  // environment can accumulate hundreds of replaced containers, and each one
-  // fans out into 4 metrics-history requests, so this bounds the request count.
+  // How many REPLACED container rows (most recently replaced first) to
+  // fetch/chart on top of the always-included running ones — an environment
+  // can accumulate hundreds of replaced containers, and each one fans out
+  // into 4 metrics-history requests, so this bounds the request count.
   const [limit, setLimit] = useState<(typeof LIMITS)[number]>(20)
   // Debugging a single deployment's containers (e.g. a specific redeploy that
   // regressed CPU/memory) means narrowing the chart to just that deployment.
@@ -155,14 +156,24 @@ export function EnvironmentMetricsCharts({
   const deploymentId =
     deploymentFilter === ALL_DEPLOYMENTS ? undefined : Number(deploymentFilter)
 
-  const deploymentsQuery = useQuery({
-    ...getProjectDeploymentsOptions({
+  // A single page (max 100 per the server's pagination cap) isn't enough
+  // for long-lived environments with more deployments than that — paged
+  // with useInfiniteQuery and an explicit "load more" control so every
+  // deployment stays reachable in the filter, not just the newest 100.
+  const deploymentsQuery = useInfiniteQuery({
+    ...getProjectDeploymentsInfiniteOptions({
       path: { id: projectId },
       query: { environment_id: environmentId, per_page: 100 },
     }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage, pages) => {
+      const loaded = pages.reduce((n, p) => n + p.deployments.length, 0)
+      return loaded < lastPage.total ? pages.length + 1 : undefined
+    },
     staleTime: 30_000,
   })
-  const deploymentOptions = deploymentsQuery.data?.deployments ?? []
+  const deploymentOptions =
+    deploymentsQuery.data?.pages.flatMap((p) => p.deployments) ?? []
 
   const historyQuery = useQuery({
     ...listContainerHistoryOptions({
@@ -424,6 +435,22 @@ export function EnvironmentMetricsCharts({
                     {d.is_current ? ' — current' : ''}
                   </SelectItem>
                 ))}
+                {deploymentsQuery.hasNextPage && (
+                  <button
+                    type="button"
+                    disabled={deploymentsQuery.isFetchingNextPage}
+                    className="w-full px-2 py-1.5 text-left text-xs text-muted-foreground hover:bg-accent disabled:opacity-50"
+                    // Radix Select would otherwise close/select on pointerdown
+                    // before our click handler runs; stop it so "load more"
+                    // can be clicked more than once without reopening the menu.
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={() => deploymentsQuery.fetchNextPage()}
+                  >
+                    {deploymentsQuery.isFetchingNextPage
+                      ? 'Loading…'
+                      : 'Load more deployments…'}
+                  </button>
+                )}
               </SelectContent>
             </Select>
             <Select
@@ -438,7 +465,7 @@ export function EnvironmentMetricsCharts({
               <SelectContent>
                 {LIMITS.map((l) => (
                   <SelectItem key={l} value={String(l)}>
-                    {l} containers
+                    {l} replaced
                   </SelectItem>
                 ))}
               </SelectContent>
