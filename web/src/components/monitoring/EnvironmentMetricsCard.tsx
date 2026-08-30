@@ -5,6 +5,7 @@ import { useMemo, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import {
   containerMetricsGetHistoryOptions,
+  getProjectDeploymentsOptions,
   listContainerHistoryOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -46,6 +47,9 @@ const RANGES = [
   { value: '7d', label: 'Last 7 days' },
 ] as const
 type RangeValue = (typeof RANGES)[number]['value']
+
+const LIMITS = [10, 20, 50, 100] as const
+const ALL_DEPLOYMENTS = 'all'
 
 interface ContainerSeries {
   key: string
@@ -140,10 +144,30 @@ export function EnvironmentMetricsCharts({
   // (one line + label per replaced container). Default to the current
   // container(s) only, with an explicit toggle to bring the rest back.
   const [showReplaced, setShowReplaced] = useState(false)
+  // How many container rows (most recent first) to fetch/chart at once — an
+  // environment can accumulate hundreds of replaced containers, and each one
+  // fans out into 4 metrics-history requests, so this bounds the request count.
+  const [limit, setLimit] = useState<(typeof LIMITS)[number]>(20)
+  // Debugging a single deployment's containers (e.g. a specific redeploy that
+  // regressed CPU/memory) means narrowing the chart to just that deployment.
+  const [deploymentFilter, setDeploymentFilter] =
+    useState<string>(ALL_DEPLOYMENTS)
+  const deploymentId =
+    deploymentFilter === ALL_DEPLOYMENTS ? undefined : Number(deploymentFilter)
+
+  const deploymentsQuery = useQuery({
+    ...getProjectDeploymentsOptions({
+      path: { id: projectId },
+      query: { environment_id: environmentId, per_page: 100 },
+    }),
+    staleTime: 30_000,
+  })
+  const deploymentOptions = deploymentsQuery.data?.deployments ?? []
 
   const historyQuery = useQuery({
     ...listContainerHistoryOptions({
       path: { project_id: projectId, environment_id: environmentId },
+      query: { deployment_id: deploymentId, limit },
     }),
     staleTime: 30_000,
   })
@@ -155,6 +179,7 @@ export function EnvironmentMetricsCharts({
       ),
     [historyQuery.data]
   )
+  const totalCount = historyQuery.data?.total_count ?? entries.length
 
   const currentCount = useMemo(
     () => entries.filter((c) => c.is_current).length,
@@ -356,37 +381,85 @@ export function EnvironmentMetricsCharts({
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="text-xs text-muted-foreground">
-          {currentCount} running
-          {replacedCount > 0 && (
-            <>
-              {' · '}
-              <Button
-                type="button"
-                variant="link"
-                size="sm"
-                className="h-auto p-0 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
-                onClick={() => setShowReplaced((v) => !v)}
-              >
-                {replacedCount} replaced by earlier redeploys —{' '}
-                {showReplaced ? 'hide' : 'show'}
-              </Button>
-            </>
-          )}
-        </p>
-        <Select value={range} onValueChange={(v) => setRange(v as RangeValue)}>
-          <SelectTrigger className="w-[160px]">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {RANGES.map((r) => (
-              <SelectItem key={r.value} value={r.value}>
-                {r.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+      <div className="flex flex-col gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-xs text-muted-foreground">
+            {currentCount} running
+            {replacedCount > 0 && (
+              <>
+                {' · '}
+                <Button
+                  type="button"
+                  variant="link"
+                  size="sm"
+                  className="h-auto p-0 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+                  onClick={() => setShowReplaced((v) => !v)}
+                >
+                  {replacedCount} replaced by earlier redeploys —{' '}
+                  {showReplaced ? 'hide' : 'show'}
+                </Button>
+              </>
+            )}
+            {totalCount > entries.length && (
+              <span>
+                {' '}
+                · showing {entries.length} of {totalCount} containers
+              </span>
+            )}
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <Select
+              value={deploymentFilter}
+              onValueChange={(v) => setDeploymentFilter(v)}
+            >
+              <SelectTrigger className="w-[200px]">
+                <SelectValue placeholder="All deployments" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_DEPLOYMENTS}>All deployments</SelectItem>
+                {deploymentOptions.map((d) => (
+                  <SelectItem key={d.id} value={String(d.id)}>
+                    Deployment #{d.id}
+                    {d.commit_hash ? ` (${d.commit_hash.slice(0, 7)})` : ''}
+                    {d.is_current ? ' — current' : ''}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
+              value={String(limit)}
+              onValueChange={(v) =>
+                setLimit(Number(v) as (typeof LIMITS)[number])
+              }
+            >
+              <SelectTrigger className="w-[130px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {LIMITS.map((l) => (
+                  <SelectItem key={l} value={String(l)}>
+                    {l} containers
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
+              value={range}
+              onValueChange={(v) => setRange(v as RangeValue)}
+            >
+              <SelectTrigger className="w-[160px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {RANGES.map((r) => (
+                  <SelectItem key={r.value} value={r.value}>
+                    {r.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

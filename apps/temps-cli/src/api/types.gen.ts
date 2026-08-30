@@ -938,13 +938,24 @@ export type AlarmResponse = {
      * Arbitrary JSON metadata attached by the alarm source.
      */
     metadata?: unknown;
-    project_id: number;
+    /**
+     * `None` for host/control-plane-wide alarms with no associated project.
+     */
+    project_id?: number | null;
     /**
      * ISO-8601 UTC timestamp when the alarm was resolved, if any.
      */
     resolved_at?: string | null;
     service_id?: number | null;
     severity: string;
+    /**
+     * ISO-8601 UTC timestamp this alarm (and future re-fires of the same
+     * type/scope) are muted until, if currently silenced. Not cleared when
+     * the silence expires — check against the current time, or compare to
+     * `fired_at` on a *new* alarm of the same scope to know a silence has
+     * lapsed.
+     */
+    silenced_until?: string | null;
     status: string;
     title: string;
     /**
@@ -3199,6 +3210,11 @@ export type ContainerHistoryEntry = {
 
 export type ContainerHistoryListResponse = {
     containers: Array<ContainerHistoryEntry>;
+    /**
+     * Total number of container rows matching the filter, before `limit`
+     * was applied — lets the client show "20 of 627".
+     */
+    total_count: number;
 };
 
 export type ContainerInfoResponse = {
@@ -17315,6 +17331,17 @@ export type SiblingRef = {
      * URL slug used to link into the sibling project's single-project trace view.
      */
     project_slug: string;
+};
+
+/**
+ * Request body for `POST .../alarms/{alarm_id}/silence`.
+ */
+export type SilenceAlarmRequest = {
+    /**
+     * How long to mute this alarm (and future re-fires of the same
+     * type/scope) for, in hours. Must be between 1 and 168 (7 days).
+     */
+    duration_hours: number;
 };
 
 export type SkillDefinitionResponse = {
@@ -41656,6 +41683,52 @@ export type ResolveAlarmResponses = {
     200: unknown;
 };
 
+export type SilenceAlarmData = {
+    body: SilenceAlarmRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/alarms/{alarm_id}/silence';
+};
+
+export type SilenceAlarmErrors = {
+    /**
+     * Invalid duration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SilenceAlarmResponses = {
+    /**
+     * Alarm silenced
+     */
+    200: unknown;
+};
+
 export type GetApiCallersData = {
     body?: never;
     path: {
@@ -44658,13 +44731,26 @@ export type ListContainerHistoryData = {
          */
         environment_id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Only return containers belonging to this deployment. Omit to list
+         * containers across every deployment the environment has ever had.
+         */
+        deployment_id?: number | null;
+        /**
+         * Maximum number of container rows to return, most recently deployed
+         * first (default 20, max 100). Use together with `deployment_id` to
+         * page through a specific deployment's containers, or alone to see the
+         * most recent history across all deployments.
+         */
+        limit?: number | null;
+    };
     url: '/projects/{project_id}/environments/{environment_id}/container-history';
 };
 
 export type ListContainerHistoryErrors = {
     /**
-     * Environment not found
+     * Environment or deployment not found
      */
     404: ProblemDetails;
     /**
@@ -44677,7 +44763,7 @@ export type ListContainerHistoryError = ListContainerHistoryErrors[keyof ListCon
 
 export type ListContainerHistoryResponses = {
     /**
-     * Every container that has ever run for this environment, current and replaced
+     * Containers that have run for this environment, current and replaced, newest first
      */
     200: ContainerHistoryListResponse;
 };
@@ -52638,6 +52724,219 @@ export type CheckForUpdateResponses = {
 };
 
 export type CheckForUpdateResponse = CheckForUpdateResponses[keyof CheckForUpdateResponses];
+
+export type ListSystemAlarmsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by alarm type (e.g. `container_restart`, `outage`).
+         */
+        alarm_type?: string | null;
+        /**
+         * Filter by status: `firing`, `acknowledged`, or `resolved`.
+         */
+        status?: string | null;
+        /**
+         * Filter by severity: `info`, `warning`, or `critical`.
+         */
+        severity?: string | null;
+        /**
+         * Filter by environment ID.
+         */
+        environment_id?: number | null;
+        /**
+         * Filter by deployment ID.
+         */
+        deployment_id?: number | null;
+        /**
+         * Filter by external service ID.
+         */
+        service_id?: number | null;
+        /**
+         * Page number (1-based, default 1).
+         */
+        page?: number | null;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number | null;
+    };
+    url: '/system/alarms';
+};
+
+export type ListSystemAlarmsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListSystemAlarmsResponses = {
+    /**
+     * Paginated list of system alarms
+     */
+    200: AlarmListResponse;
+};
+
+export type ListSystemAlarmsResponse = ListSystemAlarmsResponses[keyof ListSystemAlarmsResponses];
+
+export type GetSystemAlarmsSummaryData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/system/alarms/summary';
+};
+
+export type GetSystemAlarmsSummaryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetSystemAlarmsSummaryResponses = {
+    /**
+     * System alarm summary counts
+     */
+    200: AlarmSummaryResponse;
+};
+
+export type GetSystemAlarmsSummaryResponse = GetSystemAlarmsSummaryResponses[keyof GetSystemAlarmsSummaryResponses];
+
+export type AcknowledgeSystemAlarmData = {
+    body?: never;
+    path: {
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/system/alarms/{alarm_id}/acknowledge';
+};
+
+export type AcknowledgeSystemAlarmErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type AcknowledgeSystemAlarmResponses = {
+    /**
+     * Alarm acknowledged
+     */
+    200: unknown;
+};
+
+export type ResolveSystemAlarmData = {
+    body?: never;
+    path: {
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/system/alarms/{alarm_id}/resolve';
+};
+
+export type ResolveSystemAlarmErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ResolveSystemAlarmResponses = {
+    /**
+     * Alarm resolved
+     */
+    200: unknown;
+};
+
+export type SilenceSystemAlarmData = {
+    body: SilenceAlarmRequest;
+    path: {
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/system/alarms/{alarm_id}/silence';
+};
+
+export type SilenceSystemAlarmErrors = {
+    /**
+     * Invalid duration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SilenceSystemAlarmResponses = {
+    /**
+     * Alarm silenced
+     */
+    200: unknown;
+};
 
 export type ListTeamsData = {
     body?: never;

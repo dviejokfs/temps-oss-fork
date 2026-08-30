@@ -4270,16 +4270,26 @@ impl DeploymentService {
         Ok((container, env_info))
     }
 
-    /// List every container that has ever run for an environment — current
-    /// and replaced by a later redeploy. Unlike `get_container_detail`, this
+    /// List containers that have run for an environment — current and
+    /// replaced by a later redeploy. Unlike `get_container_detail`, this
     /// does NOT filter out rows with `deleted_at` set, since a redeploy soft
     /// deletes the previous container row and we still want its history
     /// available for metrics lookups.
+    ///
+    /// `deployment_id` narrows the result to one deployment's containers
+    /// (must belong to this environment). `limit` caps how many rows are
+    /// returned, most recently deployed first (default 20, max 100) — an
+    /// environment can accumulate hundreds of replaced containers over its
+    /// lifetime and returning them all would fan out into that many
+    /// concurrent metrics-history requests on the frontend. Returns the
+    /// capped rows plus the total count before the cap was applied.
     pub async fn list_environment_container_history(
         &self,
         project_id: i32,
         environment_id: i32,
-    ) -> Result<Vec<deployment_containers::Model>, DeploymentError> {
+        deployment_id: Option<i32>,
+        limit: Option<u64>,
+    ) -> Result<(Vec<deployment_containers::Model>, u64), DeploymentError> {
         // Verify environment exists and belongs to project
         environments::Entity::find_by_id(environment_id)
             .filter(environments::Column::ProjectId.eq(project_id))
@@ -4287,26 +4297,48 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
 
-        let deployment_ids: Vec<i32> = deployments::Entity::find()
-            .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::ProjectId.eq(project_id))
-            .all(self.db.as_ref())
-            .await?
-            .into_iter()
-            .map(|d| d.id)
-            .collect();
+        let deployment_ids: Vec<i32> = if let Some(deployment_id) = deployment_id {
+            deployments::Entity::find_by_id(deployment_id)
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .filter(deployments::Column::ProjectId.eq(project_id))
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    DeploymentError::NotFound(format!("Deployment {} not found", deployment_id))
+                })?;
+            vec![deployment_id]
+        } else {
+            deployments::Entity::find()
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .filter(deployments::Column::ProjectId.eq(project_id))
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|d| d.id)
+                .collect()
+        };
 
         if deployment_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
-        let containers = deployment_containers::Entity::find()
-            .filter(deployment_containers::Column::DeploymentId.is_in(deployment_ids))
-            .order_by_asc(deployment_containers::Column::DeployedAt)
-            .all(self.db.as_ref())
+        let limit = limit.unwrap_or(20).min(100);
+        let filter = deployment_containers::Column::DeploymentId.is_in(deployment_ids);
+
+        let total_count = deployment_containers::Entity::find()
+            .filter(filter.clone())
+            .count(self.db.as_ref())
             .await?;
 
-        Ok(containers)
+        let mut containers = deployment_containers::Entity::find()
+            .filter(filter)
+            .order_by_desc(deployment_containers::Column::DeployedAt)
+            .limit(limit)
+            .all(self.db.as_ref())
+            .await?;
+        containers.sort_by_key(|a| a.deployed_at);
+
+        Ok((containers, total_count))
     }
 
     /// Resolve a container row by docker container_id, including containers
@@ -6903,6 +6935,120 @@ mod tests {
             }
             _ => panic!("Expected NotFound error"),
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_environment_container_history_filters_by_deployment_and_limits(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // First deployment/container comes from the shared fixture.
+        let (project, environment, deployment_one, container_one) =
+            setup_test_deployment(&db).await?;
+
+        // A second deployment on the SAME environment, with two containers —
+        // simulates a redeploy that replaced one container and added another.
+        let deployment_two = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            state: Set("deployed".to_string()),
+            slug: Set("test-deployment-two".to_string()),
+            metadata: Set(Some(Default::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let deployment_two = deployment_two.insert(db.as_ref()).await?;
+
+        let now = Utc::now();
+        for (idx, container_id) in ["container-456", "container-789"].iter().enumerate() {
+            let container = deployment_containers::ActiveModel {
+                deployment_id: Set(deployment_two.id),
+                container_id: Set(container_id.to_string()),
+                container_name: Set(format!("test-container-{}", idx + 2)),
+                container_port: Set(8080),
+                image_name: Set(Some("nginx:latest".to_string())),
+                status: Set(Some("running".to_string())),
+                created_at: Set(now + chrono::Duration::seconds(idx as i64 + 1)),
+                deployed_at: Set(now + chrono::Duration::seconds(idx as i64 + 1)),
+                ..Default::default()
+            };
+            container.insert(db.as_ref()).await?;
+        }
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // No filter, no limit override: sees every container across both
+        // deployments, and total_count matches the returned rows.
+        let (all, all_total) = deployment_service
+            .list_environment_container_history(project.id, environment.id, None, None)
+            .await?;
+        assert_eq!(all.len(), 3);
+        assert_eq!(all_total, 3);
+
+        // Filtered to deployment_two: only its two containers come back,
+        // deployment_one's container is excluded.
+        let (filtered, filtered_total) = deployment_service
+            .list_environment_container_history(
+                project.id,
+                environment.id,
+                Some(deployment_two.id),
+                None,
+            )
+            .await?;
+        assert_eq!(filtered_total, 2);
+        assert!(filtered
+            .iter()
+            .all(|c| c.deployment_id == deployment_two.id));
+        assert!(!filtered.iter().any(|c| c.id == container_one.id));
+
+        // limit=1 across all deployments: total_count still reports the
+        // unfiltered total (3), but only 1 row is returned.
+        let (limited, limited_total) = deployment_service
+            .list_environment_container_history(project.id, environment.id, None, Some(1))
+            .await?;
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited_total, 3);
+
+        // Filtering by a deployment ID from a different environment 404s
+        // rather than silently returning nothing.
+        let other_project = projects::ActiveModel {
+            name: Set("Other Project".to_string()),
+            slug: Set("other-project".to_string()),
+            repo_name: Set("other-repo".to_string()),
+            repo_owner: Set("other-owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let other_project = other_project.insert(db.as_ref()).await?;
+        let other_environment = environments::ActiveModel {
+            project_id: Set(other_project.id),
+            name: Set("Other".to_string()),
+            slug: Set("other".to_string()),
+            host: Set("other.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("other.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let other_environment = other_environment.insert(db.as_ref()).await?;
+        let result = deployment_service
+            .list_environment_container_history(
+                other_project.id,
+                other_environment.id,
+                Some(deployment_one.id),
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(DeploymentError::NotFound(_))));
 
         Ok(())
     }
