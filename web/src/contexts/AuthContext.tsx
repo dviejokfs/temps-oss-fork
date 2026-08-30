@@ -7,7 +7,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { UserResponse } from '@/api/client/types.gen'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { createContext, useContext, ReactNode } from 'react'
+import { createContext, useContext, useState, ReactNode } from 'react'
 
 interface AuthContextType {
   user: UserResponse | null
@@ -47,6 +47,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     gcTime: 1000 * 60 * 10, // Keep in cache for 10 minutes
   })
 
+  // `getCurrentUser` never holds data while logged out, so TanStack Query
+  // resets its status to 'pending' (userLoading -> true) on every refetch,
+  // not just the first one -- including refetches an unrelated query
+  // triggers by invalidating this query's key after a 401 of its own (see
+  // App.tsx's QueryCache.onError). ProtectedLayout renders a full-screen
+  // spinner while `isLoading` is true, which unmounts and remounts <Login />
+  // -- wiping any in-progress email/password input. Only the very FIRST
+  // resolution (success or error) should count as "loading"; every
+  // subsequent refetch should be invisible to consumers already showing the
+  // login screen. `hasResolvedOnce` latches true the first time the query
+  // leaves its loading state and never resets — set during render (React's
+  // documented "adjusting state during rendering" pattern) rather than in an
+  // effect, so the latch applies to the very render that needs it instead of
+  // one tick later.
+  const [prevUserLoading, setPrevUserLoading] = useState(userLoading)
+  const [hasResolvedOnce, setHasResolvedOnce] = useState(false)
+  if (userLoading !== prevUserLoading) {
+    setPrevUserLoading(userLoading)
+    if (!userLoading) {
+      setHasResolvedOnce(true)
+    }
+  }
+
   const { mutateAsync: logout } = useMutation({
     ...logoutMutation({}),
     meta: {
@@ -59,7 +82,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const value = {
     user: user || null,
-    isLoading: userLoading,
+    isLoading: userLoading && !hasResolvedOnce,
     error: userError as Error | null,
     logout: async () => {
       await logout({})
