@@ -5,6 +5,7 @@ import {
   createProjectMutation,
   getRepositoryBranchesOptions,
   getRepositoryPresetLiveOptions,
+  detectPublicPresetsOptions,
   getRepositoryEnvExampleLiveOptions,
   detectPublicEnvExampleOptions,
   getRepositoryComposeServicesLiveOptions,
@@ -12,6 +13,7 @@ import {
   listPresetsOptions,
   revealServiceEnvironmentVariablesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { detectPublicPresets } from '@/api/client/sdk.gen'
 import {
   CreatableServiceTypeRoute,
   RepositoryResponse,
@@ -115,6 +117,7 @@ import {
   toggleDatabaseSelection,
 } from '@/lib/template-service-requirements'
 import { useAllServices } from '@/hooks/useAllServices'
+import { detectedPortForSelection } from '@/lib/dockerfile-port'
 
 // Derives a browsable repo URL from whatever the API gave us. clone_url is an
 // HTTPS URL (possibly `.git`-suffixed) for connected providers, but for the
@@ -561,17 +564,14 @@ interface ProjectConfiguratorProps {
 
   // Optional data
   branches?: BranchInfo[]
-  /** Pre-loaded preset data (for public repos or when already fetched) */
+  /** Pre-loaded preset data for callers that already fetched it */
   presetData?: ProjectPresetResponse[]
   /**
    * Overrides the "Refresh" button's default behavior of refetching this
-   * component's own `getRepositoryPresetLive` query. Required whenever
+   * component's own preset query. Required whenever
    * `presetData` is supplied: that internal query is keyed on `repository.id`,
    * which is a real value only when the repo comes from `getRepositoryById`.
-   * Callers that source presets another way (e.g. `detectPublicPresets` for a
-   * public "git URL" import, where `repository.id` is a synthetic `0`) must
-   * pass their own refetch here, or the button will hit a nonexistent
-   * `repositories/0` route.
+   * Callers that source presets another way must pass their own refetch here.
    */
   onRefreshPresets?: () => Promise<unknown>
   /**
@@ -751,22 +751,54 @@ export function ProjectConfigurator({
     name: 'rootDirectory',
   })
 
-  // Fetch preset data (will refetch when branch changes due to query key)
-  // Skip fetching if presetData is already provided (e.g., for public repos)
+  // Fetch connected preset data (will refetch when branch changes due to query key).
   const {
     data: fetchedPresetData,
-    isLoading: presetLoading,
-    isFetching: presetFetching,
-    error: presetError,
+    isLoading: connectedPresetLoading,
+    isFetching: connectedPresetFetching,
+    error: connectedPresetError,
     refetch: refetchPresets,
   } = useQuery({
     ...getRepositoryPresetLiveOptions({
       path: { repository_id: repository.id || 0 },
       query: { branch: selectedBranch },
     }),
-    enabled: !providedPresetData && !!repository.id && !!selectedBranch,
+    enabled:
+      !providedPresetData &&
+      !publicRepo &&
+      !!repository.id &&
+      !!selectedBranch,
     // Key includes branch, so React Query will refetch when branch changes
   })
+
+  const publicPresetQueryOptions = detectPublicPresetsOptions({
+    path: {
+      provider: publicRepo?.provider || 'github',
+      owner: publicRepo?.owner || '',
+      repo: publicRepo?.repo || '',
+    },
+    query: {
+      branch: selectedBranch,
+      base_url: publicRepo?.baseUrl,
+    },
+  })
+  const {
+    data: fetchedPublicPresetData,
+    isLoading: publicPresetLoading,
+    isFetching: publicPresetFetching,
+    error: publicPresetError,
+  } = useQuery({
+    ...publicPresetQueryOptions,
+    enabled: !providedPresetData && !!publicRepo && !!selectedBranch,
+  })
+
+  const presetLoading = publicRepo
+    ? publicPresetLoading
+    : connectedPresetLoading
+  const presetFetching = publicRepo
+    ? publicPresetFetching
+    : connectedPresetFetching
+  const presetError = publicRepo ? publicPresetError : connectedPresetError
 
   // Holds the manual "Refresh" click for a minimum visible duration so a
   // fast response doesn't cut the spin icon off before it completes a turn.
@@ -775,9 +807,33 @@ export function ProjectConfigurator({
   const handleRefreshPresets = async () => {
     setIsManuallyRefreshingPresets(true)
     try {
-      await withMinDuration(() =>
-        onRefreshPresets ? onRefreshPresets() : refetchPresets()
-      )
+      await withMinDuration(async () => {
+        if (onRefreshPresets) {
+          await onRefreshPresets()
+          return
+        }
+        if (publicRepo) {
+          const response = await detectPublicPresets({
+            path: {
+              provider: publicRepo.provider,
+              owner: publicRepo.owner,
+              repo: publicRepo.repo,
+            },
+            query: {
+              branch: selectedBranch,
+              base_url: publicRepo.baseUrl,
+              fresh: true,
+            },
+            throwOnError: true,
+          })
+          queryClient.setQueryData(
+            publicPresetQueryOptions.queryKey,
+            response.data
+          )
+          return
+        }
+        await refetchPresets()
+      })
     } finally {
       setIsManuallyRefreshingPresets(false)
     }
@@ -789,8 +845,21 @@ export function ProjectConfigurator({
     if (providedPresetData) {
       return { presets: providedPresetData }
     }
+    if (fetchedPublicPresetData) {
+      return {
+        presets: fetchedPublicPresetData.presets.map((preset) => ({
+          preset: preset.preset,
+          presetLabel: preset.preset_label,
+          exposedPort: preset.exposed_port,
+          iconUrl: preset.icon_url,
+          projectType: preset.project_type,
+          path: preset.path,
+          composeFiles: preset.compose_files,
+        })),
+      }
+    }
     return fetchedPresetData
-  }, [providedPresetData, fetchedPresetData])
+  }, [providedPresetData, fetchedPublicPresetData, fetchedPresetData])
 
   // Detect a .env.example (or common variant) directly inside the selected
   // project root. Including the root directory in the query key makes preset
@@ -987,11 +1056,50 @@ export function ProjectConfigurator({
     control: form.control,
     name: 'preset',
   })
+  const selectedPort = useWatch({
+    control: form.control,
+    name: 'port',
+  })
+  const selectedDockerfilePath = useWatch({
+    control: form.control,
+    name: 'dockerfilePath',
+  })
+  const detectedPresetPort = useMemo(
+    () => detectedPortForSelection(presetData?.presets, selectedPreset),
+    [presetData?.presets, selectedPreset]
+  )
+  const selectedPresetName = selectedPreset?.split('::')[0]?.toLowerCase()
+  const effectiveDetectedPort =
+    selectedPresetName === 'dockerfile' &&
+    (selectedDockerfilePath || 'Dockerfile') === 'Dockerfile'
+      ? detectedPresetPort
+      : undefined
+  const hasDockerfilePortMismatch =
+    selectedPresetName === 'dockerfile' &&
+    effectiveDetectedPort !== undefined &&
+    selectedPort !== undefined &&
+    selectedPort !== effectiveDetectedPort
+  const portWasManuallyEdited = useRef(false)
+
   // Auto-update port based on selected preset
   useEffect(() => {
-    if (!selectedPreset || !allPresetsData?.presets) {
+    if (!selectedPreset) {
       return
     }
+
+    if (portWasManuallyEdited.current) {
+      return
+    }
+
+    if (effectiveDetectedPort !== undefined) {
+      form.setValue('port', effectiveDetectedPort, {
+        shouldValidate: true,
+        shouldDirty: false,
+      })
+      return
+    }
+
+    if (!allPresetsData?.presets) return
 
     // Extract preset name from "preset::path" format
     const [presetName] = selectedPreset.split('::')
@@ -1012,7 +1120,7 @@ export function ProjectConfigurator({
         shouldDirty: false,
       })
     }
-  }, [selectedPreset, allPresetsData, form])
+  }, [selectedPreset, effectiveDetectedPort, allPresetsData, form])
 
   // Environment variable management
   const addEnvironmentVariable = () => {
@@ -1505,14 +1613,30 @@ export function ProjectConfigurator({
                   onBlur={field.onBlur}
                   value={field.value ?? 3000}
                   onChange={(e) => {
+                    portWasManuallyEdited.current = true
                     const v = e.target.valueAsNumber
                     field.onChange(Number.isNaN(v) ? undefined : v)
                   }}
                 />
               </FormControl>
               <p className="text-xs text-muted-foreground">
-                Port your application will listen on (e.g., 3000, 8080)
+                {effectiveDetectedPort !== undefined
+                  ? `Detected from EXPOSE ${effectiveDetectedPort} in this Dockerfile.`
+                  : 'Port your application will listen on (e.g., 3000, 8080)'}
               </p>
+              {hasDockerfilePortMismatch && (
+                <Alert variant="destructive" className="mt-2">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription>
+                    This Dockerfile exposes port {effectiveDetectedPort}, but
+                    the project is configured for port {selectedPort}. Temps
+                    routes to the exposed image port after the build, so an app
+                    that listens on the configured PORT value may fail its
+                    health check. Make these ports match unless your startup
+                    command intentionally ignores PORT.
+                  </AlertDescription>
+                </Alert>
+              )}
               <FormMessage />
             </FormItem>
           )}
