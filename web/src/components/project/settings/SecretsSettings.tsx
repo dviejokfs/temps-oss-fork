@@ -9,6 +9,7 @@ import {
   listProjectSecretsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
+import { EmptyState } from '@/components/ui/empty-state'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -145,9 +146,17 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
           <Skeleton className="h-12 w-full" />
         </div>
       ) : secrets.length === 0 ? (
-        <div className="border border-dashed rounded-md p-8 text-center text-sm text-muted-foreground">
-          No secrets yet. Click <strong>New secret</strong> to add one.
-        </div>
+        <EmptyState
+          icon={FileLock2}
+          title="No secrets yet"
+          description="Secrets are mounted into your containers as read-only files. Add one to get started."
+          action={
+            <Button onClick={() => setIsCreateOpen(true)}>
+              <Plus className="h-4 w-4 mr-1" />
+              New secret
+            </Button>
+          }
+        />
       ) : (
         <div className="border rounded-md divide-y">
           {secrets.map((s) => (

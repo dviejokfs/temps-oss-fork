@@ -24,8 +24,9 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { EmptyState } from '@/components/ui/empty-state'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { EllipsisVertical } from 'lucide-react'
+import { EllipsisVertical, Globe } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { AddDomainDialog } from './AddDomainDialog'
@@ -150,9 +151,12 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           ))}
         </div>
       ) : (
-        <div className="text-sm text-muted-foreground">
-          No domains configured yet. Add a domain to get started.
-        </div>
+        <EmptyState
+          icon={Globe}
+          title="No domains configured yet"
+          description="Add a domain to get started."
+          action={<Button onClick={() => setIsAddDialogOpen(true)}>Add Domain</Button>}
+        />
       )}
 
       <AddDomainDialog
