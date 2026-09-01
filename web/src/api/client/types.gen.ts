@@ -1008,6 +1008,51 @@ export type AllocEntry = {
     underlay_address: string;
 };
 
+/**
+ * An analytics ingest key as returned by the admin API.
+ *
+ * `public_key` is present in full on every response — see the module docs.
+ */
+export type AnalyticsIngestKey = {
+    /**
+     * Exact origins (`scheme://host[:port]`) permitted to use this key from a
+     * browser. `None` or `[]` means any origin. This is a browser-enforced
+     * convenience control, not authentication — a non-browser client ignores
+     * `Origin` entirely.
+     */
+    allowed_origins?: Array<string> | null;
+    created_at: string;
+    created_by_user_id?: number | null;
+    /**
+     * `None` means the key is scoped to the whole project. An
+     * environment-scoped key additionally attributes ingested data to that
+     * environment's current deployment, when it has one.
+     */
+    environment_id?: number | null;
+    event_count: number;
+    id: number;
+    is_active: boolean;
+    last_used_at?: string | null;
+    /**
+     * Operator-facing label.
+     */
+    name: string;
+    project_id: number;
+    /**
+     * The ingest key itself, `pa_` + 64 hex characters.
+     *
+     * **Not a secret.** It is designed to ship in client-side JavaScript and
+     * is returned unmasked so operators can copy it. See the module docs.
+     */
+    public_key: string;
+    /**
+     * `None` or `<= 0` means unlimited.
+     */
+    rate_limit_per_minute?: number | null;
+    revoked_at?: string | null;
+    updated_at: string;
+};
+
 export type AnalyticsSessionEventsResponse = {
     events: Array<SessionEvent>;
     session_id: string;
@@ -3734,6 +3779,32 @@ export type CreateAlertRuleRequest = {
      * Trigger type: new_issue, regression, frequency, new_user, user_count, status_change
      */
     trigger_type: string;
+};
+
+/**
+ * Request body for minting a new ingest key.
+ */
+export type CreateAnalyticsIngestKeyRequest = {
+    /**
+     * Exact origins permitted to use this key from a browser. Omit or send an
+     * empty array to allow any origin.
+     */
+    allowed_origins?: Array<string> | null;
+    /**
+     * Scope the key to a single environment. Recommended: it lets Temps
+     * attribute ingested data to that environment's current deployment.
+     * Omit for a project-wide key.
+     */
+    environment_id?: number | null;
+    /**
+     * Operator-facing label. Defaults to "Default ingest key".
+     */
+    name?: string | null;
+    /**
+     * Requests per minute for this key. Omit for the 600/min default; send a
+     * non-positive value for unlimited.
+     */
+    rate_limit_per_minute?: number | null;
 };
 
 export type CreateApiKeyRequest = {
@@ -7523,6 +7594,14 @@ export type EventMetricsPayload = {
      * Cumulative Layout Shift (score)
      */
     cls?: number | null;
+    /**
+     * The tracked site's own domain, computed client-side by the SDK's
+     * `resolveDomain()` and sent as a sibling of `event_data` (not nested
+     * inside it). Used on the keyed ingest path (ADR-040 §3) to attribute
+     * self-referrals/channels correctly: there, `Host` names the Temps
+     * server rather than the customer's site, so it can't be used for that.
+     */
+    domain?: string | null;
     event_data: unknown;
     event_name: string;
     /**
@@ -7552,11 +7631,23 @@ export type EventMetricsPayload = {
     screen_height?: number | null;
     screen_width?: number | null;
     /**
+     * Client-generated session id fallback (see `visitor_id`).
+     */
+    session_id?: string | null;
+    /**
      * Time to First Byte (milliseconds)
      */
     ttfb?: number | null;
     viewport_height?: number | null;
     viewport_width?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     * Accepts the SDK's `visitorId` key too, since the shared SDK helper that
+     * generates this value sends camelCase for every ingest endpoint.
+     */
+    visitor_id?: string | null;
 };
 
 /**
@@ -17101,6 +17192,13 @@ export type SessionReplayInitRequest = {
     userAgent?: string | null;
     viewportHeight?: number | null;
     viewportWidth?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     * The SDK already sends this today via `getSessionMetadata()`.
+     */
+    visitorId?: string | null;
 };
 
 export type SessionReplayInitResponse = {
@@ -18005,6 +18103,10 @@ export type SpeedMetricsPayload = {
      */
     screenWidth?: number | null;
     /**
+     * Client-generated session id fallback (see `visitor_id`).
+     */
+    sessionId?: string | null;
+    /**
      * Time to First Byte (milliseconds)
      */
     ttfb?: number | null;
@@ -18016,6 +18118,12 @@ export type SpeedMetricsPayload = {
      * Viewport width in pixels
      */
     viewportWidth?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     */
+    visitorId?: string | null;
 };
 
 /**
@@ -19471,6 +19579,30 @@ export type UpdateAlertRuleRequest = {
     notification_priority?: string | null;
     trigger_config?: unknown;
     trigger_type?: string | null;
+};
+
+/**
+ * Request body for a partial update.
+ *
+ * `allowed_origins` and `rate_limit_per_minute` use the three-state
+ * double-`Option` encoding: field absent = leave unchanged, explicit `null` =
+ * clear, value = set. Plain `Option<Option<T>>` alone cannot express this
+ * because serde collapses an explicit JSON `null` into the outer `None`.
+ */
+export type UpdateAnalyticsIngestKeyRequest = {
+    /**
+     * Absent = unchanged, `null` = clear (any origin allowed), array = replace.
+     */
+    allowed_origins?: Array<string> | null;
+    /**
+     * New operator-facing label. Absent leaves it unchanged. The column is
+     * `NOT NULL`, so there is no "clear" state — send a new label instead.
+     */
+    name?: string | null;
+    /**
+     * Absent = unchanged, `null` = clear (unlimited), value = replace.
+     */
+    rate_limit_per_minute?: number | null;
 };
 
 export type UpdateApiKeyRequest = {
@@ -21758,8 +21890,19 @@ export type UploadReleaseFileResponse = UploadReleaseFileResponses[keyof UploadR
 
 export type RecordEventMetricsData = {
     body: EventMetricsPayload;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/event';
 };
 
@@ -21831,8 +21974,19 @@ export type IngestTunneledEnvelopeResponse = IngestTunneledEnvelopeResponses[key
 
 export type AddSessionReplayEventsData = {
     body: SessionReplayEventsRequest;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used to flush the final replay batch on page unload). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/session-replay/events';
 };
 
@@ -21864,8 +22018,19 @@ export type AddSessionReplayEventsResponse = AddSessionReplayEventsResponses[key
 
 export type InitSessionReplayData = {
     body: SessionReplayInitRequest;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/session-replay/init';
 };
 
@@ -21893,8 +22058,19 @@ export type InitSessionReplayResponse = InitSessionReplayResponses[keyof InitSes
 
 export type RecordSpeedMetricsData = {
     body: SpeedMetricsPayload;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/speed';
 };
 
@@ -21926,8 +22102,19 @@ export type RecordSpeedMetricsResponse = RecordSpeedMetricsResponses[keyof Recor
 
 export type UpdateSpeedMetricsData = {
     body: UpdateSpeedMetricsPayload;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers. This endpoint is called via `navigator.sendBeacon` on page unload, so the query form is the only one available there. Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/speed/update';
 };
 
@@ -41801,6 +41988,226 @@ export type SilenceAlarmResponses = {
      */
     200: unknown;
 };
+
+export type ListAnalyticsIngestKeysData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys';
+};
+
+export type ListAnalyticsIngestKeysErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListAnalyticsIngestKeysResponses = {
+    /**
+     * Ingest keys, active and revoked, newest first
+     */
+    200: Array<AnalyticsIngestKey>;
+};
+
+export type ListAnalyticsIngestKeysResponse = ListAnalyticsIngestKeysResponses[keyof ListAnalyticsIngestKeysResponses];
+
+export type CreateAnalyticsIngestKeyData = {
+    body: CreateAnalyticsIngestKeyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys';
+};
+
+export type CreateAnalyticsIngestKeyErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key created
+     */
+    201: AnalyticsIngestKey;
+};
+
+export type CreateAnalyticsIngestKeyResponse = CreateAnalyticsIngestKeyResponses[keyof CreateAnalyticsIngestKeyResponses];
+
+export type UpdateAnalyticsIngestKeyData = {
+    body: UpdateAnalyticsIngestKeyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Analytics ingest key ID
+         */
+        key_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys/{key_id}';
+};
+
+export type UpdateAnalyticsIngestKeyErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Ingest key not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key updated
+     */
+    200: AnalyticsIngestKey;
+};
+
+export type UpdateAnalyticsIngestKeyResponse = UpdateAnalyticsIngestKeyResponses[keyof UpdateAnalyticsIngestKeyResponses];
+
+export type RevokeAnalyticsIngestKeyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Analytics ingest key ID
+         */
+        key_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys/{key_id}/revoke';
+};
+
+export type RevokeAnalyticsIngestKeyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Ingest key not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevokeAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key revoked
+     */
+    204: void;
+};
+
+export type RevokeAnalyticsIngestKeyResponse = RevokeAnalyticsIngestKeyResponses[keyof RevokeAnalyticsIngestKeyResponses];
+
+export type RotateAnalyticsIngestKeyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Analytics ingest key ID
+         */
+        key_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys/{key_id}/rotate';
+};
+
+export type RotateAnalyticsIngestKeyErrors = {
+    /**
+     * The key is revoked and cannot be rotated
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Ingest key not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RotateAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key rotated
+     */
+    200: AnalyticsIngestKey;
+};
+
+export type RotateAnalyticsIngestKeyResponse = RotateAnalyticsIngestKeyResponses[keyof RotateAnalyticsIngestKeyResponses];
 
 export type GetApiCallersData = {
     body?: never;
