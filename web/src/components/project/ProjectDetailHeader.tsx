@@ -127,10 +127,10 @@ export function ProjectDetailHeader({
               {project.slug}
             </h1>
             <Badge
-              variant={project.last_deployment ? 'default' : 'outline'}
+              variant={lastDeployment ? 'default' : 'outline'}
               className="hidden sm:inline-flex shrink-0"
             >
-              {project.last_deployment ? 'Deployed' : 'Not deployed'}
+              {lastDeployment ? 'Deployed' : 'Not deployed'}
             </Badge>
             <Link
               to={`/projects/${project.slug}/monitors`}
