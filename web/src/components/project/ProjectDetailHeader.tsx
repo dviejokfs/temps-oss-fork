@@ -87,6 +87,11 @@ export function ProjectDetailHeader({
     windowHours: 1,
   })
   const screenshotLocation = lastDeployment?.screenshot_location
+  // Mirrors the backend: project.last_deployment is only stamped once a
+  // deployment job reaches a successful terminal state (mark_deployment_complete.rs),
+  // never for pending/running/failed deployments.
+  const hasCompletedDeployment =
+    lastDeployment?.status === 'completed' || lastDeployment?.status === 'deployed'
   const repositoryUrl = repositoryCloneUrl
     ? repositoryWebUrl(repositoryCloneUrl)
     : null
@@ -127,10 +132,10 @@ export function ProjectDetailHeader({
               {project.slug}
             </h1>
             <Badge
-              variant={lastDeployment ? 'default' : 'outline'}
+              variant={hasCompletedDeployment ? 'default' : 'outline'}
               className="hidden sm:inline-flex shrink-0"
             >
-              {lastDeployment ? 'Deployed' : 'Not deployed'}
+              {hasCompletedDeployment ? 'Deployed' : 'Not deployed'}
             </Badge>
             <Link
               to={`/projects/${project.slug}/monitors`}
