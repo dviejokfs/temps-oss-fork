@@ -87,11 +87,15 @@ export function ProjectDetailHeader({
     windowHours: 1,
   })
   const screenshotLocation = lastDeployment?.screenshot_location
-  // Mirrors the backend: project.last_deployment is only stamped once a
-  // deployment job reaches a successful terminal state (mark_deployment_complete.rs),
-  // never for pending/running/failed deployments.
+  // getLastDeploymentOptions returns the most recent deployment by created_at,
+  // not necessarily the one actually live -- get_last_deployment (services.rs)
+  // computes is_current separately by checking each environment's
+  // current_deployment_id. A completed-but-superseded deployment (e.g. after
+  // a rollback to an older one) must not read as "Deployed" just because its
+  // own build succeeded once.
   const hasCompletedDeployment =
-    lastDeployment?.status === 'completed' || lastDeployment?.status === 'deployed'
+    !!lastDeployment?.is_current &&
+    (lastDeployment?.status === 'completed' || lastDeployment?.status === 'deployed')
   const repositoryUrl = repositoryCloneUrl
     ? repositoryWebUrl(repositoryCloneUrl)
     : null
