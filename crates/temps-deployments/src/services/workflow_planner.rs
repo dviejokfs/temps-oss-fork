@@ -1177,52 +1177,6 @@ impl WorkflowPlanner {
         Ok(created_jobs)
     }
 
-    /// Explicit port override configured at the environment or project scope,
-    /// in that priority order. `None` means neither scope configures one, in
-    /// which case the deploy job falls back to image `EXPOSE` auto-detection
-    /// and finally the default port.
-    ///
-    /// This is shared between `resolve_exposed_port()` (which also needs a
-    /// concrete fallback for the `PORT` env var / job config default) and the
-    /// job planner call sites, which additionally stash this value verbatim
-    /// as `job_config["configured_port"]` so `DeployImageJob::resolve_container_port()`
-    /// can tell "explicitly configured" apart from "defaulted to 3000" —
-    /// otherwise an explicit override of 3000 would be indistinguishable from
-    /// no override at all, and image `EXPOSE` detection would incorrectly
-    /// take precedence over it.
-    fn configured_port_override(
-        environment: &environments::Model,
-        project: &projects::Model,
-    ) -> Option<u16> {
-        // 1. Environment-level port override (from deployment_config)
-        if let Some(port) = environment
-            .deployment_config
-            .as_ref()
-            .and_then(|c| c.exposed_port)
-        {
-            debug!(
-                "Using environment-level port override: {} (environment: {})",
-                port, environment.name
-            );
-            return Some(port as u16);
-        }
-
-        // 2. Project-level port override (from deployment_config)
-        if let Some(port) = project
-            .deployment_config
-            .as_ref()
-            .and_then(|c| c.exposed_port)
-        {
-            debug!(
-                "Using project-level port override: {} (project: {})",
-                port, project.name
-            );
-            return Some(port as u16);
-        }
-
-        None
-    }
-
     /// Determine the fallback port configuration for the container
     ///
     /// This method resolves manual port overrides during job planning.
@@ -1237,8 +1191,8 @@ impl WorkflowPlanner {
     /// Note: Image inspection happens in the deploy job (after build completes),
     /// not during planning, since the image doesn't exist yet at planning time.
     /// This method only returns the value used as fallback/default (steps 1, 2
-    /// and 4); callers must separately consult `configured_port_override()` to
-    /// pass the "was this explicit" distinction through to the deploy job.
+    /// and 4); callers must separately consult `super::port_resolver::configured_port_override()`
+    /// to pass the "was this explicit" distinction through to the deploy job.
     ///
     /// # Arguments
     /// * `environment` - Environment model with optional exposed_port
@@ -1250,7 +1204,7 @@ impl WorkflowPlanner {
         project: &projects::Model,
         _image_name: Option<&str>, // Unused - inspection happens in deploy job after build
     ) -> u16 {
-        if let Some(port) = Self::configured_port_override(environment, project) {
+        if let Some(port) = super::port_resolver::configured_port_override(environment, project) {
             return port;
         }
 
@@ -1833,7 +1787,8 @@ impl WorkflowPlanner {
             let exposed_port = self
                 .resolve_exposed_port(environment, project, Some(&image_name))
                 .await;
-            let configured_port = Self::configured_port_override(environment, project);
+            let configured_port =
+                super::port_resolver::configured_port_override(environment, project);
 
             debug!(
                 "📡 Container will expose port {} (image: {})",
@@ -2469,7 +2424,7 @@ impl WorkflowPlanner {
         let exposed_port = self
             .resolve_exposed_port(environment, project, Some(&external_image_ref))
             .await;
-        let configured_port = Self::configured_port_override(environment, project);
+        let configured_port = super::port_resolver::configured_port_override(environment, project);
 
         // Release identity for image deploys. Unlike git builds (which have a
         // commit SHA), an image deploy is pinned to an image tag/digest — that

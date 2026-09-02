@@ -2353,17 +2353,9 @@ impl DeploymentService {
 
             // Step 1: Execute DeployImageJob with external image
             // Use the NEW rollback slug as the container name (not the old deployment's slug)
-            let exposed_port = environment
-                .deployment_config
-                .as_ref()
-                .and_then(|config| config.exposed_port)
-                .or_else(|| {
-                    project
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|config| config.exposed_port)
-                })
-                .unwrap_or(3000) as u32;
+            let configured_port =
+                super::port_resolver::configured_port_override(&environment, &project);
+            let exposed_port = configured_port.map(u32::from).unwrap_or(3000);
             let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
                 .job_id("deploy_container".to_string())
                 .build_job_id("external-image".to_string())
@@ -2387,6 +2379,7 @@ impl DeploymentService {
                         .unwrap_or(1),
                 )
                 .port(exposed_port)
+                .configured_port(configured_port)
                 .log_id(deploy_log_id.clone())
                 .log_service(self.log_service.clone());
 
@@ -3027,17 +3020,9 @@ impl DeploymentService {
             info!("Promotion: Deploying image: {}", image_name);
 
             // Execute DeployImageJob with external image
-            let exposed_port = target_env
-                .deployment_config
-                .as_ref()
-                .and_then(|config| config.exposed_port)
-                .or_else(|| {
-                    project
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|config| config.exposed_port)
-                })
-                .unwrap_or(3000) as u32;
+            let configured_port =
+                super::port_resolver::configured_port_override(&target_env, &project);
+            let exposed_port = configured_port.map(u32::from).unwrap_or(3000);
             let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
                 .job_id("deploy_container".to_string())
                 .build_job_id("external-image".to_string())
@@ -3061,6 +3046,7 @@ impl DeploymentService {
                         .unwrap_or(1),
                 )
                 .port(exposed_port)
+                .configured_port(configured_port)
                 .log_id(deploy_log_id.clone())
                 .log_service(self.log_service.clone());
 

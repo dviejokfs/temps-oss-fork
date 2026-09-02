@@ -260,9 +260,12 @@ pub struct DeploymentJobConfig {
     pub namespace: String,
     pub service_name: String,
     pub replicas: u32,
-    /// Fallback container port: the environment/project-configured port when
-    /// set, otherwise the default (3000). Used when `configured_port` is
-    /// `None` and image `EXPOSE` auto-detection finds nothing either.
+    /// Fallback container port, used when `configured_port` is `None` and
+    /// image `EXPOSE` auto-detection finds nothing either. Every caller that
+    /// builds a real deployment job resolves and sets this explicitly (3000
+    /// when neither environment nor project configures a port); the `8080`
+    /// in [`Default::default`] below is only a placeholder for tests and is
+    /// never meant to reach `resolve_container_port()` unmodified.
     pub port: u32,
     /// Explicit port override from the environment or project scope (in that
     /// priority order), as resolved by the job planner. When `Some`, this

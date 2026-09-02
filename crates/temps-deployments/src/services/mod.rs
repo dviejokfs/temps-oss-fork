@@ -20,6 +20,9 @@ pub use managed_environment_variables::*;
 pub mod env_resolver;
 pub use env_resolver::*;
 
+pub mod port_resolver;
+pub use port_resolver::*;
+
 pub mod workflow_execution_service;
 pub use workflow_execution_service::*;
 
