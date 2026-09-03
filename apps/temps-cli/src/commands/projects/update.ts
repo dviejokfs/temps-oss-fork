@@ -258,7 +258,14 @@ export async function updateSettingsAction(
   keyValue('Slug', updated?.slug ?? slug ?? project.slug)
   keyValue('Attack Mode', attackMode ? colors.success('Enabled') : colors.muted('Disabled'))
   keyValue('Preview Environments', previewEnvs ? colors.success('Enabled') : colors.muted('Disabled'))
-  keyValue('Vulnerability Scanning', vulnerabilityScanning ? colors.success('Enabled') : colors.muted('Disabled'))
+  keyValue(
+    'Vulnerability Scanning',
+    (updated?.vulnerability_scanning_enabled ??
+      vulnerabilityScanning ??
+      project.vulnerability_scanning_enabled)
+      ? colors.success('Enabled')
+      : colors.muted('Disabled')
+  )
 
   const effectiveRetention =
     imageRetentionHours !== undefined

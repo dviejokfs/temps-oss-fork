@@ -28,6 +28,7 @@ import {
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { InfoIcon, MessageSquare, Shield } from 'lucide-react'
+import { useEffect, useRef } from 'react'
 import { useForm, Controller, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { useMutation } from '@tanstack/react-query'
@@ -92,6 +93,7 @@ export function ProjectSecuritySettings({
     handleSubmit,
     setValue,
     watch,
+    reset,
     formState: { isDirty, isSubmitting },
   } = useForm<FormData>({
     defaultValues: {
@@ -138,6 +140,65 @@ export function ProjectSecuritySettings({
       },
     },
   })
+
+  // `defaultValues` are only read on mount, but this component stays mounted
+  // when the route switches between two projects' settings pages. Without
+  // this reset the form would still hold the previous project's toggles, and
+  // Save would apply the old project's attack mode / AI / vulnerability
+  // scanning choices to the newly-selected project.
+  //
+  // Keyed on the project *identity*, not its values: a plain refetch of the
+  // same project must not overwrite whatever the user is currently editing.
+  const syncedProjectId = useRef<number | undefined>(undefined)
+  useEffect(() => {
+    if (project?.id === undefined || syncedProjectId.current === project.id) {
+      return
+    }
+    syncedProjectId.current = project.id
+    reset({
+      attack_mode: project.attack_mode ?? false,
+      ai_debug_chat_enabled: project.ai_debug_chat_enabled ?? true,
+      ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
+      ai_api_traffic_summary_enabled:
+        project.ai_api_traffic_summary_enabled ?? false,
+      ai_write_actions_enabled: project.ai_write_actions_enabled ?? false,
+      vulnerability_scanning_enabled:
+        project.vulnerability_scanning_enabled ?? false,
+      security: {
+        enabled: project.deployment_config?.security?.enabled ?? undefined,
+        headers: {
+          preset:
+            project.deployment_config?.security?.headers?.preset ?? undefined,
+          contentSecurityPolicy:
+            project.deployment_config?.security?.headers
+              ?.contentSecurityPolicy ?? undefined,
+          xFrameOptions:
+            project.deployment_config?.security?.headers?.xFrameOptions ??
+            undefined,
+          strictTransportSecurity:
+            project.deployment_config?.security?.headers
+              ?.strictTransportSecurity ?? undefined,
+          referrerPolicy:
+            project.deployment_config?.security?.headers?.referrerPolicy ??
+            undefined,
+        },
+        rateLimiting: {
+          maxRequestsPerMinute:
+            project.deployment_config?.security?.rateLimiting
+              ?.maxRequestsPerMinute ?? undefined,
+          maxRequestsPerHour:
+            project.deployment_config?.security?.rateLimiting
+              ?.maxRequestsPerHour ?? undefined,
+          whitelistIps:
+            project.deployment_config?.security?.rateLimiting?.whitelistIps ??
+            [],
+          blacklistIps:
+            project.deployment_config?.security?.rateLimiting?.blacklistIps ??
+            [],
+        },
+      },
+    })
+  }, [project, reset])
 
   const securityConfig = useWatch({ control, name: 'security' })
 
