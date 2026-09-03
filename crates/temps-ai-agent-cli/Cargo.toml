@@ -27,3 +27,4 @@ subtle = "2.6"
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tower = { workspace = true }

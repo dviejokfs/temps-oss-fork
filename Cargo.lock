@@ -10404,6 +10404,7 @@ dependencies = [
  "temps-agents",
  "temps-ai",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]
