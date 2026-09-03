@@ -65,6 +65,7 @@ interface FormData {
   ai_alert_summaries_enabled?: boolean
   ai_api_traffic_summary_enabled?: boolean
   ai_write_actions_enabled?: boolean
+  vulnerability_scanning_enabled?: boolean
 }
 
 export function ProjectSecuritySettings({
@@ -100,6 +101,8 @@ export function ProjectSecuritySettings({
       ai_api_traffic_summary_enabled:
         project.ai_api_traffic_summary_enabled ?? false,
       ai_write_actions_enabled: project.ai_write_actions_enabled ?? false,
+      vulnerability_scanning_enabled:
+        project.vulnerability_scanning_enabled ?? false,
       security: {
         enabled: project.deployment_config?.security?.enabled ?? undefined,
         headers: {
@@ -149,6 +152,7 @@ export function ProjectSecuritySettings({
         ai_alert_summaries_enabled?: boolean
         ai_api_traffic_summary_enabled?: boolean
         ai_write_actions_enabled?: boolean
+        vulnerability_scanning_enabled?: boolean
       } = {}
       if (data.attack_mode !== project.attack_mode) {
         projectSettings.attack_mode = data.attack_mode
@@ -178,6 +182,13 @@ export function ProjectSecuritySettings({
         (project.ai_write_actions_enabled ?? false)
       ) {
         projectSettings.ai_write_actions_enabled = data.ai_write_actions_enabled
+      }
+      if (
+        (data.vulnerability_scanning_enabled ?? false) !==
+        (project.vulnerability_scanning_enabled ?? false)
+      ) {
+        projectSettings.vulnerability_scanning_enabled =
+          data.vulnerability_scanning_enabled
       }
 
       if (Object.keys(projectSettings).length > 0) {
@@ -440,6 +451,48 @@ export function ProjectSecuritySettings({
         <CardFooter>
           <Button type="submit" disabled={!isDirty || isSubmitting}>
             Save AI Settings
+          </Button>
+        </CardFooter>
+      </Card>
+
+      {/* Vulnerability Scanning Card */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Shield className="h-5 w-5" />
+            Vulnerability Scanning
+          </CardTitle>
+          <CardDescription>
+            Automatically scan deployed Docker images for known vulnerabilities
+            using Trivy, after every deployment and daily
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label htmlFor="vulnerability-scanning">
+                Enable vulnerability scanning
+              </Label>
+              <p className="text-sm text-muted-foreground">
+                Scan this project&apos;s deployed Docker images for known CVEs,
+                categorized by severity, after every deploy and once daily. Off
+                by default.
+              </p>
+            </div>
+            <Switch
+              id="vulnerability-scanning"
+              checked={watch('vulnerability_scanning_enabled') ?? false}
+              onCheckedChange={(checked) =>
+                setValue('vulnerability_scanning_enabled', checked, {
+                  shouldDirty: true,
+                })
+              }
+            />
+          </div>
+        </CardContent>
+        <CardFooter>
+          <Button type="submit" disabled={!isDirty || isSubmitting}>
+            Save Vulnerability Scanning Settings
           </Button>
         </CardFooter>
       </Card>
