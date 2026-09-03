@@ -13921,6 +13921,11 @@ export type ProjectResponse = {
      */
     source_type: SourceType;
     updated_at: number;
+    /**
+     * Opt-in Trivy vulnerability scanning of this project's deployed Docker
+     * images. Off by default — project owners explicitly enable it.
+     */
+    vulnerability_scanning_enabled: boolean;
 };
 
 export type ProjectSecretEnvironmentInfo = {
@@ -20729,6 +20734,11 @@ export type UpdateProjectSettingsRequest = {
     repo_name?: string | null;
     repo_owner?: string | null;
     slug?: string | null;
+    /**
+     * Opt in to Trivy vulnerability scanning of this project's deployed Docker
+     * images (post-deployment scan + daily rescans). Off by default.
+     */
+    vulnerability_scanning_enabled?: boolean | null;
 };
 
 /**
