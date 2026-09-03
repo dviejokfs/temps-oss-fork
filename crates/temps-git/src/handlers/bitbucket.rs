@@ -428,6 +428,7 @@ mod tests {
             ai_write_actions_enabled: false,
             cross_project_trace_sharing: true,
             error_source_context_enabled: false,
+            vulnerability_scanning_enabled: false,
             error_source_root: None,
             image_retention_hours: None,
             enable_preview_environments: false,

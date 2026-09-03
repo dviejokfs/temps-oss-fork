@@ -357,6 +357,9 @@ pub struct ProjectResponse {
     /// Opt-in to native error-tracking source context (false = off). When on,
     /// Temps stores uploaded source files and shows source code in stack traces.
     pub error_source_context_enabled: bool,
+    /// Opt-in Trivy vulnerability scanning of this project's deployed Docker
+    /// images. Off by default — project owners explicitly enable it.
+    pub vulnerability_scanning_enabled: bool,
     /// Where auto-capture reads source from (relative to the checkout). Null =
     /// the deployment's Docker build context.
     pub error_source_root: Option<String>,
@@ -427,6 +430,7 @@ impl ProjectResponse {
             ai_write_actions_enabled: project.ai_write_actions_enabled,
             ai_api_traffic_summary_enabled: project.ai_api_traffic_summary_enabled,
             error_source_context_enabled: project.error_source_context_enabled,
+            vulnerability_scanning_enabled: project.vulnerability_scanning_enabled,
             error_source_root: project.error_source_root,
             enable_preview_environments: project.enable_preview_environments,
             preview_envs_on_demand: project.preview_envs_on_demand,
@@ -728,6 +732,9 @@ pub struct UpdateProjectSettingsRequest {
     /// Opt in to native error-tracking source context (source-file upload +
     /// source code shown in stack traces).
     pub error_source_context_enabled: Option<bool>,
+    /// Opt in to Trivy vulnerability scanning of this project's deployed Docker
+    /// images (post-deployment scan + daily rescans). Off by default.
+    pub vulnerability_scanning_enabled: Option<bool>,
     /// Set the auto-capture source root (relative to the checkout). Send an
     /// empty string to clear it back to the build-context default. Omit to
     /// leave unchanged.
@@ -793,6 +800,7 @@ impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjec
             ai_write_actions_enabled: request.ai_write_actions_enabled,
             cross_project_trace_sharing: request.cross_project_trace_sharing,
             error_source_context_enabled: request.error_source_context_enabled,
+            vulnerability_scanning_enabled: request.vulnerability_scanning_enabled,
             error_source_root: request.error_source_root,
             ai_api_traffic_summary_enabled: request.ai_api_traffic_summary_enabled,
             image_retention_hours: request.image_retention_hours,

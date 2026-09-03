@@ -216,6 +216,7 @@ mod m20260831_000001_create_analytics_ingest_keys;
 mod m20260831_000001_create_traefik_route_certificates;
 mod m20260831_000002_backfill_acme_verification_method;
 mod m20260902_000001_backup_safety_and_provenance;
+mod m20260903_000001_add_vulnerability_scanning_enabled_to_projects;
 
 pub struct Migrator;
 
@@ -473,6 +474,9 @@ impl MigratorTrait for Migrator {
             // scheduler can dispatch them; "manual" is intentionally left untouched.
             Box::new(m20260831_000002_backfill_acme_verification_method::Migration),
             Box::new(m20260902_000001_backup_safety_and_provenance::Migration),
+            Box::new(
+                m20260903_000001_add_vulnerability_scanning_enabled_to_projects::Migration,
+            ),
         ]
     }
 }
