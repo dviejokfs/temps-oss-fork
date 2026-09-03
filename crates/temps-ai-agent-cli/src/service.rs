@@ -34,6 +34,18 @@ struct McpBridgeState {
 const MCP_EVENT_CAPACITY: usize = 32;
 const MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MCP_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Constant-time equality for the bridge's bearer token check.
+///
+/// Same primitive `temps-routes` uses for its route-sync token check
+/// (`subtle::ConstantTimeEq`), applied here as defense-in-depth: the bridge
+/// already binds to loopback on an ephemeral port behind a random per-instance
+/// path and token, but a length-preserving `==` still leaks a timing signal.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
+}
 
 async fn mcp_bridge_handler(
     axum::extract::State(state): axum::extract::State<McpBridgeState>,
@@ -43,7 +55,12 @@ async fn mcp_bridge_handler(
     let authorized = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == format!("Bearer {}", state.token));
+        .is_some_and(|value| {
+            constant_time_eq(
+                value.as_bytes(),
+                format!("Bearer {}", state.token).as_bytes(),
+            )
+        });
     if !authorized {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
@@ -197,6 +214,7 @@ impl ScopedMcpBridge {
         };
         let router = axum::Router::new()
             .route(&path, axum::routing::post(mcp_bridge_handler))
+            .layer(axum::extract::DefaultBodyLimit::max(MCP_BODY_LIMIT_BYTES))
             .with_state(state);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
