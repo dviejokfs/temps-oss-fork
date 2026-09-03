@@ -10399,10 +10399,12 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "temps-agents",
  "temps-ai",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]
