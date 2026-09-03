@@ -215,6 +215,7 @@ mod m20260830_000001_create_traefik_discovered_routes;
 mod m20260831_000001_create_analytics_ingest_keys;
 mod m20260831_000001_create_traefik_route_certificates;
 mod m20260831_000002_backfill_acme_verification_method;
+mod m20260902_000001_backup_safety_and_provenance;
 
 pub struct Migrator;
 
@@ -471,6 +472,7 @@ impl MigratorTrait for Migrator {
             // ADR-041 §7a step (b): backfill "acme"/"http" → "http-01" so the renewal
             // scheduler can dispatch them; "manual" is intentionally left untouched.
             Box::new(m20260831_000002_backfill_acme_verification_method::Migration),
+            Box::new(m20260902_000001_backup_safety_and_provenance::Migration),
         ]
     }
 }

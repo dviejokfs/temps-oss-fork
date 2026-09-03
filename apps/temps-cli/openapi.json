@@ -9327,6 +9327,14 @@
           "access_key_id": {
             "type": "string"
           },
+          "backing_service_id": {
+            "description": "Managed RustFS/S3 service that supplies this destination. When set,\nschedules using this source can never target that service itself.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "bucket_name": {
             "type": "string"
           },
@@ -16885,6 +16893,19 @@
           "service_id": {
             "format": "int32",
             "type": "integer"
+          },
+          "service_name_snapshot": {
+            "description": "Immutable provenance retained when the source service is deleted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service_type_snapshot": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "size_bytes": {
             "format": "int64",
@@ -28593,6 +28614,18 @@
             "minimum": 0,
             "type": "integer"
           },
+          "relay_dropped_batches": {
+            "description": "Cumulative count of best-effort relay batches rejected because the\nbounded relay handoff was saturated or closed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "relay_dropped_items": {
+            "description": "Cumulative signal-item count contained in rejected relay batches.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "spans_dropped": {
             "format": "int64",
             "minimum": 0,
@@ -28622,7 +28655,9 @@
           "logs_dropped",
           "ingest_errors",
           "rate_limited_requests",
-          "quota_exceeded_requests"
+          "quota_exceeded_requests",
+          "relay_dropped_batches",
+          "relay_dropped_items"
         ],
         "type": "object"
       },
@@ -28687,7 +28722,7 @@
             ]
           },
           "format": {
-            "description": "\"walg\", \"pg_dump\", \"unknown\".",
+            "description": "\"walg\", \"pg_dump\", \"mariadb_physical\", \"mariadb_dump\", \"unknown\".",
             "type": "string"
           },
           "id": {
@@ -33619,7 +33654,7 @@
             "type": "array"
           },
           "strategy": {
-            "description": "How the restore will be performed: \"walg_restore\", \"pg_dump_restore\",\nor \"unsupported\".",
+            "description": "How the restore will be performed: \"walg_restore\", \"pg_dump_restore\",\n\"mariadb_physical_restore\", \"mariadb_dump_restore\", or \"unsupported\".",
             "type": "string"
           },
           "target_service": {
@@ -33689,7 +33724,7 @@
             "type": "object"
           },
           {
-            "description": "Point-in-time recovery. Only valid on WAL-G backups (Postgres).",
+            "description": "Point-in-time recovery. Only valid on a backup that anchors a\ncontinuous change stream: a WAL-G base (Postgres) or a physical\n`mariadb-backup` base with archived binary logs (MariaDB).",
             "properties": {
               "mode": {
                 "enum": [

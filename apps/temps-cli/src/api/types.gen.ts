@@ -4579,6 +4579,11 @@ export type CreateRouteRequest = {
 
 export type CreateS3SourceRequest = {
     access_key_id: string;
+    /**
+     * Managed RustFS/S3 service that supplies this destination. When set,
+     * schedules using this source can never target that service itself.
+     */
+    backing_service_id?: number | null;
     bucket_name: string;
     bucket_path: string;
     /**
@@ -8016,6 +8021,11 @@ export type ExternalServiceBackupResponse = {
     metadata: unknown;
     s3_location: string;
     service_id: number;
+    /**
+     * Immutable provenance retained when the source service is deleted.
+     */
+    service_name_snapshot?: string | null;
+    service_type_snapshot?: string | null;
     size_bytes?: number | null;
     started_at: string;
     state: string;
@@ -13106,6 +13116,15 @@ export type PipelineStats = {
      * `otel.rate_limited_requests` (SourceKind::Node, node_id 0) every 60s.
      */
     rate_limited_requests: number;
+    /**
+     * Cumulative count of best-effort relay batches rejected because the
+     * bounded relay handoff was saturated or closed.
+     */
+    relay_dropped_batches: number;
+    /**
+     * Cumulative signal-item count contained in rejected relay batches.
+     */
+    relay_dropped_items: number;
     spans_dropped: number;
     spans_received: number;
     spans_stored: number;
@@ -13145,7 +13164,7 @@ export type PlanMetadata = {
 export type PlanSourceBackup = {
     created_at?: string | null;
     /**
-     * "walg", "pg_dump", "unknown".
+     * "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "unknown".
      */
     format: string;
     /**
@@ -15582,7 +15601,7 @@ export type RestorePlan = {
     steps: Array<string>;
     /**
      * How the restore will be performed: "walg_restore", "pg_dump_restore",
-     * or "unsupported".
+     * "mariadb_physical_restore", "mariadb_dump_restore", or "unsupported".
      */
     strategy: string;
     /**
