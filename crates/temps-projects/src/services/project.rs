@@ -1410,6 +1410,7 @@ impl ProjectService {
             ai_write_actions_enabled,
             cross_project_trace_sharing,
             error_source_context_enabled,
+            vulnerability_scanning_enabled,
             error_source_root,
             ai_api_traffic_summary_enabled,
             image_retention_hours,
@@ -1643,6 +1644,7 @@ impl ProjectService {
             || ai_debug_chat_enabled.is_some()
             || ai_write_actions_enabled.is_some()
             || error_source_context_enabled.is_some()
+            || vulnerability_scanning_enabled.is_some()
             || error_source_root.is_some()
             || ai_api_traffic_summary_enabled.is_some()
         {
@@ -1669,6 +1671,10 @@ impl ProjectService {
             // Opt-in for native error-tracking source context (non-null bool).
             if let Some(v) = error_source_context_enabled {
                 active_project.error_source_context_enabled = Set(v);
+            }
+            // Opt-in for Trivy vulnerability scanning (non-null bool, default false).
+            if let Some(v) = vulnerability_scanning_enabled {
+                active_project.vulnerability_scanning_enabled = Set(v);
             }
             // Auto-capture source root (nullable). Empty string clears it back
             // to the build-context default.
@@ -3669,6 +3675,7 @@ impl ProjectService {
             ai_write_actions_enabled: db_project.ai_write_actions_enabled,
             ai_api_traffic_summary_enabled: db_project.ai_api_traffic_summary_enabled,
             error_source_context_enabled: db_project.error_source_context_enabled,
+            vulnerability_scanning_enabled: db_project.vulnerability_scanning_enabled,
             error_source_root: db_project.error_source_root,
             enable_preview_environments: db_project.enable_preview_environments,
             preview_envs_on_demand: db_project.preview_envs_on_demand,

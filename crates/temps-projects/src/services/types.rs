@@ -83,6 +83,9 @@ pub struct Project {
     pub ai_api_traffic_summary_enabled: Option<bool>,
     /// Opt-in for native error-tracking source context.
     pub error_source_context_enabled: bool,
+    /// Opt-in Trivy vulnerability scanning (post-deployment scan + daily rescans).
+    /// Off by default — project owners explicitly enable it.
+    pub vulnerability_scanning_enabled: bool,
     /// Auto-capture source root (relative to the checkout); None = build context.
     pub error_source_root: Option<String>,
     pub enable_preview_environments: bool,
@@ -140,6 +143,7 @@ pub struct UpdateProjectSettingsParams {
     pub ai_write_actions_enabled: Option<bool>,
     pub cross_project_trace_sharing: Option<bool>,
     pub error_source_context_enabled: Option<bool>,
+    pub vulnerability_scanning_enabled: Option<bool>,
     pub error_source_root: Option<String>,
     pub ai_api_traffic_summary_enabled: Option<bool>,
     /// Outer `None` leaves the retention window unchanged; `Some(None)` clears

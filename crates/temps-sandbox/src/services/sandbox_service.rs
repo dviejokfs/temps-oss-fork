@@ -3176,6 +3176,7 @@ mod storage_cleanup_tests {
             ai_debug_chat_enabled: None,
             ai_write_actions_enabled: false,
             error_source_context_enabled: false,
+            vulnerability_scanning_enabled: false,
             error_source_root: None,
             enable_preview_environments: false,
             preview_envs_on_demand: false,

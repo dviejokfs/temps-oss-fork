@@ -29928,6 +29928,10 @@
           "updated_at": {
             "format": "int64",
             "type": "integer"
+          },
+          "vulnerability_scanning_enabled": {
+            "description": "Opt-in Trivy vulnerability scanning of this project's deployed Docker\nimages. Off by default — project owners explicitly enable it.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -29943,6 +29947,7 @@
           "attack_mode",
           "ai_write_actions_enabled",
           "error_source_context_enabled",
+          "vulnerability_scanning_enabled",
           "enable_preview_environments",
           "preview_envs_on_demand",
           "preview_envs_idle_timeout_seconds",
@@ -44863,6 +44868,13 @@
           "slug": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "vulnerability_scanning_enabled": {
+            "description": "Opt in to Trivy vulnerability scanning of this project's deployed Docker\nimages (post-deployment scan + daily rescans). Off by default.",
+            "type": [
+              "boolean",
               "null"
             ]
           }

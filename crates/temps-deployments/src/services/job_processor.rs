@@ -1931,6 +1931,9 @@ mod tests {
             is_public_repo: Set(false),
             git_url: Set(None),
             main_branch: Set("main".to_string()),
+            // Enable vulnerability scanning so the scan_vulnerabilities job is included
+            // in the workflow plan (the assertion below checks for it by name).
+            vulnerability_scanning_enabled: Set(true),
             ..Default::default()
         };
         let project = project.insert(db).await?;

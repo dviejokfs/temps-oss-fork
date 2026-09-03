@@ -4165,6 +4165,7 @@ mod tests {
             allow_alternate_sources: None,
             ai_write_actions_enabled: false,
             error_source_context_enabled: true,
+            vulnerability_scanning_enabled: false,
             error_source_root: None,
             enable_preview_environments: true,
             preview_envs_on_demand: false,

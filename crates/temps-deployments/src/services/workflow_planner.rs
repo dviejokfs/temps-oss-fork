@@ -2040,7 +2040,7 @@ impl WorkflowPlanner {
         // has no image to scan)
         // This runs in parallel with other post-deployment jobs AFTER deployment is marked complete
         // NOT required for deployment completion - if it fails, deployment still succeeds
-        if has_git_info && needs_container_build {
+        if has_git_info && needs_container_build && project.vulnerability_scanning_enabled {
             jobs.push(JobDefinition {
                 job_id: "scan_vulnerabilities".to_string(),
                 job_type: "ScanVulnerabilitiesJob".to_string(),
@@ -2062,6 +2062,11 @@ impl WorkflowPlanner {
             });
             debug!(
                 "Added scan_vulnerabilities job to workflow (runs after deployment is marked complete)"
+            );
+        } else if !project.vulnerability_scanning_enabled {
+            debug!(
+                "Skipping vulnerability scan job - vulnerability scanning is disabled for project {}",
+                project.id
             );
         } else {
             debug!("Skipping vulnerability scan job - no git info available");

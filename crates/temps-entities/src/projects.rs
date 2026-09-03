@@ -61,6 +61,12 @@ pub struct Model {
     /// application source is always a deliberate choice.
     #[sea_orm(default_value = "false")]
     pub error_source_context_enabled: bool,
+    /// Opt-in Trivy vulnerability scanning of this project's deployed Docker
+    /// images (post-deployment scan + daily rescans). Off by default — scanning
+    /// costs CPU/time per image and requires the `trivy` binary; project owners
+    /// explicitly enable it when they want the coverage.
+    #[sea_orm(default_value = "false")]
+    pub vulnerability_scanning_enabled: bool,
     /// Where the auto-capture job reads source from, relative to the git
     /// checkout. NULL = default to the deployment's Docker build context (the
     /// directory the image was built from) — the correct root for Dockerfile
