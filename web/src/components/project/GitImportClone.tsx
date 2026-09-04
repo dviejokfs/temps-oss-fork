@@ -54,6 +54,7 @@ import { getPublicRepository } from '@/api/client/sdk.gen'
 
 const SOURCE_VALUES: ProjectSource[] = [
   'templates',
+  'services',
   'browse',
   'git-url',
   'manual',
@@ -159,7 +160,11 @@ export function GitImportClone({
   useEffect(() => {
     if (mode !== 'navigation') return
     queueMicrotask(() => {
-      if (selectedSource !== 'templates' && selectedTemplate) {
+      if (
+        selectedSource !== 'templates' &&
+        selectedSource !== 'services' &&
+        selectedTemplate
+      ) {
         setSelectedTemplate(null)
       }
       if (selectedSource !== 'browse' && selectedSource !== 'git-url') {
@@ -179,7 +184,9 @@ export function GitImportClone({
     ...listProjectTemplatesOptions(),
     enabled:
       mode === 'navigation' &&
-      (selectedSource === 'templates' || selectedSource === null),
+      (selectedSource === 'templates' ||
+        selectedSource === 'services' ||
+        selectedSource === null),
   })
 
   const templateSlugFromUrl =
@@ -226,10 +233,13 @@ export function GitImportClone({
   // Wrapper that mirrors template selection to the URL in navigation mode.
   const selectTemplate = useCallback(
     (template: TemplateResponse | null) => {
+      // Apply the selection immediately. URL hydration below remains the
+      // source of truth for back/forward and shared links, but should not be
+      // required for the click itself: the unfiltered template query can be
+      // loading independently from the gallery's filtered query.
+      setSelectedTemplate(template)
       if (mode === 'navigation') {
         updateSearchParams({ template: template?.slug ?? null })
-      } else {
-        setSelectedTemplate(template)
       }
     },
     [mode, updateSearchParams]
@@ -510,9 +520,11 @@ export function GitImportClone({
   // shell (header + pills) as the picker, so configuring never swaps the
   // page frame.
   if (selectedTemplate) {
+    const selectedTemplateSource =
+      selectedTemplate.kind === 'service' ? 'services' : 'templates'
     return (
       <NewProjectShell
-        activeSource="templates"
+        activeSource={selectedTemplateSource}
         onSelectSource={setSelectedSource}
       >
         <div className="space-y-6">
@@ -523,7 +535,8 @@ export function GitImportClone({
               onClick={() => selectTemplate(null)}
             >
               <ChevronLeft className="h-4 w-4 mr-2" />
-              Back to Templates
+              Back to{' '}
+              {selectedTemplateSource === 'services' ? 'Services' : 'Templates'}
             </Button>
           </div>
 
@@ -698,6 +711,28 @@ export function GitImportClone({
               onTemplateSelect={selectTemplate}
               selectedTemplate={selectedTemplate}
               showFeaturedFirst={true}
+              kind="starter"
+            />
+          </CardContent>
+        </Card>
+      )}
+
+      {selectedSource === 'services' && (
+        <Card>
+          <CardContent className="pt-6">
+            <div className="mb-5">
+              <h2 className="text-lg font-semibold">Curated services</h2>
+              <p className="text-sm text-muted-foreground">
+                Reviewed, version-pinned applications that integrate with
+                Temps-managed databases and storage.
+              </p>
+            </div>
+            <TemplateList
+              onTemplateSelect={selectTemplate}
+              selectedTemplate={selectedTemplate}
+              showFeaturedFirst={true}
+              kind="service"
+              showTagFilter={false}
             />
           </CardContent>
         </Card>
