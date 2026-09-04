@@ -156,6 +156,11 @@ pub struct AppSettingsResponse {
     // Docker registry settings with masked password
     pub docker_registry: DockerRegistrySettingsMasked,
 
+    /// Prefix applied to implicit Docker Hub base images in generated
+    /// Dockerfiles (e.g. autopack's `FROM node:22-slim`). No sensitive
+    /// content, passed through as-is. `None`/empty disables rewriting.
+    pub registry_mirror_prefix: Option<String>,
+
     // Monitoring settings
     pub disk_space_alert: DiskSpaceAlertSettings,
 
@@ -398,6 +403,7 @@ impl From<AppSettings> for AppSettingsResponse {
                 tls_verify: settings.docker_registry.tls_verify,
                 ca_certificate: settings.docker_registry.ca_certificate,
             },
+            registry_mirror_prefix: settings.registry_mirror_prefix,
             disk_space_alert: settings.disk_space_alert,
             container_logs: settings.container_logs,
             agent_sandbox: AgentSandboxSettingsMasked {

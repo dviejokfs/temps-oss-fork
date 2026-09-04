@@ -12384,6 +12384,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "temps-core",
  "temps-entities",
  "thiserror 2.0.20",
  "tokio",
