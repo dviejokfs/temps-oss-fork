@@ -53,7 +53,7 @@ pub fn is_docker_hub_image(image: &str) -> bool {
 /// since a proxy that accepts `<prefix>/gotempsh/temps` is expected to accept
 /// `<prefix>/node` the same way.
 pub fn qualify_with_registry_prefix(image: &str, prefix: Option<&str>) -> String {
-    match prefix {
+    match prefix.map(str::trim) {
         Some(prefix) if !prefix.is_empty() && is_docker_hub_image(image) => {
             format!("{}/{}", prefix.trim_end_matches('/'), image)
         }
@@ -126,6 +126,25 @@ mod tests {
         assert_eq!(
             qualify_with_registry_prefix("node:22-slim", Some("registry.example.com/docker/")),
             "registry.example.com/docker/node:22-slim"
+        );
+    }
+
+    #[test]
+    fn trims_leading_and_trailing_whitespace_on_the_configured_prefix() {
+        // An operator pasting the prefix into the settings UI can easily pick
+        // up a trailing newline or leading space; left untrimmed, that
+        // whitespace lands verbatim inside every generated `FROM` line and
+        // breaks the build with an invalid image reference.
+        assert_eq!(
+            qualify_with_registry_prefix("node:22-slim", Some("  registry.example.com/docker \n")),
+            "registry.example.com/docker/node:22-slim"
+        );
+
+        // Whitespace-only "prefix" must behave exactly like `None`, not like
+        // an empty-string prefix baked onto every image.
+        assert_eq!(
+            qualify_with_registry_prefix("node:22-slim", Some("   ")),
+            "node:22-slim"
         );
     }
 }
