@@ -159,6 +159,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   const [statusFilter, setStatusFilter] = useState<
     'unresolved' | 'resolved' | 'all'
   >('unresolved')
+  const [groupSort, setGroupSort] = useState('last_seen:desc')
   const [page, setPage] = useState(1)
   const pageSize = 25
 
@@ -254,6 +255,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
     setPage(1)
   }, [
     statusFilter,
+    groupSort,
     environmentFilter,
     dateFilter.quickFilter,
     dateFilter.dateRange?.from,
@@ -271,6 +273,8 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         start_date: timeRange.startTime,
         end_date: timeRange.endTime,
         environment_id: environmentFilter,
+        sort_by: groupSort.split(':')[0],
+        sort_order: groupSort.split(':')[1],
       },
     }),
     enabled: hasErrors,
@@ -823,21 +827,48 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
           isRefreshing={isRefreshing}
           leftActions={
             selectedTab === 'errors' ? (
-              <Select
-                value={statusFilter}
-                onValueChange={(v) =>
-                  setStatusFilter(v as 'unresolved' | 'resolved' | 'all')
-                }
-              >
-                <SelectTrigger className="w-[130px]">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="unresolved">Unresolved</SelectItem>
-                  <SelectItem value="resolved">Resolved</SelectItem>
-                  <SelectItem value="all">All</SelectItem>
-                </SelectContent>
-              </Select>
+              <div className="flex gap-2">
+                <Select
+                  value={statusFilter}
+                  onValueChange={(v) =>
+                    setStatusFilter(v as 'unresolved' | 'resolved' | 'all')
+                  }
+                >
+                  <SelectTrigger className="w-[130px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="unresolved">Unresolved</SelectItem>
+                    <SelectItem value="resolved">Resolved</SelectItem>
+                    <SelectItem value="all">All</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Select value={groupSort} onValueChange={setGroupSort}>
+                  <SelectTrigger
+                    className="w-[170px]"
+                    aria-label="Sort error groups"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="last_seen:desc">
+                      Recently seen
+                    </SelectItem>
+                    <SelectItem value="first_seen:desc">
+                      Newest issues
+                    </SelectItem>
+                    <SelectItem value="first_seen:asc">
+                      Oldest issues
+                    </SelectItem>
+                    <SelectItem value="total_count:desc">
+                      Most events
+                    </SelectItem>
+                    <SelectItem value="total_count:asc">
+                      Fewest events
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
             ) : undefined
           }
         />
