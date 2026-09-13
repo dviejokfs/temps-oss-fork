@@ -42,6 +42,16 @@ const EVENT_INSERT_CHUNK_SIZE: usize = 1000;
 /// into logs.
 const MAX_BATCH_ID_LEN: usize = 128;
 
+/// Longest accepted client-supplied `visitorId` on `session-replay/init`.
+///
+/// Same rationale as `MAX_BATCH_ID_LEN`: the SDK emits a UUID (36 chars), the
+/// value is unauthenticated, and since `initialize_session`'s lookup-miss
+/// path (issue #980) now inserts it into `visitor`, it lands in the unique
+/// `(visitor_id, project_id)` btree index -- whose ~2704-byte tuple limit
+/// would otherwise turn a long id into a guaranteed 500 on the very request
+/// that also burns the caller's rate-limit budget for nothing.
+const MAX_VISITOR_ID_LEN: usize = 128;
+
 /// Largest payload a single ingest request may decompress to.
 ///
 /// zlib expands roughly 1000:1 on repetitive input, so the request body limit
@@ -92,6 +102,13 @@ pub enum SessionReplayError {
 
     #[error("Session not found: {0}")]
     SessionNotFound(String),
+
+    /// The client-supplied `visitorId` is longer than a real SDK could have
+    /// produced. Rejected rather than truncated or trusted: on the
+    /// lookup-miss path it would otherwise reach a unique btree index and
+    /// risk a 500 (see `MAX_VISITOR_ID_LEN`).
+    #[error("Invalid visitor id: {reason}")]
+    InvalidVisitorId { reason: String },
 
     /// Returned when a caller supplies a session_replay_id that does not
     /// belong to the project resolved from the request host.  We surface
@@ -366,8 +383,14 @@ fn environment_id_from_visitor(visitor_environment_id: i32) -> Option<i32> {
 /// Matches `EventsService::MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE`, the
 /// equivalent cap on `/event`'s own upsert-on-miss path; kept as an
 /// independent budget (and an independent in-memory bucket) rather than
-/// shared state because the two services aren't wired together, and a
-/// generous independent cap on each ingest path still bounds total growth.
+/// shared state because the two services aren't wired together. Known
+/// limitation, recorded rather than hidden: because the two budgets are
+/// independent, the effective ceiling for a project is up to double this
+/// value per minute per node (up to 120 via `/event` plus up to 120 via
+/// `/init`), and each node in a multi-node deployment enforces its own
+/// in-memory budget on top of that. Still bounded, just not as tightly as
+/// the constant alone suggests -- a shared limiter is the natural follow-up
+/// if that combined ceiling turns out to matter in practice.
 const MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE: i32 = 120;
 
 pub struct SessionReplayService {
@@ -419,6 +442,19 @@ impl SessionReplayService {
                 // first-time visitors. Upsert here too, so there is no race
                 // left to lose -- see `upsert_visitor_on_miss` below.
                 //
+                // Reject an oversized id before doing anything else with it:
+                // it is about to reach a unique btree index (see
+                // `MAX_VISITOR_ID_LEN`), and checking here means a malformed
+                // request doesn't also burn the rate-limit budget below.
+                if metadata.visitor_id.len() > MAX_VISITOR_ID_LEN {
+                    return Err(SessionReplayError::InvalidVisitorId {
+                        reason: format!(
+                            "must be at most {MAX_VISITOR_ID_LEN} characters, got {}",
+                            metadata.visitor_id.len()
+                        ),
+                    });
+                }
+
                 // Capped the same way `/event`'s equivalent path is: this
                 // endpoint is unauthenticated, so without a cap a client that
                 // keeps inventing new `visitorId`s could grow the `visitor`

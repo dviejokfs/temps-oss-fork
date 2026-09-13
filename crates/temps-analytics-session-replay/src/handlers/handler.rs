@@ -380,6 +380,9 @@ impl From<SessionReplayError> for Problem {
         let (status, message) = match &error {
             SessionReplayError::VisitorNotFound(_) => (StatusCode::NOT_FOUND, "Visitor not found"),
             SessionReplayError::SessionNotFound(_) => (StatusCode::NOT_FOUND, "Session not found"),
+            SessionReplayError::InvalidVisitorId { .. } => {
+                (StatusCode::BAD_REQUEST, "Invalid visitor id")
+            }
             // Cross-project access attempts are surfaced as 404 to avoid
             // disclosing the existence of sessions belonging to other tenants.
             SessionReplayError::CrossProjectAccess { .. } => {
@@ -1913,6 +1916,61 @@ mod tests {
             120,
             "the over-cap request must not have created a 121st row"
         );
+
+        test_db.cleanup().await;
+    }
+
+    /// Security regression: an oversized `visitorId` on the lookup-miss path
+    /// would otherwise reach an `INSERT` into `visitor`, which is uniquely
+    /// indexed on `(visitor_id, project_id)` -- Postgres' btree tuple limit
+    /// (~2704 bytes) would turn a sufficiently long id into a 500 instead of
+    /// a clean 400. Must be rejected before it reaches the database, and
+    /// before it consumes the per-project rate-limit budget tested above.
+    #[tokio::test]
+    async fn session_replay_init_rejects_oversized_visitor_id() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+
+        let result = state
+            .session_replay_service
+            .initialize_session(
+                "session-oversized",
+                SessionMetadata {
+                    visitor_id: "v".repeat(129),
+                    user_agent: "Mozilla/5.0".to_string(),
+                    language: "en-US".to_string(),
+                    timezone: "UTC".to_string(),
+                    screen: Screen {
+                        width: 1920,
+                        height: 1080,
+                        color_depth: 24,
+                    },
+                    viewport: Viewport {
+                        width: 1280,
+                        height: 720,
+                    },
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    url: "/".to_string(),
+                },
+                project.id,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(SessionReplayError::InvalidVisitorId { .. })),
+            "expected InvalidVisitorId for a 129-char visitorId, got: {result:?}"
+        );
+        assert!(stored_visitors(db.as_ref()).await.is_empty());
 
         test_db.cleanup().await;
     }
