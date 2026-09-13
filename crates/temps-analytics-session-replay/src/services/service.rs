@@ -401,9 +401,59 @@ fn environment_id_from_visitor(visitor_environment_id: i32) -> Option<i32> {
 /// if that combined ceiling turns out to matter in practice.
 const MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE: i32 = 120;
 
+/// Cap on visitor rows a single client IP may cause `initialize_session` to
+/// create for one project per minute. `MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE`
+/// alone is a *shared* budget with no per-caller limit: one unauthenticated
+/// caller sending fresh `visitorId`s could exhaust the whole project's
+/// budget and deny legitimate first-time visitors 429s until the window
+/// clears. This sub-limit bounds how much of that shared budget any single
+/// IP can burn alone -- generous enough for real shared-IP traffic (an
+/// office, a mobile carrier NAT) sending multiple genuine first visits, but
+/// tight enough that one attacker IP needs several distinct source
+/// addresses to exhaust the project cap outright.
+const MAX_NEW_VISITORS_PER_PROJECT_PER_IP_PER_MINUTE: i32 = 20;
+
+/// In-memory sliding-window limiter for `(project_id, client_ip)` pairs.
+///
+/// Same algorithm as `temps_analytics::AnalyticsIngestRateLimiter`, but
+/// keyed by a `(i32, String)` pair instead of a single `i32` -- there is no
+/// existing IP-keyed limiter in the codebase to reuse, and building a
+/// general-purpose one is out of scope for what this one call site needs.
+/// Cardinality is bounded by distinct `(project, ip)` pairs seen inside a
+/// rolling 60s window, which is what an attacker sending traffic from many
+/// IPs would grow -- the same shape of cost the caller is already paying to
+/// exhaust the project-wide budget in the first place.
+struct VisitorCreationIpLimiter {
+    entries: tokio::sync::Mutex<std::collections::HashMap<(i32, String), Vec<std::time::Instant>>>,
+}
+
+impl VisitorCreationIpLimiter {
+    fn new() -> Self {
+        Self {
+            entries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    async fn check(&self, project_id: i32, client_ip: &str, limit_per_minute: i32) -> bool {
+        let window_start = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let mut entries = self.entries.lock().await;
+        let timestamps = entries
+            .entry((project_id, client_ip.to_string()))
+            .or_default();
+        timestamps.retain(|t| *t > window_start);
+
+        if timestamps.len() >= limit_per_minute as usize {
+            return false;
+        }
+        timestamps.push(std::time::Instant::now());
+        true
+    }
+}
+
 pub struct SessionReplayService {
     db: Arc<DatabaseConnection>,
     visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter,
+    visitor_creation_ip_limiter: VisitorCreationIpLimiter,
 }
 
 impl SessionReplayService {
@@ -411,6 +461,7 @@ impl SessionReplayService {
         Self {
             db,
             visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter::new(),
+            visitor_creation_ip_limiter: VisitorCreationIpLimiter::new(),
         }
     }
 
@@ -423,8 +474,24 @@ impl SessionReplayService {
         project_id: i32,
         environment_id: Option<i32>,
         deployment_id: Option<i32>,
+        client_ip: &str,
     ) -> Result<String, SessionReplayError> {
         info!("Initializing session: {} with metadata", session_id);
+
+        // Validate at entry, before any database work: `visitor_id` is
+        // unauthenticated client input and this check is cheap and
+        // independent of whether a row for it already exists, so there is
+        // no reason to defer it past the point where it's actually needed
+        // (unlike the rate-limit check below, this doesn't depend on the
+        // lookup outcome).
+        if metadata.visitor_id.len() > MAX_VISITOR_ID_LEN {
+            return Err(SessionReplayError::InvalidVisitorId {
+                reason: format!(
+                    "must be at most {MAX_VISITOR_ID_LEN} characters, got {}",
+                    metadata.visitor_id.len()
+                ),
+            });
+        }
 
         // The visitor upsert (on a lookup miss) and the session insert below
         // must land together: without a shared transaction, a failure after
@@ -458,27 +525,15 @@ impl SessionReplayService {
                 // first-time visitors. Upsert here too, so there is no race
                 // left to lose -- see `upsert_visitor_on_miss` below.
                 //
-                // Reject an oversized id before doing anything else with it:
-                // it is about to reach a unique btree index (see
-                // `MAX_VISITOR_ID_LEN`), and checking here means a malformed
-                // request doesn't also burn the rate-limit budget below.
-                if metadata.visitor_id.len() > MAX_VISITOR_ID_LEN {
-                    return Err(SessionReplayError::InvalidVisitorId {
-                        reason: format!(
-                            "must be at most {MAX_VISITOR_ID_LEN} characters, got {}",
-                            metadata.visitor_id.len()
-                        ),
-                    });
-                }
-
-                // Capped the same way `/event`'s equivalent path is: this
-                // endpoint is unauthenticated, so without a cap a client that
-                // keeps inventing new `visitorId`s could grow the `visitor`
-                // table without bound. Over the cap, refuse rather than
-                // creating the row -- as a distinguishable 429 rather than
-                // the pre-fix 404, since this is a transient, retryable
-                // condition (the window clears every 60s) and not "this
-                // visitor does not exist."
+                // Two caps, both checked before creating the row: a shared
+                // project-wide budget (matches `/event`'s equivalent cap)
+                // and a tighter per-(project, ip) budget so a single
+                // unauthenticated caller cannot alone exhaust the shared
+                // budget and deny legitimate first-time visitors. Either
+                // one tripping refuses the request -- as a distinguishable
+                // 429 rather than the pre-fix 404, since this is a
+                // transient, retryable condition (the window clears every
+                // 60s) and not "this visitor does not exist."
                 if !self
                     .visitor_creation_limiter
                     .check(project_id, Some(MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE))
@@ -489,6 +544,24 @@ impl SessionReplayService {
                         project_id,
                         "Refusing to create a new visitor row from session-replay init: \
                          project is over its per-minute visitor-creation cap"
+                    );
+                    return Err(SessionReplayError::VisitorCreationRateLimited { project_id });
+                }
+                if !self
+                    .visitor_creation_ip_limiter
+                    .check(
+                        project_id,
+                        client_ip,
+                        MAX_NEW_VISITORS_PER_PROJECT_PER_IP_PER_MINUTE,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        visitor_id = %metadata.visitor_id,
+                        project_id,
+                        client_ip,
+                        "Refusing to create a new visitor row from session-replay init: \
+                         this IP is over its per-project per-minute visitor-creation cap"
                     );
                     return Err(SessionReplayError::VisitorCreationRateLimited { project_id });
                 }
@@ -2109,7 +2182,14 @@ mod tests {
         let service = SessionReplayService::new(db.clone());
 
         let result = service
-            .initialize_session("session-abc", make_session_metadata(), 7, None, None)
+            .initialize_session(
+                "session-abc",
+                make_session_metadata(),
+                7,
+                None,
+                None,
+                "203.0.113.1",
+            )
             .await;
 
         assert!(
@@ -2157,7 +2237,14 @@ mod tests {
         let service = SessionReplayService::new(db.clone());
 
         let result = service
-            .initialize_session("session-abc", make_session_metadata(), 7, Some(3), Some(11))
+            .initialize_session(
+                "session-abc",
+                make_session_metadata(),
+                7,
+                Some(3),
+                Some(11),
+                "203.0.113.1",
+            )
             .await;
 
         assert!(result.is_ok());

@@ -935,6 +935,7 @@ pub async fn init_session_replay(
             project_id,
             environment_id,
             deployment_id,
+            &metadata.ip_address,
         )
         .await
     {
@@ -1849,7 +1850,10 @@ mod tests {
         let state = build_state(db.clone());
 
         // Drive the cap to exhaustion with distinct client-supplied visitor
-        // ids, each a genuine lookup miss.
+        // ids from distinct IPs, each a genuine lookup miss -- distinct IPs
+        // so this exercises the project-wide cap in isolation, never the
+        // per-IP sub-limit (see `session_replay_init_ip_sublimit_trips_before_project_cap`
+        // for that one).
         for i in 0..120 {
             state
                 .session_replay_service
@@ -1875,14 +1879,15 @@ mod tests {
                     project.id,
                     None,
                     None,
+                    &format!("203.0.113.{i}"),
                 )
                 .await
                 .expect("initialize_session must succeed while under the cap");
         }
         assert_eq!(stored_visitors(db.as_ref()).await.len(), 120);
 
-        // One more distinct visitor id, now over budget: must not create
-        // another row, and must surface as the pre-fix VisitorNotFound
+        // One more distinct visitor id from a fresh IP, now over budget:
+        // must not create another row, and must surface as a retryable 429
         // rather than a silent no-op.
         let result = state
             .session_replay_service
@@ -1908,6 +1913,7 @@ mod tests {
                 project.id,
                 None,
                 None,
+                "203.0.113.200",
             )
             .await;
 
@@ -1922,6 +1928,136 @@ mod tests {
             stored_visitors(db.as_ref()).await.len(),
             120,
             "the over-cap request must not have created a 121st row"
+        );
+
+        test_db.cleanup().await;
+    }
+
+    /// Security regression: the project-wide visitor-creation cap tested
+    /// above is a *shared* budget with no per-caller limit, so one
+    /// unauthenticated IP sending fresh `visitorId`s could otherwise exhaust
+    /// it alone and deny legitimate first-time visitors from other IPs. The
+    /// per-(project, ip) sub-limit must trip well before the 120-per-project
+    /// cap when every request comes from the same IP.
+    #[tokio::test]
+    async fn session_replay_init_ip_sublimit_trips_before_project_cap() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        let attacker_ip = "198.51.100.7";
+
+        for i in 0..20 {
+            state
+                .session_replay_service
+                .initialize_session(
+                    &format!("ip-cap-test-session-{i}"),
+                    SessionMetadata {
+                        visitor_id: format!("ip-cap-test-visitor-{i}"),
+                        user_agent: "Mozilla/5.0".to_string(),
+                        language: "en-US".to_string(),
+                        timezone: "UTC".to_string(),
+                        screen: Screen {
+                            width: 1920,
+                            height: 1080,
+                            color_depth: 24,
+                        },
+                        viewport: Viewport {
+                            width: 1280,
+                            height: 720,
+                        },
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        url: "/".to_string(),
+                    },
+                    project.id,
+                    None,
+                    None,
+                    attacker_ip,
+                )
+                .await
+                .expect("initialize_session must succeed while under the per-IP cap");
+        }
+        assert_eq!(stored_visitors(db.as_ref()).await.len(), 20);
+
+        let result = state
+            .session_replay_service
+            .initialize_session(
+                "ip-cap-test-session-over-budget",
+                SessionMetadata {
+                    visitor_id: "ip-cap-test-visitor-over-budget".to_string(),
+                    user_agent: "Mozilla/5.0".to_string(),
+                    language: "en-US".to_string(),
+                    timezone: "UTC".to_string(),
+                    screen: Screen {
+                        width: 1920,
+                        height: 1080,
+                        color_depth: 24,
+                    },
+                    viewport: Viewport {
+                        width: 1280,
+                        height: 720,
+                    },
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    url: "/".to_string(),
+                },
+                project.id,
+                None,
+                None,
+                attacker_ip,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SessionReplayError::VisitorCreationRateLimited { .. })
+            ),
+            "expected VisitorCreationRateLimited once this IP's sub-cap is exhausted, got: {result:?}"
+        );
+        assert_eq!(
+            stored_visitors(db.as_ref()).await.len(),
+            20,
+            "the over-cap request must not have created a 21st row"
+        );
+
+        // A different IP for the same project is unaffected -- the
+        // sub-limit is per-(project, ip), not a project-wide lockout.
+        let other_ip_result = state
+            .session_replay_service
+            .initialize_session(
+                "ip-cap-test-session-other-ip",
+                SessionMetadata {
+                    visitor_id: "ip-cap-test-visitor-other-ip".to_string(),
+                    user_agent: "Mozilla/5.0".to_string(),
+                    language: "en-US".to_string(),
+                    timezone: "UTC".to_string(),
+                    screen: Screen {
+                        width: 1920,
+                        height: 1080,
+                        color_depth: 24,
+                    },
+                    viewport: Viewport {
+                        width: 1280,
+                        height: 720,
+                    },
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    url: "/".to_string(),
+                },
+                project.id,
+                None,
+                None,
+                "198.51.100.8",
+            )
+            .await;
+        assert!(
+            other_ip_result.is_ok(),
+            "a different IP must not be blocked by another IP's exhausted sub-cap: {other_ip_result:?}"
         );
 
         test_db.cleanup().await;
@@ -1970,6 +2106,7 @@ mod tests {
                 project.id,
                 None,
                 None,
+                "203.0.113.1",
             )
             .await;
 
