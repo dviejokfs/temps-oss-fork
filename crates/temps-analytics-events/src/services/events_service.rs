@@ -3913,7 +3913,7 @@ mod tests {
                 None,
                 None,
                 Some("Mozilla/5.0".to_string()),
-                Some("https://news.ycombinator.com/".to_string()),
+                Some("https://example-referrer.test/".to_string()),
                 None,
                 None,
                 None,
@@ -3937,12 +3937,12 @@ mod tests {
         );
         assert_eq!(
             visitor_row.first_referrer,
-            Some("https://news.ycombinator.com/".to_string()),
+            Some("https://example-referrer.test/".to_string()),
             "referrer must be backfilled onto the placeholder row"
         );
         assert_eq!(
             visitor_row.first_referrer_hostname,
-            Some("news.ycombinator.com".to_string())
+            Some("example-referrer.test".to_string())
         );
         assert_eq!(visitor_row.first_utm_source, Some("newsletter".to_string()));
         assert_eq!(visitor_row.first_utm_medium, Some("email".to_string()));
@@ -3994,7 +3994,7 @@ mod tests {
 
         assert_eq!(
             visitor_row_after_second_event.first_referrer,
-            Some("https://news.ycombinator.com/".to_string()),
+            Some("https://example-referrer.test/".to_string()),
             "first-touch attribution must not be overwritten by a later event"
         );
         assert_eq!(
