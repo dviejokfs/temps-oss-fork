@@ -1234,11 +1234,12 @@ mod tests {
         .expect("Failed to insert test project")
     }
 
-    /// `initialize_session` resolves the visitor row by its GUID and 404s when
-    /// it is absent — pre-existing behaviour, independent of ADR-040: the
-    /// browser SDK sends the `page_view` event (which upserts the visitor)
-    /// before it starts a replay. Seed one so these tests exercise the
-    /// resolution branch under test rather than that lookup.
+    /// `initialize_session` upserts the visitor row on a lookup miss (issue
+    /// #980), so seeding one is no longer required for `/init` to succeed —
+    /// but most tests here still do it up front so they exercise only the
+    /// scope-resolution branch under test rather than also touching the
+    /// upsert path (covered separately by
+    /// `session_replay_init_upserts_visitor_on_lookup_miss`).
     async fn insert_db_visitor(
         db: &sea_orm::DatabaseConnection,
         project_id: i32,
@@ -1389,6 +1390,15 @@ mod tests {
             .all(db)
             .await
             .expect("Failed to query session replay sessions")
+    }
+
+    async fn stored_visitors(
+        db: &sea_orm::DatabaseConnection,
+    ) -> Vec<temps_entities::visitor::Model> {
+        temps_entities::visitor::Entity::find()
+            .all(db)
+            .await
+            .expect("Failed to query visitors")
     }
 
     #[tokio::test]
@@ -1744,6 +1754,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        test_db.cleanup().await;
+    }
+
+    /// Regression for issue #980: the browser SDK fires `/event` and
+    /// `session-replay/init` in the same page load with no ordering between
+    /// them, so a first-time visitor's `init` commonly arrives before
+    /// `/event` has created the `visitor` row. `init` must upsert that row
+    /// itself instead of 404ing — deliberately not calling
+    /// `insert_db_visitor` here, so this test only passes if the lookup-miss
+    /// path creates the row.
+    #[tokio::test]
+    async fn session_replay_init_upserts_visitor_on_lookup_miss() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        insert_test_route(
+            &state.route_table,
+            "app.example.test",
+            Some(project.clone()),
+        );
+
+        assert!(
+            stored_visitors(db.as_ref()).await.is_empty(),
+            "test must start with no visitor row for the race to be exercised"
+        );
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "app.example.test")
+                    .header(TEST_VISITOR_ID_COOKIE_HEADER, "client-generated-visitor")
+                    .header("content-type", "application/json")
+                    .body(Body::from(init_payload("session-k").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "init must upsert the missing visitor instead of 404ing"
+        );
+
+        let sessions = stored_sessions(db.as_ref()).await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].project_id, project.id);
+
+        let visitors = stored_visitors(db.as_ref()).await;
+        assert_eq!(visitors.len(), 1);
+        assert_eq!(visitors[0].visitor_id, "client-generated-visitor");
+        assert_eq!(visitors[0].project_id, project.id);
+        assert_eq!(sessions[0].visitor_id, visitors[0].id);
 
         test_db.cleanup().await;
     }

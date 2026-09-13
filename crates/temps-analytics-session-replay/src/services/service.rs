@@ -8,8 +8,9 @@ use chrono::{DateTime, Utc};
 use flate2::read::ZlibDecoder;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    RelationTrait, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -391,16 +392,26 @@ impl SessionReplayService {
             .one(self.db.as_ref())
             .await?;
 
-        let visitor = match visitor {
-            Some(v) => v,
+        let visitor_id_int = match visitor {
+            Some(v) => v.id,
             None => {
-                return Err(SessionReplayError::VisitorNotFound(
-                    metadata.visitor_id.clone(),
-                ));
+                // The browser SDK fires `/event` and `session-replay/init` in
+                // the same page load with no ordering between them (issue
+                // #980): `/event` creates the visitor row on a lookup miss
+                // (`EventsService::upsert_visitor_on_miss`), but `init` used
+                // to 404 instead of doing the same, so whichever request lost
+                // the race silently dropped the replay for the majority of
+                // first-time visitors. Upsert here too, so there is no race
+                // left to lose -- see `upsert_visitor_on_miss` below.
+                self.upsert_visitor_on_miss(
+                    &metadata.visitor_id,
+                    project_id,
+                    environment_id.unwrap_or(0),
+                    &metadata.user_agent,
+                )
+                .await?
             }
         };
-
-        let visitor_id_int = visitor.id;
         // Parse timestamp
         let created_at = DateTime::parse_from_rfc3339(&metadata.timestamp)
             .map(|dt| dt.with_timezone(&Utc))
@@ -456,6 +467,62 @@ impl SessionReplayService {
         info!("Session {} initialized successfully", session_id);
 
         Ok(session_id.to_string())
+    }
+
+    /// Upsert a visitor row when this session's `visitor_id` has no matching
+    /// row yet. Mirrors `ProxyLogBatchWriter::upsert_visitor` and
+    /// `EventsService::upsert_visitor_on_miss` (same columns, same
+    /// `ON CONFLICT (visitor_id, project_id)` key) so whichever writer lands
+    /// first creates the canonical row and the others just bump `last_seen`.
+    ///
+    /// Only the fields available at `init` time (visitor id, project,
+    /// environment, user agent) are populated; the rest default to their
+    /// "unknown" values the same way the proxy's own speculative upsert
+    /// does. `has_activity` is left `false` rather than `true`: unlike
+    /// `EventsService`'s version (called because a real event just landed),
+    /// this call site has not observed a page-view, only a replay session
+    /// starting -- `record_event` flips it to `true` when the real event
+    /// arrives, whichever writer created the row.
+    async fn upsert_visitor_on_miss(
+        &self,
+        visitor_id: &str,
+        project_id: i32,
+        environment_id: i32,
+        user_agent: &str,
+    ) -> Result<i32, SessionReplayError> {
+        let now = chrono::Utc::now();
+        let stmt = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"INSERT INTO visitor (
+                visitor_id, project_id, environment_id,
+                first_seen, last_seen,
+                user_agent, ip_address_id, is_crawler, crawler_name, has_activity,
+                first_referrer, first_referrer_hostname, first_channel,
+                first_utm_source, first_utm_medium, first_utm_campaign
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, NULL, false, NULL, false,
+                NULL, NULL, NULL, NULL, NULL, NULL
+            )
+            ON CONFLICT (visitor_id, project_id) DO UPDATE SET
+                last_seen = EXCLUDED.last_seen
+            RETURNING id"#,
+            [
+                visitor_id.to_string().into(),
+                project_id.into(),
+                environment_id.into(),
+                now.into(),
+                now.into(),
+                user_agent.to_string().into(),
+            ],
+        );
+
+        let row = self.db.query_one(stmt).await?.ok_or_else(|| {
+            SessionReplayError::Database(sea_orm::DbErr::RecordNotFound(format!(
+                "visitor upsert for visitor_id={visitor_id} project_id={project_id} returned no row"
+            )))
+        })?;
+        row.try_get::<i32>("", "id")
+            .map_err(SessionReplayError::Database)
     }
 
     /// Add events to an existing session (events are already base64 encoded and compressed).
