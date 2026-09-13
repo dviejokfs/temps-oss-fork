@@ -353,8 +353,8 @@ function RegistryCatalog({
             Registry
           </h2>
           <p className="text-sm text-muted-foreground">
-            Releases are selected for this server, hash-verified, and installed
-            atomically.
+            Only releases supporting this server’s platform are shown. Downloads
+            are hash-verified and installed atomically.
           </p>
         </div>
         <a
@@ -390,9 +390,11 @@ function RegistryCatalog({
       ) : catalog?.plugins.length === 0 ? (
         <div className="rounded-lg border border-dashed px-4 py-8 text-center">
           <Puzzle className="mx-auto size-5 text-muted-foreground" />
-          <p className="mt-3 font-medium">The registry has no plugins yet.</p>
+          <p className="mt-3 font-medium">
+            No published plugins support this server’s platform yet.
+          </p>
           <p className="mt-1 text-sm text-muted-foreground">
-            Published releases will appear here automatically.
+            Compatible releases will appear here when they are published.
           </p>
         </div>
       ) : (
