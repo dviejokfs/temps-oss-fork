@@ -262,6 +262,19 @@ pub trait AiService: Send + Sync {
         })
     }
 
+    /// Verify a candidate against an explicitly selected model when supported.
+    async fn verify_candidate_credential_with_model(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+        _model: Option<&str>,
+    ) -> Result<(), AiError> {
+        self.verify_candidate_credential(provider, auth_type, credential, principal_id)
+            .await
+    }
+
     /// Invalidate account-scoped capability state after credentials change.
     async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {}
 

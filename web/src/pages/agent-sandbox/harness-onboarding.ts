@@ -4,6 +4,19 @@
 import type { ProviderCatalogDto } from '@/api/client'
 import { problemDetail } from '@/lib/api-problem'
 
+export function credentialVerificationMessage(result: {
+  credential_verification_status?: string
+  verification_hint?: string | null
+}) {
+  if (result.credential_verification_status === 'verified') {
+    return 'Credential verified and saved.'
+  }
+  return (
+    result.verification_hint ||
+    'Credential saved, but not verified. Choose an accessible model and verify it before continuing.'
+  )
+}
+
 export function harnessCheckError(error: unknown): string {
   const fallback =
     'The environment check failed. Check the saved credential and retry.'

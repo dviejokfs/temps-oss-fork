@@ -263,6 +263,7 @@ mod m20260912_000001_expand_managed_daemon_workspace_images;
 mod m20260912_000002_managed_daemon_workspace_images_v031;
 mod m20260912_000003_managed_daemon_workspace_images_v032;
 mod m20260913_000001_managed_daemon_workspace_images_v033;
+mod m20260913_000002_managed_daemon_workspace_images_v034;
 
 pub struct Migrator;
 
@@ -584,6 +585,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260912_000002_managed_daemon_workspace_images_v031::Migration),
             Box::new(m20260912_000003_managed_daemon_workspace_images_v032::Migration),
             Box::new(m20260913_000001_managed_daemon_workspace_images_v033::Migration),
+            Box::new(m20260913_000002_managed_daemon_workspace_images_v034::Migration),
         ]
     }
 }

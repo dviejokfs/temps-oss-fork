@@ -16,6 +16,7 @@ import {
   harnessCheckError,
   harnessSetupStatus,
   workspaceReturnTo,
+  credentialVerificationMessage,
 } from './harness-onboarding'
 
 const provider: ProviderCatalogDto = {
@@ -29,6 +30,7 @@ const provider: ProviderCatalogDto = {
   permission_modes: [],
   default_permission_mode_id: 'default',
   credential_saved: false,
+  credential_verification_status: 'not_saved',
   host_authenticated: false,
   model_source: 'bootstrap',
   supports_max_turns: true,
@@ -36,6 +38,46 @@ const provider: ProviderCatalogDto = {
 }
 
 describe('harness onboarding', () => {
+  test('never reports an unverified write as verified', () => {
+    expect(
+      credentialVerificationMessage({
+        credential_verification_status: 'unverified',
+      })
+    ).toContain('not verified')
+    expect(credentialVerificationMessage({})).toContain('not verified')
+    expect(
+      credentialVerificationMessage({
+        credential_verification_status: 'verified',
+      })
+    ).toBe('Credential verified and saved.')
+    expect(
+      credentialVerificationMessage({
+        credential_verification_status: 'unverified',
+        verification_hint: 'Choose another model.',
+      })
+    ).toBe('Choose another model.')
+  })
+  test('saved OpenCode credentials have a model verification action without re-entering a secret', () => {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ProviderEditor
+            provider={{
+              ...provider,
+              id: 'opencode',
+              name: 'OpenCode',
+              credential_saved: true,
+            }}
+            isActive={false}
+            embedded
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    expect(html).toContain('Model to verify')
+    expect(html).toContain('Verify saved login')
+    expect(html).toContain('not verified')
+  })
   test('section navigation preserves only an allowlisted workspace return path', () => {
     const returnTo = '/ai-first?application=example&thread=example-thread'
     for (const path of [

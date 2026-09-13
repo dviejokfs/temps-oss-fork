@@ -20,6 +20,7 @@ const provider: ProviderCatalogDto = {
   permission_modes: [],
   default_permission_mode_id: 'default',
   credential_saved: false,
+  credential_verification_status: 'not_saved',
   supports_max_turns: true,
   host_authenticated: false,
   model_source: 'bootstrap',

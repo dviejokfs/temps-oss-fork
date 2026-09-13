@@ -661,19 +661,67 @@ fn candidate_probe_runtime_failure(exit_code: i32, stderr: &str) -> bool {
     .any(|pattern| lower.contains(pattern))
 }
 
+/// Only explicit native authentication failures are conclusive. Model-not-found,
+/// quota, transport, and unknown errors must not be mistaken for a bad secret.
+fn candidate_probe_native_auth_rejected(stdout: &str, stderr: &str) -> bool {
+    fn explicit_auth_message(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        [
+            "authentication failed",
+            "authenticationerror",
+            "unauthorized",
+            "invalid api key",
+            "invalid token",
+            "invalid credentials",
+            "token refresh failed",
+            "401",
+            "403",
+            "forbidden",
+            "not authenticated",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    }
+
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("error"))
+        .any(|event| {
+            let error = &event["error"];
+            [
+                error["statusCode"].as_i64(),
+                error["status"].as_i64(),
+                error["data"]["statusCode"].as_i64(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|status| matches!(status, 401 | 403))
+                || [
+                    error["name"].as_str(),
+                    error["message"].as_str(),
+                    error["data"]["message"].as_str(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(explicit_auth_message)
+        })
+        || explicit_auth_message(stderr)
+}
+
 impl CandidateSandbox {
     async fn destroy(mut self) -> Result<(), AiError> {
         if let Some(handle) = self.handle.as_ref() {
             tokio::time::timeout(Duration::from_secs(15), self.provider.destroy(handle, true))
                 .await
                 .map_err(|_| AiError::Provider {
-                    purpose: "provider.credentials.verify".into(),
+                    purpose: "provider.credentials.verify.cleanup".into(),
                     reason:
                         "verification sandbox cleanup timed out; contact your Temps administrator"
                             .into(),
                 })?
                 .map_err(|_| AiError::Provider {
-                    purpose: "provider.credentials.verify".into(),
+                    purpose: "provider.credentials.verify.cleanup".into(),
                     reason: "verification sandbox cleanup failed; contact your Temps administrator"
                         .into(),
                 })?;
@@ -1347,6 +1395,35 @@ send({
             reason: format!("workspace model discovery is not implemented for '{other}'"),
         }),
     }
+}
+
+fn selected_opencode_probe_model<'a>(
+    defaults: &[&'static str],
+    requested: Option<&'a str>,
+) -> Result<Option<&'a str>, AiError> {
+    let Some(model) = requested else {
+        return Ok(defaults.first().copied());
+    };
+    let valid = model.split_once('/').is_some_and(|(provider, name)| {
+        !name.is_empty()
+            && !name.contains('/')
+            && model.len() <= 256
+            && model
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+            && defaults
+                .iter()
+                .any(|available| available.starts_with(&format!("{provider}/")))
+    });
+    if !valid {
+        return Err(AiError::Provider {
+            purpose: "provider.credentials.verify.invalid".into(),
+            reason:
+                "verification model is invalid or its provider is absent from OpenCode credentials"
+                    .into(),
+        });
+    }
+    Ok(Some(model))
 }
 
 impl AgentCliAiService {
@@ -2317,16 +2394,11 @@ impl AgentCliAiService {
                 purpose: purpose.clone(),
                 reason: format!("invalid retained runtime identity: {error}"),
             })?;
-        let invocation_id = InvocationId::new(
-            request
-                .trace_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        )
-        .map_err(|error| AiError::Provider {
-            purpose: purpose.clone(),
-            reason: format!("invalid retained turn identity: {error}"),
-        })?;
+        // A trace spans the outer chat turn, including tool rounds, salvage,
+        // and a bounded missing-session retry. The SDK invocation instead
+        // identifies one actual provider execution; reusing the trace makes
+        // its duplicate guard reject the next round before the provider runs.
+        let invocation_id = new_retained_invocation_id(&purpose)?;
         let connector = Arc::new(SandboxRuntimeConnector::new(
             sandbox.clone(),
             handle.clone(),
@@ -2338,6 +2410,19 @@ impl AgentCliAiService {
         spec.provider_session_id = request.resume_session_id.clone();
         spec.turn_timeout = timeout;
         let runtime = match client.attach(&runtime_id).await {
+            Ok(_runtime) if request.reset_retained_session => {
+                // The DB is the authority for provider session continuity.
+                // Dispose confirms termination of the stale harness runtime;
+                // managed application processes are separate and untouched.
+                client
+                    .dispose(&runtime_id)
+                    .await
+                    .map_err(|error| retained_ai_error(&purpose, error, &runtime_secrets))?;
+                client
+                    .acquire(spec)
+                    .await
+                    .map_err(|error| retained_ai_error(&purpose, error, &runtime_secrets))?
+            }
             Ok(runtime) => runtime,
             Err(error) if error.kind == RuntimeFailureKind::RuntimeNotFound => client
                 .acquire(spec)
@@ -2971,6 +3056,13 @@ fn runtime_permission_mode(
             reason: "unsupported retained sandbox provider permission contract".into(),
         }),
     }
+}
+
+fn new_retained_invocation_id(purpose: &str) -> Result<InvocationId, AiError> {
+    InvocationId::new(uuid::Uuid::new_v4().to_string()).map_err(|error| AiError::Provider {
+        purpose: purpose.to_string(),
+        reason: format!("invalid retained turn identity: {error}"),
+    })
 }
 
 fn retained_ai_error(
@@ -4355,11 +4447,43 @@ fn check_prompt_size(purpose: &str, prompt: &str) -> Result<(), AiError> {
 // AiService implementation
 // ---------------------------------------------------------------------------
 
+fn candidate_probe_create_config(
+    label: String,
+    host_work_dir: PathBuf,
+) -> Result<SandboxCreateConfig, AiError> {
+    let image =
+        temps_sandbox::services::managed_application_workspace_image("node").ok_or_else(|| {
+            AiError::Provider {
+            purpose: "provider.credentials.verify".into(),
+            reason:
+                "managed node workspace runtime image is unavailable for credential verification"
+                    .into(),
+        }
+        })?;
+    Ok(SandboxCreateConfig {
+        run_id: 0,
+        container_name_override: Some(label),
+        host_work_dir,
+        workspace_volume: None,
+        image: Some(image.to_string()),
+        cpu_limit: Some(1.0),
+        memory_limit_mb: Some(1024),
+        pids_limit: Some(128),
+        disk_size_mb: None,
+        network_mode: Some("restricted".into()),
+        env_vars: HashMap::new(),
+        idle_timeout: Duration::from_secs(120),
+        backend: None,
+        owner_user_id: None,
+    })
+}
+
 impl AgentCliAiService {
     async fn run_candidate_probe(
         &self,
         principal_id: i32,
         credentials: SandboxHarnessCredentials,
+        verification_model: Option<&str>,
     ) -> Result<(), AiError> {
         const PURPOSE: &str = "provider.credentials.verify";
         let sandbox = self
@@ -4384,22 +4508,7 @@ impl AgentCliAiService {
                 })?,
             );
         let label = format!("credential-verify-{}", uuid::Uuid::new_v4().simple());
-        let create_config = SandboxCreateConfig {
-            run_id: 0,
-            container_name_override: Some(label),
-            host_work_dir: scratch.path().to_path_buf(),
-            workspace_volume: None,
-            image: None,
-            cpu_limit: Some(1.0),
-            memory_limit_mb: Some(1024),
-            pids_limit: Some(128),
-            disk_size_mb: None,
-            network_mode: Some("restricted".into()),
-            env_vars: HashMap::new(),
-            idle_timeout: Duration::from_secs(120),
-            backend: None,
-            owner_user_id: None,
-        };
+        let create_config = candidate_probe_create_config(label, scratch.path().to_path_buf())?;
         let create_provider = sandbox.clone();
         let mut create_guard = CandidateCreateGuard {
             provider: sandbox.clone(),
@@ -4467,7 +4576,8 @@ impl AgentCliAiService {
                     .collect::<Vec<_>>(),
                 _ => Vec::new(),
             };
-            let opencode_model = opencode_models.first().copied();
+            let opencode_model =
+                selected_opencode_probe_model(&opencode_models, verification_model)?;
             let selected_model = match self.provider.name() {
                 "claude_cli" => Some("haiku"),
                 "codex_cli" => Some("gpt-5.6-luna"),
@@ -4567,6 +4677,15 @@ impl AgentCliAiService {
             if matches!(relay_guard.inference_status(), Some(402 | 429)) {
                 return Err(AiError::Provider { purpose: "provider.credentials.verify.allowance".into(), reason: format!("{} credential could not be verified because its account has insufficient allowance or is rate limited", self.provider.name()) });
             }
+            if candidate_probe_native_auth_rejected(&output.stdout, &output.stderr) {
+                return Err(AiError::Provider {
+                    purpose: "provider.credentials.verify.auth".into(),
+                    reason: format!(
+                        "{} native harness rejected the candidate credential",
+                        self.provider.name()
+                    ),
+                });
+            }
             if output.exit_code != 0 {
                 let runtime_failure =
                     candidate_probe_runtime_failure(output.exit_code, &output.stderr);
@@ -4595,7 +4714,11 @@ impl AgentCliAiService {
                     ),
                 });
             }
-            for model in opencode_models.iter().skip(1) {
+            for model in opencode_models
+                .iter()
+                .skip(1)
+                .filter(|_| verification_model.is_none())
+            {
                 let mut next_command = vec![
                     "opencode".into(),
                     "run".into(),
@@ -4623,6 +4746,27 @@ impl AgentCliAiService {
                         purpose: "provider.credentials.verify.model".into(),
                         reason: "OpenCode could not verify an additional provider entry".into(),
                     })?;
+                if matches!(relay_guard.inference_status(), Some(401 | 403)) {
+                    return Err(AiError::Provider {
+                        purpose: "provider.credentials.verify.auth".into(),
+                        reason: "OpenCode provider explicitly rejected a credential".into(),
+                    });
+                }
+                if matches!(relay_guard.inference_status(), Some(402 | 429)) {
+                    return Err(AiError::Provider {
+                        purpose: "provider.credentials.verify.allowance".into(),
+                        reason: "OpenCode provider allowance or rate limit prevented verification"
+                            .into(),
+                    });
+                }
+                if candidate_probe_native_auth_rejected(&next.stdout, &next.stderr) {
+                    return Err(AiError::Provider {
+                        purpose: "provider.credentials.verify.auth".into(),
+                        reason: format!(
+                            "OpenCode native harness rejected the credential for '{model}'"
+                        ),
+                    });
+                }
                 if next.exit_code != 0 || !candidate_probe_has_answer("opencode", &next.stdout) {
                     return Err(AiError::Provider {
                         purpose: "provider.credentials.verify.model".into(),
@@ -4661,7 +4805,7 @@ impl AiService for AgentCliAiService {
     ) -> Result<(), AiError> {
         if provider != self.provider.name() {
             return Err(AiError::Provider {
-                purpose: "provider.credentials.verify".into(),
+                purpose: "provider.credentials.verify.invalid".into(),
                 reason: format!(
                     "candidate provider '{provider}' does not match the selected harness"
                 ),
@@ -4671,11 +4815,44 @@ impl AiService for AgentCliAiService {
             self.sandbox_candidate_credentials
                 .as_ref()
                 .ok_or_else(|| AiError::Provider {
-                    purpose: "provider.credentials.verify".into(),
+                    purpose: "provider.credentials.verify.setup".into(),
                     reason: "candidate credential resolver is unavailable".into(),
                 })?;
-        let candidate = resolver(provider, auth_type, credential).await?;
-        self.run_candidate_probe(principal_id, candidate).await
+        let candidate = resolver(provider, auth_type, credential).await.map_err(|_| AiError::Provider {
+            purpose: "provider.credentials.verify.invalid".into(),
+            reason: format!("candidate credential for '{provider}' ({auth_type}) is malformed or unsupported"),
+        })?;
+        self.run_candidate_probe(principal_id, candidate, None)
+            .await
+    }
+    async fn verify_candidate_credential_with_model(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+        model: Option<&str>,
+    ) -> Result<(), AiError> {
+        if provider != "opencode" || model.is_none() {
+            return self
+                .verify_candidate_credential(provider, auth_type, credential, principal_id)
+                .await;
+        }
+        let resolver =
+            self.sandbox_candidate_credentials
+                .as_ref()
+                .ok_or_else(|| AiError::Provider {
+                    purpose: "provider.credentials.verify.setup".into(),
+                    reason: "candidate credential resolver is unavailable".into(),
+                })?;
+        let candidate = resolver(provider, auth_type, credential)
+            .await
+            .map_err(|_| AiError::Provider {
+                purpose: "provider.credentials.verify.invalid".into(),
+                reason: "candidate OpenCode credential is malformed or unsupported".into(),
+            })?;
+        self.run_candidate_probe(principal_id, candidate, model)
+            .await
     }
     /// Returns `true` when the underlying CLI reports both `installed` and
     /// `authenticated`. Callers should gate prompt construction on this check.
@@ -5524,6 +5701,35 @@ mod tests {
     use temps_ai::AiRequest;
 
     #[test]
+    fn credential_probe_uses_managed_workspace_runtime_image() {
+        let config = candidate_probe_create_config(
+            "credential-verify-test".to_string(),
+            PathBuf::from("/tmp/credential-verify-test"),
+        )
+        .expect("managed node image is configured");
+        let expected = temps_sandbox::services::managed_application_workspace_image("node")
+            .expect("managed node image");
+        assert_eq!(config.image.as_deref(), Some(expected));
+        assert_eq!(
+            config.container_name_override.as_deref(),
+            Some("credential-verify-test")
+        );
+        assert_eq!(config.network_mode.as_deref(), Some("restricted"));
+    }
+
+    #[test]
+    fn retained_execution_ids_are_distinct_within_one_traced_chat_turn() {
+        let first =
+            new_retained_invocation_id("chat.application.tools").expect("first execution identity");
+        let second = new_retained_invocation_id("chat.application.tools")
+            .expect("second execution identity");
+        assert_ne!(
+            first, second,
+            "each provider execution needs its own SDK id"
+        );
+    }
+
+    #[test]
     fn retained_sandbox_mcp_strictness_matches_provider_capability() {
         assert!(sandbox_launch_context(Provider::Claude).strict_mcp_config);
         assert!(!sandbox_launch_context(Provider::Codex).strict_mcp_config);
@@ -5935,6 +6141,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn chosen_opencode_probe_model_requires_saved_provider_and_safe_model_id() {
+        let defaults = ["anthropic/claude-haiku-4-5"];
+        assert_eq!(
+            selected_opencode_probe_model(&defaults, None).unwrap(),
+            Some(defaults[0])
+        );
+        assert_eq!(
+            selected_opencode_probe_model(&defaults, Some("anthropic/claude-sonnet-4-5")).unwrap(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+        for model in [
+            "openai/gpt-5",
+            "anthropic/",
+            "anthropic/a/b",
+            "anthropic/evil\nflag",
+        ] {
+            assert!(
+                matches!(selected_opencode_probe_model(&defaults, Some(model)), Err(AiError::Provider { purpose, .. }) if purpose == "provider.credentials.verify.invalid"),
+                "{model}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn candidate_probe_requires_upstream_inference_and_destroys_isolated_sandbox() {
         let scratch = tempfile::tempdir().expect("scratch directory");
@@ -5971,6 +6201,7 @@ mod tests {
                     "candidate-secret",
                     "http://model-relay.internal",
                 ),
+                None,
             )
             .await;
         assert!(
@@ -6004,6 +6235,28 @@ mod tests {
         ));
         assert!(candidate_probe_runtime_failure(127, ""));
         assert!(!candidate_probe_runtime_failure(1, "authentication failed"));
+    }
+
+    #[test]
+    fn native_probe_auth_errors_are_conclusive_without_relay_traffic() {
+        let rejected = r#"{"type":"error","error":{"name":"UnknownError","data":{"message":"Token refresh failed: 401"}}}"#;
+        assert!(candidate_probe_native_auth_rejected(rejected, ""));
+        assert!(candidate_probe_native_auth_rejected(
+            "",
+            "Authentication failed"
+        ));
+        assert!(candidate_probe_native_auth_rejected(
+            r#"{"type":"error","error":{"statusCode":403,"message":"Access denied"}}"#,
+            ""
+        ));
+        assert!(!candidate_probe_native_auth_rejected(
+            r#"{"type":"error","error":{"message":"Model not found"}}"#,
+            ""
+        ));
+        assert!(!candidate_probe_native_auth_rejected(
+            r#"{"type":"text","part":{"text":"401"}}"#,
+            ""
+        ));
     }
 
     #[tokio::test]

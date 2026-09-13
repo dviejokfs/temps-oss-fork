@@ -33,6 +33,9 @@ pub enum ConfigServiceError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
+    #[error("AI provider '{provider_id}' credential changed during verification")]
+    ProviderCredentialChanged { provider_id: String },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -1326,6 +1329,252 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // here would then regress the cache out of commit order.
         self.invalidate_settings_cache().await;
         Ok(current)
+    }
+
+    /// Atomically merge one provider credential into the shared settings row.
+    /// `expected` binds a verification result to the exact saved credential
+    /// that was probed; a concurrent replacement is never restored or marked
+    /// verified by an older in-flight request.
+    pub async fn update_agent_provider_credential(
+        &self,
+        provider_id: &str,
+        auth_type: &str,
+        encrypted: &str,
+        verified: bool,
+        verified_default_model: Option<&str>,
+        expected: Option<(&str, &str)>,
+    ) -> Result<(), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut data = existing
+            .as_ref()
+            .map(|row| row.data.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let providers = data
+            .as_object_mut()
+            .and_then(|root| {
+                root.entry("agent_sandbox")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+            .and_then(|sandbox| {
+                sandbox
+                    .entry("providers")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+            .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                details: "agent_sandbox.providers is not a JSON object".into(),
+            })?;
+        let mut provider = providers
+            .get(provider_id)
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some((expected_auth_type, expected_encrypted)) = expected {
+            if provider
+                .get("auth_type")
+                .and_then(serde_json::Value::as_str)
+                != Some(expected_auth_type)
+                || provider
+                    .get("credentials_encrypted")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(expected_encrypted)
+            {
+                return Err(ConfigServiceError::ProviderCredentialChanged {
+                    provider_id: provider_id.into(),
+                });
+            }
+        }
+        provider.insert(
+            "auth_type".into(),
+            serde_json::Value::String(auth_type.into()),
+        );
+        provider.insert(
+            "credentials_encrypted".into(),
+            serde_json::Value::String(encrypted.into()),
+        );
+        if let Some(model) = verified_default_model {
+            provider.insert(
+                "default_model".into(),
+                serde_json::Value::String(model.into()),
+            );
+        }
+        let extra = provider
+            .entry("extra")
+            .or_insert_with(|| serde_json::json!({}));
+        if !extra.is_object() {
+            *extra = serde_json::json!({});
+        }
+        let extra =
+            extra
+                .as_object_mut()
+                .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                    details: format!(
+                        "AI provider '{provider_id}' extra settings is not a JSON object"
+                    ),
+                })?;
+        extra.insert(
+            "credential_verified".into(),
+            serde_json::Value::Bool(verified),
+        );
+        providers.insert(provider_id.into(), serde_json::Value::Object(provider));
+        if let Some(row) = existing {
+            let mut active: settings::ActiveModel = row.into();
+            active.data = Set(data);
+            active.updated_at = Set(Utc::now());
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(data),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(())
+    }
+
+    /// Change the active harness without losing concurrent credential updates.
+    pub async fn activate_agent_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<(), ConfigServiceError> {
+        self.mutate_agent_sandbox_json(|sandbox| {
+            let has_credential = sandbox
+                .get("providers")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|providers| providers.get(provider_id))
+                .and_then(|provider| provider.get("credentials_encrypted"))
+                .and_then(serde_json::Value::as_str)
+                .is_some();
+            if !has_credential {
+                return Err(ConfigServiceError::InvalidConfiguration {
+                    details: format!("Provider '{provider_id}' has no saved credential"),
+                });
+            }
+            sandbox.insert(
+                "default_provider".into(),
+                serde_json::Value::String(provider_id.into()),
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    /// Update provider preferences while retaining its latest credential.
+    pub async fn update_agent_provider_preferences(
+        &self,
+        provider_id: &str,
+        default_auth_type: &str,
+        default_model: Option<&str>,
+        turns: [Option<i32>; 3],
+    ) -> Result<[Option<i32>; 3], ConfigServiceError> {
+        self.mutate_agent_sandbox_json(|sandbox| {
+            let providers = sandbox
+                .entry("providers")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                    details: "agent_sandbox.providers is not a JSON object".into(),
+                })?;
+            let mut provider = providers
+                .get(provider_id)
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            provider.insert(
+                "default_model".into(),
+                default_model.map_or(serde_json::Value::Null, |model| {
+                    serde_json::Value::String(model.into())
+                }),
+            );
+            let keys = ["max_turns_analysis", "max_turns_fix", "max_turns_feedback"];
+            for (key, value) in keys.into_iter().zip(turns) {
+                if let Some(value) = value {
+                    provider.insert(
+                        key.into(),
+                        if value == 0 {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::from(value)
+                        },
+                    );
+                }
+            }
+            provider
+                .entry("auth_type")
+                .or_insert_with(|| serde_json::Value::String(default_auth_type.into()));
+            provider.entry("extra").or_insert(serde_json::Value::Null);
+            let result = keys.map(|key| {
+                provider
+                    .get(key)
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|value| value as i32)
+            });
+            providers.insert(provider_id.into(), serde_json::Value::Object(provider));
+            Ok(result)
+        })
+        .await
+    }
+
+    async fn mutate_agent_sandbox_json<T>(
+        &self,
+        mutate: impl FnOnce(
+            &mut serde_json::Map<String, serde_json::Value>,
+        ) -> Result<T, ConfigServiceError>,
+    ) -> Result<T, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut data = existing
+            .as_ref()
+            .map(|row| row.data.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let sandbox = data
+            .as_object_mut()
+            .and_then(|root| {
+                root.entry("agent_sandbox")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+            .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                details: "agent_sandbox is not a JSON object".into(),
+            })?;
+        let result = mutate(sandbox)?;
+        if let Some(row) = existing {
+            let mut active: settings::ActiveModel = row.into();
+            active.data = Set(data);
+            active.updated_at = Set(Utc::now());
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(data),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(result)
     }
 
     /// Persist cluster CA material exactly once and return the material that

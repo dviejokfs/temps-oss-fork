@@ -4,6 +4,126 @@
 import { test, expect } from '@playwright/test'
 import type { ProviderCatalogDto } from '../../src/api/client'
 
+test('OpenCode imports unverified once and verifies a chosen model without re-entering credentials', async ({
+  page,
+}) => {
+  const provider = {
+    id: 'opencode',
+    name: 'OpenCode',
+    install_command: 'install',
+    auth_command: 'login',
+    auth_flavors: [
+      {
+        id: 'config_file',
+        label: 'Auth file',
+        description: 'Private auth file',
+        format: 'config_file',
+      },
+    ],
+    models: ['openai/test-model'],
+    runtime_models: [],
+    permission_modes: [],
+    default_permission_mode_id: 'auto',
+    credential_saved: false,
+    credential_verification_status: 'not_saved',
+    host_authenticated: true,
+    model_source: 'bootstrap',
+    supports_max_turns: false,
+    workspace_ready: false,
+    local_credential: {
+      auth_type: 'config_file',
+      source: 'host_auth_store',
+      label: 'Host CLI',
+    },
+  }
+  await page.route('**/api/settings/ai-providers', (route) =>
+    route.fulfill({
+      json: { default_provider: 'opencode', providers: [provider] },
+    })
+  )
+  let imports = 0
+  await page.route(
+    '**/api/settings/ai-providers/opencode/credential/import-local*',
+    (route) => {
+      imports++
+      return route.fulfill({
+        json: {
+          saved: true,
+          auth_type: 'config_file',
+          workspace_ready: false,
+          credential_verification_status: 'unverified',
+          provider: {
+            ...provider,
+            credential_saved: true,
+            credential_verification_status: 'unverified',
+          },
+        },
+      })
+    }
+  )
+  let attempts = 0
+  await page.route(
+    '**/api/settings/ai-providers/opencode/credential/verify-saved',
+    (route) => {
+      expect(route.request().postDataJSON()).toEqual({
+        verification_model: 'openai/test-model',
+      })
+      attempts++
+      if (attempts === 1)
+        return route.fulfill({
+          status: 400,
+          json: { detail: 'The provider rejected this model request.' },
+        })
+      return route.fulfill({
+        json: {
+          saved: true,
+          credential_verification_status: 'verified',
+          provider: {
+            ...provider,
+            credential_saved: true,
+            credential_verification_status: 'verified',
+            workspace_ready: true,
+            default_model: 'openai/test-model',
+          },
+        },
+      })
+    }
+  )
+  await page.goto('/ai-first?setup=workspace&setupStep=1&setupHarness=opencode')
+  await page
+    .getByRole('button', { name: 'Use local login', exact: true })
+    .click()
+  await expect(
+    page.getByRole('button', { name: 'Continue', exact: true })
+  ).toBeDisabled()
+  await expect(
+    page.getByRole('status').filter({ hasText: 'not verified' })
+  ).toBeVisible()
+  await expect(
+    page.getByText('Credential verified and saved.', { exact: true })
+  ).toHaveCount(0)
+  await page
+    .getByLabel('Model to verify', { exact: true })
+    .fill('openai/test-model')
+  await page
+    .getByRole('button', { name: 'Verify saved login', exact: true })
+    .click()
+  await expect(
+    page.getByRole('alert').filter({ hasText: 'provider rejected' })
+  ).toBeVisible()
+  await expect(
+    page.getByRole('button', { name: 'Continue', exact: true })
+  ).toBeDisabled()
+  await page
+    .getByRole('button', { name: 'Verify saved login', exact: true })
+    .click()
+  await expect(
+    page.getByRole('button', { name: 'Continue', exact: true })
+  ).toBeEnabled()
+  expect(imports).toBe(1)
+  expect(attempts).toBe(2)
+})
+
 for (const shortcut of ['Meta+Enter', 'Control+Enter']) {
   test(`${shortcut} creates an unnamed workspace once; plain Enter does not`, async ({
     page,
@@ -95,6 +215,7 @@ test('rejects invalid credentials and enables Continue after verification withou
     ],
     default_permission_mode_id: 'default',
     credential_saved: false,
+    credential_verification_status: 'not_saved',
     host_authenticated: false,
     model_source: 'bootstrap',
     supports_max_turns: true,

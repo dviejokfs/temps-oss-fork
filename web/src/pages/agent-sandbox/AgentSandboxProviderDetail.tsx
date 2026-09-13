@@ -40,6 +40,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   activateAiProvider,
   saveAiProviderCredential,
+  verifySavedAiProviderCredential,
   smokeTestAgent,
   updateAiProvider,
   type ProviderCatalogDto,
@@ -51,6 +52,7 @@ import {
   harnessCheckError,
   harnessSetupStatus,
   workspaceReturnTo,
+  credentialVerificationMessage,
 } from './harness-onboarding'
 import {
   importLocalAiProviderCredentialMutation,
@@ -203,8 +205,40 @@ export function ProviderEditor({
     credentialDraft.method === connectionMethod ? credentialDraft.value : ''
   const setCredential = (value: string) =>
     setCredentialDraft({ method: connectionMethod, value })
-  const [saving, setSaving] = useState(false)
+  const [savingCredential, setSaving] = useState(false)
   const [credentialError, setCredentialError] = useState<string | null>(null)
+  const [verificationModel, setVerificationModel] = useState(
+    provider.default_model ?? ''
+  )
+  const verifySavedMutation = useMutation({
+    mutationFn: async () => {
+      const { data } = await verifySavedAiProviderCredential({
+        path: { provider_id: provider.id },
+        body: { verification_model: verificationModel.trim() },
+        throwOnError: true,
+      })
+      return data
+    },
+    onMutate: () => {
+      setCredentialError(null)
+      onVerificationPending?.(true)
+    },
+    onSuccess: async (data) => {
+      if (data.provider)
+        await publishVerifiedProvider(queryClient, data.provider)
+      toast.success(credentialVerificationMessage(data))
+    },
+    onError: (error) => {
+      const detail = problemDetail(
+        error,
+        'Could not verify this model. Choose a model your saved account can access and retry.'
+      )
+      setCredentialError(detail)
+      toast.error('Model verification failed', { description: detail })
+    },
+    onSettled: () => onVerificationPending?.(false),
+  })
+  const saving = savingCredential || verifySavedMutation.isPending
   const [activating, setActivating] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{
@@ -225,9 +259,11 @@ export function ProviderEditor({
   )
   const [savingModel, setSavingModel] = useState(false)
   const refreshModelsMutation = useMutation(refreshAiProviderModelsMutation())
-  const importLocalCredentialMutation = useMutation(
-    importLocalAiProviderCredentialMutation()
-  )
+  const importLocalCredentialMutation = useMutation({
+    ...importLocalAiProviderCredentialMutation(),
+    // The catch below owns the inline error and its single notification.
+    onError: () => {},
+  })
 
   useEffect(() => {
     const fresh = provider.default_model ?? ''
@@ -415,7 +451,13 @@ export function ProviderEditor({
     try {
       const { data } = await saveAiProviderCredential({
         path: { provider_id: provider.id },
-        body: { auth_type: selectedFlavor.id, credential: credential.trim() },
+        body: {
+          auth_type: selectedFlavor.id,
+          credential: credential.trim(),
+          ...(provider.id === 'opencode' && verificationModel.trim()
+            ? { verification_model: verificationModel.trim() }
+            : {}),
+        },
         throwOnError: true,
       })
       setTestResult(null)
@@ -431,9 +473,7 @@ export function ProviderEditor({
           { throwOnError: true }
         )
       }
-      toast.success(
-        `${provider.name} credential ${data.provider ? 'verified and saved' : 'saved'}`
-      )
+      toast.success(credentialVerificationMessage(data))
       setCredential('')
     } catch (e) {
       const detail = problemDetail(
@@ -457,6 +497,10 @@ export function ProviderEditor({
     try {
       const imported = await importLocalCredentialMutation.mutateAsync({
         path: { provider_id: provider.id },
+        query:
+          provider.id === 'opencode' && verificationModel.trim()
+            ? { verification_model: verificationModel.trim() }
+            : undefined,
       })
       setTestResult(null)
       setSelectedFlavorId(imported.auth_type)
@@ -472,11 +516,7 @@ export function ProviderEditor({
         )
       }
       toast.success(`${provider.name} local login imported`, {
-        description: imported.workspace_ready
-          ? imported.provider
-            ? 'The credential is verified, encrypted, and ready for workspaces.'
-            : 'The credential is encrypted and configured for workspaces. Verify a first reply next.'
-          : 'The credential is encrypted and ready for supported host workflows.',
+        description: credentialVerificationMessage(imported),
       })
     } catch (cause) {
       const detail = problemDetail(
@@ -561,6 +601,57 @@ export function ProviderEditor({
           </div>
         </CardHeader>
         <CardContent className={embedded ? 'space-y-4 p-0' : 'space-y-4'}>
+          {provider.id === 'opencode' && (
+            <div className="space-y-2">
+              <Label htmlFor={`verification-model-${provider.id}`}>
+                Model to verify
+              </Label>
+              <Input
+                id={`verification-model-${provider.id}`}
+                value={verificationModel}
+                onChange={(event) => setVerificationModel(event.target.value)}
+                placeholder="provider/model"
+                list={`verification-models-${provider.id}`}
+                disabled={saving || verifySavedMutation.isPending}
+                autoComplete="off"
+              />
+              <datalist id={`verification-models-${provider.id}`}>
+                {provider.models.map((model) => (
+                  <option key={model} value={model} />
+                ))}
+              </datalist>
+              <p className="text-xs text-muted-foreground">
+                Choose a model your account can access. Verification runs a
+                small request in a temporary sandbox and may use your provider
+                allowance.
+              </p>
+              {provider.credential_saved && (
+                <>
+                  <p role="status" className="text-sm text-muted-foreground">
+                    {credentialVerificationMessage(provider)}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={
+                      saving ||
+                      verifySavedMutation.isPending ||
+                      !verificationModel.trim()
+                    }
+                    onClick={() => verifySavedMutation.mutate()}
+                  >
+                    {verifySavedMutation.isPending && (
+                      <Loader2 className="mr-1.5 size-4 animate-spin" />
+                    )}
+                    {verifySavedMutation.isPending
+                      ? 'Verifying model…'
+                      : 'Verify saved login'}
+                  </Button>
+                </>
+              )}
+            </div>
+          )}
           {usesConnectionCards && !connectionMethod && (
             <div
               className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3"
@@ -637,7 +728,9 @@ export function ProviderEditor({
               >
                 {importLocalCredentialMutation.isPending
                   ? 'Verifying…'
-                  : 'Verify & connect'}
+                  : provider.credential_saved
+                    ? 'Verify & replace login'
+                    : 'Verify & connect'}
               </Button>
               {credentialError && (
                 <p role="alert" className="text-sm text-destructive">
