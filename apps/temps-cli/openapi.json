@@ -3456,6 +3456,27 @@
         ],
         "type": "object"
       },
+      "ApplicationGitConnectionsResponse": {
+        "properties": {
+          "bindings": {
+            "items": {
+              "$ref": "#/components/schemas/GitBindingResponse"
+            },
+            "type": "array"
+          },
+          "eligibleRepositories": {
+            "items": {
+              "$ref": "#/components/schemas/EligibleGitRepositoryResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "bindings",
+          "eligibleRepositories"
+        ],
+        "type": "object"
+      },
       "ApplicationPreviewLinkResponse": {
         "properties": {
           "expires_at": {
@@ -3949,6 +3970,27 @@
           "runtime": {
             "type": "string"
           },
+          "runtime_compatible": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "runtime_update_available": {
+            "type": "boolean"
+          },
+          "runtime_update_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_update_image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "sandbox_public_id": {
             "type": [
               "string",
@@ -3969,6 +4011,7 @@
           "state",
           "desired_state",
           "runtime",
+          "runtime_update_available",
           "cpu_limit",
           "memory_limit_mb",
           "pids_limit",
@@ -4322,6 +4365,29 @@
           "access_token",
           "refresh_token",
           "expires_at"
+        ],
+        "type": "object"
+      },
+      "AuthorizeWorkspacePreviewRequest": {
+        "properties": {
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sandbox_public_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sandbox_public_id",
+          "port"
         ],
         "type": "object"
       },
@@ -5003,6 +5069,32 @@
           "tags",
           "target_all_services",
           "include_control_plane"
+        ],
+        "type": "object"
+      },
+      "BindApplicationGitConnectionRequest": {
+        "properties": {
+          "connectionId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "projectId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "remoteName": {
+            "type": "string"
+          },
+          "repositoryId": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "projectId",
+          "connectionId",
+          "repositoryId",
+          "remoteName"
         ],
         "type": "object"
       },
@@ -6194,6 +6286,29 @@
           "created",
           "model",
           "choices"
+        ],
+        "type": "object"
+      },
+      "ChatFailureResponse": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "title",
+          "detail",
+          "retryable"
         ],
         "type": "object"
       },
@@ -8839,6 +8954,45 @@
         ],
         "type": "object"
       },
+      "ContextWindowUsageResponse": {
+        "properties": {
+          "estimated": {
+            "type": "boolean"
+          },
+          "limit_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "used_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "used_tokens",
+          "source",
+          "estimated",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "ContinuousArchiveSourceResponse": {
         "properties": {
           "continuous_archive_pinned_at": {
@@ -8861,12 +9015,27 @@
         "type": "object"
       },
       "ControlApplicationWorkspaceRequest": {
+        "additionalProperties": false,
         "properties": {
           "action": {
-            "description": "restart, pause, resume, rebuild, snapshot, or restore",
+            "description": "restart, pause, resume, rebuild, snapshot, restore, or update_runtime",
             "type": "string"
           },
+          "confirm": {
+            "description": "Must be true for update_runtime because compute is replaced.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime": {
+            "description": "Optional built-in flavor to select during update_runtime.",
             "type": [
               "string",
               "null"
@@ -8921,6 +9090,199 @@
           }
         ]
       },
+      "ConversationDiagnosticMessageResponse": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "cost_microcents": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "metadata": {},
+          "role": {
+            "type": "string"
+          },
+          "tokens_in": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tokens_out": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "role",
+          "content",
+          "created_at",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ConversationDiagnosticResponse": {
+        "properties": {
+          "conversation": {
+            "$ref": "#/components/schemas/ConversationDiagnosticRuntimeResponse"
+          },
+          "message_limit": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/ConversationDiagnosticMessageResponse"
+            },
+            "type": "array"
+          },
+          "native_session": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ConversationNativeDiagnosticResponse"
+              }
+            ]
+          },
+          "pending_permission": {},
+          "returned_message_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "schema_version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ConversationDiagnosticSourceResponse"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "schema_version",
+          "conversation",
+          "source",
+          "messages",
+          "returned_message_count",
+          "message_limit",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ConversationDiagnosticRuntimeResponse": {
+        "properties": {
+          "active_turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "context_id": {
+            "type": "string"
+          },
+          "context_type": {
+            "type": "string"
+          },
+          "context_usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContextWindowUsageResponse"
+              }
+            ]
+          },
+          "last_turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "native_session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permission_mode": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "public_id": {
+            "type": "string"
+          },
+          "thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn_started_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn_status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_id",
+          "context_type",
+          "context_id",
+          "provider",
+          "model",
+          "permission_mode",
+          "turn_status"
+        ],
+        "type": "object"
+      },
+      "ConversationDiagnosticSourceResponse": {
+        "properties": {
+          "native_session_note": {
+            "type": "string"
+          },
+          "native_session_status": {
+            "type": "string"
+          },
+          "normalized_history": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "normalized_history",
+          "native_session_status",
+          "native_session_note"
+        ],
+        "type": "object"
+      },
       "ConversationListScope": {
         "enum": [
           "all",
@@ -8949,6 +9311,31 @@
         },
         "required": [
           "has_more"
+        ],
+        "type": "object"
+      },
+      "ConversationNativeDiagnosticResponse": {
+        "properties": {
+          "format": {
+            "type": "string"
+          },
+          "json": {},
+          "provider": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "provider",
+          "session_id",
+          "format",
+          "json",
+          "truncated"
         ],
         "type": "object"
       },
@@ -8988,8 +9375,28 @@
           "context_type": {
             "type": "string"
           },
+          "context_usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContextWindowUsageResponse"
+              }
+            ]
+          },
           "created_at": {
             "type": "string"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatFailureResponse"
+              }
+            ]
           },
           "last_activity_at": {
             "type": "string"
@@ -15657,6 +16064,39 @@
         ],
         "type": "object"
       },
+      "EligibleGitRepositoryResponse": {
+        "properties": {
+          "accountName": {
+            "type": "string"
+          },
+          "connectionId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "fullName": {
+            "type": "string"
+          },
+          "private": {
+            "type": "boolean"
+          },
+          "repositoryId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "repositoryUrl": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connectionId",
+          "repositoryId",
+          "accountName",
+          "fullName",
+          "repositoryUrl",
+          "private"
+        ],
+        "type": "object"
+      },
       "EmailConfig": {
         "properties": {
           "accept_invalid_certs": {
@@ -21416,6 +21856,54 @@
         ],
         "type": "object"
       },
+      "GitBindingResponse": {
+        "properties": {
+          "connectionId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "projectId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "remoteName": {
+            "type": "string"
+          },
+          "repositoryId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "repositoryUrl": {
+            "type": "string"
+          },
+          "status": {
+            "description": "`configured` means the durable authorization exists; it does not claim a live remote.",
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "projectId",
+          "connectionId",
+          "repositoryId",
+          "repositoryUrl",
+          "remoteName",
+          "status",
+          "createdAt",
+          "updatedAt"
+        ],
+        "type": "object"
+      },
       "GitPushEvent": {
         "description": "Git push event information that triggered the deployment",
         "properties": {
@@ -21660,8 +22148,28 @@
           "context_type": {
             "type": "string"
           },
+          "context_usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContextWindowUsageResponse"
+              }
+            ]
+          },
           "created_at": {
             "type": "string"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatFailureResponse"
+              }
+            ]
           },
           "last_activity_at": {
             "type": "string"
@@ -22049,7 +22557,7 @@
             ]
           },
           "scan_limit_reached": {
-            "description": "True means no complete ordered page could be established within the\nscan budget. Lines are empty; narrow the search rather than skipping logs.",
+            "description": "True means the scan budget was exhausted. Lines contain the newest\nmatches found so far, but unread chunks may contain newer lines.\nNo cursor is returned because the partial results cannot be paginated safely.",
             "type": "boolean"
           },
           "scanned_bytes": {
@@ -24208,6 +24716,46 @@
         ],
         "type": "object"
       },
+      "InstallPluginRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "Validated registry name only. URLs, paths, versions, and hashes are not\naccepted from HTTP callers.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "InstallPluginResponse": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "platform",
+          "sha256",
+          "message"
+        ],
+        "type": "object"
+      },
       "IntegrationResponse": {
         "properties": {
           "config": {
@@ -26104,16 +26652,110 @@
         ],
         "type": "object"
       },
+      "ManagedBackupArchiveConflict": {
+        "description": "A service whose continuous archive (Postgres WAL-G, MariaDB binlogs) is\npinned to a source other than the managed destination. The nightly Cloud\nschedule cannot back it up: archiving must not silently move between\nsources, so every run of that service fails until the operator repoints\nit to Cloud or points its own schedule at the pinned source.",
+        "properties": {
+          "pinned_s3_source_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "pinned_s3_source_name": {
+            "description": "Name of the pinned source, or its id as text when the row is gone.",
+            "type": "string"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "service_type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_id",
+          "service_name",
+          "service_type",
+          "pinned_s3_source_id",
+          "pinned_s3_source_name"
+        ],
+        "type": "object"
+      },
+      "ManagedBackupSchedule": {
+        "description": "What the Cloud settings page shows about the schedule that targets the\nmanaged destination.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "next_run": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retention_period": {
+            "description": "Days each backup is kept before the schedule's retention deletes it.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "schedule_expression": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "schedule_expression",
+          "retention_period",
+          "enabled"
+        ],
+        "type": "object"
+      },
       "ManagedBackupSetup": {
         "properties": {
           "action": {
             "$ref": "#/components/schemas/ManagedBackupSetupAction"
+          },
+          "archive_conflicts": {
+            "description": "Services whose continuous archive is pinned elsewhere. Each fails\nunder the nightly Cloud schedule until repointed (ADR-044).",
+            "items": {
+              "$ref": "#/components/schemas/ManagedBackupArchiveConflict"
+            },
+            "type": "array"
+          },
+          "managed_s3_source_id": {
+            "description": "The `s3_sources` row of the managed destination, when it exists, so a\nclient can repoint a conflicting service at it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "message": {
             "type": "string"
           },
           "ready": {
             "type": "boolean"
+          },
+          "schedule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ManagedBackupSchedule",
+                "description": "The schedule that writes to the managed destination, when one does.\n`None` on a ready destination means nothing backs up to Cloud yet:\nthe console offers to create the nightly schedule (ADR-044)."
+              }
+            ]
           },
           "status": {
             "$ref": "#/components/schemas/ManagedBackupSetupStatus"
@@ -26123,7 +26765,8 @@
           "status",
           "ready",
           "message",
-          "action"
+          "action",
+          "archive_conflicts"
         ],
         "type": "object"
       },
@@ -28567,6 +29210,29 @@
           "total",
           "page",
           "page_size"
+        ],
+        "type": "object"
+      },
+      "NpmRelease": {
+        "properties": {
+          "binary_path": {
+            "type": "string"
+          },
+          "integrity": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "integrity",
+          "binary_path"
         ],
         "type": "object"
       },
@@ -32023,6 +32689,31 @@
         ],
         "type": "object"
       },
+      "PlatformRelease": {
+        "properties": {
+          "npm": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NpmRelease"
+              }
+            ]
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "sha256"
+        ],
+        "type": "object"
+      },
       "PluginCapability": {
         "description": "What a plugin is allowed to do with the platform API over the channel.\n\nCoarse on purpose. Fine-grained authorization already exists in the\npermission system and is enforced per request against the acting user;\nthis exists so an operator installing a binary can see at a glance\nwhether it intends to *write* at all, without reading its source.",
         "enum": [
@@ -32030,6 +32721,34 @@
           "api_write"
         ],
         "type": "string"
+      },
+      "PluginCatalogResponse": {
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "plugins": {
+            "items": {
+              "$ref": "#/components/schemas/RegistryPlugin"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "available",
+          "source",
+          "plugins"
+        ],
+        "type": "object"
       },
       "PluginManifest": {
         "description": "The complete plugin manifest — the handshake contract.",
@@ -32115,6 +32834,27 @@
         "required": [
           "name",
           "version"
+        ],
+        "type": "object"
+      },
+      "PluginStatusResponse": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "setup_path"
         ],
         "type": "object"
       },
@@ -36151,6 +36891,97 @@
         ],
         "type": "object"
       },
+      "RegistryEnvelope": {
+        "description": "The outer envelope signs the decoded bytes in `payload`. Encoding the\npayload instead of reserializing a JSON object avoids ambiguous map order,\nwhitespace, and number representations.",
+        "properties": {
+          "key_id": {
+            "type": "string"
+          },
+          "payload": {
+            "description": "Standard-base64 encoded JSON [`RegistryDocument`].",
+            "type": "string"
+          },
+          "signature": {
+            "description": "Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key_id",
+          "payload",
+          "signature"
+        ],
+        "type": "object"
+      },
+      "RegistryPlugin": {
+        "properties": {
+          "author": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "docs_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "keywords": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "logo_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "platforms": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PlatformRelease"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "repository": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "title",
+          "summary",
+          "description",
+          "author",
+          "category",
+          "version",
+          "platforms"
+        ],
+        "type": "object"
+      },
       "ReinstallWebhookResponse": {
         "description": "Response for `POST /projects/{project_id}/gitlab/reinstall-webhook`",
         "properties": {
@@ -36221,9 +37052,33 @@
         ],
         "type": "object"
       },
+      "ReloadFailureResponse": {
+        "properties": {
+          "plugin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
       "ReloadResponse": {
         "description": "Response from the reload endpoint.",
         "properties": {
+          "failures": {
+            "description": "Activated installs that could not be verified or started.",
+            "items": {
+              "$ref": "#/components/schemas/ReloadFailureResponse"
+            },
+            "type": "array"
+          },
           "loaded": {
             "description": "Number of plugins successfully loaded after reload",
             "minimum": 0,
@@ -36244,6 +37099,7 @@
         "required": [
           "loaded",
           "plugins",
+          "failures",
           "message"
         ],
         "type": "object"
@@ -47127,6 +47983,25 @@
         ],
         "type": "object"
       },
+      "UninstallPluginResponse": {
+        "properties": {
+          "data_preserved": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "message",
+          "data_preserved"
+        ],
+        "type": "object"
+      },
       "UniqueCountsQuery": {
         "description": "Query parameters for unique counts over time frame",
         "properties": {
@@ -47467,6 +48342,13 @@
             "format": "int64",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "Pinned Temps-managed daemon image. Empty string restores the runtime default.\nOmit to leave the selected image unchanged. Arbitrary images are rejected.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -52256,6 +53138,100 @@
         ],
         "type": "string"
       },
+      "WorkspaceActivityResponse": {
+        "properties": {
+          "workspaces": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceActivitySummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "workspaces"
+        ],
+        "type": "object"
+      },
+      "WorkspaceActivitySummary": {
+        "properties": {
+          "application_public_id": {
+            "description": "Null identifies the user's global workspace.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "harnesses": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceHarnessActivity"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "harnesses"
+        ],
+        "type": "object"
+      },
+      "WorkspaceHarnessActivity": {
+        "properties": {
+          "ai_provider": {
+            "type": "string"
+          },
+          "cancelled": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "completed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "failed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "idle": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pending": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "running": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ai_provider",
+          "total",
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "cancelled",
+          "idle"
+        ],
+        "type": "object"
+      },
       "WriteApplicationWorkspaceFilesRequest": {
         "additionalProperties": false,
         "properties": {
@@ -54053,6 +55029,157 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/applications/{application_public_id}/git-connections": {
+      "get": {
+        "operationId": "listApplicationGitConnections",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationGitConnectionsResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ],
+        "x-maturity": "experimental"
+      },
+      "post": {
+        "operationId": "bindApplicationGitConnection",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BindApplicationGitConnectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GitBindingResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/applications/{application_public_id}/git-connections/{binding_id}": {
+      "delete": {
+        "operationId": "disconnectApplicationGitConnection",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/applications/{application_public_id}/preview-link": {
       "post": {
         "operationId": "create_application_preview_link",
@@ -55615,6 +56742,66 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/conversations/{public_id}/diagnostics": {
+      "get": {
+        "operationId": "getUserConversationDiagnostics",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Persisted rows to include, newest window first (default/max 25).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationDiagnosticResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Export the bounded, server-redacted diagnostic state Temps currently owns.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/conversations/{public_id}/messages": {
       "post": {
         "operationId": "send_user_message",
@@ -56060,6 +57247,58 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/preview/authorize": {
+      "post": {
+        "operationId": "authorize_workspace_preview",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthorizeWorkspacePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationPreviewLinkResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Renew a managed preview only for an already-bound, running workspace. The\nrequested sandbox ID is an object selector, never an authorization grant.",
         "tags": [
           "AI Chat"
         ],
@@ -57856,6 +59095,56 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/workspace-activity": {
+      "get": {
+        "operationId": "get_workspace_activity",
+        "parameters": [
+          {
+            "description": "Comma-separated application public IDs (maximum 100). Omit for the global workspace only.",
+            "in": "query",
+            "name": "application_public_ids",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceActivityResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Aggregate all active threads for the caller's global workspace and up to\n100 requested, visible application workspaces. Thread history is not paged.",
         "tags": [
           "AI Chat"
         ],
@@ -65418,6 +66707,72 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
+    "/cloud/backups/schedule/ensure": {
+      "post": {
+        "operationId": "ensure_cloud_backup_schedule",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedBackupSetup"
+                }
+              }
+            },
+            "description": "The managed destination's setup with the schedule that targets it, created when none did"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No schedule could be set up; the detail says why (Cloud did not answer the plan's retention, the backup plugin is not enabled)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Database or link state failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create the nightly schedule for the Temps Cloud destination unless one\nalready targets it (ADR-044). Answers the same shape as the reconcile so\nthe console can swap it into the status it already holds.",
         "tags": [
           "Cloud"
         ]
@@ -113334,6 +114689,196 @@
         ]
       }
     },
+    "/x/plugins/catalog": {
+      "get": {
+        "operationId": "list_plugin_catalog",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginCatalogResponse"
+                }
+              }
+            },
+            "description": "Signed plugin catalogue, or an unavailable state when registry trust is not configured"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/install": {
+      "post": {
+        "operationId": "install_plugin",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallPluginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstallPluginResponse"
+                }
+              }
+            },
+            "description": "Plugin verified, installed, and started"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid plugin name or registry release"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Registry rollback refused"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the configured limit"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request content type is not application/json"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request JSON does not match the install schema"
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Recent sensitive-action verification required"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Local plugin installation failed"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Registry, artifact, or plugin startup verification failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Registry trust, plugin service, or security audit unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
     "/x/plugins/reload": {
       "post": {
         "description": "Stops all running plugin processes, re-scans the plugins directory,\nstarts any discovered binaries, and hot-swaps the proxy router so new\nand removed plugins take effect immediately without a server restart.\n\nRequires `SystemAdmin` permission.",
@@ -113347,13 +114892,33 @@
                 }
               }
             },
-            "description": "Plugins reloaded successfully"
+            "description": "All plugins reloaded successfully"
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReloadResponse"
+                }
+              }
+            },
+            "description": "Some plugins reloaded and some failed"
           },
           "401": {
             "description": "Unauthorized"
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReloadResponse"
+                }
+              }
+            },
+            "description": "No activated plugin could be reloaded"
           }
         },
         "security": [
@@ -113362,6 +114927,177 @@
           }
         ],
         "summary": "Reload all external plugins.",
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/{name}/status": {
+      "get": {
+        "operationId": "get_plugin_status",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginStatusResponse"
+                }
+              }
+            },
+            "description": "Verified active plugin status"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid plugin name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/{name}/uninstall": {
+      "post": {
+        "operationId": "uninstall_plugin",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UninstallPluginResponse"
+                }
+              }
+            },
+            "description": "Plugin deactivated; data and releases preserved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unsafe plugin name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No active installation"
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Recent sensitive-action verification required"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Local deactivation failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Audit or plugin service unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Stop and deactivate a plugin while preserving all installed releases and data.",
         "tags": [
           "External Plugins"
         ]
