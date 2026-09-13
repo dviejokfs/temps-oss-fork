@@ -91,13 +91,13 @@ export default function DeploymentCompactRow({
   }, [deployment.status, pollDeployment])
 
   return (
-    <li className="flex flex-col gap-2 px-3 py-2.5 sm:flex-row sm:items-center sm:gap-3">
+    <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-2 px-3 py-2.5 sm:grid-cols-[250px_minmax(0,1fr)_140px_32px] sm:items-center">
       {/* Primary line: id + status + env + current */}
-      <div className="min-w-0 sm:shrink-0">
-        <span className="mb-1 hidden text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:block">
+      <div className="min-w-0">
+        <span className="mb-1 block text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:hidden">
           Deployment
         </span>
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 sm:flex-nowrap">
           <span className="font-medium text-sm">#{deployment.id}</span>
           <DeploymentStatusBadge
             deployment={deployment}
@@ -116,8 +116,8 @@ export default function DeploymentCompactRow({
       </div>
 
       {/* Meta line: source info — takes remaining space, truncates */}
-      <div className="min-w-0 flex-1 text-xs text-muted-foreground">
-        <span className="mb-1 hidden text-[10px] font-medium uppercase tracking-wide sm:block">
+      <div className="min-w-0 text-xs text-muted-foreground">
+        <span className="mb-1 block text-[10px] font-medium uppercase tracking-wide sm:hidden">
           Source
         </span>
         <div className="flex min-w-0 items-center gap-3">
@@ -166,8 +166,8 @@ export default function DeploymentCompactRow({
         </div>
       </div>
 
-      {/* Right cluster: author + time + menu */}
-      <div className="flex items-center gap-2 sm:shrink-0">
+      {/* Created by + time */}
+      <div className="flex min-w-0 items-center justify-end gap-2 sm:justify-start">
         {deployment.commit_author && (
           <Avatar className="h-5 w-5 shrink-0">
             <AvatarImage
@@ -179,20 +179,23 @@ export default function DeploymentCompactRow({
             </AvatarFallback>
           </Avatar>
         )}
-        <div>
-          <span className="mb-1 hidden text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:block">
+        <div className="min-w-0">
+          <span className="mb-1 block text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:hidden">
             Created
           </span>
           <span className="text-xs text-muted-foreground whitespace-nowrap">
             <TimeAgo date={deployment.created_at} />
           </span>
         </div>
+      </div>
+
+      <div className="col-start-2 row-start-1 flex justify-end sm:col-start-4 sm:row-start-auto">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
               variant="ghost"
               size="icon"
-              className="h-7 w-7 ml-auto sm:ml-0"
+              className="h-7 w-7"
               onClick={(e) => {
                 e.preventDefault()
                 e.stopPropagation()
@@ -250,6 +253,6 @@ export default function DeploymentCompactRow({
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
-    </li>
+    </div>
   )
 }

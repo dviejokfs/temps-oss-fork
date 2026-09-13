@@ -340,7 +340,7 @@ export function AddNotificationProvider() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="container max-w-5xl mx-auto py-6">
+      <div className="w-full">
         <div className="mb-8 space-y-4">
           <Button
             variant="ghost"

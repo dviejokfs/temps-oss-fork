@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 
 let role = 'reader'
 let catalogEnabledValues: boolean[] = []
+let emptyCatalog = false
 
 mock.module('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: { role } }),
@@ -33,18 +34,20 @@ mock.module('@/hooks/usePlugins', () => ({
     return {
       data: {
         available: true,
-        plugins: [
-          {
-            author: 'Temps',
-            category: 'Observability',
-            description: 'Checks deployment health.',
-            name: 'deployment-health',
-            platforms: {},
-            summary: 'Monitor recent deployments.',
-            title: 'Deployment Health',
-            version: '1.0.0',
-          },
-        ],
+        plugins: emptyCatalog
+          ? []
+          : [
+              {
+                author: 'Temps',
+                category: 'Observability',
+                description: 'Checks deployment health.',
+                name: 'deployment-health',
+                platforms: {},
+                summary: 'Monitor recent deployments.',
+                title: 'Deployment Health',
+                version: '1.0.0',
+              },
+            ],
       },
       isLoading: false,
       error: null,
@@ -69,6 +72,7 @@ const { PluginsPage } = await import('./PluginsPage')
 describe('PluginsPage management permissions', () => {
   beforeEach(() => {
     catalogEnabledValues = []
+    emptyCatalog = false
   })
 
   test('keeps plugin management and its catalog request disabled for readers', () => {
@@ -93,5 +97,21 @@ describe('PluginsPage management permissions', () => {
     expect(markup).toContain('Reload Plugins')
     expect(markup).toContain('>Registry<')
     expect(markup).toContain('>Install<')
+  })
+
+  test('explains when no published releases support the server platform', () => {
+    role = 'admin'
+    emptyCatalog = true
+
+    const markup = renderToStaticMarkup(<PluginsPage />)
+
+    expect(markup).toContain(
+      'No published plugins support this server’s platform yet.'
+    )
+    expect(markup).toContain(
+      'Compatible releases will appear here when they are published.'
+    )
+    expect(markup).not.toContain('The registry has no plugins yet.')
+    expect(markup).not.toContain('>Install<')
   })
 })

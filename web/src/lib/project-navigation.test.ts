@@ -18,6 +18,7 @@ describe('flat project navigation', () => {
       'project',
       'deployments',
       'environments',
+      'environment-variables',
       'logs',
       'errors',
       'traces',
@@ -78,11 +79,27 @@ describe('flat project navigation', () => {
     )
     expect(
       resolveProjectSectionLink(
-        'settings',
+        'environment-variables',
         'settings/environment-variables',
         ''
       )
-    ).toBe('settings/variables')
+    ).toBe('environment-variables')
+  })
+  test('environment variables has a direct home while other variable settings stay in Settings', () => {
+    for (const route of [
+      'environment-variables',
+      'environment-variables?environment=1',
+      'settings/environment-variables',
+    ]) {
+      expect(resolveProjectPrimaryRoute(route)).toBe('environment-variables')
+    }
+    for (const route of [
+      'settings/variables',
+      'settings/secrets',
+      'settings/deployment-tokens',
+    ]) {
+      expect(resolveProjectPrimaryRoute(route)).toBe('settings')
+    }
   })
   test('settings has only seven destinations', () => {
     expect(PROJECT_SECTION_LINKS.settings).toHaveLength(7)

@@ -37,11 +37,7 @@ export function SetupWizardShell({
   const currentIndex = steps.findIndex((step) => step.id === currentStep)
 
   return (
-    <div
-      className={cn(
-        fullWidth ? 'w-full space-y-6' : 'mx-auto max-w-3xl space-y-8 py-4'
-      )}
-    >
+    <div className={cn('w-full', fullWidth ? 'space-y-6' : 'space-y-8 py-4')}>
       <Confetti active={celebrate} duration={2500} particleCount={80} />
 
       <div

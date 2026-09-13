@@ -10796,6 +10796,7 @@ dependencies = [
  "hex",
  "pem 4.0.0",
  "sea-orm",
+ "sea-orm-migration",
  "serde",
  "serde_derive",
  "serde_json",
