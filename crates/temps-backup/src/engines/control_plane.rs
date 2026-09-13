@@ -49,9 +49,17 @@ const DUMP_FILE_SUFFIX: &str = "backup.sql.gz";
 /// Their data regenerates from live traffic and would otherwise dominate the
 /// dump size; everything needed to bring a control plane back (projects,
 /// deployments, domains, certs, users, secrets, settings, audit logs, revenue
-/// data) keeps its data. Excluded tables only reference other excluded tables
-/// (or kept parents), so restore recreates all FK constraints cleanly.
-const EXCLUDED_DATA_TABLES: &[&str] = &[
+/// data) keeps its data.
+///
+/// This is the seed list only. A table that keeps its data while referencing
+/// an excluded parent produces a dump that cannot be restored: pg_dump emits
+/// the child's rows and then `ALTER TABLE ... ADD CONSTRAINT`, which fails on
+/// the first dangling key (`request_logs.session_id -> request_sessions`
+/// did exactly that, and the first isolated restore verification of a
+/// control-plane backup caught it). So [`resolve_excluded_data`] closes the
+/// set over every foreign key at backup time instead of trusting this list
+/// to stay closed by hand.
+pub const EXCLUDED_DATA_TABLES: &[&str] = &[
     // Proxy / OTel telemetry (hypertables)
     "proxy_logs",
     "otel_spans",
@@ -162,14 +170,15 @@ impl BackupEngine for ControlPlaneEngine {
         let stderr_path_in_container = format!("/backup/{}", stderr_filename);
         let host_stderr_path = backup_dir.join(&stderr_filename);
 
-        let exclude_patterns = resolve_exclude_data_patterns(deps.db.as_ref()).await;
+        let excluded = resolve_excluded_data(deps.db.as_ref()).await;
         info!(
             backup_id,
-            tables = EXCLUDED_DATA_TABLES.len(),
-            patterns = exclude_patterns.len(),
+            tables = excluded.tables.len(),
+            patterns = excluded.patterns.len(),
             "ControlPlaneEngine: dumping schema-only for high-volume tables",
         );
-        let exclude_flags = exclude_patterns
+        let exclude_flags = excluded
+            .patterns
             .iter()
             .map(|p| format!("--exclude-table-data={}", v2_common::shell_escape(p)))
             .collect::<Vec<_>>()
@@ -314,7 +323,7 @@ impl BackupEngine for ControlPlaneEngine {
             s3_source_id,
             "gzip",
             Some(serde_json::json!({
-                "excluded_table_data": EXCLUDED_DATA_TABLES,
+                "excluded_table_data": excluded.tables,
             })),
         )
         .await?;
@@ -335,49 +344,115 @@ impl BackupEngine for ControlPlaneEngine {
 
 // ── Local helpers ────────────────────────────────────────────────────────────
 
-/// Build the `--exclude-table-data` patterns for [`EXCLUDED_DATA_TABLES`].
+/// What a control-plane dump leaves schema-only: the table names, and the
+/// `--exclude-table-data` patterns that implement them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludedData {
+    /// Every `public` table dumped schema-only, seeds and foreign-key
+    /// dependants alike, sorted. Recorded in the backup's `metadata.json`.
+    pub tables: Vec<String>,
+    /// `schema.table` patterns for `--exclude-table-data`, one per table plus
+    /// the chunk patterns of every hypertable among them.
+    pub patterns: Vec<String>,
+}
+
+/// Resolve [`EXCLUDED_DATA_TABLES`] against the live database.
 ///
-/// Always excludes the root `public.<table>`. For tables that are TimescaleDB
-/// hypertables, additionally excludes their chunk tables
-/// (`_timescaledb_internal._hyper_<id>_*`) and, when compression is enabled,
-/// the compressed chunks (`_timescaledb_internal.compress_hyper_<cid>_*`) —
-/// hypertable rows live in chunks, so root-table exclusion alone would keep
-/// all the data. Continuous-aggregate materializations are intentionally NOT
-/// excluded: they are small and let dashboards keep aggregate history.
+/// 1. Close the set over foreign keys: any `public` table with a foreign key
+///    to an excluded table is excluded too, recursively. A kept child whose
+///    rows point at parent rows the dump does not carry restores up to the
+///    `ADD CONSTRAINT` and then fails; excluding it is the only dump that
+///    restores. The tables added this way are logged by name so a new
+///    reference to telemetry data is noticed, not silently dropped.
+/// 2. For every table that is a TimescaleDB hypertable, additionally exclude
+///    its chunk tables (`_timescaledb_internal._hyper_<id>_*`) and, when
+///    compression is enabled, the compressed chunks
+///    (`_timescaledb_internal.compress_hyper_<cid>_*`): hypertable rows live
+///    in chunks, so root-table exclusion alone would keep all the data.
+///    Continuous-aggregate materializations are intentionally NOT excluded:
+///    they are small and let dashboards keep aggregate history.
 ///
-/// If the catalog lookup fails the backup proceeds with root-table exclusion
-/// only (worst case: a larger dump, never data loss), and the failure is
-/// logged.
-async fn resolve_exclude_data_patterns(db: &DatabaseConnection) -> Vec<String> {
+/// If a catalog lookup fails the backup proceeds with what it has (worst
+/// case: a larger dump, or for the closure step a dump that fails to restore
+/// exactly as it always did), and the failure is logged.
+pub async fn resolve_excluded_data(db: &DatabaseConnection) -> ExcludedData {
     use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
 
-    let mut patterns: Vec<String> = EXCLUDED_DATA_TABLES
+    // EXCLUDED_DATA_TABLES are compile-time identifiers, safe to inline.
+    let seed_list = EXCLUDED_DATA_TABLES
         .iter()
-        .map(|t| format!("public.{}", t))
+        .map(|t| format!("'{}'", t))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    #[derive(FromQueryResult)]
+    struct TableRow {
+        relname: String,
+    }
+    let closure_sql = format!(
+        "WITH RECURSIVE excluded(relid) AS (              SELECT c.oid FROM pg_class c              JOIN pg_namespace n ON n.oid = c.relnamespace              WHERE n.nspname = 'public' AND c.relkind IN ('r','p')                AND c.relname IN ({seed_list})            UNION              SELECT f.conrelid FROM pg_constraint f              JOIN excluded e ON f.confrelid = e.relid              JOIN pg_class c ON c.oid = f.conrelid              JOIN pg_namespace n ON n.oid = c.relnamespace              WHERE f.contype = 'f' AND f.conrelid <> f.confrelid                AND n.nspname = 'public'          )          SELECT DISTINCT c.relname FROM excluded e          JOIN pg_class c ON c.oid = e.relid          ORDER BY c.relname"
+    );
+    let mut tables: Vec<String> = match TableRow::find_by_statement(Statement::from_string(
+        DatabaseBackend::Postgres,
+        closure_sql,
+    ))
+    .all(db)
+    .await
+    {
+        Ok(rows) => rows.into_iter().map(|row| row.relname).collect(),
+        Err(e) => {
+            warn!(
+                    "ControlPlaneEngine: could not close the excluded tables over foreign keys;                      a table that references excluded data will make this dump unrestorable: {}",
+                    e
+                );
+            Vec::new()
+        }
+    };
+    // Seeds that do not exist on this schema version still get a pattern:
+    // pg_dump ignores a pattern that matches nothing, and the list stays the
+    // documented intent rather than a per-instance surprise.
+    for seed in EXCLUDED_DATA_TABLES {
+        if !tables.iter().any(|t| t == seed) {
+            tables.push((*seed).to_string());
+        }
+    }
+    tables.sort();
+    tables.dedup();
+    let dependants: Vec<&str> = tables
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !EXCLUDED_DATA_TABLES.contains(t))
         .collect();
+    if !dependants.is_empty() {
+        info!(
+            added = ?dependants,
+            "ControlPlaneEngine: also dumping schema-only tables that reference excluded data",
+        );
+    }
+
+    let mut patterns: Vec<String> = tables.iter().map(|t| format!("public.{}", t)).collect();
 
     #[derive(FromQueryResult)]
     struct HypertableRow {
         id: i32,
         compressed_hypertable_id: Option<i32>,
     }
-
-    // EXCLUDED_DATA_TABLES are compile-time identifiers, safe to inline.
-    let in_list = EXCLUDED_DATA_TABLES
+    // Names come from pg_class; quote them as literals regardless.
+    let table_list = tables
         .iter()
-        .map(|t| format!("'{}'", t))
+        .map(|t| format!("'{}'", t.replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!(
-        "SELECT id, compressed_hypertable_id \
-         FROM _timescaledb_catalog.hypertable \
-         WHERE schema_name = 'public' AND table_name IN ({})",
-        in_list
+    let hypertable_sql = format!(
+        "SELECT id, compressed_hypertable_id          FROM _timescaledb_catalog.hypertable          WHERE schema_name = 'public' AND table_name IN ({})",
+        table_list
     );
-
-    match HypertableRow::find_by_statement(Statement::from_string(DatabaseBackend::Postgres, sql))
-        .all(db)
-        .await
+    match HypertableRow::find_by_statement(Statement::from_string(
+        DatabaseBackend::Postgres,
+        hypertable_sql,
+    ))
+    .all(db)
+    .await
     {
         Ok(rows) => {
             for row in rows {
@@ -389,14 +464,13 @@ async fn resolve_exclude_data_patterns(db: &DatabaseConnection) -> Vec<String> {
         }
         Err(e) => {
             warn!(
-                "ControlPlaneEngine: could not resolve TimescaleDB chunks for data \
-                 exclusion, hypertable data will be included in the dump: {}",
+                "ControlPlaneEngine: could not resolve TimescaleDB chunks for data                  exclusion, hypertable data will be included in the dump: {}",
                 e
             );
         }
     }
 
-    patterns
+    ExcludedData { tables, patterns }
 }
 
 /// Detect the PostgreSQL major version via `current_setting('server_version')`.
