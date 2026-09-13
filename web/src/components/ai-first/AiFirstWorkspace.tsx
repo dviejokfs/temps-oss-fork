@@ -28,6 +28,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
+import { harnessSetupHref } from '@/pages/agent-sandbox/harness-onboarding'
 import {
   type InfiniteData,
   useInfiniteQuery,
@@ -110,7 +111,10 @@ import { ApplicationPreviewPanel } from './ApplicationPreviewPanel'
 import { ApplicationProjectsPanel } from './ApplicationProjectsPanel'
 import { ApplicationWorkspaceSettingsPanel } from './ApplicationWorkspaceSettingsPanel'
 import { GlobalWorkspaceStatusPanel } from './GlobalWorkspaceStatusPanel'
-import { WorkspaceActivity, WorkspaceRunningIndicator } from './WorkspaceActivity'
+import {
+  WorkspaceActivity,
+  WorkspaceRunningIndicator,
+} from './WorkspaceActivity'
 import { WorkspaceDiffViewer } from './WorkspaceDiffViewer'
 import { WorkspaceFileExplorer } from './WorkspaceFileExplorer'
 import {
@@ -130,7 +134,10 @@ import {
   threadSelectionAfterRemoval,
 } from './thread-selection'
 import { threadDisplayStatus, type ThreadDisplayStatus } from './thread-status'
-import { threadTitleFromLiveEvent, workspacePageTitle } from './thread-title-event'
+import {
+  threadTitleFromLiveEvent,
+  workspacePageTitle,
+} from './thread-title-event'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   batchLocalImportFiles,
@@ -1635,7 +1642,10 @@ export function AiFirstWorkspace() {
             workspace={activeWorkspaceStatus}
           />
           <Button asChild variant="ghost" size="sm" aria-label="Harnesses">
-            <Link to="/agent-sandbox/providers" title="Harnesses">
+            <Link
+              to={harnessSetupHref(null, `/ai-first?${searchParams}`)}
+              title="Harnesses"
+            >
               <Terminal className="size-4 sm:mr-1.5" />
               <span className="hidden sm:inline">Harnesses</span>
               <span
@@ -1824,7 +1834,8 @@ export function AiFirstWorkspace() {
                     {applicationListMode === 'active' && (
                       <WorkspaceRunningIndicator
                         harnesses={
-                          activityByWorkspace.get(application.public_id)?.harnesses
+                          activityByWorkspace.get(application.public_id)
+                            ?.harnesses
                         }
                       />
                     )}
@@ -3638,18 +3649,20 @@ export function HarnessPicker({
   selectedId: string | null
   onSelect: (providerId: string) => void
 }) {
+  const [setupParams] = useSearchParams()
+  const setupHref = harnessSetupHref(null, `/ai-first?${setupParams}`)
   return (
     <section className="rounded-lg border border-border bg-muted/40 p-3">
       <div className="flex items-center justify-between gap-3">
         <div>
-          <p className="text-sm font-medium">Detected harnesses</p>
+          <p className="text-sm font-medium">Choose a harness</p>
           <p className="mt-0.5 text-xs text-muted-foreground">
             The selected harness starts the first thread and remains pinned to
             it.
           </p>
         </div>
         <Button asChild size="sm" type="button" variant="ghost">
-          <Link to="/agent-sandbox/providers">
+          <Link to={setupHref}>
             <TerminalSquare className="mr-1.5 size-4" /> Manage
           </Link>
         </Button>
@@ -3688,12 +3701,11 @@ export function HarnessPicker({
       ) : (
         <div className="mt-3 flex items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-300">
           <p>
-            No harness is ready for persistent workspace execution. Configure
-            Claude Code to start a thread; Codex and OpenCode remain available
-            for host workflows until their secure workspace relays are added.
+            Connect Claude Code, Codex, or OpenCode to start your first thread.
+            Setup explains which credential to use and where to authenticate.
           </p>
           <Button asChild size="sm" type="button" variant="outline">
-            <Link to="/agent-sandbox/providers">Configure harness</Link>
+            <Link to={setupHref}>Connect harness</Link>
           </Button>
         </div>
       )}

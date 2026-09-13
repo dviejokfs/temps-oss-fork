@@ -54,6 +54,7 @@ require "yaml"
 repository_root = ARGV[0]
 nightly = YAML.safe_load(File.read(ARGV[1]), aliases: true)
 release = YAML.safe_load(File.read(ARGV[2]), aliases: true)
+daemon = YAML.safe_load(File.read(File.join(repository_root, ".github/workflows/daemon-images.yml")), aliases: true)
 sandbox = YAML.safe_load(File.read(ARGV[3]), aliases: true)
 e2e = YAML.safe_load(File.read(ARGV[4]), aliases: true)
 rust_tests = YAML.safe_load(File.read(ARGV[5]), aliases: true)
@@ -72,6 +73,28 @@ abort "dispatch-release must only have actions: write" unless
 
 abort "release builds can bypass ref validation" unless
   release.dig("jobs", "build-web-assets", "needs") == "validate-release-ref"
+
+# Default success() dependency semantics must gate publication on every flavor.
+publish = release.dig("jobs", "create-release")
+abort "public release can precede required daemon images" unless
+  publish.fetch("needs").include?("daemon-images") && !publish.key?("if")
+daemon_call = release.dig("jobs", "daemon-images")
+abort "daemon images must run before publication, after ref validation" unless
+  daemon_call["needs"] == "validate-release-ref" && !daemon_call.key?("continue-on-error")
+abort "daemon channel must match release stable/prerelease/dry-run policy" unless
+  daemon_call.dig("with", "channel") == "${{ (inputs.dry_run == true || contains(github.ref_name, '-')) && 'beta' || 'stable' }}"
+images = daemon.dig("jobs", "images")
+abort "all required daemon flavors must be verified" unless
+  images.dig("strategy", "matrix", "flavor") == ["nodejs", "python", "all"] &&
+  !images.key?("continue-on-error")
+steps = images.fetch("steps")
+verify_index = steps.index { |step| step["name"] == "Verify daemon lifecycle without provider credentials" }
+publish_index = steps.index { |step| step["name"] == "Build and publish daemon image" }
+abort "daemon publication must follow unconditional lifecycle verification" unless
+  verify_index && publish_index && verify_index < publish_index &&
+  !steps[verify_index].key?("if") && !steps[verify_index].key?("continue-on-error") &&
+  steps[verify_index]["run"].include?("docker info >/dev/null\n") &&
+  steps[verify_index]["run"].include?("bash tools/sandbox-runtime/smoke.sh temps-daemon-release:check")
 
 abort "release dependency fetches can fall back to Cargo's embedded Git client" unless
   release.dig("env", "CARGO_NET_GIT_FETCH_WITH_CLI") == "true"

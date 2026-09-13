@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Link, useParams } from 'react-router'
+import { Link, useParams, useSearchParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
@@ -36,7 +36,21 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import type { ProviderCatalogDto, ProviderCatalogResponse } from '@/api/client'
+import {
+  activateAiProvider,
+  saveAiProviderCredential,
+  smokeTestAgent,
+  updateAiProvider,
+  type ProviderCatalogDto,
+  type ProviderCatalogResponse,
+} from '@/api/client'
+import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
+import {
+  harnessSetupHref,
+  harnessCheckError,
+  harnessSetupStatus,
+  workspaceReturnTo,
+} from './harness-onboarding'
 import {
   importLocalAiProviderCredentialMutation,
   refreshAiProviderModelsMutation,
@@ -50,6 +64,8 @@ import {
 
 export function AgentSandboxProviderDetail() {
   const { id } = useParams<{ id: string }>()
+  const [params] = useSearchParams()
+  const returnTo = workspaceReturnTo(params.get('returnTo'))
   usePageTitle(id ? `Provider · ${id}` : 'AI Provider')
   const { data, isPending, isError } = useQuery({
     ...aiProviderCatalogQueryOptions,
@@ -84,7 +100,7 @@ export function AgentSandboxProviderDetail() {
             catalog.
           </p>
           <Button asChild variant="outline" size="sm">
-            <Link to="/agent-sandbox/providers">
+            <Link to={harnessSetupHref(null, returnTo)}>
               <ArrowLeft className="h-3.5 w-3.5 mr-1.5" />
               Back to providers
             </Link>
@@ -99,14 +115,19 @@ export function AgentSandboxProviderDetail() {
   return (
     <div className="space-y-4">
       <Link
-        to="/agent-sandbox/providers"
+        to={harnessSetupHref(null, returnTo)}
         className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
       >
         <ArrowLeft className="h-3.5 w-3.5" />
         All providers
       </Link>
 
-      <ProviderEditor provider={provider} isActive={isActive} />
+      <ProviderEditor
+        key={provider.id}
+        provider={provider}
+        isActive={isActive}
+        returnTo={returnTo}
+      />
     </div>
   )
 }
@@ -119,13 +140,25 @@ export function AgentSandboxProviderDetail() {
 interface ProviderEditorProps {
   provider: ProviderCatalogDto
   isActive: boolean
+  returnTo?: string
 }
 
-export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
+export function ProviderEditor({
+  provider,
+  isActive,
+  returnTo = '/ai-first',
+}: ProviderEditorProps) {
   const queryClient = useQueryClient()
-  const defaultFlavor =
-    provider.auth_flavors.find((f) => f.id === provider.current_auth_type) ??
-    provider.auth_flavors[0]
+  const defaultFlavor = provider.auth_flavors.find(
+    (f) => f.id === provider.current_auth_type
+  ) ??
+    provider.auth_flavors[0] ?? {
+      id: '',
+      label: 'Credential',
+      description: 'No authentication methods are available for this harness.',
+      format: 'api_key',
+      env_var: null,
+    }
 
   const [selectedFlavorId, setSelectedFlavorId] = useState(defaultFlavor.id)
   const [credential, setCredential] = useState('')
@@ -135,9 +168,10 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
   const [testResult, setTestResult] = useState<{
     passed: boolean
     environment: string
-    cli_version: string | null
-    auth_info: string | null
-    setup_hint: string | null
+    cli_version?: string | null
+    auth_info?: string | null
+    setup_hint?: string | null
+    detail?: string | null
   } | null>(null)
 
   const initialModel = provider.default_model ?? ''
@@ -232,24 +266,13 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
     if (next === serverModel) return
     setSavingModel(true)
     try {
-      const res = await fetch(`/api/settings/ai-providers/${provider.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ default_model: next }),
+      await updateAiProvider({
+        path: { provider_id: provider.id },
+        body: { default_model: next },
+        throwOnError: true,
       })
-      if (!res.ok) {
-        const detail = await res.text()
-        toast.error(`Failed to save ${provider.name} model`, {
-          description: detail.slice(0, 200),
-        })
-        setModelDraft(serverModel)
-        setCustomMode(
-          provider.models.length === 0 ||
-            (serverModel !== '' && !provider.models.includes(serverModel))
-        )
-        return
-      }
       setServerModel(next)
+      setTestResult(null)
       toast.success(
         next === ''
           ? `${provider.name} will use its default model`
@@ -260,7 +283,10 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       })
     } catch (e) {
       toast.error(`Failed to save ${provider.name} model`, {
-        description: e instanceof Error ? e.message : 'Network error',
+        description: problemDetail(
+          e,
+          'The request failed. Check your connection and permissions, then retry.'
+        ),
       })
       setModelDraft(serverModel)
     } finally {
@@ -286,17 +312,10 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
   const handleActivate = async () => {
     setActivating(true)
     try {
-      const res = await fetch(
-        `/api/settings/ai-providers/${provider.id}/activate`,
-        { method: 'POST' }
-      )
-      if (!res.ok) {
-        const detail = await res.text()
-        toast.error(`Failed to activate ${provider.name}`, {
-          description: detail.slice(0, 200),
-        })
-        return
-      }
+      await activateAiProvider({
+        path: { provider_id: provider.id },
+        throwOnError: true,
+      })
       toast.success(`${provider.name} is now the active provider`)
       await Promise.all([
         queryClient.invalidateQueries({
@@ -306,7 +325,10 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       ])
     } catch (e) {
       toast.error(`Failed to activate ${provider.name}`, {
-        description: e instanceof Error ? e.message : 'Network error',
+        description: problemDetail(
+          e,
+          'The request failed. Check your connection and permissions, then retry.'
+        ),
       })
     } finally {
       setActivating(false)
@@ -317,34 +339,27 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
     setTesting(true)
     setTestResult(null)
     try {
-      const res = await fetch(
-        `/api/projects/0/agents/smoke-test?provider_id=${encodeURIComponent(provider.id)}`,
-        { method: 'POST' }
-      )
-      if (!res.ok) {
-        const detail = await res.text()
-        toast.error('Smoke test failed', { description: detail.slice(0, 200) })
-        return
-      }
-      const data = await res.json()
-      setTestResult({
-        passed: data.passed,
-        environment: data.environment,
-        cli_version: data.cli_version,
-        auth_info: data.auth_info,
-        setup_hint: data.setup_hint,
+      const { data } = await smokeTestAgent({
+        path: { project_id: 0 },
+        query: { provider_id: provider.id },
+        throwOnError: true,
       })
+      setTestResult(data)
       if (data.passed) {
-        toast.success(`${provider.name} is ready`)
+        toast.success(`${provider.name} environment check passed`)
       } else {
         toast.error(`${provider.name} test failed`, {
           description: data.setup_hint ?? 'See card for details',
         })
       }
     } catch (e) {
-      toast.error('Smoke test failed', {
-        description: e instanceof Error ? e.message : 'Network error',
+      const detail = harnessCheckError(e)
+      setTestResult({
+        passed: false,
+        environment: 'unknown',
+        setup_hint: detail,
       })
+      toast.error('Environment check failed', { description: detail })
     } finally {
       setTesting(false)
     }
@@ -354,24 +369,12 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
     if (!credential.trim()) return
     setSaving(true)
     try {
-      const res = await fetch(
-        `/api/settings/ai-providers/${provider.id}/credential`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            auth_type: selectedFlavor.id,
-            credential: credential.trim(),
-          }),
-        }
-      )
-      if (!res.ok) {
-        const detail = await res.text()
-        toast.error(`Failed to save ${provider.name} credential`, {
-          description: detail.slice(0, 200),
-        })
-        return
-      }
+      await saveAiProviderCredential({
+        path: { provider_id: provider.id },
+        body: { auth_type: selectedFlavor.id, credential: credential.trim() },
+        throwOnError: true,
+      })
+      setTestResult(null)
       toast.success(`${provider.name} credential encrypted and saved`)
       setCredential('')
       await queryClient.invalidateQueries({
@@ -379,7 +382,10 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       })
     } catch (e) {
       toast.error(`Failed to save ${provider.name} credential`, {
-        description: e instanceof Error ? e.message : 'Network error',
+        description: problemDetail(
+          e,
+          'The request failed. Check your connection and permissions, then retry.'
+        ),
       })
     } finally {
       setSaving(false)
@@ -391,6 +397,7 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       const imported = await importLocalCredentialMutation.mutateAsync({
         path: { provider_id: provider.id },
       })
+      setTestResult(null)
       setSelectedFlavorId(imported.auth_type)
       setCredential('')
       await queryClient.invalidateQueries({
@@ -398,7 +405,7 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       })
       toast.success(`${provider.name} local login imported`, {
         description: imported.workspace_ready
-          ? 'The credential is encrypted and this harness is ready for persistent workspaces.'
+          ? 'The credential is encrypted and configured for workspaces. Verify a first reply next.'
           : 'The credential is encrypted and ready for supported host workflows.',
       })
     } catch (cause) {
@@ -413,97 +420,34 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
 
   return (
     <div className="space-y-4">
-      <Card>
-        <CardHeader>
-          <div className="flex items-start justify-between gap-3 flex-wrap">
-            <div>
-              <CardTitle className="flex items-center gap-2">
-                {provider.name}
-                {isActive && (
-                  <span className="inline-flex items-center rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
-                    Active
-                  </span>
-                )}
-                {provider.credential_saved && !isActive && (
-                  <span className="inline-flex items-center gap-1 text-xs text-green-500">
-                    <CheckCircle2 className="h-3.5 w-3.5" />
-                    Configured
-                  </span>
-                )}
-                <span
-                  className={
-                    provider.workspace_ready
-                      ? 'inline-flex rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-300'
-                      : 'inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-700 dark:text-amber-300'
-                  }
-                >
-                  {provider.workspace_ready ? 'Workspace ready' : 'Host only'}
-                </span>
-              </CardTitle>
-              <CardDescription className="mt-1 space-y-0.5">
-                <span className="block">
-                  Install:{' '}
-                  <code className="bg-muted px-1 rounded">
-                    {provider.install_command}
-                  </code>
-                </span>
-                {!provider.workspace_ready &&
-                  provider.workspace_readiness_hint && (
-                    <span className="block text-amber-700 dark:text-amber-300">
-                      {provider.workspace_readiness_hint}
-                    </span>
-                  )}
-                <span className="block">
-                  Auth:{' '}
-                  <code className="bg-muted px-1 rounded">
-                    {provider.auth_command}
-                  </code>
-                </span>
-              </CardDescription>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              {provider.credential_saved && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={handleTest}
-                  disabled={testing}
-                >
-                  {testing ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                  ) : (
-                    <Play className="h-3.5 w-3.5 mr-1.5" />
-                  )}
-                  Test
-                </Button>
-              )}
-              {provider.credential_saved && (
-                <Button
-                  type="button"
-                  variant={isActive ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={handleActivate}
-                  disabled={isActive || activating}
-                >
-                  {activating ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                  ) : null}
-                  {isActive ? 'Active' : 'Use this'}
-                </Button>
-              )}
-            </div>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <AiHarnessLogo providerId={provider.id} size={32} />
+          <div>
+            <h2 className="text-lg font-semibold">{provider.name}</h2>
+            <p className="text-sm text-muted-foreground">
+              {harnessSetupStatus(provider)}
+            </p>
           </div>
-        </CardHeader>
-      </Card>
+        </div>
+        <Button asChild variant="outline" size="sm">
+          <Link to={returnTo}>Back to workspace</Link>
+        </Button>
+      </div>
+      <p className="text-sm text-muted-foreground">
+        Setup is saved on this Temps instance. You can leave and return without
+        losing saved credentials or model settings.
+      </p>
 
       <Card>
         <CardHeader>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <CardTitle className="text-base">Credential</CardTitle>
+              <CardTitle className="text-base">
+                1. Connect your account
+              </CardTitle>
               <CardDescription>
-                Encrypted with AES-256-GCM at rest. Workspace-capable providers
+                Encrypted with AES-256-GCM at rest. Workspace-capable providers{' '}
                 {provider.id === 'opencode'
                   ? 'use a private runtime credential file for OpenCode. Code running as the harness user can access this credential; only use it in workspaces you trust. Refreshed tokens stay in this sandbox; after replacing the sandbox, you may need to import your local login again.'
                   : 'use it only through a short-lived server relay; the reusable credential is never injected into the sandbox.'}
@@ -532,17 +476,49 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Run login commands on the machine hosting Temps, as the
+            operating-system user running Temps—not in the workspace terminal.
+            Then import the detected login or paste a credential below.
+          </p>
+          <details
+            open={!provider.credential_saved}
+            className="rounded-md border p-3 text-sm"
+          >
+            <summary className="cursor-pointer font-medium">
+              Login instructions
+            </summary>
+            <div className="space-y-2 pt-3">
+              <p className="text-muted-foreground">
+                Install the CLI if needed:
+              </p>
+              <pre className="overflow-x-auto rounded bg-muted p-2 text-xs">
+                {provider.install_command}
+              </pre>
+              <p className="text-muted-foreground">
+                {provider.id === 'claude_cli'
+                  ? 'Create a Claude token, then paste it below (or use an Anthropic API key):'
+                  : 'Authenticate, then reload this page to detect the local login:'}
+              </p>
+              <pre className="overflow-x-auto rounded bg-muted p-2 text-xs">
+                {provider.id === 'claude_cli'
+                  ? 'claude setup-token'
+                  : provider.auth_command}
+              </pre>
+            </div>
+          </details>
           {provider.id === 'claude_cli' && (
             <p className="text-sm text-muted-foreground">
               Local-login import is not supported for Claude Code. Paste a token
-              from <code>claude setup-token</code> or an Anthropic API key below.
+              from <code>claude setup-token</code> or an Anthropic API key
+              below.
             </p>
           )}
           {provider.id !== 'claude_cli' && provider.local_credential && (
             <div className="flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-200">
               <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>
-                Temps found an authenticated {provider.name} credential in{' '}
+                Temps found a local {provider.name} credential in{' '}
                 {provider.local_credential.label.toLowerCase()}. Importing it
                 copies the credential directly into encrypted settings without
                 exposing it to this browser.
@@ -574,11 +550,6 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
           <div className="space-y-2">
             <Label htmlFor={`cred-${provider.id}`}>
               {selectedFlavor.label} credential
-              {selectedFlavor.env_var && (
-                <span className="ml-2 text-xs font-normal text-muted-foreground">
-                  → injected as {selectedFlavor.env_var}
-                </span>
-              )}
             </Label>
             <p className="text-xs text-muted-foreground">
               {selectedFlavor.description}
@@ -616,7 +587,7 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
                 variant="outline"
                 size="sm"
                 onClick={handleSave}
-                disabled={saving || !credential.trim()}
+                disabled={saving || !credential.trim() || !selectedFlavor.id}
               >
                 {saving ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
@@ -628,8 +599,29 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
             </div>
           </div>
 
+          <div className="space-y-2">
+            <p className="text-sm text-muted-foreground">
+              Optional: check the CLI installation and authentication in the
+              configured execution environment. This does not verify a reply in
+              your persistent workspace.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void handleTest()}
+              disabled={testing || !provider.credential_saved}
+            >
+              {testing ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Play className="size-4" />
+              )}{' '}
+              {testing ? 'Checking…' : 'Check environment'}
+            </Button>
+          </div>
           {testResult && (
             <div
+              role="status"
               className={`rounded-md border p-3 text-xs space-y-1 ${
                 testResult.passed
                   ? 'border-green-500/30 bg-green-500/5'
@@ -642,7 +634,9 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
                 ) : (
                   <XCircle className="h-3.5 w-3.5 text-red-500" />
                 )}
-                {testResult.passed ? 'Connected' : 'Test failed'}
+                {testResult.passed
+                  ? 'Environment check passed'
+                  : 'Environment check failed'}
                 <span className="text-muted-foreground font-normal">
                   ({testResult.environment})
                 </span>
@@ -660,6 +654,11 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
                   Auth: {testResult.auth_info}
                 </p>
               )}
+              {testResult.detail && (
+                <pre className="whitespace-pre-wrap break-words text-xs">
+                  {testResult.detail}
+                </pre>
+              )}
               {testResult.setup_hint && (
                 <p className="text-muted-foreground">{testResult.setup_hint}</p>
               )}
@@ -672,7 +671,7 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
         <CardHeader>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <CardTitle className="text-base">Default model</CardTitle>
+              <CardTitle className="text-base">2. Choose a model</CardTitle>
               <CardDescription>
                 {provider.workspace_ready
                   ? 'Leave blank to let the CLI pick. Refresh checks which models the saved workspace credential can run inside a short-lived isolated sandbox.'
@@ -786,7 +785,52 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
         </CardContent>
       </Card>
 
-      <TurnLimitsCard provider={provider} />
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">
+            3. Verify your first workspace reply
+          </CardTitle>
+          <CardDescription>
+            Return to your workspace, select this harness, and send “Reply with
+            OK. Do not run tools.” A successful reply verifies the selected
+            model and workspace together. This may use your provider allowance.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="text-sm text-muted-foreground">
+            For your first task, use Ask each time to review tool approvals.
+            Auto lets the harness run tools without per-command approval inside
+            the workspace; choose it only when you trust the task.
+          </p>
+          <Button asChild variant="outline" size="sm">
+            <Link to={returnTo}>Open workspace to verify</Link>
+          </Button>
+        </CardContent>
+      </Card>
+      <details className="rounded-lg border p-4">
+        <summary className="cursor-pointer text-sm font-medium">
+          Advanced: instance default and autofix limits
+        </summary>
+        <div className="space-y-4 pt-4">
+          <p className="text-sm text-muted-foreground">
+            The instance default affects server-side workflows. It does not
+            change the harness selected in an existing workspace thread.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void handleActivate()}
+            disabled={isActive || activating}
+          >
+            {activating
+              ? 'Saving…'
+              : isActive
+                ? 'Instance default'
+                : 'Use as instance default'}
+          </Button>
+          <TurnLimitsCard provider={provider} />
+        </div>
+      </details>
     </div>
   )
 }
@@ -847,25 +891,21 @@ function TurnLimitsCard({ provider }: { provider: ProviderCatalogDto }) {
     }
     setSavingTurns(true)
     try {
-      const res = await fetch(`/api/settings/ai-providers/${provider.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+      await updateAiProvider({
+        path: { provider_id: provider.id },
+        body,
+        throwOnError: true,
       })
-      if (!res.ok) {
-        const detail = await res.text()
-        toast.error(`Failed to save ${provider.name} turn limits`, {
-          description: detail.slice(0, 200),
-        })
-        return
-      }
       toast.success(`${provider.name} turn limits saved`)
       await queryClient.invalidateQueries({
         queryKey: aiProviderCatalogQueryOptions.queryKey,
       })
     } catch (e) {
       toast.error(`Failed to save ${provider.name} turn limits`, {
-        description: e instanceof Error ? e.message : 'Network error',
+        description: problemDetail(
+          e,
+          'The request failed. Check your connection and permissions, then retry.'
+        ),
       })
     } finally {
       setSavingTurns(false)
