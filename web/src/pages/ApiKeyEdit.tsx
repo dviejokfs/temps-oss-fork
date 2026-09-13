@@ -108,7 +108,7 @@ export default function ApiKeyEdit() {
 
   if (isLoading) {
     return (
-      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
+      <div className="w-full space-y-6">
         <div className="flex items-center gap-4">
           <Skeleton className="h-10 w-10" />
           <div className="space-y-2">
@@ -137,7 +137,7 @@ export default function ApiKeyEdit() {
 
   if (!apiKey && apiKeyError && !isNotFound) {
     return (
-      <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
+      <div className="w-full">
         <Card>
           <CardContent className="py-12 text-center">
             <AlertCircle className="h-12 w-12 text-destructive mx-auto mb-4" />
@@ -165,7 +165,7 @@ export default function ApiKeyEdit() {
 
   if (!apiKey) {
     return (
-      <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
+      <div className="w-full">
         <Card>
           <CardContent className="py-12 text-center">
             <AlertCircle className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
@@ -187,7 +187,7 @@ export default function ApiKeyEdit() {
     apiKey.expires_at && new Date(apiKey.expires_at) < new Date()
 
   return (
-    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
+    <div className="w-full space-y-6">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Button variant="ghost" size="icon" onClick={() => navigate('/settings/keys')}>

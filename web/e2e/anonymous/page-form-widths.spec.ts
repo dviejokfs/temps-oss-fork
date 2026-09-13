@@ -39,21 +39,34 @@ test('backup forms use the full dashboard content width', async ({ page }) => {
     await route.fulfill({ contentType: 'application/json', json })
   })
 
-  for (const [path, heading] of [
-    ['/backups/s3-sources/2/schedules/new', 'New backup schedule'],
-    ['/backups/s3-sources/2/schedules/3/edit', 'Edit backup schedule'],
-    ['/backups/s3-sources/new', 'Add S3 Source'],
+  for (const [path, panelTitle, panelAncestor] of [
+    [
+      '/backups/s3-sources/2/schedules/new',
+      'Schedule details',
+      'xpath=ancestor::section[1]',
+    ],
+    [
+      '/backups/s3-sources/2/schedules/3/edit',
+      'Edit backup schedule',
+      'xpath=ancestor::div[contains(@class, "rounded-lg") and contains(@class, "border")][1]',
+    ],
+    [
+      '/backups/s3-sources/new',
+      'S3 Configuration',
+      'xpath=ancestor::div[contains(@class, "rounded-lg") and contains(@class, "border")][1]',
+    ],
   ] as const) {
     await page.goto(path)
-    const title = page.getByText(heading, { exact: true }).first()
-    await expect(title).toBeVisible()
+    const panel = page
+      .getByText(panelTitle, { exact: true })
+      .first()
+      .locator(panelAncestor)
+    await expect(panel).toBeVisible()
 
-    const width = await title
-      .locator('xpath=ancestor::div[contains(@class, "lg:px-8")][1]')
-      .evaluate((container) => ({
-        content: container.getBoundingClientRect().width,
-        available: container.parentElement!.getBoundingClientRect().width,
-      }))
+    const width = await panel.evaluate((element) => ({
+      content: element.getBoundingClientRect().width,
+      available: element.parentElement!.getBoundingClientRect().width,
+    }))
 
     console.log(
       `${path}: ${Math.round(width.content)}px / ${Math.round(width.available)}px`
