@@ -14,11 +14,12 @@ test('direct project links and direct flat settings navigation', async ({
   await page.goto(`${root}/settings`)
   await expect(page).toHaveURL(/settings\/general$/)
   const primary = page.getByRole('list', { name: 'Project navigation' })
-  await expect(primary.getByRole('link')).toHaveCount(11)
+  await expect(primary.getByRole('link')).toHaveCount(12)
   await expect(primary.getByRole('link')).toHaveText([
     'Overview',
     'Deployments',
     'Environments',
+    'Environment Variables',
     'Logs',
     'Errors',
     'Traces',
@@ -28,6 +29,21 @@ test('direct project links and direct flat settings navigation', async ({
     'Security',
     'Settings',
   ])
+  const variables = primary.getByRole('link', {
+    name: 'Environment Variables',
+    exact: true,
+  })
+  await variables.click()
+  await expect(page).toHaveURL(/\/environment-variables$/)
+  await expect(variables).toHaveAttribute('aria-current', 'page')
+  await expect(
+    page.getByRole('heading', { name: 'Environment Variables', exact: true })
+  ).toBeVisible()
+  await page.screenshot({
+    path: '/tmp/temps-project-environment-variables.png',
+    fullPage: true,
+  })
+  await primary.getByRole('link', { name: 'Settings', exact: true }).click()
   const settings = page.getByRole('navigation', { name: 'Settings pages' })
   await expect(settings.getByRole('link')).toHaveCount(7)
   await expect(settings.locator('a > svg')).toHaveCount(7)
