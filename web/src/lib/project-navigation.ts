@@ -5,6 +5,7 @@ export const PROJECT_PRIMARY_ROUTES = [
   'project',
   'deployments',
   'environments',
+  'environment-variables',
   'logs',
   'errors',
   'traces',
@@ -23,6 +24,13 @@ export interface ProjectSectionLink {
 export const PROJECT_SECTION_LINKS: Partial<
   Record<ProjectSection, ProjectSectionLink[]>
 > = {
+  'environment-variables': [
+    {
+      title: 'Environment Variables',
+      url: 'environment-variables',
+      aliases: ['settings/environment-variables'],
+    },
+  ],
   project: [
     { title: 'Overview', url: 'project' },
     { title: 'Activity', url: 'observe' },
@@ -86,12 +94,7 @@ export const PROJECT_SECTION_LINKS: Partial<
     {
       title: 'Variables',
       url: 'settings/variables',
-      aliases: [
-        'environment-variables',
-        'settings/environment-variables',
-        'settings/secrets',
-        'settings/deployment-tokens',
-      ],
+      aliases: ['settings/secrets', 'settings/deployment-tokens'],
     },
     {
       title: 'Automation',
@@ -116,6 +119,7 @@ export function resolveProjectPrimaryRoute(
   if (matches(route, 'deployments') || route === 'drop') return 'deployments'
   if (matches(route, 'environments')) return 'environments'
   for (const section of [
+    'environment-variables',
     'security',
     'monitoring',
     'logs',

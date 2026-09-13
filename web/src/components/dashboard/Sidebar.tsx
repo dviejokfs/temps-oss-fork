@@ -49,6 +49,7 @@ import {
   Sparkles,
   Terminal,
   Wand2,
+  Variable,
 } from 'lucide-react'
 
 import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -937,6 +938,12 @@ const projectPrimaryItems = [
     url: 'environments',
     icon: Layers,
     section: 'environments',
+  },
+  {
+    title: 'Environment Variables',
+    url: 'environment-variables',
+    icon: Variable,
+    section: 'environment-variables',
   },
   { title: 'Logs', url: 'runtime', icon: ScrollText, section: 'logs' },
   { title: 'Errors', url: 'errors', icon: ShieldAlert, section: 'errors' },
