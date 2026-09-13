@@ -359,13 +359,28 @@ fn environment_id_from_visitor(visitor_environment_id: i32) -> Option<i32> {
     (visitor_environment_id != 0).then_some(visitor_environment_id)
 }
 
+/// Cap on visitor rows `initialize_session` may create per project per
+/// minute on a lookup miss. `session-replay/init` is an unauthenticated
+/// public ingest endpoint (ADR-040): without this, a client that keeps
+/// sending fresh `visitorId`s could grow the `visitor` table without bound.
+/// Matches `EventsService::MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE`, the
+/// equivalent cap on `/event`'s own upsert-on-miss path; kept as an
+/// independent budget (and an independent in-memory bucket) rather than
+/// shared state because the two services aren't wired together, and a
+/// generous independent cap on each ingest path still bounds total growth.
+const MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE: i32 = 120;
+
 pub struct SessionReplayService {
     db: Arc<DatabaseConnection>,
+    visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter,
 }
 
 impl SessionReplayService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter::new(),
+        }
     }
 
     /// Initialize a new session replay with metadata only
@@ -403,6 +418,28 @@ impl SessionReplayService {
                 // the race silently dropped the replay for the majority of
                 // first-time visitors. Upsert here too, so there is no race
                 // left to lose -- see `upsert_visitor_on_miss` below.
+                //
+                // Capped the same way `/event`'s equivalent path is: this
+                // endpoint is unauthenticated, so without a cap a client that
+                // keeps inventing new `visitorId`s could grow the `visitor`
+                // table without bound. Over the cap, fall back to the
+                // pre-fix 404 rather than creating the row.
+                if !self
+                    .visitor_creation_limiter
+                    .check(project_id, Some(MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE))
+                    .await
+                {
+                    tracing::warn!(
+                        visitor_id = %metadata.visitor_id,
+                        project_id,
+                        "Refusing to create a new visitor row from session-replay init: \
+                         project is over its per-minute visitor-creation cap"
+                    );
+                    return Err(SessionReplayError::VisitorNotFound(
+                        metadata.visitor_id.clone(),
+                    ));
+                }
+
                 self.upsert_visitor_on_miss(
                     &metadata.visitor_id,
                     project_id,

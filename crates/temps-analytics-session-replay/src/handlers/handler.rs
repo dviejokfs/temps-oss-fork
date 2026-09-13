@@ -1821,6 +1821,102 @@ mod tests {
         test_db.cleanup().await;
     }
 
+    /// Security regression: `session-replay/init` is unauthenticated, and its
+    /// lookup-miss path (added for issue #980, above) now creates a `visitor`
+    /// row per distinct `visitorId`. Without a cap, a client that keeps
+    /// inventing fresh ids could grow the `visitor` table without bound.
+    /// Calls the service directly (not through HTTP) to drive the cap to
+    /// exhaustion quickly, mirroring
+    /// `EventsService`'s `test_record_event_caps_new_visitor_creation_per_project`.
+    #[tokio::test]
+    async fn session_replay_init_caps_new_visitor_creation_per_project() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+
+        // Drive the cap to exhaustion with distinct client-supplied visitor
+        // ids, each a genuine lookup miss.
+        for i in 0..120 {
+            state
+                .session_replay_service
+                .initialize_session(
+                    &format!("cap-test-session-{i}"),
+                    SessionMetadata {
+                        visitor_id: format!("cap-test-visitor-{i}"),
+                        user_agent: "Mozilla/5.0".to_string(),
+                        language: "en-US".to_string(),
+                        timezone: "UTC".to_string(),
+                        screen: Screen {
+                            width: 1920,
+                            height: 1080,
+                            color_depth: 24,
+                        },
+                        viewport: Viewport {
+                            width: 1280,
+                            height: 720,
+                        },
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        url: "/".to_string(),
+                    },
+                    project.id,
+                    None,
+                    None,
+                )
+                .await
+                .expect("initialize_session must succeed while under the cap");
+        }
+        assert_eq!(stored_visitors(db.as_ref()).await.len(), 120);
+
+        // One more distinct visitor id, now over budget: must not create
+        // another row, and must surface as the pre-fix VisitorNotFound
+        // rather than a silent no-op.
+        let result = state
+            .session_replay_service
+            .initialize_session(
+                "cap-test-session-over-budget",
+                SessionMetadata {
+                    visitor_id: "cap-test-visitor-over-budget".to_string(),
+                    user_agent: "Mozilla/5.0".to_string(),
+                    language: "en-US".to_string(),
+                    timezone: "UTC".to_string(),
+                    screen: Screen {
+                        width: 1920,
+                        height: 1080,
+                        color_depth: 24,
+                    },
+                    viewport: Viewport {
+                        width: 1280,
+                        height: 720,
+                    },
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    url: "/".to_string(),
+                },
+                project.id,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(SessionReplayError::VisitorNotFound(_))),
+            "expected VisitorNotFound once the per-project cap is exhausted, got: {result:?}"
+        );
+        assert_eq!(
+            stored_visitors(db.as_ref()).await.len(),
+            120,
+            "the over-cap request must not have created a 121st row"
+        );
+
+        test_db.cleanup().await;
+    }
+
     /// The client-supplied `visitorId` fallback (ADR-040 §3) exists only for
     /// the keyed cross-origin path. A Host-resolved request — the case every
     /// Temps-hosted app takes — must still 400 when it carries no
