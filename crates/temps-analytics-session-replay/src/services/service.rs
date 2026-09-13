@@ -431,45 +431,54 @@ const MAX_TRACKED_VISITOR_CREATION_IPS: usize = 10_000;
 /// `MAX_TRACKED_VISITOR_CREATION_IPS`) instead of a single `i32` -- there is
 /// no existing IP-keyed limiter in the codebase to reuse, and building a
 /// general-purpose one is out of scope for what this one call site needs.
+///
+/// Backed by `DashMap` rather than a `Mutex<HashMap<..>>`: this is on the
+/// analytics ingest hot path, and a single shared `Mutex` would serialize
+/// every concurrent `session-replay/init` request that misses the visitor
+/// lookup, regardless of project or IP. `DashMap` shards its internal
+/// locking per-bucket, so unrelated keys don't contend -- mirrors
+/// `temps_proxy::connection_limiter::ConnectionLimiter`, the codebase's
+/// existing precedent for a lock-free/sharded bounded map on a hot path.
 struct VisitorCreationIpLimiter {
-    entries: tokio::sync::Mutex<std::collections::HashMap<(i32, String), Vec<std::time::Instant>>>,
+    entries: dashmap::DashMap<(i32, String), Vec<std::time::Instant>>,
 }
 
 impl VisitorCreationIpLimiter {
     fn new() -> Self {
         Self {
-            entries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            entries: dashmap::DashMap::new(),
         }
     }
 
-    async fn check(&self, project_id: i32, client_ip: &str, limit_per_minute: i32) -> bool {
+    fn check(&self, project_id: i32, client_ip: &str, limit_per_minute: i32) -> bool {
         let now = std::time::Instant::now();
         let window_start = now - std::time::Duration::from_secs(60);
         let key = (project_id, client_ip.to_string());
-
-        let mut entries = self.entries.lock().await;
 
         // Evict entries with no timestamps left in the window once
         // approaching the cap, so long-lived traffic doesn't accumulate
         // stale keys forever. Runs at 50% capacity, not every request, to
         // avoid paying the full-map scan on every call once near the limit.
-        if entries.len() >= MAX_TRACKED_VISITOR_CREATION_IPS / 2 {
-            entries.retain(|_, timestamps| timestamps.iter().any(|t| *t > window_start));
+        if self.entries.len() >= MAX_TRACKED_VISITOR_CREATION_IPS / 2 {
+            self.entries
+                .retain(|_, timestamps| timestamps.iter().any(|t| *t > window_start));
         }
 
         // If still at the cap after eviction, only allow IPs already being
         // tracked -- a flood of brand-new IPs must not grow the map further,
         // even at the cost of refusing legitimate new traffic during the
         // flood (fails closed on memory, not open on the rate limit).
-        if entries.len() >= MAX_TRACKED_VISITOR_CREATION_IPS && !entries.contains_key(&key) {
+        if self.entries.len() >= MAX_TRACKED_VISITOR_CREATION_IPS
+            && !self.entries.contains_key(&key)
+        {
             tracing::warn!(
-                tracked_ips = entries.len(),
+                tracked_ips = self.entries.len(),
                 "Visitor-creation IP limiter at capacity, rejecting new identity"
             );
             return false;
         }
 
-        let timestamps = entries.entry(key).or_default();
+        let mut timestamps = self.entries.entry(key).or_default();
         timestamps.retain(|t| *t > window_start);
 
         if timestamps.len() >= limit_per_minute as usize {
@@ -573,15 +582,11 @@ impl SessionReplayService {
                 // distinguishable 429 rather than the pre-fix 404, since
                 // this is a transient, retryable condition (the window
                 // clears every 60s) and not "this visitor does not exist."
-                if !self
-                    .visitor_creation_ip_limiter
-                    .check(
-                        project_id,
-                        client_ip,
-                        MAX_NEW_VISITORS_PER_PROJECT_PER_IP_PER_MINUTE,
-                    )
-                    .await
-                {
+                if !self.visitor_creation_ip_limiter.check(
+                    project_id,
+                    client_ip,
+                    MAX_NEW_VISITORS_PER_PROJECT_PER_IP_PER_MINUTE,
+                ) {
                     tracing::warn!(
                         visitor_id = %metadata.visitor_id,
                         project_id,
