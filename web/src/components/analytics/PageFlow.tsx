@@ -61,6 +61,10 @@ function formatDuration(seconds: number | null | undefined): string {
   return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`
 }
 
+export function durationSortValue(seconds: number | null | undefined) {
+  return seconds != null && seconds > 0 ? seconds : null
+}
+
 function formatRate(rate: number): string {
   return `${(rate * 100).toFixed(1)}%`
 }
@@ -97,7 +101,7 @@ function EntryPagesTable({ pages }: { pages: PageFlowEntry[] }) {
             entries: page.entry_count,
             views: page.total_views,
             bounce: page.bounce_rate,
-            time: page.avg_time_on_page,
+            time: durationSortValue(page.avg_time_on_page),
           })[sort.key],
         sort.direction
       ),
@@ -204,7 +208,7 @@ function ExitPagesTable({ pages }: { pages: PageFlowEntry[] }) {
             exits: page.exit_count,
             views: page.total_views,
             rate: page.exit_rate,
-            time: page.avg_time_on_page,
+            time: durationSortValue(page.avg_time_on_page),
           })[sort.key],
         sort.direction
       ),

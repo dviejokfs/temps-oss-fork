@@ -92,6 +92,7 @@ import { toast } from 'sonner'
 import { TimeAgo } from '../utils/TimeAgo'
 import { CopyButton } from '../ui/copy-button'
 import { SourceMaps } from '../error-tracking/SourceMaps'
+import { errorGroupSortQuery, EVENT_COUNT_SORT } from './error-group-sort'
 
 interface ErrorTrackingProps {
   project: ProjectResponse
@@ -273,8 +274,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         start_date: timeRange.startTime,
         end_date: timeRange.endTime,
         environment_id: environmentFilter,
-        sort_by: groupSort.split(':')[0],
-        sort_order: groupSort.split(':')[1],
+        ...errorGroupSortQuery(groupSort),
       },
     }),
     enabled: hasErrors,
@@ -860,10 +860,10 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
                     <SelectItem value="first_seen:asc">
                       Oldest issues
                     </SelectItem>
-                    <SelectItem value="total_count:desc">
+                    <SelectItem value={EVENT_COUNT_SORT.most}>
                       Most events
                     </SelectItem>
-                    <SelectItem value="total_count:asc">
+                    <SelectItem value={EVENT_COUNT_SORT.fewest}>
                       Fewest events
                     </SelectItem>
                   </SelectContent>
