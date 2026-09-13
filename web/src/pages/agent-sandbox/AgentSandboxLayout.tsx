@@ -4,6 +4,7 @@
 import { Outlet, useLocation, useNavigate } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { harnessSectionHref } from './harness-onboarding'
 import {
   Select,
   SelectContent,
@@ -43,7 +44,7 @@ export function AgentSandboxLayout() {
 
   const handleChange = (id: string) => {
     const target = sections.find((s) => s.id === id)
-    if (target) navigate(target.path)
+    if (target) navigate(harnessSectionHref(target.path, location.search))
   }
 
   return (

@@ -537,7 +537,13 @@ impl From<AppSettings> for AppSettingsResponse {
                                 auth_type: cfg.auth_type,
                                 credential_saved: cfg.credentials_encrypted.is_some(),
                                 default_model: cfg.default_model,
-                                extra: cfg.extra,
+                                extra: {
+                                    let mut extra = cfg.extra;
+                                    if let Some(object) = extra.as_object_mut() {
+                                        object.remove("credential_verified");
+                                    }
+                                    extra
+                                },
                             },
                         )
                     })
@@ -1790,6 +1796,42 @@ fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSet
     }
 }
 
+fn preserve_provider_credential_proof(incoming: &mut AppSettings, current: &AppSettings) {
+    for (id, current_cfg) in &current.agent_sandbox.providers {
+        match incoming.agent_sandbox.providers.get_mut(id) {
+            Some(candidate) => {
+                candidate.credentials_encrypted = current_cfg.credentials_encrypted.clone();
+                if current_cfg.credentials_encrypted.is_some() {
+                    candidate.auth_type = current_cfg.auth_type.clone();
+                }
+                if !candidate.extra.is_object() {
+                    candidate.extra = serde_json::json!({});
+                }
+                if let Some(extra) = candidate.extra.as_object_mut() {
+                    extra.remove("credential_verified");
+                    if let Some(proof) = current_cfg.extra.get("credential_verified") {
+                        extra.insert("credential_verified".into(), proof.clone());
+                    }
+                }
+            }
+            None => {
+                incoming
+                    .agent_sandbox
+                    .providers
+                    .insert(id.clone(), current_cfg.clone());
+            }
+        }
+    }
+    for (id, candidate) in &mut incoming.agent_sandbox.providers {
+        if !current.agent_sandbox.providers.contains_key(id) {
+            candidate.credentials_encrypted = None;
+            if let Some(extra) = candidate.extra.as_object_mut() {
+                extra.remove("credential_verified");
+            }
+        }
+    }
+}
+
 /// Which of the operator-tuned `cloud.*` keys a `PUT /settings` body actually
 /// carried.
 ///
@@ -2451,30 +2493,9 @@ async fn update_settings(
             // guard authorization depends on the merged value, so it cannot
             // wait until here.
 
-            // Per-provider credentials: keep existing unless caller supplied a new one
-            for (id, current_cfg) in current_settings.agent_sandbox.providers.iter() {
-                match settings.agent_sandbox.providers.get_mut(id) {
-                    Some(incoming) => {
-                        // Caller didn't include credentials -> restore from DB
-                        if incoming
-                            .credentials_encrypted
-                            .as_deref()
-                            .map(|s| s.is_empty() || s == "******")
-                            .unwrap_or(true)
-                        {
-                            incoming.credentials_encrypted =
-                                current_cfg.credentials_encrypted.clone();
-                        }
-                    }
-                    None => {
-                        // Caller dropped the provider entry entirely -> put it back
-                        settings
-                            .agent_sandbox
-                            .providers
-                            .insert(id.clone(), current_cfg.clone());
-                    }
-                }
-            }
+            // The dedicated credential endpoint is the only write path for
+            // encrypted provider secrets and native-verification proof.
+            preserve_provider_credential_proof(&mut settings, &current_settings);
             // Legacy flat credential
             if settings
                 .agent_sandbox
@@ -2963,6 +2984,50 @@ mod tests {
         AgentSandboxSettings, AiChatLimitsSettings, AiWorkspaceFileLimitsSettings, AppSettings,
         ProviderConfig,
     };
+
+    #[test]
+    fn general_settings_put_cannot_forge_or_replace_provider_verification() {
+        let mut current = AppSettings::default();
+        current.agent_sandbox.providers.insert(
+            "opencode".into(),
+            ProviderConfig {
+                auth_type: "config_file".into(),
+                credentials_encrypted: Some("encrypted-good".into()),
+                extra: serde_json::json!({ "credential_verified": true, "preserved": 1 }),
+                ..Default::default()
+            },
+        );
+        let mut incoming = AppSettings::default();
+        incoming.agent_sandbox.providers.insert(
+            "opencode".into(),
+            ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("encrypted-bad".into()),
+                extra: serde_json::json!({ "credential_verified": false, "user_setting": 2 }),
+                ..Default::default()
+            },
+        );
+        incoming.agent_sandbox.providers.insert(
+            "new".into(),
+            ProviderConfig {
+                credentials_encrypted: Some("forged".into()),
+                extra: serde_json::json!({ "credential_verified": true }),
+                ..Default::default()
+            },
+        );
+        preserve_provider_credential_proof(&mut incoming, &current);
+        let saved = &incoming.agent_sandbox.providers["opencode"];
+        assert_eq!(
+            saved.credentials_encrypted.as_deref(),
+            Some("encrypted-good")
+        );
+        assert_eq!(saved.auth_type, "config_file");
+        assert_eq!(saved.extra["credential_verified"], true);
+        assert_eq!(saved.extra["user_setting"], 2);
+        let forged = &incoming.agent_sandbox.providers["new"];
+        assert_eq!(forged.credentials_encrypted, None);
+        assert!(forged.extra.get("credential_verified").is_none());
+    }
 
     fn rotation_test_user(mfa_enabled: bool) -> temps_entities::users::Model {
         let now = chrono::Utc::now();

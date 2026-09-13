@@ -224,16 +224,16 @@ pub struct ApplicationWorkspaceConfig {
 /// image is NULL.
 pub fn managed_application_workspace_image(runtime: &str) -> Option<&'static str> {
     match runtime {
-        "node" | "bun" => Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2"),
-        "python" => Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.2"),
-        "rust" | "go" | "full" => Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.2"),
+        "node" | "bun" => Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.3"),
+        "python" => Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.3"),
+        "rust" | "go" | "full" => Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.3"),
         _ => None,
     }
 }
 
 pub fn is_managed_application_workspace_image(image: &str) -> bool {
     ["nodejs", "python", "all"].iter().any(|flavor| {
-        ["0.2.0", "0.3.0", "0.3.1", "0.3.2"]
+        ["0.2.0", "0.3.0", "0.3.1", "0.3.2", "0.3.3"]
             .iter()
             .any(|version| image == format!("ghcr.io/gotempsh/temps-sandbox-{flavor}:{version}"))
     }) || image == "ghcr.io/gotempsh/temps-sandbox-node:0.1.0"
@@ -4186,22 +4186,33 @@ mod tests {
 
     #[test]
     fn application_workspace_runtimes_resolve_to_managed_daemon_images() {
+        // A candidate can pass runtime preflight but fail persistence if its
+        // pinned tag is absent from the database image CHECK constraint.
+        let migration = include_str!("../../../temps-migrations/src/migration/m20260913_000001_managed_daemon_workspace_images_v033.rs");
+        for runtime in ["node", "bun", "python", "rust", "go", "full"] {
+            let image = managed_application_workspace_image(runtime)
+                .expect("managed runtime must resolve to an image");
+            assert!(
+                migration.contains(&format!("'{image}'")),
+                "migration does not allow {image}"
+            );
+        }
         assert_eq!(
             managed_application_workspace_image("node"),
-            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2")
+            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.3")
         );
         assert_eq!(
             managed_application_workspace_image("bun"),
-            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2")
+            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.3")
         );
         assert_eq!(
             managed_application_workspace_image("python"),
-            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.2")
+            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.3")
         );
         for runtime in ["rust", "go", "full"] {
             assert_eq!(
                 managed_application_workspace_image(runtime),
-                Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.2")
+                Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.3")
             );
         }
         assert_eq!(managed_application_workspace_image("custom"), None);
@@ -4220,6 +4231,9 @@ mod tests {
         ));
         assert!(is_managed_application_workspace_image(
             "ghcr.io/gotempsh/temps-sandbox-all:0.3.2"
+        ));
+        assert!(is_managed_application_workspace_image(
+            "ghcr.io/gotempsh/temps-sandbox-all:0.3.3"
         ));
         assert!(!is_managed_application_workspace_image(
             "ghcr.io/gotempsh/temps-sandbox-nodejs:0.1.0"
@@ -4249,7 +4263,7 @@ mod tests {
         let mapped = ApplicationWorkspaceConfig::from(&row);
         assert_eq!(
             mapped.image.as_deref(),
-            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.2")
+            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.3")
         );
 
         row.image = Some("ghcr.io/gotempsh/temps-sandbox-all:0.2.0".to_string());

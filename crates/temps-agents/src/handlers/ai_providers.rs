@@ -173,6 +173,7 @@ pub struct SaveCredentialResponse {
     pub saved: bool,
     pub provider_id: String,
     pub auth_type: String,
+    pub provider: ProviderCatalogDto,
 }
 
 /// Metadata about a credential that Temps can import from the server process
@@ -192,6 +193,7 @@ pub struct ImportLocalCredentialResponse {
     pub auth_type: String,
     pub source: String,
     pub workspace_ready: bool,
+    pub provider: ProviderCatalogDto,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -700,7 +702,7 @@ async fn provider_catalog_dto(
             .or(snapshot.capabilities.default_model_id);
         dto.model_source = snapshot.model_source;
         dto.models_refreshed_at = snapshot.models_refreshed_at;
-        if entry.id == "opencode" {
+        if entry.id == "opencode" && dto.workspace_ready {
             dto.workspace_ready = true;
             dto.workspace_readiness_hint = None;
         }
@@ -726,8 +728,15 @@ fn provider_catalog_dto_from_runtime(
     // OpenCode config files require semantic validation and a successful
     // native runtime probe. An encrypted blob alone must never be presented
     // as executable.
-    let workspace_ready =
-        entry.workspace_chat_supported && credential_saved && entry.id != "opencode";
+    let verified_opencode = entry.id == "opencode"
+        && provider_cfg
+            .extra
+            .get("credential_verified")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let workspace_ready = entry.workspace_chat_supported
+        && credential_saved
+        && (entry.id != "opencode" || verified_opencode);
     let workspace_readiness_hint = if workspace_ready {
         None
     } else if !entry.workspace_chat_supported {
@@ -736,7 +745,7 @@ fn provider_catalog_dto_from_runtime(
             entry.name
         ))
     } else if entry.id == "opencode" && credential_saved {
-        Some("The saved OpenCode credential has not completed a successful workspace model refresh. Refresh models to validate its Anthropic or OpenAI API-key/OAuth entries; custom providers remain unsupported.".to_string())
+        Some("The saved OpenCode credential predates native verification. Save or import it again to verify an authenticated request; custom providers remain unsupported.".to_string())
     } else {
         Some(format!(
             "Save a {} credential to run this harness inside a persistent workspace.",
@@ -880,6 +889,15 @@ pub async fn save_ai_provider_credential(
         }));
     }
 
+    verify_candidate(
+        &app_state,
+        &auth,
+        &provider_id,
+        &request.auth_type,
+        &request.credential,
+    )
+    .await?;
+
     let encrypted = app_state
         .encryption_service
         .encrypt_string(&request.credential)
@@ -914,10 +932,14 @@ pub async fn save_ai_provider_credential(
     )
     .await;
 
+    let sandbox = load_agent_sandbox(&app_state).await?;
+    let provider_dto =
+        provider_catalog_dto(provider, sandbox.provider_config(&provider_id), None, None).await;
     Ok(Json(SaveCredentialResponse {
         saved: true,
         provider_id,
         auth_type: request.auth_type,
+        provider: provider_dto,
     }))
 }
 
@@ -968,6 +990,15 @@ pub async fn import_local_ai_provider_credential(
                 ))
         })?;
 
+    verify_candidate(
+        &app_state,
+        &auth,
+        &provider_id,
+        &discovered.auth_type,
+        &discovered.credential,
+    )
+    .await?;
+
     let encrypted = app_state
         .encryption_service
         .encrypt_string(&discovered.credential)
@@ -1002,15 +1033,59 @@ pub async fn import_local_ai_provider_credential(
     )
     .await;
 
+    let sandbox = load_agent_sandbox(&app_state).await?;
+    let provider_dto =
+        provider_catalog_dto(provider, sandbox.provider_config(&provider_id), None, None).await;
     Ok(Json(ImportLocalCredentialResponse {
         saved: true,
         provider_id,
         auth_type: discovered.auth_type,
         source: discovered.source.as_str().to_string(),
-        // Import alone cannot promote OpenCode: strict validation and a
-        // successful native runtime model refresh establish readiness.
-        workspace_ready: provider.workspace_chat_supported && provider.id != "opencode",
+        workspace_ready: provider_dto.workspace_ready,
+        provider: provider_dto,
     }))
+}
+
+async fn verify_candidate(
+    app_state: &Arc<AppState>,
+    auth: &temps_auth::AuthContext,
+    provider_id: &str,
+    auth_type: &str,
+    credential: &str,
+) -> Result<(), Problem> {
+    ensure_workspace_model_discovery_permission(auth)?;
+    let ai_service = app_state.ai_service.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Credential verification unavailable")
+            .with_detail("The secure AI harness service is not configured on this Temps instance.")
+    })?;
+    ai_service.verify_candidate_credential(provider_id, auth_type, credential, auth.user_id()).await
+        .map_err(|error| {
+            let (status, title, guidance) = credential_verification_failure(&error);
+            tracing::warn!(provider_id, auth_type, error_kind = ?std::mem::discriminant(&error), "candidate credential verification failed");
+            problemdetails::new(status)
+                .with_title(title)
+                .with_detail(format!("Provider '{provider_id}' ({auth_type}): {guidance} A previously saved credential was not changed."))
+        })
+}
+
+fn credential_verification_failure(
+    error: &temps_ai::AiError,
+) -> (StatusCode, &'static str, &'static str) {
+    match error {
+        temps_ai::AiError::Provider { purpose, .. } if purpose == "provider.credentials.verify.auth" => (
+            StatusCode::BAD_REQUEST, "Credential rejected by provider", "The provider rejected this credential or denied model access. Refresh the login or key and retry.",
+        ),
+        temps_ai::AiError::Provider { purpose, .. } if purpose == "provider.credentials.verify.allowance" => (
+            StatusCode::TOO_MANY_REQUESTS, "Provider allowance unavailable", "The account has insufficient allowance or is rate limited. Restore allowance and retry.",
+        ),
+        temps_ai::AiError::Provider { purpose, .. } if purpose == "provider.credentials.verify.model" => (
+            StatusCode::BAD_REQUEST, "Harness model request failed", "The harness could not complete a minimal model request with this credential. Check its model access and retry.",
+        ),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE, "Harness verification unavailable", "Temps could not complete the isolated harness check. Check sandbox/runtime availability and retry.",
+        ),
+    }
 }
 
 async fn write_provider_credential_audit(
@@ -1106,6 +1181,14 @@ async fn persist_provider_credential_and_invalidate(
     merged
         .entry("extra".to_string())
         .or_insert(serde_json::Value::Null);
+    if let Some(extra) = merged.get_mut("extra") {
+        if !extra.is_object() {
+            *extra = serde_json::json!({});
+        }
+        if let Some(extra) = extra.as_object_mut() {
+            extra.insert("credential_verified".into(), serde_json::Value::Bool(true));
+        }
+    }
     providers_value.insert(provider_id.to_string(), serde_json::Value::Object(merged));
 
     let active = temps_entities::settings::ActiveModel {
@@ -1476,6 +1559,34 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_config::ServerConfig;
     use temps_core::{AppSettings, ProviderConfig};
+
+    #[test]
+    fn candidate_verification_errors_are_safe_and_actionable() {
+        let auth = temps_ai::AiError::Provider {
+            purpose: "provider.credentials.verify.auth".into(),
+            reason: "secret-shaped-provider-response-must-not-be-rendered".into(),
+        };
+        let (status, title, guidance) = credential_verification_failure(&auth);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(title, "Credential rejected by provider");
+        assert!(!guidance.contains("secret-shaped"));
+        let runtime = temps_ai::AiError::Provider {
+            purpose: "provider.credentials.verify".into(),
+            reason: "sandbox unavailable".into(),
+        };
+        assert_eq!(
+            credential_verification_failure(&runtime).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let quota = temps_ai::AiError::Provider {
+            purpose: "provider.credentials.verify.allowance".into(),
+            reason: "rate limited".into(),
+        };
+        assert_eq!(
+            credential_verification_failure(&quota).0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
 
     fn provider_settings_row(encrypted: &str) -> temps_entities::settings::Model {
         let mut settings = AppSettings::default();

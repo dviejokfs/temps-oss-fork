@@ -49,3 +49,10 @@ export function harnessSetupHref(providerId: string | null, returnTo: string) {
     (providerId ? `/${encodeURIComponent(providerId)}` : '')
   return `${path}?returnTo=${encodeURIComponent(workspaceReturnTo(returnTo))}`
 }
+
+export function harnessSectionHref(path: string, search: string): string {
+  const returnTo = new URLSearchParams(search).get('returnTo')
+  return returnTo
+    ? `${path}?${new URLSearchParams({ returnTo: workspaceReturnTo(returnTo) })}`
+    : path
+}

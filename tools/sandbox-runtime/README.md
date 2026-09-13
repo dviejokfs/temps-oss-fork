@@ -25,7 +25,7 @@ Node.js includes Node, Bun and the Claude/Codex/OpenCode CLIs. Python adds
 Python, pip and venv. All adds build-essential and Debian's Go/Rust toolchains.
 The latter are distribution versions, not promises of the latest toolchains.
 
-Application workspaces use the managed `ghcr.io/gotempsh/temps-sandbox-{nodejs,python,all}:0.3.2`
+Application workspaces use the managed `ghcr.io/gotempsh/temps-sandbox-{nodejs,python,all}:0.3.3`
 pins. For local application-workspace testing, build the corresponding managed
 tag with `build-local.sh`; arbitrary custom images are not accepted by this
 surface. These tags must be published before distributing a release that uses

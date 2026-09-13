@@ -79,8 +79,9 @@ publish = release.dig("jobs", "create-release")
 abort "public release can precede required daemon images" unless
   publish.fetch("needs").include?("daemon-images") && !publish.key?("if")
 daemon_call = release.dig("jobs", "daemon-images")
-abort "daemon images must run before publication, after ref validation" unless
-  daemon_call["needs"] == "validate-release-ref" && !daemon_call.key?("continue-on-error")
+abort "daemon images must wait for every platform build before publication" unless
+  daemon_call["needs"].sort == %w[build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64].sort &&
+  !daemon_call.key?("continue-on-error")
 abort "daemon channel must match release stable/prerelease/dry-run policy" unless
   daemon_call.dig("with", "channel") == "${{ (inputs.dry_run == true || contains(github.ref_name, '-')) && 'beta' || 'stable' }}"
 images = daemon.dig("jobs", "images")

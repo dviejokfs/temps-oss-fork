@@ -599,6 +599,106 @@ fn pin_context_usage_model(
 pub type SandboxCredentialResolver = Arc<
     dyn Fn(&str) -> BoxFuture<'static, Result<SandboxHarnessCredentials, AiError>> + Send + Sync,
 >;
+pub type SandboxCandidateCredentialResolver = Arc<
+    dyn Fn(&str, &str, &str) -> BoxFuture<'static, Result<SandboxHarnessCredentials, AiError>>
+        + Send
+        + Sync,
+>;
+
+struct CandidateSandbox {
+    provider: Arc<dyn SandboxProvider>,
+    handle: Option<temps_agents::sandbox::SandboxHandle>,
+    scratch: Arc<tempfile::TempDir>,
+}
+
+struct CandidateCreateGuard {
+    provider: Arc<dyn SandboxProvider>,
+    task: Option<tokio::task::JoinHandle<Result<temps_agents::sandbox::SandboxHandle, AgentError>>>,
+    scratch: Arc<tempfile::TempDir>,
+}
+
+impl Drop for CandidateCreateGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            let provider = self.provider.clone();
+            let scratch = self.scratch.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if let Ok(Ok(handle)) = task.await {
+                        if let Err(error) = provider.destroy(&handle, true).await {
+                            tracing::error!(sandbox_id = %handle.sandbox_id, %error, "cancelled verification sandbox cleanup failed");
+                        }
+                    }
+                    drop(scratch);
+                });
+            }
+        }
+    }
+}
+
+fn candidate_probe_has_answer(provider: &str, output: &str) -> bool {
+    output.lines().any(|line| {
+        temps_agents::ai_cli::extract_assistant_text(provider, line)
+            .is_some_and(|text| !text.trim().is_empty())
+    })
+}
+
+fn candidate_probe_runtime_failure(exit_code: i32, stderr: &str) -> bool {
+    if exit_code == 127 {
+        return true;
+    }
+    let lower = stderr.to_ascii_lowercase();
+    [
+        "unknown option",
+        "unrecognized option",
+        "unexpected argument",
+        "command not found",
+        "operation not permitted",
+        "failed to create namespace",
+        "bwrap:",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+}
+
+impl CandidateSandbox {
+    async fn destroy(mut self) -> Result<(), AiError> {
+        if let Some(handle) = self.handle.as_ref() {
+            tokio::time::timeout(Duration::from_secs(15), self.provider.destroy(handle, true))
+                .await
+                .map_err(|_| AiError::Provider {
+                    purpose: "provider.credentials.verify".into(),
+                    reason:
+                        "verification sandbox cleanup timed out; contact your Temps administrator"
+                            .into(),
+                })?
+                .map_err(|_| AiError::Provider {
+                    purpose: "provider.credentials.verify".into(),
+                    reason: "verification sandbox cleanup failed; contact your Temps administrator"
+                        .into(),
+                })?;
+            self.handle = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CandidateSandbox {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let provider = self.provider.clone();
+            let scratch = self.scratch.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if let Err(error) = provider.destroy(&handle, true).await {
+                        tracing::error!(sandbox_id = %handle.sandbox_id, %error, "candidate verification sandbox cleanup failed");
+                    }
+                    drop(scratch);
+                });
+            }
+        }
+    }
+}
 
 async fn mcp_bridge_handler(
     axum::extract::State(state): axum::extract::State<McpBridgeState>,
@@ -882,6 +982,7 @@ pub struct AgentCliAiService {
     /// arbitrary server directory by constructing `ChatTurnRequest` directly.
     sandbox_workspace_root: Option<PathBuf>,
     sandbox_credentials: Option<SandboxCredentialResolver>,
+    sandbox_candidate_credentials: Option<SandboxCandidateCredentialResolver>,
     /// Host-side provider relay. The sandbox receives only its short-lived
     /// capability; real provider credentials never cross the boundary.
     sandbox_model_relay: Option<Arc<SandboxModelRelayService>>,
@@ -1279,6 +1380,7 @@ impl AgentCliAiService {
             sandbox_provider: None,
             sandbox_workspace_root: None,
             sandbox_credentials: None,
+            sandbox_candidate_credentials: None,
             sandbox_model_relay: None,
             sandbox_workspace_resolver: None,
             sandbox_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -1299,12 +1401,14 @@ impl AgentCliAiService {
         sandbox_provider: Arc<dyn SandboxProvider>,
         sandbox_workspace_root: PathBuf,
         sandbox_credentials: SandboxCredentialResolver,
+        sandbox_candidate_credentials: SandboxCandidateCredentialResolver,
         sandbox_model_relay: Arc<SandboxModelRelayService>,
         sandbox_workspace_resolver: SandboxWorkspaceResolverSlot,
     ) -> Self {
         self.sandbox_provider = Some(sandbox_provider);
         self.sandbox_workspace_root = Some(sandbox_workspace_root);
         self.sandbox_credentials = Some(sandbox_credentials);
+        self.sandbox_candidate_credentials = Some(sandbox_candidate_credentials);
         self.sandbox_model_relay = Some(sandbox_model_relay);
         self.sandbox_workspace_resolver = Some(sandbox_workspace_resolver);
         self.sandbox_timeout = Some(Duration::from_secs(15 * 60));
@@ -4251,8 +4355,328 @@ fn check_prompt_size(purpose: &str, prompt: &str) -> Result<(), AiError> {
 // AiService implementation
 // ---------------------------------------------------------------------------
 
+impl AgentCliAiService {
+    async fn run_candidate_probe(
+        &self,
+        principal_id: i32,
+        credentials: SandboxHarnessCredentials,
+    ) -> Result<(), AiError> {
+        const PURPOSE: &str = "provider.credentials.verify";
+        let sandbox = self
+            .sandbox_provider
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: PURPOSE.into(),
+                reason: "sandbox provider is unavailable for credential verification".into(),
+            })?;
+        let relay_service = self
+            .sandbox_model_relay
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: PURPOSE.into(),
+                reason: "model relay is unavailable for credential verification".into(),
+            })?;
+        let scratch =
+            Arc::new(
+                tempfile::tempdir_in(&self.scratch_dir).map_err(|_| AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "could not create an isolated verification directory".into(),
+                })?,
+            );
+        let label = format!("credential-verify-{}", uuid::Uuid::new_v4().simple());
+        let create_config = SandboxCreateConfig {
+            run_id: 0,
+            container_name_override: Some(label),
+            host_work_dir: scratch.path().to_path_buf(),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: Some(1.0),
+            memory_limit_mb: Some(1024),
+            pids_limit: Some(128),
+            disk_size_mb: None,
+            network_mode: Some("restricted".into()),
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(120),
+            backend: None,
+            owner_user_id: None,
+        };
+        let create_provider = sandbox.clone();
+        let mut create_guard = CandidateCreateGuard {
+            provider: sandbox.clone(),
+            task: Some(tokio::spawn(async move {
+                create_provider.create(create_config).await
+            })),
+            scratch: scratch.clone(),
+        };
+        let task = create_guard
+            .task
+            .as_mut()
+            .ok_or_else(|| AiError::Provider {
+                purpose: PURPOSE.into(),
+                reason: "verification sandbox startup task is unavailable".into(),
+            })?;
+        let handle = match tokio::time::timeout(Duration::from_secs(60), task).await {
+            Ok(Ok(Ok(handle))) => {
+                create_guard.task = None;
+                handle
+            }
+            Ok(_) => {
+                return Err(AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "could not start the isolated verification sandbox".into(),
+                })
+            }
+            Err(_) => {
+                return Err(AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "isolated verification sandbox startup timed out".into(),
+                })
+            }
+        };
+        let guard = CandidateSandbox {
+            provider: sandbox.clone(),
+            handle: Some(handle.clone()),
+            scratch,
+        };
+        if handle.backend == SandboxBackend::Local {
+            guard.destroy().await?;
+            return Err(AiError::Provider {
+                purpose: PURPOSE.into(),
+                reason: "credential verification requires an isolated Docker or VM sandbox".into(),
+            });
+        }
+        let probe = async {
+            let relay_base_url = sandbox
+                .model_relay_base_url(&handle, &credentials.internal_api_url)
+                .await
+                .map_err(|_| AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "verification sandbox cannot reach the model relay".into(),
+                })?;
+            let opencode_models = match &credentials.provider_credential {
+                crate::model_relay::SandboxProviderCredential::OpenCodeAuthJson {
+                    providers,
+                    ..
+                } => providers
+                    .iter()
+                    .filter_map(|provider| match provider.as_str() {
+                        "anthropic" => Some("anthropic/claude-haiku-4-5"),
+                        "openai" => Some("openai/gpt-5.4"),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            let opencode_model = opencode_models.first().copied();
+            let selected_model = match self.provider.name() {
+                "claude_cli" => Some("haiku"),
+                "codex_cli" => Some("gpt-5.6-luna"),
+                "opencode" => opencode_model,
+                _ => None,
+            };
+            let (relay, relay_guard) = relay_service.register(
+                self.provider.name(),
+                principal_id,
+                selected_model,
+                credentials,
+                &relay_base_url,
+                Duration::from_secs(100),
+            )?;
+            let mut command = match self.provider.name() {
+                "claude_cli" => vec![
+                    "claude".into(),
+                    "--print".into(),
+                    "Reply OK.".into(),
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--verbose".into(),
+                    "--tools".into(),
+                    "".into(),
+                    "--strict-mcp-config".into(),
+                    "--setting-sources=".into(),
+                    "--model".into(),
+                    "haiku".into(),
+                ],
+                "codex_cli" => vec![
+                    "codex".into(),
+                    "exec".into(),
+                    "--strict-config".into(),
+                    "--ignore-user-config".into(),
+                    "--ephemeral".into(),
+                    "--ignore-rules".into(),
+                    "--sandbox".into(),
+                    "read-only".into(),
+                    "--model".into(),
+                    "gpt-5.6-luna".into(),
+                    "Reply OK.".into(),
+                    "--json".into(),
+                    "--skip-git-repo-check".into(),
+                ],
+                "opencode" => vec![
+                    "opencode".into(),
+                    "run".into(),
+                    "--pure".into(),
+                    "--format".into(),
+                    "json".into(),
+                    "--model".into(),
+                    opencode_model
+                        .ok_or_else(|| AiError::Provider {
+                            purpose: PURPOSE.into(),
+                            reason: "OpenCode auth has no supported provider".into(),
+                        })?
+                        .into(),
+                    "--".into(),
+                    "Reply OK.".into(),
+                ],
+                _ => {
+                    return Err(AiError::Provider {
+                        purpose: PURPOSE.into(),
+                        reason: "provider has no native verification command".into(),
+                    })
+                }
+            };
+            let mut environment = HashMap::new();
+            let mut files = Vec::new();
+            configure_sandbox_model_relay(
+                self.provider.name(),
+                &mut command,
+                &mut environment,
+                &mut files,
+                &relay,
+            )?;
+            prepare_native_opencode_auth(sandbox.as_ref(), &handle, &relay, PURPOSE).await?;
+            for (path, contents) in &files {
+                sandbox
+                    .write_file(&handle, path, contents, 0o600)
+                    .await
+                    .map_err(|_| AiError::Provider {
+                        purpose: PURPOSE.into(),
+                        reason: "could not stage a temporary relay capability".into(),
+                    })?;
+            }
+            let output = sandbox
+                .exec(&handle, command, environment, None)
+                .await
+                .map_err(|_| AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "native harness verification failed to run".into(),
+                })?;
+            if matches!(relay_guard.inference_status(), Some(401 | 403)) {
+                return Err(AiError::Provider { purpose: "provider.credentials.verify.auth".into(), reason: format!("{} credential was rejected by its model provider (authentication or access denied)", self.provider.name()) });
+            }
+            if matches!(relay_guard.inference_status(), Some(402 | 429)) {
+                return Err(AiError::Provider { purpose: "provider.credentials.verify.allowance".into(), reason: format!("{} credential could not be verified because its account has insufficient allowance or is rate limited", self.provider.name()) });
+            }
+            if output.exit_code != 0 {
+                let runtime_failure =
+                    candidate_probe_runtime_failure(output.exit_code, &output.stderr);
+                return Err(AiError::Provider {
+                    purpose: if runtime_failure {
+                        PURPOSE.into()
+                    } else {
+                        "provider.credentials.verify.model".into()
+                    },
+                    reason: if runtime_failure {
+                        format!("{} verification runtime is unavailable or incompatible with required safe flags (exit {}); update the sandbox image", self.provider.name(), output.exit_code)
+                    } else {
+                        format!("{} could not complete a minimal model request (exit {}); check model access", self.provider.name(), output.exit_code)
+                    },
+                });
+            }
+            let answered = candidate_probe_has_answer(self.provider.name(), &output.stdout);
+            if !answered
+                || (self.provider.name() != "opencode" && !relay_guard.inference_succeeded())
+            {
+                return Err(AiError::Provider {
+                    purpose: "provider.credentials.verify.model".into(),
+                    reason: format!(
+                        "{} did not confirm an authenticated model response",
+                        self.provider.name()
+                    ),
+                });
+            }
+            for model in opencode_models.iter().skip(1) {
+                let mut next_command = vec![
+                    "opencode".into(),
+                    "run".into(),
+                    "--pure".into(),
+                    "--format".into(),
+                    "json".into(),
+                    "--model".into(),
+                    (*model).into(),
+                    "--".into(),
+                    "Reply OK.".into(),
+                ];
+                let mut next_environment = HashMap::new();
+                let mut next_files = Vec::new();
+                configure_sandbox_model_relay(
+                    "opencode",
+                    &mut next_command,
+                    &mut next_environment,
+                    &mut next_files,
+                    &relay,
+                )?;
+                let next = sandbox
+                    .exec(&handle, next_command, next_environment, None)
+                    .await
+                    .map_err(|_| AiError::Provider {
+                        purpose: "provider.credentials.verify.model".into(),
+                        reason: "OpenCode could not verify an additional provider entry".into(),
+                    })?;
+                if next.exit_code != 0 || !candidate_probe_has_answer("opencode", &next.stdout) {
+                    return Err(AiError::Provider {
+                        purpose: "provider.credentials.verify.model".into(),
+                        reason: format!(
+                            "OpenCode did not complete an authenticated request for '{model}'"
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        };
+        let result = tokio::time::timeout(Duration::from_secs(100), probe)
+            .await
+            .unwrap_or_else(|_| {
+                Err(AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "native credential verification timed out".into(),
+                })
+            });
+        if let Err(cleanup_error) = guard.destroy().await {
+            tracing::error!(provider = %self.provider.name(), probe_succeeded = result.is_ok(), "candidate verification sandbox cleanup failed");
+            return Err(cleanup_error);
+        }
+        result
+    }
+}
+
 #[async_trait]
 impl AiService for AgentCliAiService {
+    async fn verify_candidate_credential(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+    ) -> Result<(), AiError> {
+        if provider != self.provider.name() {
+            return Err(AiError::Provider {
+                purpose: "provider.credentials.verify".into(),
+                reason: format!(
+                    "candidate provider '{provider}' does not match the selected harness"
+                ),
+            });
+        }
+        let resolver =
+            self.sandbox_candidate_credentials
+                .as_ref()
+                .ok_or_else(|| AiError::Provider {
+                    purpose: "provider.credentials.verify".into(),
+                    reason: "candidate credential resolver is unavailable".into(),
+                })?;
+        let candidate = resolver(provider, auth_type, credential).await?;
+        self.run_candidate_probe(principal_id, candidate).await
+    }
     /// Returns `true` when the underlying CLI reports both `installed` and
     /// `authenticated`. Callers should gate prompt construction on this check.
     async fn is_available(&self) -> bool {
@@ -5242,6 +5666,7 @@ mod tests {
     }
 
     struct RecordingModelDiscoverySandbox {
+        candidate_mode: bool,
         exec_calls: Arc<AtomicUsize>,
         lifecycle_calls: Arc<AtomicUsize>,
         cleanup_calls: Arc<AtomicUsize>,
@@ -5252,9 +5677,20 @@ mod tests {
     impl SandboxProvider for RecordingModelDiscoverySandbox {
         async fn create(
             &self,
-            _config: SandboxCreateConfig,
+            config: SandboxCreateConfig,
         ) -> Result<temps_agents::sandbox::SandboxHandle, AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
+            if self.candidate_mode {
+                assert!(config
+                    .container_name_override
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("credential-verify-")));
+                assert!(config.workspace_volume.is_none());
+                assert!(config.env_vars.is_empty());
+                let mut handle = test_sandbox_handle();
+                handle.backend = SandboxBackend::Docker;
+                return Ok(handle);
+            }
             Err(AgentError::SandboxExecFailed {
                 run_id: 0,
                 sandbox_id: "unexpected-create".to_string(),
@@ -5270,6 +5706,16 @@ mod tests {
             _on_output: Option<OnEventCallback>,
         ) -> Result<temps_agents::sandbox::SandboxExecResult, AgentError> {
             self.exec_calls.fetch_add(1, Ordering::SeqCst);
+            if self.candidate_mode {
+                assert_eq!(command.first().map(String::as_str), Some("claude"));
+                assert!(command.iter().any(|arg| arg == "--tools"));
+                assert!(environment.contains_key("ANTHROPIC_AUTH_TOKEN"));
+                return Ok(temps_agents::sandbox::SandboxExecResult {
+                    exit_code: 0,
+                    stdout: r#"{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}"#.into(),
+                    stderr: String::new(),
+                });
+            }
             if command.first().map(String::as_str) == Some("temps-sandbox-runtime") {
                 let response = self
                     .runtime_responses
@@ -5441,6 +5887,7 @@ mod tests {
         let exec_calls = Arc::new(AtomicUsize::new(0));
         let lifecycle_calls = Arc::new(AtomicUsize::new(0));
         let sandbox: Arc<dyn SandboxProvider> = Arc::new(RecordingModelDiscoverySandbox {
+            candidate_mode: false,
             exec_calls: exec_calls.clone(),
             lifecycle_calls: lifecycle_calls.clone(),
             cleanup_calls: Arc::new(AtomicUsize::new(0)),
@@ -5468,6 +5915,7 @@ mod tests {
             sandbox,
             workspace_root,
             credentials,
+            Arc::new(|_, _, _| Box::pin(async { Err(AiError::NotAvailable) })),
             Arc::new(SandboxModelRelayService::new().expect("model relay")),
             resolver,
         );
@@ -5485,6 +5933,106 @@ mod tests {
             0,
             "successful discovery must not create, recover, restart, stop, or destroy managed compute"
         );
+    }
+
+    #[tokio::test]
+    async fn candidate_probe_requires_upstream_inference_and_destroys_isolated_sandbox() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let lifecycle = Arc::new(AtomicUsize::new(0));
+        let exec_calls = Arc::new(AtomicUsize::new(0));
+        let sandbox: Arc<dyn SandboxProvider> = Arc::new(RecordingModelDiscoverySandbox {
+            candidate_mode: true,
+            exec_calls: exec_calls.clone(),
+            lifecycle_calls: lifecycle.clone(),
+            cleanup_calls: Arc::new(AtomicUsize::new(0)),
+            runtime_responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        });
+        let service = AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: Arc::new(AtomicUsize::new(0)),
+                discovery_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            scratch.path().to_path_buf(),
+            Duration::from_secs(30),
+            1,
+        )
+        .with_temps_sandbox(
+            sandbox,
+            scratch.path().to_path_buf(),
+            Arc::new(|_| Box::pin(async { Err(AiError::NotAvailable) })),
+            Arc::new(|_, _, _| Box::pin(async { Err(AiError::NotAvailable) })),
+            Arc::new(SandboxModelRelayService::new().expect("relay")),
+            SandboxWorkspaceResolverSlot::new(),
+        );
+        let result = service
+            .run_candidate_probe(
+                42,
+                SandboxHarnessCredentials::claude_oauth_token(
+                    "candidate-secret",
+                    "http://model-relay.internal",
+                ),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AiError::Provider { reason, .. }) if reason.contains("did not confirm"))
+        );
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            lifecycle.load(Ordering::SeqCst),
+            2,
+            "create and destroy must both run"
+        );
+    }
+
+    #[test]
+    fn candidate_probe_accepts_only_substantive_assistant_events() {
+        assert!(candidate_probe_has_answer(
+            "claude_cli",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}"#,
+        ));
+        assert!(!candidate_probe_has_answer(
+            "claude_cli",
+            r#"{"type":"system","subtype":"init","session_id":"session-1"}"#,
+        ));
+        assert!(!candidate_probe_has_answer(
+            "opencode",
+            r#"{"type":"step_finish","part":{"type":"step_finish"}}"#,
+        ));
+        assert!(candidate_probe_runtime_failure(
+            2,
+            "error: unexpected argument '--pure'"
+        ));
+        assert!(candidate_probe_runtime_failure(127, ""));
+        assert!(!candidate_probe_runtime_failure(1, "authentication failed"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_candidate_creation_destroys_late_sandbox() {
+        let scratch = Arc::new(tempfile::tempdir().expect("scratch directory"));
+        let lifecycle = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn SandboxProvider> = Arc::new(RecordingModelDiscoverySandbox {
+            candidate_mode: true,
+            exec_calls: Arc::new(AtomicUsize::new(0)),
+            lifecycle_calls: lifecycle.clone(),
+            cleanup_calls: Arc::new(AtomicUsize::new(0)),
+            runtime_responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        });
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(test_sandbox_handle())
+        });
+        drop(CandidateCreateGuard {
+            provider,
+            task: Some(task),
+            scratch,
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while lifecycle.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late sandbox should be destroyed");
     }
 
     #[tokio::test]
@@ -7564,6 +8112,7 @@ mod tests {
         let cleanup_calls = Arc::new(AtomicUsize::new(0));
         (
             Arc::new(RecordingModelDiscoverySandbox {
+                candidate_mode: false,
                 exec_calls: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(AtomicUsize::new(0)),
                 cleanup_calls: cleanup_calls.clone(),
@@ -8116,6 +8665,7 @@ mod tests {
         let exec_calls = Arc::new(AtomicUsize::new(0));
         let lifecycle_calls = Arc::new(AtomicUsize::new(0));
         let sandbox: Arc<dyn SandboxProvider> = Arc::new(RecordingModelDiscoverySandbox {
+            candidate_mode: false,
             exec_calls: exec_calls.clone(),
             lifecycle_calls: lifecycle_calls.clone(),
             cleanup_calls: Arc::new(AtomicUsize::new(0)),

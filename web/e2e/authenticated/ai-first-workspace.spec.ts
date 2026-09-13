@@ -30,7 +30,7 @@ test.describe('AI workspace', () => {
 
       await page.getByRole('button', { name: 'New workspace' }).click()
       await expect(
-        page.getByRole('heading', { name: 'Start a persistent machine.' })
+        page.getByRole('heading', { name: 'Choose your harness' })
       ).toBeVisible()
 
       const viewportOverflow = await page.evaluate(

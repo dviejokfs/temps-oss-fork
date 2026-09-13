@@ -10928,6 +10928,7 @@ export type ImportExternalServiceRequest = {
 
 export type ImportLocalCredentialResponse = {
     auth_type: string;
+    provider: ProviderCatalogDto;
     provider_id: string;
     saved: boolean;
     source: string;
@@ -18026,6 +18027,7 @@ export type SaveCredentialRequest = {
 
 export type SaveCredentialResponse = {
     auth_type: string;
+    provider: ProviderCatalogDto;
     provider_id: string;
     saved: boolean;
 };
