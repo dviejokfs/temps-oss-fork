@@ -9,8 +9,8 @@ use flate2::read::ZlibDecoder;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
-    EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
-    RelationTrait, Set, Statement, TransactionTrait,
+    DatabaseTransaction, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, RelationTrait, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -109,6 +109,14 @@ pub enum SessionReplayError {
     /// risk a 500 (see `MAX_VISITOR_ID_LEN`).
     #[error("Invalid visitor id: {reason}")]
     InvalidVisitorId { reason: String },
+
+    /// The project's per-minute visitor-creation budget
+    /// (`MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE`) is exhausted. Distinct
+    /// from `VisitorNotFound`: the visitor may well exist a moment from now
+    /// once the window clears, so a caller (or the SDK) has a reason to
+    /// retry rather than treat this as a permanent absence.
+    #[error("Visitor-creation rate limit exceeded for project {project_id}")]
+    VisitorCreationRateLimited { project_id: i32 },
 
     /// Returned when a caller supplies a session_replay_id that does not
     /// belong to the project resolved from the request host.  We surface
@@ -418,6 +426,14 @@ impl SessionReplayService {
     ) -> Result<String, SessionReplayError> {
         info!("Initializing session: {} with metadata", session_id);
 
+        // The visitor upsert (on a lookup miss) and the session insert below
+        // must land together: without a shared transaction, a failure after
+        // the upsert but before the session insert would leave a new
+        // `visitor` row committed with nothing to show for it, and a retried
+        // request would then see that row as "existing" and skip re-creating
+        // the session it was actually trying to open.
+        let txn = self.db.begin().await?;
+
         // Look up visitor by visitor_id GUID, scoped to this project.
         // `visitor` is uniquely keyed on (visitor_id, project_id) — the same
         // visitor_id string can legitimately belong to different projects —
@@ -427,7 +443,7 @@ impl SessionReplayService {
         let visitor = visitor::Entity::find()
             .filter(visitor::Column::VisitorId.eq(&metadata.visitor_id))
             .filter(visitor::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
+            .one(&txn)
             .await?;
 
         let visitor_id_int = match visitor {
@@ -458,8 +474,11 @@ impl SessionReplayService {
                 // Capped the same way `/event`'s equivalent path is: this
                 // endpoint is unauthenticated, so without a cap a client that
                 // keeps inventing new `visitorId`s could grow the `visitor`
-                // table without bound. Over the cap, fall back to the
-                // pre-fix 404 rather than creating the row.
+                // table without bound. Over the cap, refuse rather than
+                // creating the row -- as a distinguishable 429 rather than
+                // the pre-fix 404, since this is a transient, retryable
+                // condition (the window clears every 60s) and not "this
+                // visitor does not exist."
                 if !self
                     .visitor_creation_limiter
                     .check(project_id, Some(MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE))
@@ -471,12 +490,11 @@ impl SessionReplayService {
                         "Refusing to create a new visitor row from session-replay init: \
                          project is over its per-minute visitor-creation cap"
                     );
-                    return Err(SessionReplayError::VisitorNotFound(
-                        metadata.visitor_id.clone(),
-                    ));
+                    return Err(SessionReplayError::VisitorCreationRateLimited { project_id });
                 }
 
                 self.upsert_visitor_on_miss(
+                    &txn,
                     &metadata.visitor_id,
                     project_id,
                     environment_id.unwrap_or(0),
@@ -493,10 +511,15 @@ impl SessionReplayService {
         // Check if session already exists by session_replay_id
         let existing = session_replay_sessions::Entity::find()
             .filter(session_replay_sessions::Column::SessionReplayId.eq(session_id))
-            .one(self.db.as_ref())
+            .one(&txn)
             .await?;
 
         if existing.is_some() {
+            // Still commit: a lookup-miss above may have upserted the
+            // visitor row (or bumped its `last_seen`), and that write is
+            // real and wanted even though this call turns out to be a no-op
+            // retry of an already-initialized session.
+            txn.commit().await?;
             info!(
                 "Session {} already exists, skipping initialization",
                 session_id
@@ -536,7 +559,8 @@ impl SessionReplayService {
             is_active: Set(true),
         };
 
-        session_model.insert(self.db.as_ref()).await?;
+        session_model.insert(&txn).await?;
+        txn.commit().await?;
         info!("Session {} initialized successfully", session_id);
 
         Ok(session_id.to_string())
@@ -558,6 +582,7 @@ impl SessionReplayService {
     /// arrives, whichever writer created the row.
     async fn upsert_visitor_on_miss(
         &self,
+        txn: &DatabaseTransaction,
         visitor_id: &str,
         project_id: i32,
         environment_id: i32,
@@ -589,7 +614,7 @@ impl SessionReplayService {
             ],
         );
 
-        let row = self.db.query_one(stmt).await?.ok_or_else(|| {
+        let row = txn.query_one(stmt).await?.ok_or_else(|| {
             SessionReplayError::Database(sea_orm::DbErr::RecordNotFound(format!(
                 "visitor upsert for visitor_id={visitor_id} project_id={project_id} returned no row"
             )))
@@ -2098,11 +2123,18 @@ mod tests {
             Ok(conn) => conn.into_transaction_log(),
             Err(_) => panic!("service still holds a connection handle"),
         };
-        let insert = format!("{:?}", log.get(2).expect("an INSERT must have been issued"));
-        assert!(
-            insert.contains("INSERT INTO") && insert.contains("session_replay_sessions"),
-            "expected an insert into session_replay_sessions, got: {insert}"
-        );
+        // The visitor lookup, existing-session check, and session insert all
+        // run inside one transaction (see `initialize_session`), so the mock
+        // groups them into a single logged `Transaction` -- pick out the
+        // INSERT statement specifically rather than indexing by position.
+        let insert = log
+            .iter()
+            .flat_map(|t| t.statements())
+            .find(|stmt| {
+                stmt.sql.starts_with("INSERT INTO") && stmt.sql.contains("session_replay_sessions")
+            })
+            .map(|stmt| format!("{stmt:?}"))
+            .expect("an INSERT into session_replay_sessions must have been issued");
         assert!(
             !insert.contains("Int(Some(0))"),
             "the `0` sentinel must never reach an FK column: {insert}"
@@ -2135,7 +2167,14 @@ mod tests {
             Ok(conn) => conn.into_transaction_log(),
             Err(_) => panic!("service still holds a connection handle"),
         };
-        let insert = format!("{:?}", log.get(2).expect("an INSERT must have been issued"));
+        let insert = log
+            .iter()
+            .flat_map(|t| t.statements())
+            .find(|stmt| {
+                stmt.sql.starts_with("INSERT INTO") && stmt.sql.contains("session_replay_sessions")
+            })
+            .map(|stmt| format!("{stmt:?}"))
+            .expect("an INSERT into session_replay_sessions must have been issued");
         assert!(
             insert.contains("Int(Some(3))") && insert.contains("Int(Some(11))"),
             "a fully resolved route must keep its attribution: {insert}"

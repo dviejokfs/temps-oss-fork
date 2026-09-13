@@ -383,6 +383,10 @@ impl From<SessionReplayError> for Problem {
             SessionReplayError::InvalidVisitorId { .. } => {
                 (StatusCode::BAD_REQUEST, "Invalid visitor id")
             }
+            SessionReplayError::VisitorCreationRateLimited { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Visitor creation rate limit exceeded",
+            ),
             // Cross-project access attempts are surfaced as 404 to avoid
             // disclosing the existence of sessions belonging to other tenants.
             SessionReplayError::CrossProjectAccess { .. } => {
@@ -1908,8 +1912,11 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(SessionReplayError::VisitorNotFound(_))),
-            "expected VisitorNotFound once the per-project cap is exhausted, got: {result:?}"
+            matches!(
+                result,
+                Err(SessionReplayError::VisitorCreationRateLimited { .. })
+            ),
+            "expected VisitorCreationRateLimited once the per-project cap is exhausted, got: {result:?}"
         );
         assert_eq!(
             stored_visitors(db.as_ref()).await.len(),
