@@ -2063,6 +2063,134 @@ mod tests {
         test_db.cleanup().await;
     }
 
+    fn cap_test_metadata(visitor_id: String) -> SessionMetadata {
+        SessionMetadata {
+            visitor_id,
+            user_agent: "Mozilla/5.0".to_string(),
+            language: "en-US".to_string(),
+            timezone: "UTC".to_string(),
+            screen: Screen {
+                width: 1920,
+                height: 1080,
+                color_depth: 24,
+            },
+            viewport: Viewport {
+                width: 1280,
+                height: 720,
+            },
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            url: "/".to_string(),
+        }
+    }
+
+    /// Security regression: the per-IP sub-limit must be checked *before*
+    /// the shared project-wide budget is consumed, not after. Each rate
+    /// limiter's `check()` both tests and consumes a slot in the same call,
+    /// so if the project-wide check ran first, an attacker IP already over
+    /// its own sub-cap could keep sending requests that get rejected by the
+    /// IP check afterward -- but each one would have already burned a slot
+    /// from the *shared* project budget for nothing, letting one blocked
+    /// caller drain capacity meant for other IPs. Proves the fix
+    /// behaviorally: after one IP is driven past its own sub-cap (spending
+    /// some rejected requests along the way), exactly
+    /// `120 - (that IP's successes)` more distinct-IP requests must still
+    /// fit under the project cap -- not fewer.
+    #[tokio::test]
+    async fn session_replay_init_rejected_ip_requests_do_not_consume_project_budget() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        let attacker_ip = "198.51.100.9";
+
+        // Drive the attacker's own per-IP sub-cap (20) to exhaustion, then
+        // keep hammering from the same IP well past it -- every one of
+        // these extra calls must be rejected by the IP check without ever
+        // reaching (and consuming) the shared project-wide budget.
+        for i in 0..25 {
+            let result = state
+                .session_replay_service
+                .initialize_session(
+                    &format!("budget-test-attacker-session-{i}"),
+                    cap_test_metadata(format!("budget-test-attacker-visitor-{i}")),
+                    project.id,
+                    None,
+                    None,
+                    attacker_ip,
+                )
+                .await;
+            if i < 20 {
+                assert!(result.is_ok(), "call {i} must succeed (under the IP cap)");
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(SessionReplayError::VisitorCreationRateLimited { .. })
+                    ),
+                    "call {i} must be rejected by the IP cap, got: {result:?}"
+                );
+            }
+        }
+        assert_eq!(
+            stored_visitors(db.as_ref()).await.len(),
+            20,
+            "only the attacker's first 20 calls should have created a row"
+        );
+
+        // The shared project budget is 120; the attacker legitimately used
+        // 20 of it. If the fix holds, exactly 100 more requests from fresh,
+        // distinct IPs must still succeed -- the attacker's 5 rejected
+        // retries above must not have silently eaten into this budget too.
+        for i in 0..100 {
+            let result = state
+                .session_replay_service
+                .initialize_session(
+                    &format!("budget-test-legit-session-{i}"),
+                    cap_test_metadata(format!("budget-test-legit-visitor-{i}")),
+                    project.id,
+                    None,
+                    None,
+                    &format!("203.0.113.{i}"),
+                )
+                .await;
+            assert!(
+                result.is_ok(),
+                "legitimate request {i} from a fresh IP must fit in the remaining project budget: {result:?}"
+            );
+        }
+        assert_eq!(stored_visitors(db.as_ref()).await.len(), 120);
+
+        // The 101st fresh-IP request is the true 121st project-wide upsert
+        // attempt (20 + 100 + 1) and must now hit the project cap.
+        let over_budget = state
+            .session_replay_service
+            .initialize_session(
+                "budget-test-legit-session-over",
+                cap_test_metadata("budget-test-legit-visitor-over".to_string()),
+                project.id,
+                None,
+                None,
+                "203.0.113.250",
+            )
+            .await;
+        assert!(
+            matches!(
+                over_budget,
+                Err(SessionReplayError::VisitorCreationRateLimited { .. })
+            ),
+            "the project cap must trip at exactly 120, proving the attacker's rejected \
+             retries consumed none of the shared budget: {over_budget:?}"
+        );
+
+        test_db.cleanup().await;
+    }
+
     /// Security regression: an oversized `visitorId` on the lookup-miss path
     /// would otherwise reach an `INSERT` into `visitor`, which is uniquely
     /// indexed on `(visitor_id, project_id)` -- Postgres' btree tuple limit

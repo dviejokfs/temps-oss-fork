@@ -413,16 +413,24 @@ const MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE: i32 = 120;
 /// addresses to exhaust the project cap outright.
 const MAX_NEW_VISITORS_PER_PROJECT_PER_IP_PER_MINUTE: i32 = 20;
 
+/// Bound on the number of distinct `(project_id, client_ip)` pairs
+/// `VisitorCreationIpLimiter` tracks at once. Unlike `project_id` (bounded
+/// by how many projects exist) or an ingest-key id, client IPs are
+/// unbounded -- a plain `HashMap` that only ever inserts and never evicts
+/// would grow forever under sustained traffic from many distinct IPs,
+/// which is an OOM vector on a 4GB box. Mirrors
+/// `temps_auth::rate_limit::AuthRateLimiter`'s `max_tracked_ips` +
+/// eviction-at-capacity pattern, the codebase's existing precedent for
+/// bounding a per-IP map.
+const MAX_TRACKED_VISITOR_CREATION_IPS: usize = 10_000;
+
 /// In-memory sliding-window limiter for `(project_id, client_ip)` pairs.
 ///
-/// Same algorithm as `temps_analytics::AnalyticsIngestRateLimiter`, but
-/// keyed by a `(i32, String)` pair instead of a single `i32` -- there is no
-/// existing IP-keyed limiter in the codebase to reuse, and building a
+/// Same sliding-window algorithm as `temps_analytics::AnalyticsIngestRateLimiter`,
+/// but keyed by a `(i32, String)` pair with bounded cardinality (see
+/// `MAX_TRACKED_VISITOR_CREATION_IPS`) instead of a single `i32` -- there is
+/// no existing IP-keyed limiter in the codebase to reuse, and building a
 /// general-purpose one is out of scope for what this one call site needs.
-/// Cardinality is bounded by distinct `(project, ip)` pairs seen inside a
-/// rolling 60s window, which is what an attacker sending traffic from many
-/// IPs would grow -- the same shape of cost the caller is already paying to
-/// exhaust the project-wide budget in the first place.
 struct VisitorCreationIpLimiter {
     entries: tokio::sync::Mutex<std::collections::HashMap<(i32, String), Vec<std::time::Instant>>>,
 }
@@ -435,17 +443,39 @@ impl VisitorCreationIpLimiter {
     }
 
     async fn check(&self, project_id: i32, client_ip: &str, limit_per_minute: i32) -> bool {
-        let window_start = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let now = std::time::Instant::now();
+        let window_start = now - std::time::Duration::from_secs(60);
+        let key = (project_id, client_ip.to_string());
+
         let mut entries = self.entries.lock().await;
-        let timestamps = entries
-            .entry((project_id, client_ip.to_string()))
-            .or_default();
+
+        // Evict entries with no timestamps left in the window once
+        // approaching the cap, so long-lived traffic doesn't accumulate
+        // stale keys forever. Runs at 50% capacity, not every request, to
+        // avoid paying the full-map scan on every call once near the limit.
+        if entries.len() >= MAX_TRACKED_VISITOR_CREATION_IPS / 2 {
+            entries.retain(|_, timestamps| timestamps.iter().any(|t| *t > window_start));
+        }
+
+        // If still at the cap after eviction, only allow IPs already being
+        // tracked -- a flood of brand-new IPs must not grow the map further,
+        // even at the cost of refusing legitimate new traffic during the
+        // flood (fails closed on memory, not open on the rate limit).
+        if entries.len() >= MAX_TRACKED_VISITOR_CREATION_IPS && !entries.contains_key(&key) {
+            tracing::warn!(
+                tracked_ips = entries.len(),
+                "Visitor-creation IP limiter at capacity, rejecting new identity"
+            );
+            return false;
+        }
+
+        let timestamps = entries.entry(key).or_default();
         timestamps.retain(|t| *t > window_start);
 
         if timestamps.len() >= limit_per_minute as usize {
             return false;
         }
-        timestamps.push(std::time::Instant::now());
+        timestamps.push(now);
         true
     }
 }
@@ -525,28 +555,24 @@ impl SessionReplayService {
                 // first-time visitors. Upsert here too, so there is no race
                 // left to lose -- see `upsert_visitor_on_miss` below.
                 //
-                // Two caps, both checked before creating the row: a shared
-                // project-wide budget (matches `/event`'s equivalent cap)
-                // and a tighter per-(project, ip) budget so a single
-                // unauthenticated caller cannot alone exhaust the shared
-                // budget and deny legitimate first-time visitors. Either
-                // one tripping refuses the request -- as a distinguishable
-                // 429 rather than the pre-fix 404, since this is a
-                // transient, retryable condition (the window clears every
-                // 60s) and not "this visitor does not exist."
-                if !self
-                    .visitor_creation_limiter
-                    .check(project_id, Some(MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE))
-                    .await
-                {
-                    tracing::warn!(
-                        visitor_id = %metadata.visitor_id,
-                        project_id,
-                        "Refusing to create a new visitor row from session-replay init: \
-                         project is over its per-minute visitor-creation cap"
-                    );
-                    return Err(SessionReplayError::VisitorCreationRateLimited { project_id });
-                }
+                // Two caps, both checked before creating the row: a
+                // tighter per-(project, ip) budget, and a shared
+                // project-wide budget (matches `/event`'s equivalent cap).
+                // The narrow, per-caller check runs FIRST and the shared
+                // one second, deliberately: each `check()` call both tests
+                // and consumes a slot, so checking the shared budget first
+                // would let a caller already over their own IP limit keep
+                // draining the project's shared budget with requests that
+                // are doomed to be rejected anyway -- the exact cross-caller
+                // amplification this sub-limit exists to prevent. Checking
+                // IP first means a blocked IP is turned away before it ever
+                // touches the shared resource; the only budget it can waste
+                // by retrying is its own.
+                //
+                // Either cap tripping refuses the request -- as a
+                // distinguishable 429 rather than the pre-fix 404, since
+                // this is a transient, retryable condition (the window
+                // clears every 60s) and not "this visitor does not exist."
                 if !self
                     .visitor_creation_ip_limiter
                     .check(
@@ -562,6 +588,19 @@ impl SessionReplayService {
                         client_ip,
                         "Refusing to create a new visitor row from session-replay init: \
                          this IP is over its per-project per-minute visitor-creation cap"
+                    );
+                    return Err(SessionReplayError::VisitorCreationRateLimited { project_id });
+                }
+                if !self
+                    .visitor_creation_limiter
+                    .check(project_id, Some(MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE))
+                    .await
+                {
+                    tracing::warn!(
+                        visitor_id = %metadata.visitor_id,
+                        project_id,
+                        "Refusing to create a new visitor row from session-replay init: \
+                         project is over its per-minute visitor-creation cap"
                     );
                     return Err(SessionReplayError::VisitorCreationRateLimited { project_id });
                 }
