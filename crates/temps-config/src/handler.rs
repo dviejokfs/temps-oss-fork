@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::disk_status::DiskSpaceCheckResult;
+use crate::service::preserve_provider_credential_proof;
 use crate::{ConfigService, EffectiveTelemetryPolicies};
 use axum::{
     extract::{Extension, State},
@@ -537,7 +538,13 @@ impl From<AppSettings> for AppSettingsResponse {
                                 auth_type: cfg.auth_type,
                                 credential_saved: cfg.credentials_encrypted.is_some(),
                                 default_model: cfg.default_model,
-                                extra: cfg.extra,
+                                extra: {
+                                    let mut extra = cfg.extra;
+                                    if let Some(object) = extra.as_object_mut() {
+                                        object.remove("credential_verified");
+                                    }
+                                    extra
+                                },
                             },
                         )
                     })
@@ -2434,8 +2441,8 @@ async fn update_settings(
     // Merge sensitive sandbox/gateway/multi-node fields back from DB. The GET
     // endpoint strips encrypted credentials, shared secrets, and token hashes,
     // so any client round-trip would otherwise wipe them on save. We always
-    // preserve them from the DB unless the incoming payload explicitly sets
-    // them (e.g. a fresh credential save via the AI Providers page).
+    // preserve them from the DB. Provider credentials are only changed through
+    // the dedicated credential endpoint, never through this bulk PUT.
     match app_state.config_service.get_settings().await {
         Ok(current_settings) => {
             // `console_version` is self-recorded state, written only by a starting
@@ -2451,30 +2458,9 @@ async fn update_settings(
             // guard authorization depends on the merged value, so it cannot
             // wait until here.
 
-            // Per-provider credentials: keep existing unless caller supplied a new one
-            for (id, current_cfg) in current_settings.agent_sandbox.providers.iter() {
-                match settings.agent_sandbox.providers.get_mut(id) {
-                    Some(incoming) => {
-                        // Caller didn't include credentials -> restore from DB
-                        if incoming
-                            .credentials_encrypted
-                            .as_deref()
-                            .map(|s| s.is_empty() || s == "******")
-                            .unwrap_or(true)
-                        {
-                            incoming.credentials_encrypted =
-                                current_cfg.credentials_encrypted.clone();
-                        }
-                    }
-                    None => {
-                        // Caller dropped the provider entry entirely -> put it back
-                        settings
-                            .agent_sandbox
-                            .providers
-                            .insert(id.clone(), current_cfg.clone());
-                    }
-                }
-            }
+            // The dedicated credential endpoint is the only write path for
+            // encrypted provider secrets and native-verification proof.
+            preserve_provider_credential_proof(&mut settings, &current_settings);
             // Legacy flat credential
             if settings
                 .agent_sandbox
@@ -2963,6 +2949,50 @@ mod tests {
         AgentSandboxSettings, AiChatLimitsSettings, AiWorkspaceFileLimitsSettings, AppSettings,
         ProviderConfig,
     };
+
+    #[test]
+    fn general_settings_put_cannot_forge_or_replace_provider_verification() {
+        let mut current = AppSettings::default();
+        current.agent_sandbox.providers.insert(
+            "opencode".into(),
+            ProviderConfig {
+                auth_type: "config_file".into(),
+                credentials_encrypted: Some("encrypted-good".into()),
+                extra: serde_json::json!({ "credential_verified": true, "preserved": 1 }),
+                ..Default::default()
+            },
+        );
+        let mut incoming = AppSettings::default();
+        incoming.agent_sandbox.providers.insert(
+            "opencode".into(),
+            ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("encrypted-bad".into()),
+                extra: serde_json::json!({ "credential_verified": false, "user_setting": 2 }),
+                ..Default::default()
+            },
+        );
+        incoming.agent_sandbox.providers.insert(
+            "new".into(),
+            ProviderConfig {
+                credentials_encrypted: Some("forged".into()),
+                extra: serde_json::json!({ "credential_verified": true }),
+                ..Default::default()
+            },
+        );
+        preserve_provider_credential_proof(&mut incoming, &current);
+        let saved = &incoming.agent_sandbox.providers["opencode"];
+        assert_eq!(
+            saved.credentials_encrypted.as_deref(),
+            Some("encrypted-good")
+        );
+        assert_eq!(saved.auth_type, "config_file");
+        assert_eq!(saved.extra["credential_verified"], true);
+        assert_eq!(saved.extra["user_setting"], 2);
+        let forged = &incoming.agent_sandbox.providers["new"];
+        assert_eq!(forged.credentials_encrypted, None);
+        assert!(forged.extra.get("credential_verified").is_none());
+    }
 
     fn rotation_test_user(mfa_enabled: bool) -> temps_entities::users::Model {
         let now = chrono::Utc::now();

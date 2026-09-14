@@ -10928,9 +10928,12 @@ export type ImportExternalServiceRequest = {
 
 export type ImportLocalCredentialResponse = {
     auth_type: string;
+    credential_verification_status: string;
+    provider: ProviderCatalogDto;
     provider_id: string;
     saved: boolean;
     source: string;
+    verification_hint?: string | null;
     workspace_ready: boolean;
 };
 
@@ -15976,6 +15979,10 @@ export type ProviderCatalogDto = {
      */
     credential_saved: boolean;
     /**
+     * `verified`, `unverified`, or `not_saved`; never implies model access.
+     */
+    credential_verification_status: string;
+    /**
      * Currently saved auth flavor id (when `credential_saved` is true).
      * `None` when no credential is saved yet.
      */
@@ -16065,6 +16072,7 @@ export type ProviderCatalogDto = {
      * max-turns inputs accordingly.
      */
     supports_max_turns: boolean;
+    verification_hint?: string | null;
     /**
      * Actionable explanation when `workspace_ready` is false.
      */
@@ -18022,12 +18030,21 @@ export type SaveCredentialRequest = {
      * inside the `agent_sandbox.providers` JSON map.
      */
     credential: string;
+    /**
+     * OpenCode model to test, in `provider/model` form. Omit to use the
+     * built-in minimal probe model. A successfully verified explicit model
+     * becomes this provider's workspace default.
+     */
+    verification_model?: string | null;
 };
 
 export type SaveCredentialResponse = {
     auth_type: string;
+    credential_verification_status: string;
+    provider: ProviderCatalogDto;
     provider_id: string;
     saved: boolean;
+    verification_hint?: string | null;
 };
 
 export type ScalewayCredentialsRequest = {
@@ -23620,6 +23637,13 @@ export type ValidationSummary = {
 
 export type VerifyMfaRequest = {
     code: string;
+};
+
+export type VerifySavedCredentialRequest = {
+    /**
+     * OpenCode model in `provider/model` form, used to verify the saved secret.
+     */
+    verification_model: string;
 };
 
 export type VerifyStepUpRequest = {
@@ -57600,7 +57624,12 @@ export type ImportLocalAiProviderCredentialData = {
          */
         provider_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * OpenCode model to use for the verification request, in `provider/model` form.
+         */
+        verification_model?: string;
+    };
     url: '/settings/ai-providers/{provider_id}/credential/import-local';
 };
 
@@ -57628,6 +57657,35 @@ export type ImportLocalAiProviderCredentialResponses = {
 };
 
 export type ImportLocalAiProviderCredentialResponse = ImportLocalAiProviderCredentialResponses[keyof ImportLocalAiProviderCredentialResponses];
+
+export type VerifySavedAiProviderCredentialData = {
+    body: VerifySavedCredentialRequest;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/credential/verify-saved';
+};
+
+export type VerifySavedAiProviderCredentialErrors = {
+    /**
+     * Invalid model or credential rejected
+     */
+    400: unknown;
+    /**
+     * No saved credential
+     */
+    404: unknown;
+};
+
+export type VerifySavedAiProviderCredentialResponses = {
+    200: SaveCredentialResponse;
+};
+
+export type VerifySavedAiProviderCredentialResponse = VerifySavedAiProviderCredentialResponses[keyof VerifySavedAiProviderCredentialResponses];
 
 export type RefreshAiProviderModelsData = {
     body?: never;

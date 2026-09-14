@@ -51,7 +51,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Implement pagination (default: 20, max: 100) and sorting (default: `created_at` DESC)
 - Use typed error handling with proper propagation
 - Follow the three-layer architecture pattern
-- Keep tests in the same file as the code they test
+- Keep Rust unit tests in the same file as the code they test. Frontend TypeScript/React tests belong in adjacent `.test.ts` or `.test.tsx` files so test-runner imports are excluded from production modules.
 - Return dates in ISO 8601 format with `Z` suffix
 - Use `permission_guard!` macro for authorization in handlers
 - Add audit logging for all write operations (CREATE, UPDATE, DELETE)
