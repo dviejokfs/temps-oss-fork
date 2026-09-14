@@ -9,6 +9,13 @@ if ! docker info >/dev/null 2>&1; then
   echo 'SKIP: Docker is unavailable; no lifecycle checks ran'
   exit 0
 fi
+if [ -n "${DOCKER_DEFAULT_PLATFORM:-}" ]; then
+  actual_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")
+  if [ "$actual_platform" != "$DOCKER_DEFAULT_PLATFORM" ]; then
+    echo "ERROR: expected $DOCKER_DEFAULT_PLATFORM image, found $actual_platform"
+    exit 1
+  fi
+fi
 suffix="$(date +%s)-$$"
 container="temps-runtime-smoke-$suffix"
 volume="temps-runtime-smoke-$suffix"

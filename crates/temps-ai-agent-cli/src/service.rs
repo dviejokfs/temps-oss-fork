@@ -751,7 +751,7 @@ impl Drop for CandidateSandbox {
 async fn mcp_bridge_handler(
     axum::extract::State(state): axum::extract::State<McpBridgeState>,
     headers: axum::http::HeaderMap,
-    axum::Json(request): axum::Json<serde_json::Value>,
+    axum::Json(request): axum::Json<temps_ai::mcp::McpRequest>,
 ) -> Response {
     let authorized = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -765,74 +765,72 @@ async fn mcp_bridge_handler(
     if !authorized {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({"error": "unauthorized"})),
+            axum::Json(temps_ai::mcp::McpTransportError {
+                error: "unauthorized",
+            }),
         )
             .into_response();
     }
 
-    let id = request
-        .get("id")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let method = request
-        .get("method")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    use temps_ai::mcp::{
+        McpCallResult, McpEmptyResult, McpInitializeResult, McpResponse, McpResult,
+        McpToolDefinition, McpToolsResult,
+    };
     // JSON-RPC notifications deliberately have no response. Native MCP
     // clients send `notifications/initialized` immediately after initialize.
-    if request.get("id").is_none() {
+    let Some(id) = request.id else {
         return axum::http::StatusCode::ACCEPTED.into_response();
-    }
-    let response = match method {
-        "initialize" => serde_json::json!({
-            "jsonrpc": "2.0", "id": id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "temps-chat", "version": "1"}
-            }
-        }),
-        "tools/list" => serde_json::json!({
-            "jsonrpc": "2.0", "id": id,
-            "result": {"tools": state.tools.iter().map(|tool| serde_json::json!({
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool.parameters
-            })).collect::<Vec<_>>()}
-        }),
-        "ping" => serde_json::json!({
-            "jsonrpc": "2.0", "id": id, "result": {}
-        }),
+    };
+    let response = match request.method.as_str() {
+        "initialize" => McpResponse::result(
+            id,
+            McpResult::Initialize(McpInitializeResult::new("temps-chat")),
+        ),
+        "tools/list" => McpResponse::result(
+            id,
+            McpResult::Tools(McpToolsResult {
+                tools: state
+                    .tools
+                    .iter()
+                    .map(|tool| McpToolDefinition {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        input_schema: tool.parameters.clone(),
+                    })
+                    .collect(),
+            }),
+        ),
+        "ping" => McpResponse::result(id, McpResult::Empty(McpEmptyResult::default())),
         "tools/call" => {
-            let params = request.get("params").cloned().unwrap_or_default();
-            let name = params
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
+            let params = request.params.unwrap_or_default();
+            let name = params.name.as_deref().unwrap_or_default();
             let known = state.tools.iter().any(|tool| tool.name == name);
             if !known {
-                serde_json::json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"content": [{"type": "text", "text": "Tool is not available for this conversation"}], "isError": true}
-                })
+                McpResponse::result(
+                    id,
+                    McpResult::Call(McpCallResult::text(
+                        "Tool is not available for this conversation",
+                        true,
+                    )),
+                )
             } else {
                 let _tool_permit = match state.tool_slot.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
                         return (
                             axum::http::StatusCode::OK,
-                            axum::Json(serde_json::json!({
-                                "jsonrpc": "2.0", "id": id,
-                                "result": {"content": [{"type": "text", "text": "Another Temps tool call is already running for this turn"}], "isError": true}
-                            })),
+                            axum::Json(McpResponse::result(
+                                id,
+                                McpResult::Call(McpCallResult::text(
+                                    "Another Temps tool call is already running for this turn",
+                                    true,
+                                )),
+                            )),
                         )
                             .into_response();
                     }
                 };
-                let arguments = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
+                let arguments = params.arguments.unwrap_or_else(|| serde_json::json!({}));
                 let call = ToolCall {
                     id: uuid::Uuid::new_v4().simple().to_string(),
                     name: name.to_string(),
@@ -868,16 +866,10 @@ async fn mcp_bridge_handler(
                         result: result.clone(),
                     }))
                     .await;
-                serde_json::json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"content": [{"type": "text", "text": result}], "isError": is_error}
-                })
+                McpResponse::result(id, McpResult::Call(McpCallResult::text(result, is_error)))
             }
         }
-        _ => serde_json::json!({
-            "jsonrpc": "2.0", "id": id,
-            "error": {"code": -32601, "message": "Method not found"}
-        }),
+        _ => McpResponse::error(id, -32601, "Method not found"),
     };
     (axum::http::StatusCode::OK, axum::Json(response)).into_response()
 }
@@ -5691,6 +5683,12 @@ impl AiService for AgentCliAiService {
 
 #[cfg(test)]
 mod tests {
+    macro_rules! mcp_request {
+        ($($json:tt)*) => {
+            serde_json::from_value::<temps_ai::mcp::McpRequest>(serde_json::json!($($json)*))
+                .expect("valid MCP request fixture")
+        };
+    }
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -7586,7 +7584,7 @@ mod tests {
         let response = mcp_bridge_handler(
             axum::extract::State(state),
             axum::http::HeaderMap::new(),
-            axum::Json(serde_json::json!({"id": 1, "method": "initialize"})),
+            axum::Json(mcp_request!({"id": 1, "method": "initialize"})),
         )
         .await;
         assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
@@ -7599,7 +7597,7 @@ mod tests {
             mcp_bridge_handler(
                 axum::extract::State(state.clone()),
                 authorized_headers(),
-                axum::Json(serde_json::json!({"id": 1, "method": "initialize"})),
+                axum::Json(mcp_request!({"id": 1, "method": "initialize"})),
             )
             .await,
         )
@@ -7610,7 +7608,7 @@ mod tests {
             mcp_bridge_handler(
                 axum::extract::State(state.clone()),
                 authorized_headers(),
-                axum::Json(serde_json::json!({"id": 2, "method": "tools/list"})),
+                axum::Json(mcp_request!({"id": 2, "method": "tools/list"})),
             )
             .await,
         )
@@ -7621,7 +7619,7 @@ mod tests {
             mcp_bridge_handler(
                 axum::extract::State(state),
                 authorized_headers(),
-                axum::Json(serde_json::json!({
+                axum::Json(mcp_request!({
                     "id": 3,
                     "method": "tools/call",
                     "params": {"name": "temps", "arguments": {"command": "projects list"}}
@@ -7650,7 +7648,7 @@ mod tests {
         let response = mcp_bridge_handler(
             axum::extract::State(state),
             authorized_headers(),
-            axum::Json(serde_json::json!({
+            axum::Json(mcp_request!({
                 "jsonrpc": "2.0",
                 "method": "notifications/initialized"
             })),
@@ -7676,7 +7674,7 @@ mod tests {
         let response = mcp_bridge_handler(
             axum::extract::State(state),
             authorized_headers(),
-            axum::Json(serde_json::json!({
+            axum::Json(mcp_request!({
                 "id": 4,
                 "method": "tools/call",
                 "params": {"name": "temps", "arguments": {}}
@@ -7699,7 +7697,7 @@ mod tests {
         let response = mcp_bridge_handler(
             axum::extract::State(state),
             authorized_headers(),
-            axum::Json(serde_json::json!({
+            axum::Json(mcp_request!({
                 "id": 5,
                 "method": "tools/call",
                 "params": {"name": "temps", "arguments": {}}
@@ -7726,6 +7724,60 @@ mod tests {
     // `mcp_bridge_handler` directly, as the tests above do) because
     // `DefaultBodyLimit` is enforced by the extractor via a `tower::Layer`,
     // which only runs when a request actually passes through the router.
+    #[tokio::test]
+    async fn mcp_bridge_router_preserves_null_ids_and_rejects_malformed_requests() {
+        use tower::ServiceExt;
+        let (state, _events) = test_mcp_state();
+        let router = build_bridge_router("/mcp/test", state);
+        for (body, status, expected_id) in [
+            (
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                axum::http::StatusCode::ACCEPTED,
+                None,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+                axum::http::StatusCode::OK,
+                Some(serde_json::Value::Null),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":"rpc-1","method":"ping"}"#,
+                axum::http::StatusCode::OK,
+                Some(serde_json::json!("rpc-1")),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":false}"#,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":{},"method":"ping"}"#,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":[]}"#,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+            ),
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp/test")
+                .header(axum::http::header::AUTHORIZATION, "Bearer one-turn-token")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body))
+                .expect("request");
+            let response = router.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), status, "{body}");
+            if let Some(id) = expected_id {
+                let json = response_json(response).await;
+                assert_eq!(json["id"], id);
+                assert_eq!(json["result"], serde_json::json!({}));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn mcp_bridge_router_rejects_request_over_body_limit() {
         use tower::ServiceExt;
@@ -7794,7 +7846,7 @@ mod tests {
         let response = mcp_bridge_handler(
             axum::extract::State(state),
             authorized_headers(),
-            axum::Json(serde_json::json!({
+            axum::Json(mcp_request!({
                 "id": 6,
                 "method": "tools/call",
                 "params": {"name": "temps", "arguments": {}}

@@ -36,10 +36,14 @@ publish an image.
 
 ## GitHub Actions publication
 
-`daemon-images-check.yml` builds all three flavors for Linux amd64 and arm64
-on pull requests without registry credentials or pushes. `sandbox-images-beta.yml`
+`daemon-images-check.yml` builds and lifecycle-tests all three flavors for Linux
+amd64 and arm64 on pull requests without registry credentials or pushes. `sandbox-images-beta.yml`
 calls `daemon-images.yml` on image-related main changes; `release.yml` calls
-the same workflow after its release validation. Both honor their dry-run input.
+the same workflow after all four platform builds pass. Both honor their dry-run input.
+For each flavor, publication waits for separate amd64 and arm64 lifecycle smoke
+tests. QEMU runs arm64 on the amd64 runner; the smoke test checks the loaded
+image's architecture against the requested platform before starting a container.
+Neither architecture is published if either smoke test fails.
 
 The build reads the image version from the actual managed-workspace image
 mapping and fetches the SDK commit pinned above. Stable release tags publish

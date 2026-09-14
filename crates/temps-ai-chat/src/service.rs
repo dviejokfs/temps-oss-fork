@@ -584,14 +584,15 @@ fn is_managed_process_echo(name: &str) -> bool {
 
 fn managed_process_call_id(
     bridge_id: &str,
-    rpc_id: &serde_json::Value,
+    rpc_id: &temps_ai::mcp::McpRequestId,
 ) -> Result<String, temps_ai::AiError> {
-    if !rpc_id.is_string() && !rpc_id.is_number() {
+    if matches!(rpc_id, temps_ai::mcp::McpRequestId::Null) {
         return Err(invalid_process_request(
             "the managed process request id is invalid",
         ));
     }
-    let normalized = rpc_id.to_string();
+    let normalized = serde_json::to_string(rpc_id)
+        .map_err(|_| invalid_process_request("the managed process request id cannot be encoded"))?;
     if normalized.len() > 256 {
         return Err(invalid_process_request(
             "the managed process request id exceeds safe limits",
@@ -1948,8 +1949,12 @@ impl ConversationService {
         &self,
         bridge_id: &str,
         bearer: &str,
-        request: serde_json::Value,
-    ) -> Result<Option<serde_json::Value>, HarnessMcpError> {
+        request: temps_ai::mcp::McpRequest,
+    ) -> Result<Option<temps_ai::mcp::McpResponse>, HarnessMcpError> {
+        use temps_ai::mcp::{
+            McpEmptyResult, McpInitializeResult, McpResponse, McpResult, McpToolDefinition,
+            McpToolsResult,
+        };
         let entry = {
             let mut registry = match self.harness_mcp_entries.lock() {
                 Ok(registry) => registry,
@@ -1974,65 +1979,36 @@ impl ConversationService {
         );
 
         // MCP notifications have no response body.
-        let Some(id) = request.get("id").cloned() else {
+        let Some(id) = request.id else {
             return Ok(None);
         };
-        let method = request
-            .get("method")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let response = match method {
-            "initialize" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "temps-application", "version": "1"}
-                }
-            }),
-            "tools/list" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {"tools": entry.tools.iter().map(|tool| serde_json::json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": tool.parameters,
-                })).chain(std::iter::once(serde_json::json!({
-                    "name": "temps_native_permission",
-                    "description": "Internal approval bridge used by the development harness. Do not invoke directly.",
-                    "inputSchema": {
-                        "type": "object",
-                        "required": ["tool_name", "input"],
-                        "properties": {
-                            "tool_name": {"type": "string"},
-                            "input": {"type": "object", "additionalProperties": true}
-                        },
+        let response = match request.method.as_str() {
+            "initialize" => McpResponse::result(id, McpResult::Initialize(McpInitializeResult::new("temps-application"))),
+            "tools/list" => McpResponse::result(id, McpResult::Tools(McpToolsResult {
+                tools: entry.tools.iter().map(|tool| McpToolDefinition {
+                    name: tool.name.clone(), description: tool.description.clone(), input_schema: tool.parameters.clone(),
+                }).chain(std::iter::once(McpToolDefinition {
+                    name: "temps_native_permission".into(),
+                    description: "Internal approval bridge used by the development harness. Do not invoke directly.".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object", "required": ["tool_name", "input"],
+                        "properties": {"tool_name": {"type": "string"}, "input": {"type": "object", "additionalProperties": true}},
                         "additionalProperties": true
-                    }
-                }))).collect::<Vec<_>>()}
-            }),
-            "ping" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                    }),
+                })).collect(),
+            })),
+            "ping" => McpResponse::result(id, McpResult::Empty(McpEmptyResult::default())),
             "tools/call" => {
-                let params = request.get("params").cloned().unwrap_or_default();
-                let name = params
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
+                let params = request.params.unwrap_or_default();
+                let name = params.name.as_deref().unwrap_or_default();
                 if name == "temps_native_permission" {
-                    let arguments = params
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    let tool_name = arguments
-                        .get("tool_name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("Unknown tool")
-                        .to_string();
-                    let input = arguments
-                        .get("input")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
+                    let arguments = params.arguments.clone().unwrap_or_else(|| serde_json::json!({}));
+                    let arguments = match serde_json::from_value::<temps_ai::mcp::McpNativePermissionArguments>(arguments) {
+                        Ok(arguments) => arguments,
+                        Err(_) => return Ok(Some(McpResponse::error(id, -32602, "Invalid native permission arguments"))),
+                    };
+                    let tool_name = arguments.tool_name;
+                    let input = arguments.input;
                     let permission = temps_ai::PermissionRequest {
                         id: uuid::Uuid::new_v4().simple().to_string(),
                         kind: temps_ai::PermissionKind::ToolApproval,
@@ -2043,46 +2019,19 @@ impl ConversationService {
                     let decision =
                         tokio::time::timeout(remaining, (entry.interactions)(permission)).await;
                     let payload = match decision {
-                        Ok(Ok(temps_ai::PermissionDecision::AllowTool)) => serde_json::json!({
-                            "behavior": "allow",
-                            "updatedInput": input,
-                        }),
-                        Ok(Ok(temps_ai::PermissionDecision::DenyTool { reason })) => {
-                            serde_json::json!({
-                                "behavior": "deny",
-                                "message": reason.unwrap_or_else(|| "Permission denied".to_string()),
-                            })
-                        }
-                        Ok(Ok(_)) => serde_json::json!({
-                            "behavior": "deny",
-                            "message": "The approval response did not match this tool request",
-                        }),
-                        Ok(Err(error)) => serde_json::json!({
-                            "behavior": "deny",
-                            "message": error.to_string(),
-                        }),
-                        Err(_) => serde_json::json!({
-                            "behavior": "deny",
-                            "message": "Permission request timed out",
-                        }),
+                        Ok(Ok(temps_ai::PermissionDecision::AllowTool)) => temps_ai::mcp::McpPermissionDecision::allow(input),
+                        Ok(Ok(temps_ai::PermissionDecision::DenyTool { reason })) => temps_ai::mcp::McpPermissionDecision::deny(reason.unwrap_or_else(|| "Permission denied".to_string())),
+                        Ok(Ok(_)) => temps_ai::mcp::McpPermissionDecision::deny("The approval response did not match this tool request"),
+                        Ok(Err(error)) => temps_ai::mcp::McpPermissionDecision::deny(error.to_string()),
+                        Err(_) => temps_ai::mcp::McpPermissionDecision::deny("Permission request timed out"),
                     };
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{"type": "text", "text": payload.to_string()}],
-                            "isError": false,
-                        }
-                    })
+                    let payload_text = match serde_json::to_string(&payload) {
+                        Ok(text) => text,
+                        Err(_) => "{\"behavior\":\"deny\",\"message\":\"Permission response could not be encoded\"}".into(),
+                    };
+                    McpResponse::call_text(id, payload_text, false)
                 } else if !entry.tools.iter().any(|tool| tool.name == name) {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{"type": "text", "text": "Tool is not available for this application turn"}],
-                            "isError": true,
-                        }
-                    })
+                    McpResponse::call_text(id, "Tool is not available for this application turn", true)
                 } else {
                     let managed_process = is_managed_process_tool(name);
                     let call_id = if managed_process {
@@ -2090,9 +2039,7 @@ impl ConversationService {
                             Ok(call_id) => call_id,
                             Err(_) => {
                                 let call_id = uuid::Uuid::new_v4().simple().to_string();
-                                let arguments = params
-                                    .get("arguments")
-                                    .cloned()
+                                let arguments = params.arguments.clone()
                                     .unwrap_or_else(|| serde_json::json!({}))
                                     .to_string();
                                 let safe_error = serde_json::json!({
@@ -2114,14 +2061,7 @@ impl ConversationService {
                                     },
                                     result: safe_error.clone(),
                                 });
-                                return Ok(Some(serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "result": {
-                                        "content": [{"type": "text", "text": safe_error}],
-                                        "isError": true,
-                                    }
-                                })));
+                                return Ok(Some(McpResponse::call_text(id, safe_error, true)));
                             }
                         }
                     } else {
@@ -2130,9 +2070,7 @@ impl ConversationService {
                     let call = ToolCall {
                         id: call_id,
                         name: name.to_string(),
-                        arguments: params
-                            .get("arguments")
-                            .cloned()
+                        arguments: params.arguments.clone()
                             .unwrap_or_else(|| serde_json::json!({}))
                             .to_string(),
                     };
@@ -2154,14 +2092,7 @@ impl ConversationService {
                                     result: safe_error.clone(),
                                 });
                             }
-                            return Ok(Some(serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": {
-                                    "content": [{"type": "text", "text": safe_error}],
-                                    "isError": true,
-                                }
-                            })));
+                            return Ok(Some(McpResponse::call_text(id, safe_error, true)));
                         }
                     };
                     if managed_process
@@ -2175,10 +2106,7 @@ impl ConversationService {
                             .is_err()
                     {
                         drop(permit);
-                        return Ok(Some(serde_json::json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "result": {"content": [{"type":"text","text":"The managed process event queue is busy. Retry shortly."}], "isError": true}
-                        })));
+                        return Ok(Some(McpResponse::call_text(id, "The managed process event queue is busy. Retry shortly.", true)));
                     }
                     // A platform write may be waiting on a human approval. Do
                     // not impose the old 30-second read-tool timeout on that
@@ -2231,21 +2159,10 @@ impl ConversationService {
                             result: safe_text.clone(),
                         });
                     }
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{"type": "text", "text": safe_text}],
-                            "isError": is_error,
-                        }
-                    })
+                    McpResponse::call_text(id, safe_text, is_error)
                 }
             }
-            _ => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": -32601, "message": "Method not found"},
-            }),
+            _ => McpResponse::error(id, -32601, "Method not found"),
         };
         Ok(Some(response))
     }
@@ -7199,6 +7116,12 @@ async fn audit_action_transition_failed(
 
 #[cfg(test)]
 mod tests {
+    macro_rules! mcp_request {
+        ($($json:tt)*) => {
+            serde_json::from_value::<temps_ai::mcp::McpRequest>(serde_json::json!($($json)*))
+                .expect("valid MCP request fixture")
+        };
+    }
     use super::*;
 
     #[test]
@@ -11917,16 +11840,48 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 "wrong-token",
-                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                mcp_request!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
             )
             .await;
         assert_eq!(unauthorized, Err(HarnessMcpError::Unauthorized));
+
+        let notification = svc
+            .handle_harness_mcp_request(
+                bridge_id,
+                &server.authorization_token,
+                mcp_request!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            )
+            .await
+            .expect("authorized notification");
+        assert!(notification.is_none());
+        let ping = svc
+            .handle_harness_mcp_request(
+                bridge_id,
+                &server.authorization_token,
+                mcp_request!({"jsonrpc":"2.0","id":null,"method":"ping"}),
+            )
+            .await
+            .expect("authorized ping")
+            .expect("null id still receives response");
+        assert_eq!(ping.id, temps_ai::mcp::McpRequestId::Null);
+        assert!(matches!(
+            ping.result,
+            Some(temps_ai::mcp::McpResult::Empty(_))
+        ));
+        let invalid_permission = svc
+            .handle_harness_mcp_request(bridge_id, &server.authorization_token,
+                mcp_request!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"temps_native_permission","arguments":{}}}))
+            .await.expect("authorized capability").expect("invalid params response");
+        assert_eq!(
+            invalid_permission.error.expect("JSON-RPC error").code,
+            -32602
+        );
 
         let response = svc
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({
+                mcp_request!({
                     "jsonrpc": "2.0",
                     "id": 2,
                     "method": "tools/call",
@@ -11936,6 +11891,7 @@ mod tests {
             .await
             .expect("authorized capability")
             .expect("request response");
+        let response = serde_json::to_value(response).expect("MCP response JSON");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(response["result"]["isError"], false);
         assert!(response["result"]["content"][0]["text"]
@@ -11947,7 +11903,7 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+                mcp_request!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
             )
             .await;
         assert_eq!(after_turn, Err(HarnessMcpError::NotFound));
@@ -11982,7 +11938,7 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                mcp_request!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
             )
             .await;
         assert_eq!(result, Err(HarnessMcpError::Expired));
@@ -12020,7 +11976,7 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({
+                mcp_request!({
                     "jsonrpc": "2.0",
                     "id": 9,
                     "method": "tools/call",
@@ -12036,6 +11992,7 @@ mod tests {
             .await
             .expect("authorized capability")
             .expect("request response");
+        let response = serde_json::to_value(response).expect("MCP response JSON");
 
         let permission = seen
             .lock()
@@ -12087,7 +12044,7 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({
+                mcp_request!({
                     "jsonrpc": "2.0",
                     "id": 10,
                     "method": "tools/call",
@@ -12103,6 +12060,7 @@ mod tests {
             .await
             .expect("authorized capability")
             .expect("request response");
+        let response = serde_json::to_value(response).expect("MCP response JSON");
 
         let payload: serde_json::Value = serde_json::from_str(
             response["result"]["content"][0]["text"]
@@ -12162,7 +12120,7 @@ mod tests {
 
     #[test]
     fn managed_process_rpc_ids_are_stable_bounded_and_capability_scoped() {
-        let rpc_id = serde_json::json!("request-42");
+        let rpc_id = temps_ai::mcp::McpRequestId::String("request-42".into());
         let first = managed_process_call_id("bridge-a", &rpc_id).expect("valid rpc id");
         let retry = managed_process_call_id("bridge-a", &rpc_id).expect("stable retry id");
         let other_capability =
@@ -12170,8 +12128,12 @@ mod tests {
         assert_eq!(first, retry);
         assert_ne!(first, other_capability);
         assert!(first.starts_with("tmcp_"));
-        assert!(managed_process_call_id("bridge-a", &serde_json::json!({"bad": true})).is_err());
-        assert!(managed_process_call_id("bridge-a", &serde_json::json!("x".repeat(257))).is_err());
+        assert!(managed_process_call_id("bridge-a", &temps_ai::mcp::McpRequestId::Null).is_err());
+        assert!(managed_process_call_id(
+            "bridge-a",
+            &temps_ai::mcp::McpRequestId::String("x".repeat(257))
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -12212,7 +12174,7 @@ mod tests {
             .nth(1)
             .and_then(|suffix| suffix.split('/').next())
             .expect("bridge id in scoped URL");
-        let request = serde_json::json!({
+        let request = mcp_request!({
             "jsonrpc":"2.0", "id":"stable-request", "method":"tools/call",
             "params":{"name":PROCESS_STATUS_TOOL,"arguments":{"process_id":"proc_1"}}
         });
@@ -12247,6 +12209,7 @@ mod tests {
             .expect("request task")
             .expect("authorized process request")
             .expect("process response");
+        let response = serde_json::to_value(response).expect("MCP response JSON");
         assert_eq!(response["result"]["isError"], false);
         assert!(!response.to_string().contains("must-redact"));
     }
@@ -12385,7 +12348,7 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({
+                mcp_request!({
                     "jsonrpc":"2.0", "id":8, "method":"tools/call",
                     "params":{"name":PROCESS_STATUS_TOOL,"arguments":{"process_id":"proc_1"}}
                 }),
@@ -12393,6 +12356,7 @@ mod tests {
             .await
             .expect("authorized capability")
             .expect("queue error response");
+        let response = serde_json::to_value(response).expect("MCP response JSON");
         assert_eq!(response["result"]["isError"], true);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }

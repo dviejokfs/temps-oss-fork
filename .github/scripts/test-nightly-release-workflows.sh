@@ -89,13 +89,50 @@ abort "all required daemon flavors must be verified" unless
   images.dig("strategy", "matrix", "flavor") == ["nodejs", "python", "all"] &&
   !images.key?("continue-on-error")
 steps = images.fetch("steps")
-verify_index = steps.index { |step| step["name"] == "Verify daemon lifecycle without provider credentials" }
 publish_index = steps.index { |step| step["name"] == "Build and publish daemon image" }
-abort "daemon publication must follow unconditional lifecycle verification" unless
-  verify_index && publish_index && verify_index < publish_index &&
-  !steps[verify_index].key?("if") && !steps[verify_index].key?("continue-on-error") &&
-  steps[verify_index]["run"].include?("docker info >/dev/null\n") &&
-  steps[verify_index]["run"].include?("bash tools/sandbox-runtime/smoke.sh temps-daemon-release:check")
+abort "daemon publication step is missing or bypasses failed checks" unless
+  publish_index && !steps[publish_index].key?("if") && !steps[publish_index].key?("continue-on-error")
+published_platforms = steps[publish_index].fetch("with").fetch("platforms").split(",")
+abort "daemon publication must cover both supported architectures" unless
+  published_platforms.sort == %w[linux/amd64 linux/arm64]
+published_platforms.each do |platform|
+  arch = platform.split("/").last
+  load_index = steps.index { |step| step["name"] == "Load #{arch} image for lifecycle verification" }
+  verify_index = steps.index { |step| step["name"] == "Verify #{arch} daemon lifecycle without provider credentials" }
+  abort "#{platform} must be loaded and verified unconditionally before publication" unless
+    load_index && verify_index && load_index < verify_index && verify_index < publish_index &&
+    [load_index, verify_index].all? { |index| !steps[index].key?("if") && !steps[index].key?("continue-on-error") } &&
+    steps[load_index].dig("with", "platforms") == platform &&
+    steps[load_index].dig("with", "load") == true &&
+    steps[load_index].dig("with", "push") == false &&
+    steps[load_index].dig("with", "tags") == "temps-daemon-release:check" &&
+    steps[verify_index].dig("env", "DOCKER_DEFAULT_PLATFORM") == platform &&
+    steps[verify_index]["run"].include?("docker info >/dev/null\n") &&
+    steps[verify_index]["run"].include?("bash tools/sandbox-runtime/smoke.sh temps-daemon-release:check")
+  abort "#{platform} verification can use an overwritten image tag" if
+    steps[(load_index + 1)...verify_index].any? { |step| step.dig("with", "load") == true }
+end
+
+daemon_check = YAML.safe_load(File.read(File.join(repository_root, ".github/workflows/daemon-images-check.yml")), aliases: true)
+check_job = daemon_check.dig("jobs", "build")
+abort "PR checks must exercise every published flavor and architecture" unless
+  check_job.dig("strategy", "matrix", "flavor") == ["nodejs", "python", "all"] &&
+  check_job.dig("strategy", "matrix", "arch") == ["amd64", "arm64"] &&
+  !check_job.key?("continue-on-error")
+check_steps = check_job.fetch("steps")
+check_load_index = check_steps.index { |step| step["name"] == "Load image for lifecycle verification" }
+check_smoke_index = check_steps.index { |step| step["name"] == "Verify daemon lifecycle without provider credentials" }
+abort "PR image smoke checks must not skip matrix entries" unless
+  check_load_index && check_smoke_index && check_load_index < check_smoke_index &&
+  check_steps.all? { |step| !step.key?("if") && !step.key?("continue-on-error") } &&
+  check_steps[check_load_index].dig("with", "platforms") == "linux/${{ matrix.arch }}" &&
+  check_steps[check_load_index].dig("with", "target") == "${{ matrix.flavor }}" &&
+  check_steps[check_load_index].dig("with", "load") == true &&
+  check_steps[check_load_index].dig("with", "push") == false &&
+  check_steps[check_load_index].dig("with", "tags") == "temps-daemon-ci:check" &&
+  check_steps[check_smoke_index].dig("env", "DOCKER_DEFAULT_PLATFORM") == "linux/${{ matrix.arch }}" &&
+  check_steps[check_smoke_index]["run"].include?("docker info >/dev/null\n") &&
+  check_steps[check_smoke_index]["run"].include?("bash tools/sandbox-runtime/smoke.sh temps-daemon-ci:check")
 
 abort "release dependency fetches can fall back to Cargo's embedded Git client" unless
   release.dig("env", "CARGO_NET_GIT_FETCH_WITH_CLI") == "true"
