@@ -16,6 +16,7 @@
     "resolveJsonModule": true,
     "moduleResolution": "Bundler",
     "allowImportingTsExtensions": true,
+    "types": ["bun"],
     /* type checking */
     "strict": true,
     "noUnusedLocals": true,
