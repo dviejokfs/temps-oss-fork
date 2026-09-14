@@ -28,6 +28,46 @@ pub const SQLITE_DB_NAME: &str = "temps.db";
 use serde_derive::{Deserialize, Serialize};
 use temps_core::{AppSettings, PublicHostnameStrategy};
 
+/// Rebase credential-owned fields onto the row locked by the settings writer.
+/// A bulk settings payload (including one built from an older GET) is never
+/// allowed to create, restore, or verify a provider credential.
+pub(crate) fn preserve_provider_credential_proof(
+    incoming: &mut AppSettings,
+    current: &AppSettings,
+) {
+    for (id, current_cfg) in &current.agent_sandbox.providers {
+        match incoming.agent_sandbox.providers.get_mut(id) {
+            Some(candidate) => {
+                candidate.credentials_encrypted = current_cfg.credentials_encrypted.clone();
+                candidate.auth_type = current_cfg.auth_type.clone();
+                if !candidate.extra.is_object() {
+                    candidate.extra = serde_json::json!({});
+                }
+                if let Some(extra) = candidate.extra.as_object_mut() {
+                    extra.remove("credential_verified");
+                    if let Some(proof) = current_cfg.extra.get("credential_verified") {
+                        extra.insert("credential_verified".into(), proof.clone());
+                    }
+                }
+            }
+            None => {
+                incoming
+                    .agent_sandbox
+                    .providers
+                    .insert(id.clone(), current_cfg.clone());
+            }
+        }
+    }
+    for (id, candidate) in &mut incoming.agent_sandbox.providers {
+        if !current.agent_sandbox.providers.contains_key(id) {
+            candidate.credentials_encrypted = None;
+            if let Some(extra) = candidate.extra.as_object_mut() {
+                extra.remove("credential_verified");
+            }
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum ConfigServiceError {
     #[error("Database error: {0}")]
@@ -951,16 +991,28 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         true
     }
 
-    async fn replace_settings_cache(&self, settings: AppSettings) {
+    async fn publish_committed_settings_if_current(
+        &self,
+        generation: u64,
+        settings: AppSettings,
+    ) -> bool {
         let mut cache = self.settings_cache.write().await;
+        if cache.generation != generation {
+            return false;
+        }
         cache.generation = cache.generation.wrapping_add(1);
         temps_core::tls::set_insecure_tls(settings.insecure_tls);
         cache.snapshot = Some((settings, std::time::Instant::now()));
+        true
     }
 
     /// Update the application settings
-    pub async fn update_settings(&self, settings: AppSettings) -> Result<(), ConfigServiceError> {
+    pub async fn update_settings(
+        &self,
+        mut settings: AppSettings,
+    ) -> Result<(), ConfigServiceError> {
         let now = Utc::now();
+        let cache_generation = self.settings_cache.read().await.generation;
 
         // The settings row can drift from the actual TimescaleDB jobs (for
         // example after a manual policy change). Prefer the live, tiny policy
@@ -1002,6 +1054,14 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             existing_query
         };
         let existing = existing_query.one(&txn).await?;
+
+        // The handler's earlier snapshot is advisory only. Rebase against the
+        // authoritative row while its write lock is held, before serializing.
+        let locked_settings = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        preserve_provider_credential_proof(&mut settings, &locked_settings);
 
         let previous_compression = existing
             .as_ref()
@@ -1141,11 +1201,15 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         txn.commit().await?;
 
-        // Write-through: refresh the cache with the just-written value so an
-        // admin's change takes effect immediately in this process, rather than
-        // waiting out SETTINGS_CACHE_TTL. Runtime TLS publication happens in
-        // the same generation-checked critical section.
-        self.replace_settings_cache(settings).await;
+        // A dedicated writer may commit and invalidate between our commit and
+        // cache publication. Its generation change prevents this older bulk
+        // snapshot from replacing the authoritative cache.
+        if !self
+            .publish_committed_settings_if_current(cache_generation, settings)
+            .await
+        {
+            self.invalidate_settings_cache().await;
+        }
 
         Ok(())
     }
@@ -1977,6 +2041,179 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn locked_provider_rebase_rejects_stale_and_forged_credentials() {
+        let mut locked = AppSettings::default();
+        locked.agent_sandbox.providers.insert(
+            "replaced".into(),
+            temps_core::ProviderConfig {
+                auth_type: "subscription".into(),
+                credentials_encrypted: Some("new-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        locked.agent_sandbox.providers.insert(
+            "omitted".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("omitted-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        let mut incoming = AppSettings::default();
+        incoming.agent_sandbox.providers.insert(
+            "replaced".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("old-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": false, "custom": 1}),
+                ..Default::default()
+            },
+        );
+        incoming.agent_sandbox.providers.insert(
+            "new".into(),
+            temps_core::ProviderConfig {
+                credentials_encrypted: Some("forged-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        preserve_provider_credential_proof(&mut incoming, &locked);
+        let replaced = &incoming.agent_sandbox.providers["replaced"];
+        assert_eq!(replaced.auth_type, "subscription");
+        assert_eq!(
+            replaced.credentials_encrypted.as_deref(),
+            Some("new-ciphertext")
+        );
+        assert_eq!(replaced.extra["credential_verified"], true);
+        assert_eq!(replaced.extra["custom"], 1);
+        assert_eq!(
+            incoming.agent_sandbox.providers["omitted"]
+                .credentials_encrypted
+                .as_deref(),
+            Some("omitted-ciphertext")
+        );
+        let new_provider = &incoming.agent_sandbox.providers["new"];
+        assert_eq!(new_provider.credentials_encrypted, None);
+        assert!(new_provider.extra.get("credential_verified").is_none());
+
+        // A credential deleted by the dedicated endpoint must not be restored
+        // by a bulk payload prepared before that deletion.
+        let mut deleted = locked.clone();
+        deleted.agent_sandbox.providers.insert(
+            "replaced".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: None,
+                extra: serde_json::json!({}),
+                ..Default::default()
+            },
+        );
+        let mut stale = incoming;
+        stale
+            .agent_sandbox
+            .providers
+            .get_mut("replaced")
+            .expect("provider")
+            .credentials_encrypted = Some("old-ciphertext".into());
+        preserve_provider_credential_proof(&mut stale, &deleted);
+        let after_deletion = &stale.agent_sandbox.providers["replaced"];
+        assert_eq!(after_deletion.credentials_encrypted, None);
+        assert!(after_deletion.extra.get("credential_verified").is_none());
+    }
+
+    #[tokio::test]
+    async fn bulk_update_uses_locked_credential_and_publishes_rebased_cache() {
+        let mut locked = settings_row("old.example.com");
+        let mut locked_settings = AppSettings::from_json(locked.data.clone());
+        locked_settings.agent_sandbox.providers.insert(
+            "codex_cli".into(),
+            temps_core::ProviderConfig {
+                auth_type: "subscription".into(),
+                credentials_encrypted: Some("replacement".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        locked.data = locked_settings.to_json();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results(vec![
+                vec![locked.clone()],
+                vec![locked.clone()],
+                vec![locked.clone()],
+                vec![locked],
+            ])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let db = Arc::new(db);
+        let svc = ConfigService::new(test_config(), db.clone());
+        let mut incoming = AppSettings {
+            preview_domain: "new.example.com".into(),
+            ..AppSettings::default()
+        };
+        incoming.agent_sandbox.providers.insert(
+            "codex_cli".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("stale".into()),
+                extra: serde_json::json!({"credential_verified": false}),
+                ..Default::default()
+            },
+        );
+        svc.update_settings(incoming).await.expect("bulk update");
+        let cached = svc.get_settings().await.expect("rebased cache");
+        assert_eq!(cached.preview_domain, "new.example.com");
+        let provider = &cached.agent_sandbox.providers["codex_cli"];
+        assert_eq!(provider.auth_type, "subscription");
+        assert_eq!(
+            provider.credentials_encrypted.as_deref(),
+            Some("replacement")
+        );
+        assert_eq!(provider.extra["credential_verified"], true);
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("settings update statement");
+        assert!(update_sql.contains("replacement"), "{update_sql}");
+        assert!(!update_sql.contains("stale"), "{update_sql}");
+    }
+
+    #[tokio::test]
+    async fn late_bulk_cache_publish_cannot_restore_snapshot_after_credential_invalidation() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![settings_row("authoritative.example.com")]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let started_generation = svc.settings_cache.read().await.generation;
+        svc.invalidate_settings_cache().await;
+        let stale = AppSettings {
+            preview_domain: "stale.example.com".into(),
+            ..AppSettings::default()
+        };
+        assert!(
+            !svc.publish_committed_settings_if_current(started_generation, stale)
+                .await
+        );
+        assert_eq!(
+            svc.get_settings()
+                .await
+                .expect("authoritative cache")
+                .preview_domain,
+            "authoritative.example.com"
+        );
     }
 
     fn settings_row_with_cluster_ca(

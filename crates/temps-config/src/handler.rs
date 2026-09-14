@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::disk_status::DiskSpaceCheckResult;
+use crate::service::preserve_provider_credential_proof;
 use crate::{ConfigService, EffectiveTelemetryPolicies};
 use axum::{
     extract::{Extension, State},
@@ -1796,42 +1797,6 @@ fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSet
     }
 }
 
-fn preserve_provider_credential_proof(incoming: &mut AppSettings, current: &AppSettings) {
-    for (id, current_cfg) in &current.agent_sandbox.providers {
-        match incoming.agent_sandbox.providers.get_mut(id) {
-            Some(candidate) => {
-                candidate.credentials_encrypted = current_cfg.credentials_encrypted.clone();
-                if current_cfg.credentials_encrypted.is_some() {
-                    candidate.auth_type = current_cfg.auth_type.clone();
-                }
-                if !candidate.extra.is_object() {
-                    candidate.extra = serde_json::json!({});
-                }
-                if let Some(extra) = candidate.extra.as_object_mut() {
-                    extra.remove("credential_verified");
-                    if let Some(proof) = current_cfg.extra.get("credential_verified") {
-                        extra.insert("credential_verified".into(), proof.clone());
-                    }
-                }
-            }
-            None => {
-                incoming
-                    .agent_sandbox
-                    .providers
-                    .insert(id.clone(), current_cfg.clone());
-            }
-        }
-    }
-    for (id, candidate) in &mut incoming.agent_sandbox.providers {
-        if !current.agent_sandbox.providers.contains_key(id) {
-            candidate.credentials_encrypted = None;
-            if let Some(extra) = candidate.extra.as_object_mut() {
-                extra.remove("credential_verified");
-            }
-        }
-    }
-}
-
 /// Which of the operator-tuned `cloud.*` keys a `PUT /settings` body actually
 /// carried.
 ///
@@ -2476,8 +2441,8 @@ async fn update_settings(
     // Merge sensitive sandbox/gateway/multi-node fields back from DB. The GET
     // endpoint strips encrypted credentials, shared secrets, and token hashes,
     // so any client round-trip would otherwise wipe them on save. We always
-    // preserve them from the DB unless the incoming payload explicitly sets
-    // them (e.g. a fresh credential save via the AI Providers page).
+    // preserve them from the DB. Provider credentials are only changed through
+    // the dedicated credential endpoint, never through this bulk PUT.
     match app_state.config_service.get_settings().await {
         Ok(current_settings) => {
             // `console_version` is self-recorded state, written only by a starting
