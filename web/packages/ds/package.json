@@ -74,6 +74,6 @@
     "react-router": "^8.3.1",
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.6.0",
-    "typescript": "^5.9.2"
+    "typescript": "^7.0.2"
   }
 }
