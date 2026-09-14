@@ -1569,6 +1569,13 @@ export type AppSettings = {
      * upgrade never changes what an existing config means.
      */
     tenant_resource_ceilings?: TenantResourceCeilings;
+    /**
+     * Allow the proxy to use forwarding headers from a loopback peer for
+     * client IP attribution. `None` means an older client did not send the
+     * field; the settings handler preserves the stored decision on PUT.
+     * This is the sole control surface — there is no CLI/env override.
+     */
+    trust_loopback_forwarded_ip?: boolean | null;
 };
 
 /**
@@ -1712,6 +1719,11 @@ export type AppSettingsResponse = {
      * directly. Unenforced by default.
      */
     tenant_resource_ceilings: TenantResourceCeilings;
+    /**
+     * Database-backed opt-in; this is the sole control surface for every
+     * proxy process, including a standalone `temps proxy`.
+     */
+    trust_loopback_forwarded_ip: boolean;
 };
 
 export type ApplicationGitConnectionsResponse = {
