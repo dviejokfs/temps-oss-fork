@@ -44024,6 +44024,14 @@
               "null"
             ]
           },
+          "expires_at": {
+            "description": "When retention deletes this backup, if it is governed by a schedule.\n`null` for manual backups and S3-scan entries — those are kept until\nsomeone deletes them.",
+            "example": "2024-02-14T14:30:00.123Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "format": {
             "description": "Storage format: \"walg\" for continuous-archive (PITR-capable),\n\"pg_dump\" for point-in-time dumps, \"\" for non-postgres.",
             "example": "walg",

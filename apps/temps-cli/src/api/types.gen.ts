@@ -20096,6 +20096,12 @@ export type SourceBackupEntry = {
      */
     engine?: string | null;
     /**
+     * When retention deletes this backup, if it is governed by a schedule.
+     * `null` for manual backups and S3-scan entries — those are kept until
+     * someone deletes them.
+     */
+    expires_at?: string | null;
+    /**
      * Storage format: "walg" for continuous-archive (PITR-capable),
      * "pg_dump" for point-in-time dumps, "" for non-postgres.
      */
