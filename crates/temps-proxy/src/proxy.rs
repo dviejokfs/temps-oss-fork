@@ -4749,14 +4749,61 @@ impl ProxyHttp for LoadBalancer {
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("");
 
-                    let redirect = params
-                        .iter()
-                        .find(|(k, _)| k == "redirect")
-                        .map(|(_, v)| v.as_str())
-                        .unwrap_or("/");
+                    // The destination is client input: reduce it to a
+                    // same-origin path before it becomes a Location header.
+                    let redirect = crate::handler::password_wall::sanitize_redirect_path(
+                        params
+                            .iter()
+                            .find(|(k, _)| k == "redirect")
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or("/"),
+                    );
+
+                    // Guesses are limited per (client IP, environment) with
+                    // the same sliding window as the sandbox preview login,
+                    // so the wall cannot be brute-forced. The attempt is
+                    // taken atomically before the password is checked, so a
+                    // concurrent burst cannot outrun the count. An unparsable
+                    // client address shares one bucket rather than escaping
+                    // the limit.
+                    let client_ip = ctx
+                        .ip_address
+                        .as_deref()
+                        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+                    if !self
+                        .preview_auth_limiter
+                        .try_admit_password_wall(client_ip, env_id)
+                    {
+                        warn!(
+                            environment_id = env_id,
+                            client_ip = %client_ip,
+                            "password-wall: verify POST rate limited"
+                        );
+                        let mut resp = ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
+                        resp.insert_header("Retry-After", "60")?;
+                        resp.insert_header("Cache-Control", "no-store")?;
+                        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                        resp.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                        resp.insert_header("Referrer-Policy", "no-referrer")?;
+                        resp.insert_header("X-Frame-Options", "DENY")?;
+                        session.write_response_header(Box::new(resp), false).await?;
+                        session
+                            .write_response_body(
+                                Some(Bytes::from_static(
+                                    b"Too many failed attempts. Try again in a minute.\n",
+                                )),
+                                true,
+                            )
+                            .await?;
+                        ctx.routing_status = "password_rate_limited".to_string();
+                        return Ok(true);
+                    }
 
                     if crate::handler::password_wall::verify_password(password, &password_hash) {
                         // Password correct — set cookie and redirect
+                        self.preview_auth_limiter
+                            .clear_password_wall(client_ip, env_id);
                         let host = ctx.host.clone();
                         let set_cookie = crate::handler::password_wall::build_set_cookie_header(
                             env_id,
@@ -4768,13 +4815,15 @@ impl ProxyHttp for LoadBalancer {
                         resp.insert_header("Location", redirect)?;
                         resp.insert_header("Set-Cookie", &set_cookie)?;
                         resp.insert_header("Cache-Control", "no-store")?;
+                        resp.insert_header("Referrer-Policy", "no-referrer")?;
                         resp.insert_header("X-Request-ID", &ctx.request_id)?;
 
                         session.write_response_header(Box::new(resp), true).await?;
                         ctx.routing_status = "password_verified".to_string();
                         return Ok(true);
                     } else {
-                        // Wrong password — show form again with error
+                        // Wrong password — the attempt is already counted;
+                        // show the form again with an error
                         let html = crate::handler::password_wall::generate_password_form_html(
                             redirect,
                             true,
@@ -4787,6 +4836,9 @@ impl ProxyHttp for LoadBalancer {
                         resp.insert_header("Content-Type", "text/html; charset=utf-8")?;
                         resp.insert_header("Cache-Control", "no-store")?;
                         resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                        // A credential prompt must not be framed or leak its URL.
+                        resp.insert_header("Referrer-Policy", "no-referrer")?;
+                        resp.insert_header("X-Frame-Options", "DENY")?;
 
                         session.write_response_header(Box::new(resp), false).await?;
                         session.write_response_body(Some(html_bytes), true).await?;
@@ -4837,6 +4889,9 @@ impl ProxyHttp for LoadBalancer {
                     resp.insert_header("Content-Type", "text/html; charset=utf-8")?;
                     resp.insert_header("Cache-Control", "no-store")?;
                     resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                    // A credential prompt must not be framed or leak its URL.
+                    resp.insert_header("Referrer-Policy", "no-referrer")?;
+                    resp.insert_header("X-Frame-Options", "DENY")?;
 
                     session.write_response_header(Box::new(resp), false).await?;
                     session.write_response_body(Some(html_bytes), true).await?;
