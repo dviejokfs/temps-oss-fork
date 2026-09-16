@@ -498,7 +498,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 
 ## Externally Hosted Apps (Cross-Origin Ingest)
 
-If Temps isn't the platform hosting this app -- e.g. a Next.js app on Vercel talking to a self-hosted Temps backend on another domain -- point the provider at your Temps backend with an ingest key instead of the default same-origin `basePath`:
+If Temps isn't the platform hosting this app -- e.g. a Next.js app on a separate hosting platform talking to a self-hosted Temps backend on another domain -- point the provider at your Temps backend with an ingest key instead of the default same-origin `basePath`:
 
 ```tsx
 <TempsAnalyticsProvider

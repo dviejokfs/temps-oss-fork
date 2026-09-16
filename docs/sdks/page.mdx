@@ -47,7 +47,7 @@ Every SDK wraps the same framework-agnostic `@temps-sdk/analytics-core`, so beha
 
 ## Externally Hosted Apps (Cross-Origin Ingest) {{ anchor: true, id: 'external-hosting' }}
 
-Every example above assumes Temps deployed your frontend, so `/api/_temps/*` requests are same-origin and Temps can read/write its own session cookies. If your frontend is hosted elsewhere — a Next.js app on Vercel, a Netlify site, your own nginx — and you're pointing it at a **self-hosted Temps backend on a different domain**, use a **keyed ingest key** instead. This is a first-class, supported topology ("bring your own hosting, use Temps for analytics"), not a workaround.
+Every example above assumes Temps deployed your frontend, so `/api/_temps/*` requests are same-origin and Temps can read/write its own session cookies. If your frontend is hosted elsewhere — a separate static/JS hosting platform, your own nginx — and you're pointing it at a **self-hosted Temps backend on a different domain**, use a **keyed ingest key** instead. This is a first-class, supported topology ("bring your own hosting, use Temps for analytics"), not a workaround.
 
 <Note>
   **What breaks without a key:** the public ingest endpoints resolve `project_id`/`environment_id` by matching the request's `Host` header against Temps' own route table. A backend-only Temps instance has no route-table entry for a domain it didn't deploy, so every request 404s before identity is even considered.
@@ -77,7 +77,7 @@ This mints a `pa_`-prefixed key. It's shown once in full and is safe to ship in 
 </TempsAnalyticsProvider>
 ```
 
-`ingestKey` is sent as the `X-Temps-Analytics-Key` header on every request. This alone works — but every request now crosses origins, which brings in two constraints worth designing around: CORS (Temps' ingest endpoints answer with `Access-Control-Allow-Origin: *` and no credentials, so cookies never round-trip) and `navigator.sendBeacon`, used for the `page_leave` event on unload, which cannot set custom headers at all. Both are why step 3 is recommended over calling the backend directly.
+`ingestKey` is sent as the `X-Temps-Analytics-Key` header on ordinary fetch requests. Reliable unload delivery instead appends it as the `temps_key` query parameter, because `navigator.sendBeacon` — used for the `page_leave` event on unload — cannot set custom headers at all. This alone works, but every request now crosses origins: Temps' ingest endpoints answer with `Access-Control-Allow-Origin: *` and no credentials, so cookies never round-trip. Both constraints are why step 3 is recommended over calling the backend directly.
 
 ### 3. Recommended: proxy through your own domain
 
@@ -88,9 +88,10 @@ Route ingest calls through a same-origin API route on your frontend's own domain
 const TEMPS_BACKEND = 'https://api.your-domain.example.com/api/_temps';
 const INGEST_KEY = process.env.TEMPS_ANALYTICS_INGEST_KEY!;
 
-async function handler(req: Request, { params }: { params: { path: string[] } }) {
+async function handler(req: Request, { params }: { params: Promise<{ path: string[] }> }) {
   const url = new URL(req.url);
-  const target = `${TEMPS_BACKEND}/${params.path.join('/')}${url.search}`;
+  const { path } = await params;
+  const target = `${TEMPS_BACKEND}/${path.join('/')}${url.search}`;
 
   const upstream = await fetch(target, {
     method: req.method,
