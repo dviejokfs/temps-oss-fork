@@ -3198,7 +3198,7 @@ mod tests {
     #[tokio::test]
     async fn test_active_visitors_count_counts_identified_visitors_not_sessions() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_database::test_utils::TestDatabase;
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{deployments, environments, events, projects, visitor};
 
         let test_db = match TestDatabase::with_migrations().await {
@@ -3207,12 +3207,7 @@ mod tests {
                 // Only skip for an actually-missing container runtime --
                 // otherwise a real regression (e.g. a broken migration)
                 // would silently report as "skipped" instead of failing.
-                let message = error.to_string().to_lowercase();
-                let missing_runtime = message.contains("docker")
-                    || message.contains("no such file or directory")
-                    || message.contains("connection refused")
-                    || message.contains("permission denied");
-                if !missing_runtime {
+                if !is_container_runtime_unavailable(&error.to_string()) {
                     panic!("active-visitors count test setup failed: {error}");
                 }
                 eprintln!(
