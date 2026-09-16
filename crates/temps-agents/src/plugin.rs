@@ -63,6 +63,51 @@ impl AgentSyncService for AgentConfigSyncAdapter {
 /// Maximum number of simultaneous active runs per project.
 const MAX_CONCURRENT_RUNS_PER_PROJECT: u64 = 5;
 
+#[derive(Debug)]
+struct AgentPlatformSettings {
+    agent_sandbox: temps_core::AgentSandboxSettings,
+    preview_gateway: temps_core::PreviewGatewaySettings,
+}
+
+fn decode_platform_settings(
+    data: Option<serde_json::Value>,
+) -> Result<AgentPlatformSettings, PluginError> {
+    let Some(data) = data else {
+        return Ok(AgentPlatformSettings {
+            agent_sandbox: Default::default(),
+            preview_gateway: Default::default(),
+        });
+    };
+    let object = data.as_object().ok_or_else(|| {
+        PluginError::InitializationFailed(
+            "decode sandbox and preview-gateway settings: settings row is not an object".into(),
+        )
+    })?;
+    let agent_sandbox = object
+        .get("agent_sandbox")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| {
+            PluginError::InitializationFailed(format!("decode agent_sandbox settings: {error}"))
+        })?
+        .unwrap_or_default();
+    let preview_gateway = object
+        .get("preview_gateway")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| {
+            PluginError::InitializationFailed(format!("decode preview_gateway settings: {error}"))
+        })?
+        .unwrap_or_default();
+
+    Ok(AgentPlatformSettings {
+        agent_sandbox,
+        preview_gateway,
+    })
+}
+
 /// Narrow a list of trigger-matching agents down to the agent the trigger
 /// actually identifies, when the trigger type encodes a single source.
 ///
@@ -488,21 +533,27 @@ impl TempsPlugin for AgentsPlugin {
             let notification_service = context.require_service::<NotificationService>();
             let platform_config_service = context.require_service::<temps_config::ConfigService>();
 
-            // Load global sandbox settings to configure the Docker provider
-            let global_sandbox = {
+            // Load both values from one strictly decoded settings-row
+            // snapshot. Gateway ownership is a security boundary when multiple
+            // Temps instances share a Docker daemon, so a database or decoding failure must
+            // fail initialization rather than silently selecting the default
+            // singleton and attaching this instance's sandboxes to it.
+            let platform_settings = {
                 use sea_orm::EntityTrait;
-                temps_entities::settings::Entity::find_by_id(1)
+                let record = temps_entities::settings::Entity::find_by_id(1)
                     .one(db.as_ref())
                     .await
-                    .ok()
-                    .flatten()
-                    .and_then(|s| {
-                        s.data.get("agent_sandbox").cloned().and_then(|v| {
-                            serde_json::from_value::<temps_core::AgentSandboxSettings>(v).ok()
-                        })
-                    })
-                    .unwrap_or_default()
+                    .map_err(|error| {
+                        PluginError::InitializationFailed(format!(
+                            "load sandbox and preview-gateway settings: {error}"
+                        ))
+                    })?;
+                decode_platform_settings(record.map(|record| record.data))?
             };
+            let global_sandbox = platform_settings.agent_sandbox;
+            let preview_gateway_settings = platform_settings.preview_gateway;
+            let preview_gateway_container_name =
+                crate::preview_gateway::container_name(&preview_gateway_settings);
 
             // Set up sandbox provider: try Docker first, fall back to local.
             //
@@ -527,6 +578,7 @@ impl TempsPlugin for AgentsPlugin {
                                     control_plane_url: platform_config_service
                                         .resolve_internal_url()
                                         .await,
+                                    preview_gateway_container_name,
                                 };
                                 let provider =
                                     Arc::new(DockerSandboxProvider::new(docker.clone(), config));
@@ -793,6 +845,62 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase, Value};
     use std::collections::BTreeMap;
     use temps_entities::project_agents;
+
+    #[test]
+    fn platform_settings_preserve_custom_preview_gateway_ownership() {
+        let settings = decode_platform_settings(Some(serde_json::json!({
+            "preview_gateway": {
+                "container_name": "temps-preview-gateway-instance-b"
+            }
+        })))
+        .expect("valid settings should decode");
+
+        assert_eq!(
+            crate::preview_gateway::container_name(&settings.preview_gateway),
+            "temps-preview-gateway-instance-b"
+        );
+    }
+
+    #[test]
+    fn malformed_preview_gateway_settings_fail_closed() {
+        let error = decode_platform_settings(Some(serde_json::json!({
+            "preview_gateway": {
+                "container_name": 42
+            }
+        })))
+        .expect_err("malformed ownership settings must fail initialization");
+
+        assert!(matches!(error, PluginError::InitializationFailed(_)));
+        assert!(error
+            .to_string()
+            .contains("decode preview_gateway settings"));
+    }
+
+    #[test]
+    fn malformed_unrelated_settings_do_not_disable_agents() {
+        let settings = decode_platform_settings(Some(serde_json::json!({
+            "preview_gateway": {
+                "container_name": "temps-preview-gateway-instance-b"
+            },
+            "letsencrypt": "malformed but unrelated"
+        })))
+        .expect("unrelated settings must be isolated from agent startup");
+
+        assert_eq!(
+            crate::preview_gateway::container_name(&settings.preview_gateway),
+            "temps-preview-gateway-instance-b"
+        );
+    }
+
+    #[test]
+    fn missing_settings_row_uses_the_legacy_singleton_defaults() {
+        let settings = decode_platform_settings(None).expect("missing row should use defaults");
+
+        assert_eq!(
+            crate::preview_gateway::container_name(&settings.preview_gateway),
+            crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
+        );
+    }
 
     /// Mock row for a COUNT(*) AS num_items query (used by sea-orm's `.count()` via paginator).
     fn count_row(n: i64) -> BTreeMap<String, Value> {

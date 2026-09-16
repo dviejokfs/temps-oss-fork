@@ -40,7 +40,7 @@ use futures::TryStreamExt;
 use regex::Regex;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use temps_core::PreviewGatewaySettings;
 use tracing::{debug, info, warn};
@@ -153,7 +153,16 @@ pub const PREVIEW_GATEWAY_CONTAINER: &str = "temps-preview-gateway";
 /// network, but never receives an externally routed interface.
 pub const PREVIEW_GATEWAY_NETWORK: &str = "temps-preview-gateway-control-v7";
 const PREVIEW_GATEWAY_INGRESS_NETWORK: &str = "temps-preview-gateway-ingress-v3";
-const PREVIEW_GATEWAY_LABEL: &str = "sh.temps.preview-gateway";
+
+#[derive(Debug, thiserror::Error)]
+enum PreviewGatewayOwnershipError {
+    #[error("failed to load instance-owned sandboxes for preview gateway reconciliation")]
+    LoadSandboxes {
+        #[source]
+        source: sea_orm::DbErr,
+    },
+}
+pub(crate) const PREVIEW_GATEWAY_LABEL: &str = "sh.temps.preview-gateway";
 const PREVIEW_GATEWAY_NETWORK_LABEL: &str = "sh.temps.preview-gateway-control";
 const PREVIEW_GATEWAY_NETWORK_POLICY_VERSION: &str = "2";
 const PREVIEW_GATEWAY_INGRESS_LABEL: &str = "sh.temps.preview-gateway-ingress";
@@ -323,7 +332,11 @@ pub async fn load_settings(db: &DatabaseConnection) -> PreviewGatewaySettings {
 }
 
 /// Reconcile the gateway to match `spec`. Idempotent.
-pub async fn reconcile(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<()> {
+pub async fn reconcile(
+    docker: Arc<Docker>,
+    db: &DatabaseConnection,
+    spec: PreviewGatewaySpec,
+) -> Result<()> {
     info!(
         image = %spec.image,
         container = %spec.container_name,
@@ -336,6 +349,7 @@ pub async fn reconcile(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<
     export_host_port(spec.host_port);
 
     disable_unsafe_existing_gateway(&docker, &spec.container_name).await?;
+    let legacy_owned_networks = owned_legacy_sandbox_networks(db).await?;
     ensure_network(&docker, &spec.network).await?;
     ensure_ingress_network(&docker).await?;
     let desired_image_id = match ensure_image(&docker, &spec.image).await {
@@ -369,16 +383,16 @@ pub async fn reconcile(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<
                 "preview gateway drift detected — recreating"
             );
             remove_gateway_pair(&docker, &spec.container_name).await?;
-            create_and_start(&docker, &spec, &ingress_image).await?;
+            create_and_start(&docker, &spec, &ingress_image, &legacy_owned_networks).await?;
         }
         None => {
             info!("preview gateway not present — creating");
             remove_if_present(&docker, &ingress_container_name(&spec.container_name)).await?;
-            create_and_start(&docker, &spec, &ingress_image).await?;
+            create_and_start(&docker, &spec, &ingress_image, &legacy_owned_networks).await?;
         }
     }
 
-    connect_sandbox_networks(&docker, &spec.container_name).await?;
+    connect_sandbox_networks(&docker, &spec.container_name, &legacy_owned_networks).await?;
 
     info!(
         "preview gateway ready on 127.0.0.1:{} → {}:{}",
@@ -387,21 +401,21 @@ pub async fn reconcile(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<
     Ok(())
 }
 
-async fn connect_sandbox_networks(docker: &Docker, container_name: &str) -> Result<()> {
+async fn connect_sandbox_networks(
+    docker: &Docker,
+    container_name: &str,
+    legacy_owned_networks: &HashSet<String>,
+) -> Result<()> {
     let networks = docker
         .list_networks(None::<ListNetworksOptions>)
         .await
         .context("failed to discover isolated sandbox networks")?;
     for network in networks {
-        let managed = network
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))
-            .is_some();
-        if !managed {
-            continue;
-        }
-        let Some(network_name) = network.name.as_deref() else {
+        let Some(network_name) = managed_sandbox_network_name(
+            &network,
+            container_name,
+            legacy_owned_networks.contains(network.name.as_deref().unwrap_or_default()),
+        ) else {
             continue;
         };
         let request = bollard::models::NetworkConnectRequest {
@@ -418,6 +432,51 @@ async fn connect_sandbox_networks(docker: &Docker, container_name: &str) -> Resu
         }
     }
     Ok(())
+}
+
+fn managed_sandbox_network_name<'a>(
+    network: &'a bollard::models::Network,
+    gateway_container_name: &str,
+    legacy_owned_by_instance: bool,
+) -> Option<&'a str> {
+    let network_name = network.name.as_deref()?;
+    let owner = network
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))?;
+    let labels = network.labels.as_ref()?;
+    let gateway_matches = labels
+        .get(crate::sandbox::docker::SANDBOX_PREVIEW_GATEWAY_LABEL)
+        .map_or(
+            // The historical singleton owned every legacy network. A custom
+            // gateway may adopt one only when this instance's sandbox table
+            // identifies the exact network owner; Docker attachment is not
+            // ownership evidence because older releases attached all managed
+            // gateways to all sandbox networks on a shared daemon.
+            gateway_container_name == PREVIEW_GATEWAY_CONTAINER || legacy_owned_by_instance,
+            |value| value == gateway_container_name,
+        );
+    (!owner.is_empty()
+        && network_name == crate::sandbox::docker::sandbox_network_name(owner)
+        && gateway_matches)
+        .then_some(network_name)
+}
+
+async fn owned_legacy_sandbox_networks(
+    db: &DatabaseConnection,
+) -> std::result::Result<HashSet<String>, PreviewGatewayOwnershipError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let rows = temps_entities::sandboxes::Entity::find()
+        .filter(temps_entities::sandboxes::Column::Status.ne("destroyed"))
+        .all(db)
+        .await
+        .map_err(|source| PreviewGatewayOwnershipError::LoadSandboxes { source })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|sandbox| crate::sandbox::docker::sandbox_network_name(&sandbox.name))
+        .collect())
 }
 
 async fn ensure_network(docker: &Docker, name: &str) -> Result<()> {
@@ -510,13 +569,17 @@ fn preview_gateway_network_matches_policy(network: &bollard::models::NetworkInsp
 }
 
 async fn ensure_ingress_network(docker: &Docker) -> Result<()> {
+    ensure_ingress_network_named(docker, PREVIEW_GATEWAY_INGRESS_NETWORK).await
+}
+
+async fn ensure_ingress_network_named(docker: &Docker, network_name: &str) -> Result<()> {
     let networks = docker
         .list_networks(None::<ListNetworksOptions>)
         .await
         .context("failed to list Docker networks for preview ingress")?;
     if let Some(network) = networks
         .iter()
-        .find(|network| network.name.as_deref() == Some(PREVIEW_GATEWAY_INGRESS_NETWORK))
+        .find(|network| network.name.as_deref() == Some(network_name))
     {
         let policy_matches = network
             .labels
@@ -539,22 +602,27 @@ async fn ensure_ingress_network(docker: &Docker) -> Result<()> {
         {
             return Err(anyhow!(
                 "existing preview ingress network {} does not match the managed bridge policy",
-                PREVIEW_GATEWAY_INGRESS_NETWORK
+                network_name
             ));
         }
         return Ok(());
     }
 
     docker
-        .create_network(preview_gateway_ingress_network_request())
+        .create_network(preview_gateway_ingress_network_request_named(network_name))
         .await
         .context("failed to create preview gateway ingress network")?;
     Ok(())
 }
 
+#[cfg(test)]
 fn preview_gateway_ingress_network_request() -> NetworkCreateRequest {
+    preview_gateway_ingress_network_request_named(PREVIEW_GATEWAY_INGRESS_NETWORK)
+}
+
+fn preview_gateway_ingress_network_request_named(network_name: &str) -> NetworkCreateRequest {
     NetworkCreateRequest {
-        name: PREVIEW_GATEWAY_INGRESS_NETWORK.to_string(),
+        name: network_name.to_string(),
         driver: Some("bridge".to_string()),
         internal: Some(false),
         enable_ipv6: Some(false),
@@ -918,6 +986,24 @@ async fn create_and_start(
     docker: &Docker,
     spec: &PreviewGatewaySpec,
     ingress_image: &str,
+    legacy_owned_networks: &HashSet<String>,
+) -> Result<()> {
+    create_and_start_on_ingress(
+        docker,
+        spec,
+        ingress_image,
+        legacy_owned_networks,
+        PREVIEW_GATEWAY_INGRESS_NETWORK,
+    )
+    .await
+}
+
+async fn create_and_start_on_ingress(
+    docker: &Docker,
+    spec: &PreviewGatewaySpec,
+    ingress_image: &str,
+    legacy_owned_networks: &HashSet<String>,
+    ingress_network: &str,
 ) -> Result<()> {
     let container_port_key = format!("{}/tcp", GATEWAY_CONTAINER_PORT);
     let exposed_ports: Vec<String> = vec![container_port_key.clone()];
@@ -984,7 +1070,19 @@ async fn create_and_start(
         .await
         .with_context(|| format!("failed to start container {}", spec.container_name))?;
 
-    if let Err(error) = create_and_start_ingress(docker, spec, ingress_image).await {
+    // A recreated gateway starts with only its control-network attachment.
+    // Restore every existing workspace route as part of creation so callers
+    // cannot accidentally leave already-running sandboxes unreachable. Keep
+    // the gateway pair fail-closed if Docker cannot restore every owned route.
+    if let Err(error) =
+        connect_sandbox_networks(docker, &spec.container_name, legacy_owned_networks).await
+    {
+        let _ = remove_gateway_pair(docker, &spec.container_name).await;
+        return Err(error);
+    }
+
+    if let Err(error) = create_and_start_ingress(docker, spec, ingress_image, ingress_network).await
+    {
         let _ = remove_gateway_pair(docker, &spec.container_name).await;
         return Err(error);
     }
@@ -996,6 +1094,7 @@ async fn create_and_start_ingress(
     docker: &Docker,
     spec: &PreviewGatewaySpec,
     ingress_image: &str,
+    ingress_network: &str,
 ) -> Result<()> {
     let name = ingress_container_name(&spec.container_name);
     let container_port_key = format!("{GATEWAY_CONTAINER_PORT}/tcp");
@@ -1024,7 +1123,7 @@ async fn create_and_start_ingress(
             PREVIEW_GATEWAY_NETWORK_POLICY_VERSION.to_string(),
         )])),
         host_config: Some(HostConfig {
-            network_mode: Some(PREVIEW_GATEWAY_INGRESS_NETWORK.to_string()),
+            network_mode: Some(ingress_network.to_string()),
             port_bindings: Some(port_bindings),
             cap_drop: Some(vec!["ALL".to_string()]),
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
@@ -1265,7 +1364,7 @@ pub fn spawn_reconcile(
             }
         }
 
-        match reconcile(docker, spec).await {
+        match reconcile(docker, &db, spec).await {
             Ok(()) => {
                 info!("✅ preview gateway reconciled");
             }
@@ -1511,13 +1610,18 @@ pub async fn inspect_status(
 /// Force-restart the gateway: ensures network/image, then removes any
 /// existing container and recreates it fresh. Unlike `reconcile`, this
 /// always replaces the container even if it already matches the spec.
-pub async fn force_restart(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<()> {
+pub async fn force_restart(
+    docker: Arc<Docker>,
+    db: &DatabaseConnection,
+    spec: PreviewGatewaySpec,
+) -> Result<()> {
     info!(
         image = %spec.image,
         container = %spec.container_name,
         "force-restarting preview gateway"
     );
     disable_unsafe_existing_gateway(&docker, &spec.container_name).await?;
+    let legacy_owned_networks = owned_legacy_sandbox_networks(db).await?;
     ensure_network(&docker, &spec.network).await?;
     ensure_ingress_network(&docker).await?;
     ensure_image(&docker, &spec.image).await?;
@@ -1525,7 +1629,7 @@ pub async fn force_restart(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Res
     ensure_image_present(&docker, &ingress_image).await?;
 
     remove_gateway_pair(&docker, &spec.container_name).await?;
-    create_and_start(&docker, &spec, &ingress_image).await?;
+    create_and_start(&docker, &spec, &ingress_image, &legacy_owned_networks).await?;
     info!("preview gateway restarted");
     Ok(())
 }
@@ -1713,6 +1817,159 @@ mod tests {
         assert!(should_preserve_existing_image(false, true));
         assert!(!should_preserve_existing_image(false, false));
         assert!(!should_preserve_existing_image(true, true));
+    }
+
+    #[test]
+    fn gateway_reconnects_only_to_managed_per_sandbox_networks() {
+        let legacy_default = bollard::models::Network {
+            name: Some("temps-sandbox-net-v3-temps-sandbox-workspace".to_string()),
+            labels: Some(HashMap::from([(
+                SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                "temps-sandbox-workspace".to_string(),
+            )])),
+            ..Default::default()
+        };
+        let scoped_custom = bollard::models::Network {
+            name: legacy_default.name.clone(),
+            labels: Some(HashMap::from([
+                (
+                    SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                    "temps-sandbox-workspace".to_string(),
+                ),
+                (
+                    crate::sandbox::docker::SANDBOX_PREVIEW_GATEWAY_LABEL.to_string(),
+                    "temps-preview-gateway-custom".to_string(),
+                ),
+            ])),
+            ..Default::default()
+        };
+        let spoofed_name = bollard::models::Network {
+            name: Some("application-production".to_string()),
+            labels: legacy_default.labels.clone(),
+            ..Default::default()
+        };
+        let missing_owner = bollard::models::Network {
+            name: legacy_default.name.clone(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            managed_sandbox_network_name(&legacy_default, PREVIEW_GATEWAY_CONTAINER, false),
+            Some("temps-sandbox-net-v3-temps-sandbox-workspace")
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&legacy_default, "temps-preview-gateway-custom", false),
+            None
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&legacy_default, "temps-preview-gateway-custom", true),
+            Some("temps-sandbox-net-v3-temps-sandbox-workspace")
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&scoped_custom, "temps-preview-gateway-custom", false),
+            Some("temps-sandbox-net-v3-temps-sandbox-workspace")
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&scoped_custom, PREVIEW_GATEWAY_CONTAINER, true),
+            None
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&spoofed_name, PREVIEW_GATEWAY_CONTAINER, false),
+            None
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&missing_owner, PREVIEW_GATEWAY_CONTAINER, false),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn recreated_custom_gateway_preserves_db_owned_legacy_sandbox_network() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => docker,
+            _ => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let image = crate::sandbox::docker::image_name_for_runtime("node");
+        if docker.inspect_image(&image).await.is_err() {
+            println!("Managed node sandbox image not present, skipping test");
+            return;
+        }
+
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        );
+        let gateway_name = format!("temps-preview-gateway-test-{suffix}");
+        let control_network = format!("temps-preview-gateway-control-test-{suffix}");
+        let ingress_network = format!("temps-preview-gateway-ingress-test-{suffix}");
+        let sandbox_container = format!("temps-sandbox-test-{suffix}");
+        let sandbox_network = crate::sandbox::docker::sandbox_network_name(&sandbox_container);
+        let spec = PreviewGatewaySpec {
+            image: image.clone(),
+            container_name: gateway_name.clone(),
+            network: control_network.clone(),
+            host_port: 0,
+            shared_secret: String::new(),
+        };
+        let test_result: Result<bool> = async {
+            ensure_network(&docker, &control_network).await?;
+            ensure_ingress_network_named(&docker, &ingress_network).await?;
+            create_host_isolated_network(
+                &docker,
+                with_host_isolation(NetworkCreateRequest {
+                    name: sandbox_network.clone(),
+                    labels: Some(HashMap::from([(
+                        SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                        sandbox_container,
+                    )])),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+            create_and_start_on_ingress(&docker, &spec, &image, &HashSet::new(), &ingress_network)
+                .await?;
+            docker
+                .connect_network(
+                    &sandbox_network,
+                    bollard::models::NetworkConnectRequest {
+                        container: gateway_name.clone(),
+                        endpoint_config: None,
+                    },
+                )
+                .await?;
+            let preserved = HashSet::from([sandbox_network.clone()]);
+
+            remove_gateway_pair(&docker, &gateway_name).await?;
+            create_and_start_on_ingress(&docker, &spec, &image, &preserved, &ingress_network)
+                .await?;
+            Ok(docker
+                .inspect_container(&gateway_name, None::<InspectContainerOptions>)
+                .await
+                .ok()
+                .and_then(|container| container.network_settings)
+                .and_then(|settings| settings.networks)
+                .is_some_and(|networks| networks.contains_key(&sandbox_network)))
+        }
+        .await;
+
+        let _ = remove_gateway_pair(&docker, &gateway_name).await;
+        let _ = docker.remove_network(&sandbox_network).await;
+        let _ = docker.remove_network(&ingress_network).await;
+        let _ = docker.remove_network(&control_network).await;
+
+        let attached = test_result.expect("gateway recreation should succeed");
+        assert!(
+            attached,
+            "the recreated custom gateway must preserve its DB-owned legacy sandbox network"
+        );
     }
 
     #[test]
