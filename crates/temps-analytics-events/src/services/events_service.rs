@@ -3204,7 +3204,20 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                eprintln!("Skipping active-visitors count test: {error}");
+                // Only skip for an actually-missing container runtime --
+                // otherwise a real regression (e.g. a broken migration)
+                // would silently report as "skipped" instead of failing.
+                let message = error.to_string().to_lowercase();
+                let missing_runtime = message.contains("docker")
+                    || message.contains("no such file or directory")
+                    || message.contains("connection refused")
+                    || message.contains("permission denied");
+                if !missing_runtime {
+                    panic!("active-visitors count test setup failed: {error}");
+                }
+                eprintln!(
+                    "Skipping active-visitors count test: container runtime unavailable: {error}"
+                );
                 return;
             }
         };
