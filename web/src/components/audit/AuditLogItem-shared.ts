@@ -36,6 +36,7 @@ export interface AuditLogItemProps {
 }
 
 export type Category =
+  | 'plugin'
   | 'auth'
   | 'user'
   | 'mfa'
@@ -69,6 +70,7 @@ export function humanize(op: string): string {
 }
 
 export function categorize(op: string): Category {
+  if (op.startsWith('EXTERNAL_PLUGIN_')) return 'plugin'
   if (
     op.startsWith('LOGIN_') ||
     op.startsWith('AUTH_') ||
@@ -128,6 +130,11 @@ export const CATEGORY_META: Record<
   Category,
   { label: string; icon: typeof LogIn; tone: string }
 > = {
+  plugin: {
+    label: 'Plugin',
+    icon: Plug,
+    tone: 'bg-muted text-muted-foreground',
+  },
   auth: {
     label: 'Auth',
     icon: LogIn,

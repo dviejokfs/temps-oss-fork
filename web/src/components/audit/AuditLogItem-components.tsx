@@ -7,9 +7,10 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { TableCell, TableRow } from '@/components/ui/table'
 import { describePermissionDenial } from '@/lib/permission-denial-display'
+import { pluginAuditActor } from '@/lib/plugin-audit-actor'
 import { cn } from '@/lib/utils'
 import { format } from 'date-fns'
-import { ChevronDown, ChevronRight } from 'lucide-react'
+import { ChevronDown, ChevronRight, Plug } from 'lucide-react'
 import { ReactNode, useState } from 'react'
 import { Link } from 'react-router'
 import {
@@ -69,6 +70,29 @@ function describe(
   const failureReason = get<string>(data, 'reason')
 
   switch (op) {
+    case 'EXTERNAL_PLUGIN_HOST_OPERATION_ALLOWED':
+    case 'EXTERNAL_PLUGIN_HOST_OPERATION_DENIED':
+    case 'EXTERNAL_PLUGIN_HOST_OPERATION_SUCCEEDED':
+    case 'EXTERNAL_PLUGIN_HOST_OPERATION_FAILED': {
+      const operation =
+        typeof data?.operation === 'string'
+          ? humanize(data.operation.replace(/([a-z0-9])([A-Z])/g, '$1_$2'))
+          : 'host operation'
+      const result = op.endsWith('_DENIED')
+        ? 'Denied'
+        : op.endsWith('_SUCCEEDED')
+          ? 'Completed'
+          : op.endsWith('_FAILED')
+            ? 'Failed'
+            : 'Allowed'
+      return `${result} plugin ${operation.toLowerCase()}`
+    }
+    case 'EXTERNAL_PLUGIN_GRANTS_CHANGED':
+      return 'Changed plugin permissions'
+    case 'EXTERNAL_PLUGIN_GRANTS_CHANGE_REQUESTED':
+      return 'Requested a plugin permission change'
+    case 'EXTERNAL_PLUGIN_INSTALL_GRANTS_APPROVED':
+      return 'Approved plugin installation permissions'
     // Auth
     case 'LOGIN_SUCCESS':
       return 'Logged in successfully'
@@ -399,6 +423,7 @@ export function AuditLogItemRow({
   const meta = CATEGORY_META[category]
   const Icon = meta.icon
   const hasData = data && Object.keys(data).length > 0
+  const pluginActor = pluginAuditActor(operation_type, data)
   const location = ip_address
     ? [ip_address.city, ip_address.country].filter(Boolean).join(', ')
     : ''
@@ -434,10 +459,27 @@ export function AuditLogItemRow({
           <div className="text-xs text-muted-foreground font-mono mt-0.5">
             {operation_type}
           </div>
+          {pluginActor && (
+            <div className="mt-1 text-xs text-muted-foreground md:hidden">
+              Plugin: {pluginActor.name}
+            </div>
+          )}
         </TableCell>
         <TableCell className="hidden md:table-cell text-sm">
-          {user?.name ?? (
-            <span className="text-muted-foreground italic">system</span>
+          {pluginActor ? (
+            <div title={`Plugin actor ${pluginActor.id}`}>
+              <span className="inline-flex items-center gap-1.5">
+                <Plug className="size-3.5" aria-hidden="true" />
+                {pluginActor.name}
+              </span>
+              <span className="block text-xs text-muted-foreground">
+                {user ? `Plugin acting for ${user.name}` : 'Plugin'}
+              </span>
+            </div>
+          ) : (
+            (user?.name ?? (
+              <span className="text-muted-foreground italic">system</span>
+            ))
           )}
         </TableCell>
         <TableCell className="hidden lg:table-cell text-sm text-muted-foreground">
