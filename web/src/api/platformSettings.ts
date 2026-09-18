@@ -259,8 +259,17 @@ export async function updatePlatformSettings(
     throw new Error(detail)
   }
 
-  // The PUT endpoint returns only an ack message, so we hand back our
-  // merged view. Callers that need the absolute server state should refetch.
+  // The PUT endpoint returns only an ack message, so we hand back our merged
+  // view, which `useUpdateSettings` places directly into the React Query
+  // cache. `geo.maxmind_license_key` is write-only plaintext the caller may
+  // have just submitted -- it must never sit in client-side cache, even
+  // briefly before the invalidating refetch lands. Strip both write-only geo
+  // fields; `maxmind_license_key_saved` (already on `updated.geo`) is what
+  // the UI actually reads back.
+  if (updated.geo) {
+    const { maxmind_license_key: _key, clear_maxmind_license_key: _clear, ...maskedGeo } = updated.geo
+    return { ...updated, geo: maskedGeo as GeoSettings }
+  }
   return updated
 }
 

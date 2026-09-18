@@ -626,12 +626,42 @@ pub async fn attempt_refresh(
     let (bytes, source) = fetch_latest_mmdb_bytes(license_key, http).await?;
     let build_epoch = validate_mmdb_bytes(&bytes, source.as_str())?;
     // One allocation, shared by the comparison and the write below.
-    let bytes = std::sync::Arc::new(bytes);
+    install_downloaded_database(
+        service,
+        source,
+        build_epoch,
+        std::sync::Arc::new(bytes),
+        path,
+    )
+    .await
+}
 
-    if file_matches(path, std::sync::Arc::clone(&bytes)).await {
+/// Put a validated download in front of lookups: skip, write, or write and
+/// reload, decided against what the service currently *serves*.
+///
+/// The skip is gated on the **loaded** database's `build_epoch`, never on what
+/// happens to be on disk. Comparing against disk made a failed reload
+/// permanent: the tick that wrote the file and then failed to load it left the
+/// new bytes on disk, so every later tick downloading those same bytes saw
+/// "disk already matches", reported `Unchanged`, recorded a successful check
+/// and never retried the reload -- the process kept serving the old database
+/// with nothing anywhere saying so.
+///
+/// The disk write is still skipped when the file already holds these bytes
+/// (that is a redundant ~60 MB write, not a correctness question), but the
+/// reload is always retried while the loaded build is behind the download, so a
+/// stuck reader self-heals on the next tick.
+async fn install_downloaded_database(
+    service: &GeoIpService,
+    source: DbSource,
+    build_epoch: u64,
+    bytes: std::sync::Arc<Vec<u8>>,
+    path: &Path,
+) -> Result<RefreshOutcome, GeoIpError> {
+    if service.build_epoch() == Some(build_epoch) {
         debug!(
             source = source.as_str(),
-            build_epoch, "geo database is already up to date; skipping write and swap"
+            build_epoch, "the loaded geo database is already this build; skipping write and swap"
         );
         return Ok(RefreshOutcome::Unchanged {
             source,
@@ -640,7 +670,18 @@ pub async fn attempt_refresh(
     }
 
     let size_bytes = bytes.len();
-    write_mmdb_atomically(path, bytes).await?;
+    if file_matches(path, std::sync::Arc::clone(&bytes)).await {
+        debug!(
+            source = source.as_str(),
+            build_epoch,
+            path = %path.display(),
+            "the geo database on disk already holds this build but the loaded reader does not; \
+             retrying the reload without rewriting the file"
+        );
+    } else {
+        write_mmdb_atomically(path, bytes).await?;
+    }
+
     let loaded_epoch = service.refresh_from_path(path)?;
 
     Ok(RefreshOutcome::Updated {
@@ -865,6 +906,183 @@ pub fn spawn_refresh_job(
     });
 
     true
+}
+
+/// How often the on-disk city database is `stat`ed for a change made by
+/// somebody else.
+///
+/// Deliberately a fixed constant rather than a share of the configurable
+/// `refresh_interval_hours`: this poll has nothing to do with downloading. Its
+/// job is to notice, quickly and cheaply, that the file changed -- by the
+/// refresh job in another process, by an operator dropping in a new `.mmdb`, or
+/// by a bind-mount update -- so a minute of lag is the right order of magnitude
+/// whatever the download cadence is. One `stat` a minute is not measurable.
+pub const DB_FILE_WATCH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Ensures at most one file watcher per process, for the same reason
+/// [`REFRESH_JOB_SPAWNED`] exists: the monolithic `temps serve` registers
+/// `GeoPlugin` twice (proxy registry and console registry) in one process.
+static FILE_WATCHER_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// What `stat` says about the database file, which is all the watcher needs to
+/// decide whether re-opening it is worth doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileFingerprint {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    })
+}
+
+/// Watch the city database file and hot-reload `service` whenever the file on
+/// disk turns out to hold a different build than the one loaded.
+///
+/// This is what makes a **split-role** deployment (ADR-017) correct. `temps
+/// proxy` and `temps serve --role=console` are separate OS processes, each with
+/// its own `GeoIpService` and its own `ArcSwap`. Only the console has an
+/// `EncryptionService`, so only the console runs [`spawn_refresh_job`] and only
+/// the console's reader is swapped when a refresh lands -- the proxy kept
+/// serving the database it opened at boot until someone restarted it, silently
+/// geolocating analytics and log enrichment from a database that could be
+/// arbitrarily old. The watcher needs no license key, no network, no
+/// `ConfigService` and no `EncryptionService`, so it runs in every context,
+/// including the proxy's deliberately minimal one. In the monolith it is a
+/// near-permanent no-op: the file only changes when that same process just
+/// refreshed it, which already swapped the shared reader.
+///
+/// Returns `false` when a watcher is already running in this process, when the
+/// service is a mock (nothing on disk to watch), or when the thread cannot be
+/// started.
+pub fn spawn_db_file_watcher(service: std::sync::Arc<GeoIpService>) -> bool {
+    if service.build_epoch().is_none() {
+        debug!("mock geo service is enabled; not watching the database file for changes");
+        return false;
+    }
+
+    if FILE_WATCHER_SPAWNED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        debug!("the geo database file watcher is already running in this process");
+        return false;
+    }
+
+    let path = city_db_path();
+    match spawn_db_file_watcher_every(&service, path.clone(), DB_FILE_WATCH_INTERVAL) {
+        Ok(_handle) => {
+            info!(
+                path = %path.display(),
+                poll_interval_secs = DB_FILE_WATCH_INTERVAL.as_secs(),
+                "watching the GeoLite2 city database file so a refresh performed by another \
+                 process is picked up without a restart"
+            );
+            true
+        }
+        Err(error) => {
+            FILE_WATCHER_SPAWNED.store(false, Ordering::SeqCst);
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "could not start the GeoLite2 database file watcher; this process will keep \
+                 serving the database it loaded at startup until it is restarted"
+            );
+            false
+        }
+    }
+}
+
+/// The watcher runs on a dedicated OS thread, **not** on `tokio::spawn`.
+///
+/// `temps proxy` drives plugin registration from a throwaway
+/// `new_current_thread` runtime that is dropped as soon as registration returns
+/// (see `temps_proxy::server::setup_proxy_server`), so anything spawned onto
+/// the ambient runtime from `register_services` dies immediately -- in exactly
+/// the process this watcher exists for. A thread also suits the work: the poll
+/// is a blocking `stat`, and the reload copies and maps ~60 MB, which has no
+/// business running on a reactor.
+///
+/// Holding the service **weakly** gives the thread a termination condition: it
+/// stops the first time the `GeoIpService` it would refresh no longer exists.
+fn spawn_db_file_watcher_every(
+    service: &std::sync::Arc<GeoIpService>,
+    path: PathBuf,
+    interval: Duration,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let service = std::sync::Arc::downgrade(service);
+    std::thread::Builder::new()
+        .name("geo-db-watch".to_string())
+        .spawn(move || watch_db_file(service, path, interval))
+}
+
+fn watch_db_file(service: std::sync::Weak<GeoIpService>, path: PathBuf, interval: Duration) {
+    // What the loaded reader corresponds to. Seeded from the current file so a
+    // process that just opened it does not immediately re-open it.
+    let mut loaded_from = file_fingerprint(&path);
+    // The fingerprint a failure was already reported for, so a permanently
+    // broken file warns once instead of every poll.
+    let mut reported_failure: Option<FileFingerprint> = None;
+
+    loop {
+        std::thread::sleep(interval);
+
+        let Some(service) = service.upgrade() else {
+            debug!(
+                path = %path.display(),
+                "the geo service was dropped; stopping the database file watcher"
+            );
+            return;
+        };
+
+        let Some(current) = file_fingerprint(&path) else {
+            // Missing or unreadable right now (a refresh is mid-rename, or the
+            // file was removed). The loaded database keeps serving lookups and
+            // the next poll looks again.
+            continue;
+        };
+
+        if Some(&current) == loaded_from.as_ref() {
+            continue;
+        }
+
+        match service.refresh_from_path_if_changed(&path) {
+            Ok(Some(build_epoch)) => {
+                info!(
+                    path = %path.display(),
+                    build_epoch,
+                    "reloaded the GeoLite2 city database after it changed on disk"
+                );
+                loaded_from = Some(current);
+                reported_failure = None;
+            }
+            Ok(None) => {
+                debug!(
+                    path = %path.display(),
+                    "the GeoLite2 city database file changed but holds the build already loaded"
+                );
+                loaded_from = Some(current);
+                reported_failure = None;
+            }
+            Err(error) => {
+                // `loaded_from` is deliberately left alone so the next poll
+                // retries: a reload that fails must not be remembered as done.
+                if reported_failure.as_ref() != Some(&current) {
+                    warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "the GeoLite2 city database changed on disk but could not be loaded; \
+                         keeping the database currently in memory and retrying on the next poll"
+                    );
+                    reported_failure = Some(current);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1256,6 +1474,240 @@ mod tests {
 
         assert_eq!(outcome, RefreshOutcome::SkippedNoLicenseKey);
         assert!(!path.exists());
+    }
+
+    /// The city database committed to this repository, read once and shared by
+    /// every test that needs a genuine `.mmdb` (it is ~58 MB).
+    ///
+    /// `None` when the file is not in this checkout, in which case the tests
+    /// that need it skip rather than fail -- the same convention the
+    /// Docker-dependent tests in this workspace follow.
+    fn bundled_city_db() -> Option<std::sync::Arc<Vec<u8>>> {
+        static BUNDLED: std::sync::OnceLock<Option<std::sync::Arc<Vec<u8>>>> =
+            std::sync::OnceLock::new();
+        BUNDLED
+            .get_or_init(|| {
+                let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("temps-cli")
+                    .join(CITY_DB_FILENAME);
+                std::fs::read(path).ok().map(std::sync::Arc::new)
+            })
+            .clone()
+    }
+
+    fn build_epoch_of(bytes: &[u8]) -> u64 {
+        maxminddb::Reader::from_source(bytes)
+            .expect("the fixture must be a readable database")
+            .metadata()
+            .build_epoch
+    }
+
+    /// Re-stamp a database's `build_epoch`, producing a second *build* of the
+    /// same data.
+    ///
+    /// Every test here is about one build replacing another, and MaxMind
+    /// publishes one file at a time, so the second build is made by rewriting
+    /// the metadata field of the first. The new value is written over the
+    /// existing field at its existing length, so no offset in the file moves.
+    fn with_build_epoch(bytes: &[u8], epoch: u64) -> Vec<u8> {
+        const MARKER: &[u8] = b"\xAB\xCD\xEFMaxMind.com";
+        // A utf8 string (type 2) of length 11, i.e. control byte 0b010_01011.
+        const KEY: &[u8] = b"\x4Bbuild_epoch";
+
+        let metadata_at = bytes
+            .windows(MARKER.len())
+            .rposition(|window| window == MARKER)
+            .expect("the fixture must carry a metadata marker");
+        let key_at = metadata_at
+            + bytes[metadata_at..]
+                .windows(KEY.len())
+                .position(|window| window == KEY)
+                .expect("the metadata must carry a build_epoch key");
+        let control = key_at + KEY.len();
+
+        // uint64 is an extended type: a control byte whose type bits are zero
+        // and whose low five bits are the payload length, then `type - 7` == 2.
+        assert_eq!(
+            bytes[control] >> 5,
+            0,
+            "build_epoch must be stored as an extended type"
+        );
+        assert_eq!(bytes[control + 1], 2, "build_epoch must be a uint64");
+        let len = usize::from(bytes[control] & 0x1F);
+        let encoded = epoch.to_be_bytes();
+        let significant = 8 - len;
+        assert!(
+            encoded[..significant].iter().all(|byte| *byte == 0),
+            "epoch {} does not fit the existing {}-byte field",
+            epoch,
+            len
+        );
+
+        let mut patched = bytes.to_vec();
+        patched[control + 2..control + 2 + len].copy_from_slice(&encoded[significant..]);
+        assert_eq!(build_epoch_of(&patched), epoch);
+        patched
+    }
+
+    /// ADR-017 split roles: `temps proxy` and `temps serve --role=console` are
+    /// separate OS processes holding separate readers over one file, and only
+    /// the console ever refreshes it. Without the watcher the proxy process
+    /// serves the build it opened at boot until someone restarts it.
+    #[tokio::test]
+    async fn the_file_watcher_reloads_a_database_another_process_replaced() {
+        let Some(base) = bundled_city_db() else {
+            println!("{} is not in this checkout; skipping", CITY_DB_FILENAME);
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CITY_DB_FILENAME);
+        std::fs::write(&path, base.as_slice()).expect("seed the database");
+        let initial_epoch = build_epoch_of(&base);
+        let newer_epoch = initial_epoch + 86_400;
+
+        // Two independent services over one path, as the two processes have.
+        let console = GeoIpService::from_city_db_path(&path).expect("console reader");
+        let proxy =
+            std::sync::Arc::new(GeoIpService::from_city_db_path(&path).expect("proxy reader"));
+        assert_eq!(proxy.build_epoch(), Some(initial_epoch));
+
+        // Short poll so the test does not wait a real minute.
+        let _watcher = spawn_db_file_watcher_every(&proxy, path.clone(), Duration::from_millis(25))
+            .expect("start the watcher");
+
+        // The console process refreshes: the file is replaced and *its* reader
+        // is swapped. Nothing tells the proxy's reader anything.
+        write_mmdb_atomically(&path, shared(with_build_epoch(&base, newer_epoch)))
+            .await
+            .expect("write the refreshed database");
+        assert_eq!(
+            console
+                .refresh_from_path(&path)
+                .expect("the console reloads its own reader"),
+            newer_epoch
+        );
+
+        let picked_up = tokio::time::timeout(Duration::from_secs(20), async {
+            while proxy.build_epoch() != Some(newer_epoch) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            picked_up.is_ok(),
+            "the proxy process kept serving build {} after the console refreshed the file to {}",
+            initial_epoch,
+            newer_epoch
+        );
+
+        // Dropping the last strong reference is the watcher thread's stop
+        // signal, so the test leaves nothing polling behind it.
+        drop(proxy);
+    }
+
+    /// The poll exists to notice an out-of-process write quickly; it must stay
+    /// far below any download cadence rather than track it.
+    #[test]
+    fn the_watch_interval_is_far_shorter_than_any_refresh_cadence() {
+        assert_eq!(DB_FILE_WATCH_INTERVAL, Duration::from_secs(60));
+        assert!(
+            DB_FILE_WATCH_INTERVAL
+                < Duration::from_secs(
+                    u64::from(temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600
+                )
+        );
+    }
+
+    /// Tick N wrote the new build to disk and then failed to load it. Tick N+1
+    /// downloads the identical bytes: deciding "unchanged" from *disk* reported
+    /// a successful no-op check forever and never retried the reload, so the
+    /// process served the old build with nothing anywhere saying so.
+    #[tokio::test]
+    async fn a_failed_reload_is_retried_when_the_next_download_is_identical() {
+        let Some(base) = bundled_city_db() else {
+            println!("{} is not in this checkout; skipping", CITY_DB_FILENAME);
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CITY_DB_FILENAME);
+        std::fs::write(&path, base.as_slice()).expect("seed the database");
+
+        let service = GeoIpService::from_city_db_path(&path).expect("reader");
+        let loaded_epoch = build_epoch_of(&base);
+        let downloaded_epoch = loaded_epoch + 86_400;
+
+        // Tick N: the download reached disk, the swap never reached memory.
+        let newer = with_build_epoch(&base, downloaded_epoch);
+        std::fs::write(&path, &newer).expect("simulate the write of a tick whose reload failed");
+        assert_eq!(service.build_epoch(), Some(loaded_epoch));
+        let before = file_fingerprint(&path);
+
+        // Tick N+1: MaxMind has not republished, so these are the same bytes
+        // the file already holds.
+        let outcome = install_downloaded_database(
+            &service,
+            DbSource::MaxMindOfficial,
+            downloaded_epoch,
+            shared(newer.clone()),
+            &path,
+        )
+        .await
+        .expect("the reload must be retried");
+
+        assert_eq!(
+            outcome,
+            RefreshOutcome::Updated {
+                source: DbSource::MaxMindOfficial,
+                build_epoch: downloaded_epoch,
+                size_bytes: newer.len(),
+            },
+            "an identical download must retry the reload, not report Unchanged"
+        );
+        assert_eq!(
+            service.build_epoch(),
+            Some(downloaded_epoch),
+            "the loaded reader must have caught up with the file"
+        );
+        assert_eq!(
+            file_fingerprint(&path),
+            before,
+            "the file already held these bytes, so it must not be rewritten"
+        );
+    }
+
+    /// The other half of the same decision: once the *loaded* build matches the
+    /// download there is genuinely nothing to do.
+    #[tokio::test]
+    async fn a_download_matching_the_loaded_build_is_reported_unchanged() {
+        let Some(base) = bundled_city_db() else {
+            println!("{} is not in this checkout; skipping", CITY_DB_FILENAME);
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CITY_DB_FILENAME);
+        std::fs::write(&path, base.as_slice()).expect("seed the database");
+
+        let service = GeoIpService::from_city_db_path(&path).expect("reader");
+        let build_epoch = build_epoch_of(&base);
+
+        let outcome = install_downloaded_database(
+            &service,
+            DbSource::MaxMindOfficial,
+            build_epoch,
+            shared(base.as_slice().to_vec()),
+            &path,
+        )
+        .await
+        .expect("an already-loaded build is a no-op, not a failure");
+
+        assert_eq!(
+            outcome,
+            RefreshOutcome::Unchanged {
+                source: DbSource::MaxMindOfficial,
+                build_epoch,
+            }
+        );
     }
 
     #[test]

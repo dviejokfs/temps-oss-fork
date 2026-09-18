@@ -449,6 +449,26 @@ impl GeoIpService {
         Ok(Self::MaxMind(service))
     }
 
+    /// Load a city database from an explicit path into a reader of its own,
+    /// bypassing the process-wide [`LOADED_DATABASES`] memo.
+    ///
+    /// Test-only: it exists to reproduce the split-role topology (ADR-017),
+    /// where `temps proxy` and `temps serve --role=console` are separate OS
+    /// processes and therefore hold two independent `ArcSwap`s over the same
+    /// file. Inside one test process the memo would hand both sides the same
+    /// reader and hide exactly the propagation bug being tested.
+    #[cfg(test)]
+    pub(crate) fn from_city_db_path(path: &std::path::Path) -> Result<Self, GeoIpError> {
+        let reader = open_mmdb(path).map_err(|e| GeoIpError::ReloadFailed {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        Ok(Self::MaxMind(Arc::new(MaxMindGeoIpService {
+            reader: ArcSwap::from_pointee(reader),
+            asn_reader: None,
+        })))
+    }
+
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
         match self {
             Self::MaxMind(service) => service.geolocate(ip).await,
@@ -473,6 +493,40 @@ impl GeoIpService {
             }
             // Mock mode never reads the filesystem, so there is nothing to
             // swap; report the absence rather than pretending a refresh landed.
+            Self::Mock(_) => Err(GeoIpError::ReloadFailed {
+                path: path.display().to_string(),
+                reason: "mock geo service is enabled (TEMPS_GEO_MOCK); no database is loaded"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Reload the city database from `path`, but only when the file holds a
+    /// different build than the one currently loaded.
+    ///
+    /// Returns the new `build_epoch` when a swap happened, and `None` when the
+    /// file turned out to hold the build already in memory (a touched file, or
+    /// a write of identical bytes). This is what the file watcher uses: it
+    /// notices *that* the file changed from `stat` alone, which cannot tell
+    /// whether the content is actually a newer database, and a blind swap would
+    /// log a refresh and drop a perfectly good reader on every `touch`.
+    pub fn refresh_from_path_if_changed(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<u64>, GeoIpError> {
+        match self {
+            Self::MaxMind(service) => {
+                let reader = open_mmdb(path).map_err(|e| GeoIpError::ReloadFailed {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })?;
+                let build_epoch = reader.metadata().build_epoch;
+                if build_epoch == service.build_epoch() {
+                    return Ok(None);
+                }
+                service.refresh(reader);
+                Ok(Some(build_epoch))
+            }
             Self::Mock(_) => Err(GeoIpError::ReloadFailed {
                 path: path.display().to_string(),
                 reason: "mock geo service is enabled (TEMPS_GEO_MOCK); no database is loaded"

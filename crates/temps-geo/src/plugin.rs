@@ -87,6 +87,20 @@ impl TempsPlugin for GeoPlugin {
             })?);
             context.register_service(geo_ip_service.clone());
 
+            // Unconditional, and deliberately outside the match below: this is
+            // the only thing that keeps a **split-role** deployment (ADR-017)
+            // current. There, `temps proxy` is its own OS process with its own
+            // reader, and it has no `EncryptionService`, so it never spawns the
+            // refresh job and never learns that the console process replaced
+            // the `.mmdb` -- it served the database it opened at boot until
+            // restarted. The watcher needs nothing but the filesystem: no
+            // license key, no network, no settings. In the monolith it is a
+            // no-op, because there the refresh already swapped the one reader
+            // both registries share. Skipped in mock mode, which has no file.
+            if !use_mock {
+                refresh::spawn_db_file_watcher(geo_ip_service.clone());
+            }
+
             // Every geo knob lives on the settings row, so the refresh policy,
             // the encrypted MaxMind key and the recorded freshness metadata
             // are all reached through these two services rather than the

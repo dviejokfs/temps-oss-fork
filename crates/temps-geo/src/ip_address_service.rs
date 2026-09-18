@@ -206,9 +206,11 @@ impl IpAddressService {
     /// time it was ever seen.
     ///
     /// The re-resolution is a local mmdb lookup with no network or external
-    /// call, so a burst of expired rows cannot stampede anything; only a row
-    /// whose values actually changed costs a write. Any failure keeps the
-    /// stored row: degrading to slightly stale data beats losing it.
+    /// call, so a burst of expired rows cannot stampede anything, and each row
+    /// costs one write per staleness window -- the write happens even when the
+    /// values are identical, because it is what records that the row was
+    /// verified. Any failure keeps the stored row: degrading to slightly stale
+    /// data beats losing it.
     async fn refresh_if_stale(
         &self,
         stored: ip_geolocations::Model,
@@ -244,13 +246,14 @@ impl IpAddressService {
             }
         };
 
-        if !geolocation_differs(&stored, &resolved) {
-            debug!(
-                ip_address = stored.ip_address,
-                age_days, "stale IP geolocation re-resolved to the same values"
-            );
-            return stored.into();
-        }
+        // Written back even when nothing changed, which is the common case: the
+        // staleness test is purely `now - updated_at`, so returning early here
+        // would leave the row eternally stale and re-resolve it again on the
+        // first lookup after every cache expiry, forever, for any IP that is
+        // actively used and simply never moves. The row content is identical;
+        // what the write is for is advancing `updated_at` -- the record of when
+        // this row was last *verified* against the current database.
+        let unchanged = !geolocation_differs(&stored, &resolved);
 
         let ip_address = stored.ip_address.clone();
         let stored_info: IpAddressInfo = stored.clone().into();
@@ -259,10 +262,19 @@ impl IpAddressService {
 
         match active.update(self.db.as_ref()).await {
             Ok(updated) => {
-                info!(
-                    ip_address = ip_address,
-                    age_days, "re-resolved a stale IP geolocation against the current database"
-                );
+                if unchanged {
+                    debug!(
+                        ip_address = ip_address,
+                        age_days,
+                        "stale IP geolocation re-resolved to the same values; refreshed only its \
+                         verification time"
+                    );
+                } else {
+                    info!(
+                        ip_address = ip_address,
+                        age_days, "re-resolved a stale IP geolocation against the current database"
+                    );
+                }
                 updated.into()
             }
             Err(e) => {
@@ -497,6 +509,65 @@ mod tests {
 
         let stale = stored_row(now - chrono::Duration::days(31));
         assert!((now - stale.updated_at).num_days() >= window);
+    }
+
+    /// A row whose re-resolution matches what is stored must still have its
+    /// verification time advanced. Staleness is measured purely as
+    /// `now - updated_at`, so leaving the timestamp alone makes the row stale
+    /// again on the very next lookup after the 6h cache entry expires, and an
+    /// actively used IP whose geolocation never changes -- the common case --
+    /// is re-resolved forever.
+    #[tokio::test]
+    async fn an_unchanged_re_resolution_still_advances_the_staleness_clock() {
+        let now = Utc::now();
+        // Exactly what the mock service resolves a public IP to, so the
+        // re-resolution compares equal.
+        let stored = ip_geolocations::Model {
+            id: 7,
+            ip_address: "203.0.113.10".to_string(),
+            country: "Unknown".to_string(),
+            country_code: Some("XX".to_string()),
+            region: Some("Unknown".to_string()),
+            city: Some("Unknown".to_string()),
+            latitude: Some(0.0),
+            longitude: Some(0.0),
+            timezone: Some("UTC".to_string()),
+            is_eu: false,
+            asn_org: None,
+            is_hosting_provider: None,
+            created_at: now - chrono::Duration::days(400),
+            updated_at: now - chrono::Duration::days(400),
+        };
+        let touched = ip_geolocations::Model {
+            updated_at: now,
+            ..stored.clone()
+        };
+
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![touched]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 7,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = IpAddressService::new(
+            db,
+            Arc::new(GeoIpService::Mock(crate::MockGeoIpService::new())),
+        );
+
+        let info = service.refresh_if_stale(stored.clone(), now).await;
+
+        assert!(
+            info.updated_at > stored.updated_at,
+            "an identical re-resolution must still reset the staleness clock"
+        );
+        assert_eq!(info.updated_at, now);
+        assert_eq!(
+            info.city, stored.city,
+            "the values themselves must not move"
+        );
     }
 
     /// Without a settings source the service must still apply a sane window
