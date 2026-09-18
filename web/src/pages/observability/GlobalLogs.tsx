@@ -4,7 +4,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { LogExplorer } from '@/components/observability/LogExplorer'
 import { useGlobalView } from '@/hooks/useGlobalView'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueries } from '@tanstack/react-query'
+import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { searchGlobalLogs } from '@/api/client/sdk.gen'
 import type { GlobalLogSource, LogLevel } from '@/api/client/types.gen'
 import { QueryContent } from '@/components/observability/GlobalPage'
@@ -15,7 +16,8 @@ import { LogQueryInput } from '@/components/observability/LogQueryInput'
 import { positiveInteger } from '@/lib/global-observability'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { AlertTriangle, RefreshCw, Play, Pause } from 'lucide-react'
+import { RefreshCw, Play, Pause } from 'lucide-react'
+import { Callout, HelpPopover } from '@temps-sdk/ds'
 
 const LEVELS: LogLevel[] = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']
 export default function GlobalLogs() {
@@ -75,17 +77,33 @@ export default function GlobalLogs() {
   const ready = !query.error && !query.isPending
   const incomplete = ready && !!query.data?.scan_limit_reached
   const lines = ready ? (query.data?.lines ?? []) : []
+  const environmentProjects = [
+    ...new Set([
+      ...(view.projectId ? [view.projectId] : []),
+      ...lines.flatMap((line) =>
+        line.project_id != null ? [line.project_id] : []
+      ),
+    ]),
+  ]
+  const environmentQueries = useQueries({
+    queries: environmentProjects.map((project_id) => ({
+      ...getEnvironmentsOptions({ path: { project_id } }),
+      staleTime: 60_000,
+    })),
+  })
+  const environmentLabels = Object.fromEntries(
+    environmentQueries.flatMap((query) =>
+      (query.data ?? []).map((environment) => [
+        String(environment.id),
+        environment.slug,
+      ])
+    )
+  )
   const status = incomplete ? (
-    <div
-      role="status"
-      className="flex items-center gap-1.5 px-1 text-xs text-amber-700 dark:text-amber-400"
-    >
-      <AlertTriangle className="size-3.5 shrink-0" aria-hidden="true" />
-      <span>
-        Scan limit reached{lines.length ? ' · showing partial results' : ''}.
-        Use Next page to continue or narrow the search.
-      </span>
-    </div>
+    <Callout tone="warning" title="Scan limit reached">
+      {lines.length ? 'Showing partial results. ' : ''}
+      Use Next page to continue, or narrow your search or time range.
+    </Callout>
   ) : !ready || !lines.length ? (
     <QueryContent
       title="Logs"
@@ -105,6 +123,7 @@ export default function GlobalLogs() {
       />
       <LogExplorer
         lines={lines}
+        environmentLabels={environmentLabels}
         onFilter={filter}
         onInspect={() => setAuto(false)}
         status={status}
@@ -114,6 +133,7 @@ export default function GlobalLogs() {
               params={view.params}
               text={view.search}
               lines={lines}
+              environmentLabels={environmentLabels}
               onChange={filter}
             />
             <div className="flex flex-wrap items-center gap-2">
@@ -125,8 +145,12 @@ export default function GlobalLogs() {
                 }}
               />
               <span className="text-[11px] text-muted-foreground">
-                Times in UTC
+                UTC
               </span>
+              <HelpPopover label="About log search">
+                <p>Search messages or use project:, env:, source:, and level: filters.</p>
+                <p>Counts and groups describe the loaded page. Times are in UTC.</p>
+              </HelpPopover>
               <Button
                 size="sm"
                 variant="ghost"
@@ -189,7 +213,7 @@ export default function GlobalLogs() {
           </div>
         }
         footer={
-          <div className="flex flex-wrap items-center justify-between gap-2 border-t py-2 text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center justify-between gap-2 py-3 text-xs text-muted-foreground">
             <span>
               {ready
                 ? `${lines.length} loaded ${lines.length === 1 ? 'line' : 'lines'} · ${incomplete ? 'partial results' : 'newest first'}`
