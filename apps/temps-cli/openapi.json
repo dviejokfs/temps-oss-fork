@@ -3011,6 +3011,25 @@
               "null"
             ]
           },
+          "geo": {
+            "default": {
+              "build_epoch": null,
+              "last_check_at": null,
+              "last_check_status": null,
+              "last_error": null,
+              "last_refreshed_at": null,
+              "maxmind_license_key_encrypted": null,
+              "refresh_interval_hours": null,
+              "source": null,
+              "stale_lookup_days": null
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GeoSettings",
+                "description": "Geolocation database refresh policy, MaxMind credential (encrypted at\nrest), and the self-recorded freshness metadata of the last refresh."
+              }
+            ]
+          },
           "image_retention": {
             "default": {
               "default_hours": 336,
@@ -3340,6 +3359,10 @@
               "null"
             ]
           },
+          "geo": {
+            "$ref": "#/components/schemas/GeoSettingsMasked",
+            "description": "Geolocation refresh policy and freshness, with the MaxMind license key\nreported only as a boolean."
+          },
           "image_retention": {
             "$ref": "#/components/schemas/ImageRetentionSettings",
             "description": "Deployment-image retention policy. No sensitive content, passed through\nas-is so the settings UI can show and edit the system-wide default."
@@ -3461,6 +3484,7 @@
           "monitoring",
           "observability_compression",
           "observability_retention",
+          "geo",
           "effective_metrics_store",
           "effective_observability_store",
           "insecure_tls",
@@ -21484,6 +21508,107 @@
         ],
         "type": "object"
       },
+      "GeoDatabaseStatusResponse": {
+        "description": "Freshness of the geolocation database backing this instance",
+        "properties": {
+          "age_days": {
+            "description": "Age in days of the loaded data, from `build_time` when known and from\n`last_refreshed_at` otherwise",
+            "example": 3,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "build_epoch": {
+            "description": "MaxMind `build_epoch` of the loaded database (Unix seconds)",
+            "example": 1767225600,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "build_time": {
+            "description": "When MaxMind built the loaded data (ISO 8601, UTC)",
+            "example": "2026-09-01T02:00:00Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_stale": {
+            "description": "Whether `age_days` has passed `stale_after_days`, or the last check\nfailed",
+            "example": false,
+            "type": "boolean"
+          },
+          "last_check_at": {
+            "description": "When a refresh was last attempted, successful or not (ISO 8601, UTC)",
+            "example": "2026-09-17T03:14:00Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_check_status": {
+            "description": "`ok` or `error` for the most recent refresh attempt; `null` when none\nhas run yet",
+            "example": "ok",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Redacted reason the last refresh failed, so an operator can act on it\nwithout reading server logs",
+            "example": "Geo database download from source 'maxmind_official' failed: HTTP 401",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_refreshed_at": {
+            "description": "When new database bytes were last installed (ISO 8601, UTC)",
+            "example": "2026-09-01T03:14:00Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "license_key_configured": {
+            "description": "Whether a MaxMind license key is configured. The key itself is never\nreturned, logged, or persisted.",
+            "example": true,
+            "type": "boolean"
+          },
+          "refresh_interval_hours": {
+            "description": "How often the scheduled refresh job runs",
+            "example": 24,
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "description": "Where the loaded database was downloaded from: `maxmind_official` when\na license key is configured, `bundled_github` otherwise. `null` when no\nrefresh has run yet (the database was provisioned by the operator).",
+            "example": "maxmind_official",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stale_after_days": {
+            "description": "Age after which this instance treats the database, and cached IP\nlookups, as stale",
+            "example": 30,
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "license_key_configured",
+          "stale_after_days",
+          "is_stale",
+          "refresh_interval_hours"
+        ],
+        "type": "object"
+      },
       "GeoLocationResponse": {
         "description": "Response containing geolocation information for an IP address",
         "properties": {
@@ -21580,6 +21705,176 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "GeoSettings": {
+        "description": "Geolocation database configuration and freshness state.\n\nBoth the data-policy knobs an admin sets and the metadata the refresh job\nrecords live on one typed struct on purpose. The `settings` row is a shared\nJSON document and `AppSettings` is deserialized/reserialized in full by the\ngeneric settings endpoint, so any geo key kept *outside* this struct would\nbe silently dropped the next time an unrelated settings page was saved.\n\nThe license key is stored as ciphertext only\n([`GeoSettings::maxmind_license_key_encrypted`]). The plaintext field\nbeside it is write-only input from the admin UI: it is `skip_serializing`,\nso it can never be persisted or returned, and\n[`GeoSettings::apply_license_key_update`] clears it after encrypting.",
+        "properties": {
+          "build_epoch": {
+            "default": null,
+            "description": "MaxMind `build_epoch` of the database that was last installed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_check_at": {
+            "default": null,
+            "description": "When a refresh was last attempted, successful or not.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_check_status": {
+            "default": null,
+            "description": "[`GEO_CHECK_STATUS_OK`] or [`GEO_CHECK_STATUS_ERROR`].",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "default": null,
+            "description": "Redacted reason the last refresh failed, so an operator can act on it\nwithout reading server logs. Never contains the license key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_refreshed_at": {
+            "default": null,
+            "description": "When new database bytes were last installed and swapped in.\nSelf-recorded by the refresh job; never writable by a client.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxmind_license_key_encrypted": {
+            "default": null,
+            "description": "AES-256-GCM ciphertext of the MaxMind license key, as produced by\n`EncryptionService::encrypt_string`. Never returned by the API.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "refresh_interval_hours": {
+            "default": null,
+            "description": "How often the scheduled refresh job runs. `None` means\n[`DEFAULT_GEO_REFRESH_INTERVAL_HOURS`]; read it through\n[`GeoSettings::effective_refresh_interval_hours`].",
+            "example": 24,
+            "format": "int32",
+            "maximum": 8760,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source": {
+            "default": null,
+            "description": "[`GEO_SOURCE_MAXMIND_OFFICIAL`] or [`GEO_SOURCE_BUNDLED_GITHUB`].",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stale_lookup_days": {
+            "default": null,
+            "description": "Age at which a stored IP -> location row is re-resolved on its next\nlookup. `None` means [`DEFAULT_GEO_STALE_LOOKUP_DAYS`]; read it through\n[`GeoSettings::effective_stale_lookup_days`].",
+            "example": 30,
+            "format": "int32",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "GeoSettingsMasked": {
+        "description": "Geolocation settings with the MaxMind license key masked.\n\nThe stored value is AES-256-GCM ciphertext, and neither it nor the\nplaintext is ever returned: the UI only needs to know whether a key is\nsaved, so it can render the \"leave blank to keep current\" affordance the\nemail-provider credentials use. The refresh metadata below is reported\nread-only — it is written by the refresh job, not by a settings save.",
+        "properties": {
+          "effective_refresh_interval_hours": {
+            "description": "Refresh cadence actually applied, with defaults and bounds resolved.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "effective_stale_lookup_days": {
+            "description": "Staleness window actually applied, with defaults and bounds resolved.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_check_at": {
+            "description": "When a refresh was last attempted, successful or not (ISO 8601, UTC).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_check_status": {
+            "description": "`ok` or `error` for the most recent refresh attempt.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Redacted reason the last refresh failed. Never contains the key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_refreshed_at": {
+            "description": "When new database bytes were last installed (ISO 8601, UTC).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxmind_license_key_saved": {
+            "description": "True when a MaxMind license key is stored. The key is never returned.",
+            "type": "boolean"
+          },
+          "refresh_interval_hours": {
+            "description": "`null` means the effective default (24 hours).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "`maxmind_official` or `bundled_github`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stale_lookup_days": {
+            "description": "`null` means the effective default (30 days).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "effective_refresh_interval_hours",
+          "effective_stale_lookup_days",
+          "maxmind_license_key_saved"
+        ],
         "type": "object"
       },
       "GetDeploymentsParams": {
@@ -76326,6 +76621,62 @@
         "summary": "Every flag for the caller's environment, collapsed to what the evaluator\nneeds.",
         "tags": [
           "Feature Flags"
+        ]
+      }
+    },
+    "/geo/status": {
+      "get": {
+        "operationId": "get_geo_database_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GeoDatabaseStatusResponse"
+                }
+              }
+            },
+            "description": "Geolocation database status retrieved"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get the freshness of the geolocation database",
+        "tags": [
+          "geo"
         ]
       }
     },

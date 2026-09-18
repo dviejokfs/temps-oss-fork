@@ -155,13 +155,19 @@ pub use app_settings::{
     AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
     AppSettings, BuildLimitsSettings, CeilingEnforcement, CloudSettings, ClusterDnsSettings,
     ConnectionLimitSettings, ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings,
-    DockerRegistrySettings, ImageRetentionSettings, LetsEncryptSettings, McpServerSettings,
-    MetricsStoreKind, MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
+    DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
+    ImageRetentionSettings, LetsEncryptSettings, McpServerSettings, MetricsStoreKind,
+    MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
     ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
     RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
     TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
-    DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
+    DEFAULT_GEO_STALE_LOOKUP_DAYS, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,
+    GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,
+    GEO_SOURCE_MAXMIND_OFFICIAL, MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    MAX_GEO_REFRESH_INTERVAL_HOURS, MAX_GEO_STALE_LOOKUP_DAYS,
     MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+    MIN_GEO_REFRESH_INTERVAL_HOURS, MIN_GEO_STALE_LOOKUP_DAYS,
 };
 pub use async_trait;
 pub use chrono;

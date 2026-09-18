@@ -74,7 +74,7 @@ use temps_teams::TeamsPlugin;
 use temps_vulnerability_scanner::VulnerabilityScannerPlugin;
 use temps_webhooks::WebhooksPlugin;
 use tokio::net::TcpListener;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // Multi-node support
 use temps_deployments::handlers::nodes::NodeAppState;
@@ -1019,96 +1019,90 @@ fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
     }
 }
 
-/// Source URL for downloading GeoLite2-City.mmdb when missing on startup.
-/// Mirrors `setup.rs::GEOLITE2_DOWNLOAD_URL` so `temps serve` recovers a missing
-/// database the same way the setup wizard would.
-const GEOLITE2_DOWNLOAD_URL: &str =
-    "https://raw.githubusercontent.com/gotempsh/temps/refs/heads/main/crates/temps-cli/GeoLite2-City.mmdb";
+/// Download GeoLite2-City.mmdb to `dest` when it is missing.
+///
+/// Delegates to `temps_geo::refresh`, which owns every download path: the
+/// source selection (MaxMind with a license key, the repository copy without
+/// one), validation that the bytes really are a parseable database, and the
+/// `.tmp`-then-rename write. The scheduled refresh job calls the same code, so
+/// startup recovery and periodic refresh can no longer drift apart.
+/// `license_key` is the plaintext key the caller decrypted from the settings
+/// row, or `None` to use the repository copy. It is never logged here.
+async fn download_geolite2_database_on_startup(
+    dest: &Path,
+    license_key: Option<&str>,
+) -> anyhow::Result<()> {
+    let http = temps_geo::refresh::build_http_client()
+        .map_err(|e| anyhow::anyhow!("Failed to build the GeoLite2 download client: {}", e))?;
 
-/// Download GeoLite2-City.mmdb to `dest` from GitHub (same source as `temps setup`).
-/// Writes to a sibling `.tmp` file and renames atomically on success.
-async fn download_geolite2_database_on_startup(dest: &Path) -> anyhow::Result<()> {
-    use futures::StreamExt;
-    use std::io::Write;
+    info!(
+        "Downloading GeoLite2-City.mmdb to {} (MaxMind license key configured: {})",
+        dest.display(),
+        license_key.is_some()
+    );
 
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
+    temps_geo::refresh::ensure_mmdb_present(dest, license_key, &http)
+        .await
+        .map_err(|e| {
             anyhow::anyhow!(
-                "Failed to create data directory {}: {}",
-                parent.display(),
-                e
+                "{}",
+                temps_geo::redact_license_key(e.to_string(), license_key)
             )
         })?;
-    }
-
-    info!(
-        "Downloading GeoLite2-City.mmdb from {} to {}",
-        GEOLITE2_DOWNLOAD_URL,
-        dest.display()
-    );
-
-    let response = reqwest::Client::new()
-        .get(GEOLITE2_DOWNLOAD_URL)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to start GeoLite2 download: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to download GeoLite2 database: HTTP {}",
-            response.status()
-        ));
-    }
-
-    let temp_path = dest.with_extension("mmdb.tmp");
-    let mut file = std::fs::File::create(&temp_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to create temporary file {}: {}",
-            temp_path.display(),
-            e
-        )
-    })?;
-
-    let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = 0;
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| anyhow::anyhow!("Download error: {}", e))?;
-        file.write_all(&chunk)
-            .map_err(|e| anyhow::anyhow!("Failed to write to {}: {}", temp_path.display(), e))?;
-        downloaded += chunk.len() as u64;
-    }
-    drop(file);
-
-    std::fs::rename(&temp_path, dest).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to move {} to {}: {}",
-            temp_path.display(),
-            dest.display(),
-            e
-        )
-    })?;
-
-    if downloaded < 1_000_000 {
-        return Err(anyhow::anyhow!(
-            "Downloaded GeoLite2 database is too small ({} bytes); file may be corrupted",
-            downloaded
-        ));
-    }
-
-    info!(
-        "✓ Downloaded GeoLite2 database to {} ({:.1} MB)",
-        dest.display(),
-        downloaded as f64 / 1024.0 / 1024.0
-    );
 
     Ok(())
 }
 
+/// Read the MaxMind license key configured in the settings row, decrypted.
+///
+/// A key that cannot be read or decrypted is reported as "no key" rather than
+/// as a startup failure: the download then falls back to the repository copy,
+/// which is strictly better than refusing to boot over an optional credential.
+/// The plaintext is returned to the single caller below and never logged.
+async fn configured_maxmind_license_key(
+    db: &Arc<DbConnection>,
+    encryption_service: &Arc<EncryptionService>,
+) -> Option<String> {
+    let settings = match temps_entities::settings::Entity::find_by_id(1)
+        .one(db.as_ref())
+        .await
+    {
+        Ok(Some(row)) => temps_core::AppSettings::from_json(row.data),
+        Ok(None) => return None,
+        Err(e) => {
+            warn!(
+                "Could not read the settings row for the MaxMind license key; falling back to \
+                 the bundled GeoLite2 source: {}",
+                e
+            );
+            return None;
+        }
+    };
+
+    match settings
+        .geo
+        .decrypt_license_key(encryption_service.as_ref())
+    {
+        Ok(key) => key,
+        Err(e) => {
+            warn!(
+                "Could not decrypt the stored MaxMind license key; falling back to the bundled \
+                 GeoLite2 source: {}",
+                e
+            );
+            None
+        }
+    }
+}
+
 /// Validate GeoLite2-City database exists in multiple locations.
 /// Checks current directory and data directory; if neither has the file,
-/// downloads it to `default_db_path` from the same GitHub URL used by
-/// `temps setup`. Errors only after the download attempt fails.
-async fn validate_geolite2_database(default_db_path: &Path) -> anyhow::Result<()> {
+/// downloads it to `default_db_path`. Errors only after the download attempt
+/// fails.
+async fn validate_geolite2_database(
+    default_db_path: &Path,
+    license_key: Option<&str>,
+) -> anyhow::Result<()> {
     // Check multiple locations in order of preference
     let search_paths = vec![
         // 1. Current working directory (most convenient for local development)
@@ -1132,7 +1126,7 @@ async fn validate_geolite2_database(default_db_path: &Path) -> anyhow::Result<()
         search_paths[0].display(),
         search_paths[1].display()
     );
-    match download_geolite2_database_on_startup(default_db_path).await {
+    match download_geolite2_database_on_startup(default_db_path, license_key).await {
         Ok(()) => Ok(()),
         Err(e) => Err(anyhow::anyhow!(
             "❌ GeoLite2-City.mmdb not found and automatic download failed\n\n\
@@ -1153,6 +1147,11 @@ async fn validate_geolite2_database(default_db_path: &Path) -> anyhow::Result<()
                # Option B: Data directory\n\
                cp GeoLite2-City_*/GeoLite2-City.mmdb {}\n\n\
             6. Start the server again\n\n\
+            🔑 Automatic downloads and refreshes:\n\
+            Add a MaxMind license key (free MaxMind account) under\n\
+            Settings → Metrics Monitoring → Geolocation database, and Temps\n\
+            downloads GeoLite2-City itself and re-checks it on the refresh\n\
+            interval configured there (default every 24 hours).\n\n\
             🐳 For Docker users:\n\
             See Dockerfile in the repository for embedding the database",
             search_paths[0].display(),
@@ -2368,7 +2367,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // 2. Validate GeoPlugin dependencies (GeoLite2 database)
     debug!("Checking GeoLite2 database...");
     let geo_db_path = config.data_dir.join("GeoLite2-City.mmdb");
-    validate_geolite2_database(&geo_db_path).await?;
+    // The license key is an admin setting on the `settings` row, not an env
+    // var, so a startup download uses whatever the admin configured through
+    // the UI -- the same value the scheduled refresh job reads each tick.
+    let maxmind_license_key = configured_maxmind_license_key(&db, &encryption_service).await;
+    validate_geolite2_database(&geo_db_path, maxmind_license_key.as_deref()).await?;
     debug!("✓ GeoLite2 database file found");
 
     // 3. Validate logs directory is writable

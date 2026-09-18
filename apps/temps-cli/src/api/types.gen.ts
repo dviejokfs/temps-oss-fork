@@ -1470,6 +1470,11 @@ export type AppSettings = {
     edge_target?: string | null;
     external_url?: string | null;
     /**
+     * Geolocation database refresh policy, MaxMind credential (encrypted at
+     * rest), and the self-recorded freshness metadata of the last refresh.
+     */
+    geo?: GeoSettings;
+    /**
      * Retention policy for locally-built deployment images. Modeled as a
      * settings row (not an env var) per CLAUDE.md so an operator can change
      * the system-wide default at runtime without restarting the binary.
@@ -1649,6 +1654,11 @@ export type AppSettingsResponse = {
      */
     effective_observability_store: MetricsStoreKind;
     external_url?: string | null;
+    /**
+     * Geolocation refresh policy and freshness, with the MaxMind license key
+     * reported only as a boolean.
+     */
+    geo: GeoSettingsMasked;
     /**
      * Deployment-image retention policy. No sensitive content, passed through
      * as-is so the settings UI can show and edit the system-wide default.
@@ -10051,6 +10061,68 @@ export type GenerateJoinTokenResponse = {
 };
 
 /**
+ * Freshness of the geolocation database backing this instance
+ */
+export type GeoDatabaseStatusResponse = {
+    /**
+     * Age in days of the loaded data, from `build_time` when known and from
+     * `last_refreshed_at` otherwise
+     */
+    age_days?: number | null;
+    /**
+     * MaxMind `build_epoch` of the loaded database (Unix seconds)
+     */
+    build_epoch?: number | null;
+    /**
+     * When MaxMind built the loaded data (ISO 8601, UTC)
+     */
+    build_time?: string | null;
+    /**
+     * Whether `age_days` has passed `stale_after_days`, or the last check
+     * failed
+     */
+    is_stale: boolean;
+    /**
+     * When a refresh was last attempted, successful or not (ISO 8601, UTC)
+     */
+    last_check_at?: string | null;
+    /**
+     * `ok` or `error` for the most recent refresh attempt; `null` when none
+     * has run yet
+     */
+    last_check_status?: string | null;
+    /**
+     * Redacted reason the last refresh failed, so an operator can act on it
+     * without reading server logs
+     */
+    last_error?: string | null;
+    /**
+     * When new database bytes were last installed (ISO 8601, UTC)
+     */
+    last_refreshed_at?: string | null;
+    /**
+     * Whether a MaxMind license key is configured. The key itself is never
+     * returned, logged, or persisted.
+     */
+    license_key_configured: boolean;
+    /**
+     * How often the scheduled refresh job runs
+     */
+    refresh_interval_hours: number;
+    /**
+     * Where the loaded database was downloaded from: `maxmind_official` when
+     * a license key is configured, `bundled_github` otherwise. `null` when no
+     * refresh has run yet (the database was provisioned by the operator).
+     */
+    source?: string | null;
+    /**
+     * Age after which this instance treats the database, and cached IP
+     * lookups, as stale
+     */
+    stale_after_days: number;
+};
+
+/**
  * Response containing geolocation information for an IP address
  */
 export type GeoLocationResponse = {
@@ -10104,6 +10176,119 @@ export type GeoRestrictionsConfig = {
      * Block traffic from specific countries (ISO 3166-1 alpha-2 codes)
      */
     blockedCountries?: Array<string>;
+};
+
+/**
+ * Geolocation database configuration and freshness state.
+ *
+ * Both the data-policy knobs an admin sets and the metadata the refresh job
+ * records live on one typed struct on purpose. The `settings` row is a shared
+ * JSON document and `AppSettings` is deserialized/reserialized in full by the
+ * generic settings endpoint, so any geo key kept *outside* this struct would
+ * be silently dropped the next time an unrelated settings page was saved.
+ *
+ * The license key is stored as ciphertext only
+ * ([`GeoSettings::maxmind_license_key_encrypted`]). The plaintext field
+ * beside it is write-only input from the admin UI: it is `skip_serializing`,
+ * so it can never be persisted or returned, and
+ * [`GeoSettings::apply_license_key_update`] clears it after encrypting.
+ */
+export type GeoSettings = {
+    /**
+     * MaxMind `build_epoch` of the database that was last installed.
+     */
+    build_epoch?: number | null;
+    /**
+     * When a refresh was last attempted, successful or not.
+     */
+    last_check_at?: string | null;
+    /**
+     * [`GEO_CHECK_STATUS_OK`] or [`GEO_CHECK_STATUS_ERROR`].
+     */
+    last_check_status?: string | null;
+    /**
+     * Redacted reason the last refresh failed, so an operator can act on it
+     * without reading server logs. Never contains the license key.
+     */
+    last_error?: string | null;
+    /**
+     * When new database bytes were last installed and swapped in.
+     * Self-recorded by the refresh job; never writable by a client.
+     */
+    last_refreshed_at?: string | null;
+    /**
+     * AES-256-GCM ciphertext of the MaxMind license key, as produced by
+     * `EncryptionService::encrypt_string`. Never returned by the API.
+     */
+    maxmind_license_key_encrypted?: string | null;
+    /**
+     * How often the scheduled refresh job runs. `None` means
+     * [`DEFAULT_GEO_REFRESH_INTERVAL_HOURS`]; read it through
+     * [`GeoSettings::effective_refresh_interval_hours`].
+     */
+    refresh_interval_hours?: number | null;
+    /**
+     * [`GEO_SOURCE_MAXMIND_OFFICIAL`] or [`GEO_SOURCE_BUNDLED_GITHUB`].
+     */
+    source?: string | null;
+    /**
+     * Age at which a stored IP -> location row is re-resolved on its next
+     * lookup. `None` means [`DEFAULT_GEO_STALE_LOOKUP_DAYS`]; read it through
+     * [`GeoSettings::effective_stale_lookup_days`].
+     */
+    stale_lookup_days?: number | null;
+};
+
+/**
+ * Geolocation settings with the MaxMind license key masked.
+ *
+ * The stored value is AES-256-GCM ciphertext, and neither it nor the
+ * plaintext is ever returned: the UI only needs to know whether a key is
+ * saved, so it can render the "leave blank to keep current" affordance the
+ * email-provider credentials use. The refresh metadata below is reported
+ * read-only — it is written by the refresh job, not by a settings save.
+ */
+export type GeoSettingsMasked = {
+    /**
+     * Refresh cadence actually applied, with defaults and bounds resolved.
+     */
+    effective_refresh_interval_hours: number;
+    /**
+     * Staleness window actually applied, with defaults and bounds resolved.
+     */
+    effective_stale_lookup_days: number;
+    /**
+     * When a refresh was last attempted, successful or not (ISO 8601, UTC).
+     */
+    last_check_at?: string | null;
+    /**
+     * `ok` or `error` for the most recent refresh attempt.
+     */
+    last_check_status?: string | null;
+    /**
+     * Redacted reason the last refresh failed. Never contains the key.
+     */
+    last_error?: string | null;
+    /**
+     * When new database bytes were last installed (ISO 8601, UTC).
+     */
+    last_refreshed_at?: string | null;
+    /**
+     * True when a MaxMind license key is stored. The key is never returned.
+     */
+    maxmind_license_key_saved: boolean;
+    /**
+     * `null` means the effective default (24 hours).
+     */
+    refresh_interval_hours?: number | null;
+    /**
+     * `maxmind_official` or `bundled_github`.
+     */
+    source?: string | null;
+    /**
+     * `null` means the effective default (30 days).
+     */
+    stale_lookup_days?: number | null;
 };
 
 export type GetDeploymentsParams = {
@@ -37876,6 +38061,39 @@ export type GetFlagSnapshotResponses = {
 };
 
 export type GetFlagSnapshotResponse = GetFlagSnapshotResponses[keyof GetFlagSnapshotResponses];
+
+export type GetGeoDatabaseStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/geo/status';
+};
+
+export type GetGeoDatabaseStatusErrors = {
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetGeoDatabaseStatusError = GetGeoDatabaseStatusErrors[keyof GetGeoDatabaseStatusErrors];
+
+export type GetGeoDatabaseStatusResponses = {
+    /**
+     * Geolocation database status retrieved
+     */
+    200: GeoDatabaseStatusResponse;
+};
+
+export type GetGeoDatabaseStatusResponse = GetGeoDatabaseStatusResponses[keyof GetGeoDatabaseStatusResponses];
 
 export type GetIpGeolocationData = {
     body?: never;
