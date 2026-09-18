@@ -40,6 +40,7 @@ pub mod release_images {
     pub const LOCAL_PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448";
     include!(concat!(env!("OUT_DIR"), "/release_images.rs"));
 }
+pub mod docker_handle;
 pub mod retention;
 pub mod retry;
 pub mod runtime;
@@ -47,6 +48,7 @@ pub mod sandbox_runtime;
 pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
+pub mod serve_profile;
 pub mod source_drop;
 pub mod static_files;
 pub mod telemetry;
@@ -54,11 +56,15 @@ pub mod time_window;
 pub mod tls;
 pub mod traces;
 pub mod update_status;
+pub use docker_handle::{DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON};
 pub use problemdetails::ProblemDetails;
 pub use self_update::{
     ReleaseCheckResult, SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability,
     SelfUpdateError, SelfUpdatePhase, SelfUpdatePolicy, SelfUpdateRestartMode, SelfUpdateStatus,
     SelfUpdater, StartedSelfUpdate, SupervisorKind, SELF_UPDATE_JOURNAL_FILE,
+};
+pub use serve_profile::{
+    policy_or_default, LocalWorkloadPolicy, PROFILE_CONTROL_PLANE, PROFILE_FULL,
 };
 pub use update_status::{AvailableUpdate, UpdateStatusSlot, UPGRADE_DOCS_URL};
 mod app_settings;
