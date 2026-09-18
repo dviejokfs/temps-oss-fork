@@ -827,7 +827,11 @@ impl WorkflowExecutionService {
         info!("Built workflow with {} jobs", workflow.jobs.len());
 
         // Create job tracker for updating deployment_jobs table
-        let job_tracker = Arc::new(DeploymentJobTracker::new(self.db.clone(), deployment_id));
+        let job_tracker = Arc::new(DeploymentJobTracker::new(
+            self.db.clone(),
+            deployment_id,
+            self.log_service.clone(),
+        ));
 
         // Execute workflow
         let executor = WorkflowExecutor::new(Some(job_tracker));
