@@ -57,8 +57,8 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 use temps_cloud_protocol::{
-    Capability, Envelope, Heartbeat, HeartbeatAck, Hello, StatusReport, StatusRequest,
-    PROTOCOL_VERSION,
+    truncate_status_text, Capability, Envelope, Heartbeat, HeartbeatAck, Hello, StatusReport,
+    StatusRequest, StatusSelfUpdate, PROTOCOL_VERSION,
 };
 
 use crate::link::CloudLink;
@@ -94,6 +94,23 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// fresher read sooner (see [`heartbeat_loop`]); this interval only bounds
 /// the *unprompted* cadence.
 pub const STATUS_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Bound on a single [`StatusProvider::snapshot`] call.
+///
+/// This loop shares one `tokio::select!` between heartbeats, socket reads,
+/// cancellation, and status reports: while one arm's future is running, none
+/// of the others are polled. An unbounded `snapshot()` call (a real
+/// implementation will typically be a database read) could therefore stall
+/// heartbeats past the server's idle window and delay clean shutdown for as
+/// long as the call hangs — this is not something every future
+/// `StatusProvider` implementation can be trusted to bound on its own, so it
+/// is enforced at the one call site instead. Five seconds matches this
+/// codebase's own convention for a single bounded database operation (see
+/// `CLAUDE.md`'s timeout-handling example) and sits comfortably under both
+/// [`HEARTBEAT_INTERVAL`] (30s) and the server's heartbeat-idle timeout
+/// (90s), so a single slow snapshot can cost at most one skipped status
+/// report, never a missed heartbeat or a wedged shutdown.
+const STATUS_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bound on connect + handshake. The server closes the connection if it does
 /// not receive this task's `Hello` within its own 10s window, so completing
@@ -351,9 +368,35 @@ fn status_reporting_enabled(negotiated: &[Capability], has_status_provider: bool
     has_status_provider && negotiated.contains(&Capability::InstanceStatusReporting)
 }
 
+/// Enforce [`temps_cloud_protocol::MAX_STATUS_TEXT_CHARS`] on the free-text
+/// fields of a self-update snapshot at the point it is copied into an
+/// outgoing [`StatusReport`].
+///
+/// [`StatusSelfUpdate`]'s own doc comment is explicit that the wire type does
+/// not re-validate this itself — some producer on the send path has to, and
+/// that must not depend on every [`StatusProvider`] implementation
+/// remembering to call [`truncate_status_text`] before returning its
+/// snapshot. Enforcing it here, once, on the way to the wire, makes the bound
+/// hold regardless of what any given provider does.
+fn cap_self_update_text(mut self_update: StatusSelfUpdate) -> StatusSelfUpdate {
+    self_update.blocker_reason = self_update
+        .blocker_reason
+        .as_deref()
+        .map(truncate_status_text);
+    if let Some(attempt) = self_update.last_attempt.as_mut() {
+        attempt.error = attempt.error.as_deref().map(truncate_status_text);
+    }
+    self_update
+}
+
 /// Build and send one [`StatusReport`], filling in the parts this crate knows
 /// about itself (`instance_id`, `temps_version`, `uptime_seconds`) around the
 /// snapshot from `status_provider`.
+///
+/// The snapshot call is bounded by [`STATUS_SNAPSHOT_TIMEOUT`]: a timeout is
+/// logged and treated as "nothing to report this cycle" (`Ok(())`), never as
+/// a connection failure — the whole point of the bound is that a slow
+/// provider must not be able to take the management connection down with it.
 async fn send_status_report(
     write: &mut WsWrite,
     link: &CloudLink,
@@ -361,7 +404,17 @@ async fn send_status_report(
     started_at: Instant,
     status_provider: &Arc<dyn StatusProvider>,
 ) -> Result<(), HeartbeatError> {
-    let snapshot = status_provider.snapshot().await;
+    let snapshot =
+        match tokio::time::timeout(STATUS_SNAPSHOT_TIMEOUT, status_provider.snapshot()).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = STATUS_SNAPSHOT_TIMEOUT.as_secs(),
+                    "Cloud status provider snapshot timed out; skipping this status report cycle"
+                );
+                return Ok(());
+            }
+        };
     let report = StatusReport {
         instance_id,
         temps_version: link.agent_version().to_string(),
@@ -370,9 +423,11 @@ async fn send_status_report(
         service_count: snapshot.service_count,
         project_count: snapshot.project_count,
         resources: snapshot.resources,
-        self_update: snapshot.self_update,
+        self_update: snapshot.self_update.map(cap_self_update_text),
     };
-    send_envelope(write, "status_report", &report).await
+    send_envelope(write, "status_report", &report).await?;
+    tracing::debug!("Cloud status report sent");
+    Ok(())
 }
 
 /// Send heartbeats on [`HEARTBEAT_INTERVAL`] and read back acknowledgements
@@ -445,7 +500,6 @@ async fn heartbeat_loop(
                         tracing::debug!(%error, "Cloud status report send failed; will reconnect");
                         return CycleOutcome::Disconnected;
                     }
-                    tracing::debug!("Cloud status report sent");
                 }
             }
             message = read.next() => {
@@ -739,6 +793,17 @@ mod tests {
     impl StatusProvider for FixedStatusProvider {
         async fn snapshot(&self) -> StatusSnapshot {
             self.0.clone()
+        }
+    }
+
+    /// A [`StatusProvider`] whose `snapshot()` never resolves inside the test
+    /// window, for exercising [`STATUS_SNAPSHOT_TIMEOUT`].
+    struct HangingStatusProvider;
+
+    #[async_trait]
+    impl StatusProvider for HangingStatusProvider {
+        async fn snapshot(&self) -> StatusSnapshot {
+            std::future::pending().await
         }
     }
 
@@ -1173,6 +1238,203 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), cycle)
             .await
             .expect("connection cycle must stop promptly on cancellation")
+            .expect("connection cycle must not panic");
+    }
+
+    fn long_text() -> String {
+        "x".repeat(temps_cloud_protocol::MAX_STATUS_TEXT_CHARS + 500)
+    }
+
+    fn self_update_with_free_text(
+        blocker_reason: Option<String>,
+        error: Option<String>,
+    ) -> StatusSelfUpdate {
+        StatusSelfUpdate {
+            enabled: false,
+            supervisor: temps_cloud_protocol::StatusSupervisorKind::None,
+            restart_mode: temps_cloud_protocol::StatusSelfUpdateRestartMode::Manual,
+            blocker: Some(temps_cloud_protocol::StatusSelfUpdateBlocker::BinaryNotWritable),
+            blocker_reason,
+            phase: temps_cloud_protocol::StatusSelfUpdatePhase::Failed,
+            available_update: None,
+            last_attempt: Some(temps_cloud_protocol::StatusSelfUpdateAttempt {
+                status: temps_cloud_protocol::StatusSelfUpdateAttemptOutcome::Failed,
+                from_version: "v0.2.9".into(),
+                to_version: None,
+                finished_at: None,
+                error,
+            }),
+        }
+    }
+
+    #[test]
+    fn cap_self_update_text_truncates_both_free_text_fields() {
+        let long = long_text();
+        let capped = cap_self_update_text(self_update_with_free_text(
+            Some(long.clone()),
+            Some(long.clone()),
+        ));
+
+        let blocker_reason = capped
+            .blocker_reason
+            .expect("blocker reason must remain set");
+        assert!(blocker_reason.chars().count() < long.chars().count());
+        assert!(blocker_reason.ends_with("…[truncated]"));
+
+        let error = capped
+            .last_attempt
+            .expect("last attempt must remain set")
+            .error
+            .expect("error must remain set");
+        assert!(error.chars().count() < long.chars().count());
+        assert!(error.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn cap_self_update_text_leaves_short_text_and_absent_fields_untouched() {
+        let self_update = self_update_with_free_text(None, None);
+        let capped = cap_self_update_text(self_update.clone());
+        assert_eq!(capped, self_update);
+
+        let short = self_update_with_free_text(
+            Some("binary not writable".into()),
+            Some("permission denied".into()),
+        );
+        let capped = cap_self_update_text(short.clone());
+        assert_eq!(capped, short, "short text must round-trip unchanged");
+    }
+
+    /// End to end: even a `StatusProvider` that forgets to bound its own
+    /// free-text fields must never put an oversized frame on the wire -- the
+    /// cap has to be enforced on the send path itself, not merely documented
+    /// as the provider's responsibility.
+    #[tokio::test]
+    async fn oversized_self_update_text_is_truncated_before_it_reaches_the_wire() {
+        let long = long_text();
+        let stub = Stub {
+            extra_server_capabilities: Arc::new(Mutex::new(vec![
+                Capability::InstanceStatusReporting,
+            ])),
+            ..Default::default()
+        };
+        let Some(backend_url) = serve(stub.clone()).await else {
+            return;
+        };
+        let (link, _directory) = linked_test_link(&backend_url).await;
+        let snapshot = StatusSnapshot {
+            self_update: Some(self_update_with_free_text(
+                Some(long.clone()),
+                Some(long.clone()),
+            )),
+            ..fixed_snapshot()
+        };
+        let provider: Arc<dyn StatusProvider> = Arc::new(FixedStatusProvider(snapshot));
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let mut cancel = cancel_rx;
+        let link_for_cycle = link.clone();
+        let cycle = tokio::spawn(async move {
+            connection_cycle(
+                &link_for_cycle,
+                &mut cancel,
+                Some(&provider),
+                Instant::now(),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stub.status_reports_received.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a status report must arrive");
+
+        let report = stub
+            .last_status_report
+            .lock()
+            .expect("last status report lock")
+            .clone()
+            .expect("a status report must have been recorded");
+        let self_update = report.self_update.expect("self update must be present");
+        let blocker_reason = self_update
+            .blocker_reason
+            .expect("blocker reason must be present");
+        let error = self_update
+            .last_attempt
+            .expect("last attempt must be present")
+            .error
+            .expect("error must be present");
+        assert!(
+            blocker_reason.chars().count() < long.chars().count(),
+            "the oversized blocker reason must have been truncated before it left the instance"
+        );
+        assert!(blocker_reason.ends_with("…[truncated]"));
+        assert!(
+            error.chars().count() < long.chars().count(),
+            "the oversized attempt error must have been truncated before it left the instance"
+        );
+        assert!(error.ends_with("…[truncated]"));
+
+        cancel_tx.send(true).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(5), cycle)
+            .await
+            .expect("connection cycle must stop promptly on cancellation")
+            .expect("connection cycle must not panic");
+    }
+
+    /// The bug this guards against: without a bound on `snapshot()`, a single
+    /// stalled provider call would occupy the `select!` loop indefinitely,
+    /// silently suppressing heartbeats and blocking cancellation for as long
+    /// as it hangs. A provider that never resolves must instead cost at most
+    /// one skipped status report, with heartbeats and shutdown unaffected.
+    #[tokio::test]
+    async fn a_hanging_status_provider_is_bounded_and_never_wedges_the_loop() {
+        let stub = Stub {
+            extra_server_capabilities: Arc::new(Mutex::new(vec![
+                Capability::InstanceStatusReporting,
+            ])),
+            ..Default::default()
+        };
+        let Some(backend_url) = serve(stub.clone()).await else {
+            return;
+        };
+        let (link, _directory) = linked_test_link(&backend_url).await;
+        let provider: Arc<dyn StatusProvider> = Arc::new(HangingStatusProvider);
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let mut cancel = cancel_rx;
+        let link_for_cycle = link.clone();
+        let cycle = tokio::spawn(async move {
+            connection_cycle(
+                &link_for_cycle,
+                &mut cancel,
+                Some(&provider),
+                Instant::now(),
+            )
+            .await
+        });
+
+        // Let the immediate on-connect tick fire and time out on its own --
+        // this is what proves the bound actually applies, rather than the
+        // call coincidentally finishing fast.
+        tokio::time::sleep(STATUS_SNAPSHOT_TIMEOUT + Duration::from_millis(500)).await;
+        assert_eq!(
+            stub.status_reports_received.load(Ordering::SeqCst),
+            0,
+            "a snapshot call that never resolves must never produce a report"
+        );
+
+        // The loop must still be responsive to cancellation: proof it was
+        // never wedged on the hanging snapshot call.
+        cancel_tx.send(true).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(5), cycle)
+            .await
+            .expect(
+                "connection cycle must remain responsive to cancellation \
+                 even after a snapshot timeout",
+            )
             .expect("connection cycle must not panic");
     }
 }

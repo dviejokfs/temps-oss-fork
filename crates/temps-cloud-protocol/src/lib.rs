@@ -32,21 +32,21 @@
 pub mod messages;
 
 pub use messages::{
-    BackupCompression, BackupEngine, BackupFormat, BackupLifecycleEventAccepted,
-    BackupLifecycleEventRequest, BackupLifecycleStage, BackupManifest, BackupManifestObjects,
-    EnrollRequest, EnrollResponse, Envelope, Heartbeat, HeartbeatAck, IngestAck,
-    ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability, ManagedAiChatRequest,
-    ManagedAiChatResponse, ManagedAiCitation, ManagedAiEvidence, ManagedAiTask,
-    ManagedBackupCapability, ManagedNotificationAccepted, ManagedNotificationRequest,
-    ManagedNotificationSeverity, NativeSnapshot, NativeSnapshotIdentity,
-    NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind, NativeSnapshotRequest, SpanRecord,
-    StatusAvailableUpdate, StatusReport, StatusRequest, StatusResourceSummary, StatusSelfUpdate,
-    StatusSelfUpdateAttempt, StatusSelfUpdateAttemptOutcome, StatusSelfUpdateBlocker,
-    StatusSelfUpdatePhase, StatusSelfUpdateRestartMode, StatusSupervisorKind, TelemetryBatch,
-    WalGObjectCompleted, WalGObjectDeclaration, WalGObjectKind, WalGObjectTarget,
-    WalGObjectTargetRequest, WalGSnapshot, WalGSnapshotCompleted, WalGSnapshotRequest,
-    BACKUP_MANIFEST_VERSION, MANIFEST_DECLARATION_THRESHOLD, MAX_BACKUP_MANIFEST_BYTES,
-    MAX_STATUS_TEXT_CHARS,
+    truncate_status_text, BackupCompression, BackupEngine, BackupFormat,
+    BackupLifecycleEventAccepted, BackupLifecycleEventRequest, BackupLifecycleStage,
+    BackupManifest, BackupManifestObjects, EnrollRequest, EnrollResponse, Envelope, Heartbeat,
+    HeartbeatAck, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
+    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedAiCitation,
+    ManagedAiEvidence, ManagedAiTask, ManagedBackupCapability, ManagedNotificationAccepted,
+    ManagedNotificationRequest, ManagedNotificationSeverity, NativeSnapshot,
+    NativeSnapshotIdentity, NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind,
+    NativeSnapshotRequest, SpanRecord, StatusAvailableUpdate, StatusReport, StatusRequest,
+    StatusResourceSummary, StatusSelfUpdate, StatusSelfUpdateAttempt,
+    StatusSelfUpdateAttemptOutcome, StatusSelfUpdateBlocker, StatusSelfUpdatePhase,
+    StatusSelfUpdateRestartMode, StatusSupervisorKind, TelemetryBatch, WalGObjectCompleted,
+    WalGObjectDeclaration, WalGObjectKind, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
+    WalGSnapshotCompleted, WalGSnapshotRequest, BACKUP_MANIFEST_VERSION,
+    MANIFEST_DECLARATION_THRESHOLD, MAX_BACKUP_MANIFEST_BYTES, MAX_STATUS_TEXT_CHARS,
 };
 
 use serde::{Deserialize, Serialize};
