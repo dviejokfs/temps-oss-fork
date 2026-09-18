@@ -20,6 +20,7 @@ pub mod error_metrics;
 pub mod external_plugin;
 pub mod feature_maturity;
 pub mod jobs;
+pub mod log_storage_config;
 pub mod managed_backup_schedule;
 pub mod node_pki;
 pub mod notifications;
@@ -106,6 +107,7 @@ pub use env_vars_provider::{
 pub use error::*;
 pub use error_builder::*;
 pub use jobs::*;
+pub use log_storage_config::LogStorageConfig;
 pub use managed_backup_schedule::{
     ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleError,
     ManagedBackupScheduleProvisioner, ReleasedManagedBackupSchedules,
