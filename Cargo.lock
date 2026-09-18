@@ -12157,6 +12157,8 @@ name = "temps-logs"
 version = "0.1.0-beta.56"
 dependencies = [
  "async-stream",
+ "async-trait",
+ "aws-sdk-s3",
  "bollard",
  "chrono",
  "futures",

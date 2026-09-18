@@ -2547,9 +2547,19 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     plugin_manager.register_plugin(queue_plugin);
 
     // 2.5. LogsPlugin - provides logging services (no dependencies)
+    //
+    // Resolved once here and reused for LogAggregatorPlugin below: one
+    // TEMPS_LOG_STORAGE_BACKEND / TEMPS_LOG_S3_* operator decision drives
+    // where Temps puts BOTH build/deploy job logs (this plugin) and
+    // aggregated container logs (LogAggregatorPlugin) -- they're the same
+    // "local disk or S3-compatible bucket" question, so they share one
+    // config resolution instead of two independent env-var reads that could
+    // drift out of sync.
     debug!("Registering LogsPlugin");
     let logs_dir = config.data_dir.join("logs");
-    let logs_plugin = Box::new(LogsPlugin::new(logs_dir));
+    let shared_log_storage_config = log_aggregator_storage_config(&config.data_dir)
+        .map_err(|e| anyhow::anyhow!("❌ Log storage configuration is invalid\n\n{e}"))?;
+    let logs_plugin = Box::new(LogsPlugin::new(logs_dir, shared_log_storage_config.clone()));
     plugin_manager.register_plugin(logs_plugin);
 
     // 3.1. EventsPlugin - provides custom events tracking (depends on database)
@@ -2765,11 +2775,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // would 404 those routes and leave worker logs uncollected, which is the
     // opposite of what this profile is for.
     debug!("Registering LogAggregatorPlugin");
-    let log_aggregator_storage_config =
-        log_aggregator_storage_config(&config.data_dir).map_err(|e| {
-            anyhow::anyhow!("❌ Log aggregator storage configuration is invalid\n\n{e}")
-        })?;
-    let log_aggregator_plugin = Box::new(LogAggregatorPlugin::new(log_aggregator_storage_config));
+    // Reuses `shared_log_storage_config`, resolved once above alongside
+    // LogsPlugin -- see the comment there for why these two plugins share a
+    // single config resolution instead of two independent env-var reads.
+    let log_aggregator_plugin = Box::new(LogAggregatorPlugin::new(shared_log_storage_config));
     plugin_manager.register_plugin(log_aggregator_plugin);
 
     // 9.5. ImportPlugin - provides workload import functionality (depends on

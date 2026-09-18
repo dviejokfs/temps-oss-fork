@@ -9,17 +9,40 @@ use temps_database::DbConnection;
 use temps_entities::{
     deployment_jobs, prelude::DeploymentJobs, types::JobStatus as EntityJobStatus,
 };
-use tracing::debug;
+use temps_logs::LogService;
+use tracing::{debug, warn};
 
 /// Tracks job execution status in the deployment_jobs table
 pub struct DeploymentJobTracker {
     db: Arc<DbConnection>,
     deployment_id: i32,
+    log_service: Arc<LogService>,
 }
 
 impl DeploymentJobTracker {
-    pub fn new(db: Arc<DbConnection>, deployment_id: i32) -> Self {
-        Self { db, deployment_id }
+    pub fn new(db: Arc<DbConnection>, deployment_id: i32, log_service: Arc<LogService>) -> Self {
+        Self {
+            db,
+            deployment_id,
+            log_service,
+        }
+    }
+
+    /// Archive a job's log to the configured backend (S3, when
+    /// `TEMPS_LOG_STORAGE_BACKEND=s3`) now that it has reached a terminal
+    /// state, freeing the local scratch file. Best-effort: an archival
+    /// failure must never fail the job/deployment that already finished --
+    /// the job's outcome and the log's storage location are independent
+    /// concerns, and a build the user is waiting on should not be reported
+    /// as failed because of a transient S3 hiccup after the fact.
+    async fn archive_job_log(&self, log_id: &str) {
+        if let Err(e) = self.log_service.archive_log(log_id).await {
+            warn!(
+                deployment_id = self.deployment_id,
+                log_id, error = %e,
+                "Failed to archive job log to configured backend; log remains on local disk"
+            );
+        }
     }
 
     /// Convert temps_core::JobStatus to temps_entities::types::JobStatus
@@ -55,6 +78,12 @@ impl JobTracker for DeploymentJobTracker {
                 WorkflowError::Other(format!("Job {} not found in deployment_jobs", job_id))
             })?;
 
+        // Capture before `job` is consumed below -- needed for archival if
+        // this call already lands the job in a terminal state (e.g.
+        // `WorkflowExecutor::persist_terminal_status` creating a job record
+        // that failed prerequisite validation without ever running).
+        let log_id = job.log_id.clone();
+
         // Update status and timestamps
         let mut active_job: deployment_jobs::ActiveModel = job.clone().into();
         active_job.status = Set(Self::convert_status(status.clone()));
@@ -71,6 +100,16 @@ impl JobTracker for DeploymentJobTracker {
             .await
             .map_err(|e| WorkflowError::Other(format!("Failed to update job status: {}", e)))?;
 
+        if matches!(
+            status,
+            CoreJobStatus::Success
+                | CoreJobStatus::Failure
+                | CoreJobStatus::Cancelled
+                | CoreJobStatus::Skipped
+        ) {
+            self.archive_job_log(&log_id).await;
+        }
+
         Ok(job.id)
     }
 
@@ -86,10 +125,22 @@ impl JobTracker for DeploymentJobTracker {
             .map_err(|e| WorkflowError::Other(format!("Failed to find job: {}", e)))?
             .ok_or_else(|| WorkflowError::Other("Job not found".to_string()))?;
 
+        // Captured before `job` is consumed below -- this is the job whose
+        // log gets archived once we know the status update below reaches a
+        // terminal state.
+        let log_id = job.log_id.clone();
+
         let mut active_job: deployment_jobs::ActiveModel = job.into();
         active_job.status = Set(Self::convert_status(status.clone()));
 
         // Set timestamps based on status
+        let is_terminal = matches!(
+            status,
+            CoreJobStatus::Success
+                | CoreJobStatus::Failure
+                | CoreJobStatus::Cancelled
+                | CoreJobStatus::Skipped
+        );
         match status {
             CoreJobStatus::Running => {
                 let now = chrono::Utc::now();
@@ -116,6 +167,15 @@ impl JobTracker for DeploymentJobTracker {
             .update(self.db.as_ref())
             .await
             .map_err(|e| WorkflowError::Other(format!("Failed to update job status: {}", e)))?;
+
+        // Archive the job's log now that its terminal status is durably
+        // recorded (only once a job has actually finished running is it
+        // safe to stop treating the local file as a live scratch file --
+        // see `LogService::archive_log`'s doc comment). This is the hook
+        // that keeps local disk bounded to currently-running jobs.
+        if is_terminal {
+            self.archive_job_log(&log_id).await;
+        }
 
         Ok(())
     }
@@ -178,6 +238,15 @@ impl JobTracker for DeploymentJobTracker {
         Ok(())
     }
 
+    /// Cancel every still-`Pending` job for this deployment in one bulk
+    /// UPDATE. Deliberately does not archive these jobs' logs: a `Pending`
+    /// job has by definition never entered `Running` (that transition only
+    /// happens via `create_job_execution`/`update_job_status` above), so it
+    /// never called `LogService::log_*` and has no local log file to
+    /// archive. `archive_log` would be a correct no-op here too, but calling
+    /// it would mean an extra per-row S3-config check (and, if this bulk
+    /// path is ever used for a large fan-out of pending jobs, N archive
+    /// calls) for something that structurally cannot have written a log.
     async fn cancel_pending_jobs(
         &self,
         _workflow_run_id: &str,
@@ -231,6 +300,15 @@ mod tests {
     use temps_entities::{
         deployments, environments, preset::Preset, projects, upstream_config::UpstreamList,
     };
+
+    /// A `LogService` with no archive backend configured, matching the
+    /// default (filesystem-only) production behavior. None of these tests
+    /// exercise archival directly -- that's covered in `temps-logs`'
+    /// `file_logs` tests -- they only need a real `LogService` to satisfy
+    /// `DeploymentJobTracker::new`'s constructor.
+    fn test_log_service() -> Arc<LogService> {
+        Arc::new(LogService::new(std::env::temp_dir()))
+    }
 
     async fn create_test_deployment(
         db: &Arc<DbConnection>,
@@ -342,7 +420,7 @@ mod tests {
         )
         .await?;
 
-        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id, test_log_service());
 
         // Complete first required job
         tracker
@@ -432,7 +510,7 @@ mod tests {
         let job2_id =
             create_test_job(&db, deployment_id, "deploy", true, EntityJobStatus::Pending).await?;
 
-        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id, test_log_service());
 
         // Complete first job
         tracker
@@ -476,7 +554,7 @@ mod tests {
         )
         .await?;
 
-        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id, test_log_service());
 
         // Complete optional job
         tracker
@@ -522,7 +600,7 @@ mod tests {
         )
         .await?;
 
-        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id, test_log_service());
 
         // Complete only the required jobs
         tracker
@@ -598,7 +676,7 @@ mod tests {
         )
         .await?;
 
-        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id, test_log_service());
 
         // This is what WorkflowExecutor::persist_terminal_status does when
         // validate_prerequisites fails.
@@ -648,7 +726,7 @@ mod tests {
         let job_id =
             create_test_job(&db, deployment_id, "crons", false, EntityJobStatus::Pending).await?;
 
-        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id, test_log_service());
         tracker
             .update_job_status(
                 job_id,
@@ -691,7 +769,7 @@ mod tests {
         let job5_id =
             create_test_job(&db, deployment_id, "job5", true, EntityJobStatus::Pending).await?;
 
-        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id, test_log_service());
 
         // Mark job1 as success
         tracker
@@ -753,6 +831,137 @@ mod tests {
             .await?
             .unwrap();
         assert_eq!(job5.status, EntityJobStatus::Cancelled);
+
+        Ok(())
+    }
+
+    /// Records every `upload_log` call so tests can assert the
+    /// completion-hook wiring (not `LogService`'s own archival logic, which
+    /// is covered by `temps-logs`' own tests) actually fires exactly once
+    /// per terminal transition, with the right key.
+    #[derive(Default)]
+    struct RecordingArchive {
+        uploaded_keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_logs::LogArchiveStorage for RecordingArchive {
+        async fn upload_log(
+            &self,
+            key: &str,
+            _data: Vec<u8>,
+        ) -> Result<(), temps_logs::LogArchiveStorageError> {
+            self.uploaded_keys
+                .lock()
+                .expect("recording archive lock poisoned")
+                .push(key.to_string());
+            Ok(())
+        }
+
+        async fn download_log(
+            &self,
+            key: &str,
+        ) -> Result<Vec<u8>, temps_logs::LogArchiveStorageError> {
+            Err(temps_logs::LogArchiveStorageError::NotFound {
+                bucket: "recording-archive".to_string(),
+                key: key.to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_job_status_terminal_archives_log_when_backend_configured(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (deployment_id, _environment_id) = create_test_deployment(&db).await?;
+        let job_id =
+            create_test_job(&db, deployment_id, "build", true, EntityJobStatus::Pending).await?;
+
+        let temp_dir = tempfile::TempDir::new()?;
+        let archive = std::sync::Arc::new(RecordingArchive::default());
+        let log_service = std::sync::Arc::new(LogService::with_archive(
+            temp_dir.path().to_path_buf(),
+            Some(archive.clone() as std::sync::Arc<dyn temps_logs::LogArchiveStorage>),
+        ));
+
+        // `create_test_job`'s log_id ("test-log-build") deliberately has no
+        // `/` and no extension, which is fine for the other tests in this
+        // file but doesn't reflect real `deployment_jobs.log_id` values
+        // (always `{project}/{env}/{date-path}/deployment-{id}-job-{job}.log`,
+        // see `workflow_planner.rs`) and would exercise the dormant
+        // `LogService` path-resolution quirk documented on
+        // `realistic_log_id` in `temps-logs`' `file_logs.rs` tests. Give
+        // this job a realistic log_id instead so the test exercises what
+        // production actually does.
+        let job = DeploymentJobs::find_by_id(job_id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        let mut active_job: deployment_jobs::ActiveModel = job.into();
+        active_job.log_id =
+            Set("proj/prod/2026/09/18/12/00/deployment-1-job-build.log".to_string());
+        let job = active_job.update(db.as_ref()).await?;
+
+        // The job actually "runs" and writes a log line, exactly like a real
+        // deployment job would via DeploymentStageLogWriter, so there is a
+        // local file for the completion hook to archive.
+        log_service
+            .log_info(&job.log_id, "Building image...")
+            .await?;
+
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id, log_service.clone());
+
+        tracker
+            .update_job_status(job_id, CoreJobStatus::Success, None)
+            .await?;
+
+        let uploaded = archive.uploaded_keys.lock().unwrap().clone();
+        assert_eq!(
+            uploaded.len(),
+            1,
+            "expected exactly one archive upload for the completed job"
+        );
+        assert!(
+            uploaded[0].ends_with(&job.log_id),
+            "archived key '{}' should be derived from the job's log_id '{}'",
+            uploaded[0],
+            job.log_id
+        );
+
+        // The completion hook must also have deleted the local scratch file.
+        assert!(!log_service.get_log_path(&job.log_id).exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_job_status_non_terminal_does_not_archive(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (deployment_id, _environment_id) = create_test_deployment(&db).await?;
+        let job_id =
+            create_test_job(&db, deployment_id, "build", true, EntityJobStatus::Pending).await?;
+
+        let temp_dir = tempfile::TempDir::new()?;
+        let archive = std::sync::Arc::new(RecordingArchive::default());
+        let log_service = std::sync::Arc::new(LogService::with_archive(
+            temp_dir.path().to_path_buf(),
+            Some(archive.clone() as std::sync::Arc<dyn temps_logs::LogArchiveStorage>),
+        ));
+
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id, log_service);
+
+        // Transitioning to Running (non-terminal) must never trigger archival
+        // -- the job is still writing to its log file.
+        tracker
+            .update_job_status(job_id, CoreJobStatus::Running, None)
+            .await?;
+
+        assert!(archive.uploaded_keys.lock().unwrap().is_empty());
 
         Ok(())
     }
