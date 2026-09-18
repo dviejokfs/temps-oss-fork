@@ -27,6 +27,22 @@ use crate::structured_logs::{LogEntry, LogLevel, StructuredLogService};
 /// and `TEMPS_LOG_S3_PREFIX`.
 const ARCHIVE_KEY_PREFIX: &str = "build-logs";
 
+/// Per-attempt bound on the S3 upload issued by `archive_log`. Paired with
+/// `ARCHIVE_UPLOAD_RETRIES` below so a stalled connection to the configured
+/// backend can't hang the archival step indefinitely -- worst case is
+/// `ARCHIVE_UPLOAD_RETRIES` attempts of up to this long each, plus backoff
+/// between them, not an unbounded wait.
+const ARCHIVE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Number of attempts `archive_log` makes against the configured S3 backend
+/// before giving up and leaving the log on local disk. Transient network
+/// blips or momentary bucket unavailability are common enough on
+/// self-hosted setups (a MinIO/RustFS container restarting, a brief network
+/// partition) that a single failed attempt shouldn't strand the log
+/// permanently -- see the "Retry with Exponential Backoff" pattern in
+/// `CLAUDE.md`.
+const ARCHIVE_UPLOAD_RETRIES: u32 = 3;
+
 /// Default number of trailing lines replayed when a tail stream first attaches.
 ///
 /// This is the initial backlog the client receives before it starts seeing
@@ -190,9 +206,30 @@ impl LogService {
         };
 
         let key = self.archive_key(log_id);
-        archive.upload_log(&key, data).await.map_err(|e| {
-            std::io::Error::other(format!("failed to archive log '{log_id}' to S3: {e}"))
-        })?;
+
+        // Transient failures (a momentary network blip, a backend container
+        // mid-restart) are retried with backoff rather than immediately
+        // stranding the log on local disk -- each attempt is individually
+        // bounded by ARCHIVE_UPLOAD_TIMEOUT so a hung connection can't block
+        // the retry loop indefinitely.
+        let retry_config = temps_core::retry::RetryConfig::new(ARCHIVE_UPLOAD_RETRIES)
+            .with_base_delay(Duration::from_secs(1))
+            .with_max_delay(Duration::from_secs(10));
+        retry_config
+            .retry(|| {
+                let data = data.clone();
+                let key = key.clone();
+                async move {
+                    tokio::time::timeout(ARCHIVE_UPLOAD_TIMEOUT, archive.upload_log(&key, data))
+                        .await
+                        .map_err(|_| format!("upload timed out after {ARCHIVE_UPLOAD_TIMEOUT:?}"))?
+                        .map_err(|e| e.to_string())
+                }
+            })
+            .await
+            .map_err(|e| {
+                std::io::Error::other(format!("failed to archive log '{log_id}' to S3: {e}"))
+            })?;
 
         if let Err(e) = tokio::fs::remove_file(&log_path).await {
             // The archive upload succeeded -- the important half of this

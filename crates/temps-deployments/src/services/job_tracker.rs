@@ -35,14 +35,38 @@ impl DeploymentJobTracker {
     /// the job's outcome and the log's storage location are independent
     /// concerns, and a build the user is waiting on should not be reported
     /// as failed because of a transient S3 hiccup after the fact.
-    async fn archive_job_log(&self, log_id: &str) {
-        if let Err(e) = self.log_service.archive_log(log_id).await {
-            warn!(
-                deployment_id = self.deployment_id,
-                log_id, error = %e,
-                "Failed to archive job log to configured backend; log remains on local disk"
-            );
-        }
+    ///
+    /// Fire-and-forget: spawned onto its own task rather than awaited on the
+    /// caller's stack. `update_job_status`/`create_job_execution` sit on the
+    /// workflow executor's critical path -- it can't schedule a dependent
+    /// job batch or report the deployment as complete until they return --
+    /// so a slow or momentarily unavailable S3 endpoint must never stall
+    /// them, even with `LogService::archive_log`'s own bounded
+    /// timeout/retry, whose worst case (several attempts, each up to 30s,
+    /// with backoff between) is still far too long to hold up scheduling.
+    /// If the process exits before the spawned task completes (e.g. a
+    /// restart raced with a job finishing), the archive step simply never
+    /// ran: the local scratch file is left in place rather than orphaned or
+    /// deleted, and `LogService::get_log_content`'s local-file-first read
+    /// path keeps serving it exactly as it would have before this feature
+    /// existed -- nothing is lost, that one job's log just permanently stays
+    /// on local disk (today's default behavior) instead of also landing in
+    /// the bucket. This is a known, documented trade-off of the
+    /// fire-and-forget design, not a failure mode: it trades a rare,
+    /// bounded amount of local disk for never blocking the workflow on S3.
+    fn archive_job_log(&self, log_id: String) {
+        let log_service = self.log_service.clone();
+        let deployment_id = self.deployment_id;
+        tokio::spawn(async move {
+            if let Err(e) = log_service.archive_log(&log_id).await {
+                warn!(
+                    deployment_id,
+                    log_id = %log_id,
+                    error = %e,
+                    "Failed to archive job log to configured backend; log remains on local disk"
+                );
+            }
+        });
     }
 
     /// Convert temps_core::JobStatus to temps_entities::types::JobStatus
@@ -107,7 +131,7 @@ impl JobTracker for DeploymentJobTracker {
                 | CoreJobStatus::Cancelled
                 | CoreJobStatus::Skipped
         ) {
-            self.archive_job_log(&log_id).await;
+            self.archive_job_log(log_id);
         }
 
         Ok(job.id)
@@ -174,7 +198,7 @@ impl JobTracker for DeploymentJobTracker {
         // see `LogService::archive_log`'s doc comment). This is the hook
         // that keeps local disk bounded to currently-running jobs.
         if is_terminal {
-            self.archive_job_log(&log_id).await;
+            self.archive_job_log(log_id);
         }
 
         Ok(())
@@ -296,10 +320,34 @@ impl JobTracker for DeploymentJobTracker {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
+    use std::time::Duration;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         deployments, environments, preset::Preset, projects, upstream_config::UpstreamList,
     };
+
+    /// Polls `check` every 10ms until it returns `Some`, up to `timeout`.
+    ///
+    /// `DeploymentJobTracker::archive_job_log` is fire-and-forget
+    /// (`tokio::spawn`, deliberately not awaited on the workflow's critical
+    /// path -- see its doc comment), so tests asserting on its effects
+    /// (an upload landing in a mock archive, a local file disappearing)
+    /// can't rely on those effects being visible the instant the tracker
+    /// call returns. This gives the spawned task a bounded window to run
+    /// instead, mirroring the polling pattern `temps-logs`' own tests use
+    /// for tail-stream convergence.
+    async fn wait_for<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(value) = check() {
+                return Some(value);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     /// A `LogService` with no archive backend configured, matching the
     /// default (filesystem-only) production behavior. None of these tests
@@ -917,7 +965,16 @@ mod tests {
             .update_job_status(job_id, CoreJobStatus::Success, None)
             .await?;
 
-        let uploaded = archive.uploaded_keys.lock().unwrap().clone();
+        // Archival is fire-and-forget (spawned onto its own task so a slow
+        // S3 call can never block workflow progression -- see
+        // `DeploymentJobTracker::archive_job_log`), so give the spawned task
+        // a bounded window to actually run before asserting on its effects.
+        let uploaded = wait_for(Duration::from_secs(2), || {
+            let uploaded = archive.uploaded_keys.lock().unwrap().clone();
+            (!uploaded.is_empty()).then_some(uploaded)
+        })
+        .await
+        .expect("archive upload did not complete within 2s of update_job_status returning");
         assert_eq!(
             uploaded.len(),
             1,
@@ -930,8 +987,17 @@ mod tests {
             job.log_id
         );
 
-        // The completion hook must also have deleted the local scratch file.
-        assert!(!log_service.get_log_path(&job.log_id).exists());
+        // The completion hook must also have deleted the local scratch file
+        // once the upload succeeded -- also part of the same spawned task,
+        // so give it the same bounded window rather than a hard assertion.
+        let deleted = wait_for(Duration::from_secs(2), || {
+            (!log_service.get_log_path(&job.log_id).exists()).then_some(())
+        })
+        .await;
+        assert!(
+            deleted.is_some(),
+            "local scratch file was not removed within 2s of the archive upload"
+        );
 
         Ok(())
     }
