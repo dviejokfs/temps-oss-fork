@@ -43,6 +43,21 @@ const ARCHIVE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// `CLAUDE.md`.
 const ARCHIVE_UPLOAD_RETRIES: u32 = 3;
 
+/// Maximum number of `archive_log` uploads permitted to run concurrently.
+///
+/// S3 has no streaming-append primitive, so each concurrent upload buffers
+/// one finished log's *entire* contents in memory for the duration of the
+/// call (including retries). Temps targets small self-hosted machines (see
+/// CLAUDE.md's "Scalability & Efficiency" reference deployment: a 3 vCPU /
+/// 4 GB box), so a burst of many jobs completing at once -- or a slow S3
+/// endpoint holding uploads open -- must not be allowed to buffer an
+/// unbounded number of full logs simultaneously. Calls queue on this
+/// semaphore instead of racing to read+upload immediately; queued callers
+/// hold no log data in memory while waiting, only cheap suspended-task
+/// state (see `archive_log`, which acquires the permit before reading the
+/// file).
+const ARCHIVE_MAX_CONCURRENT_UPLOADS: usize = 4;
+
 /// Default number of trailing lines replayed when a tail stream first attaches.
 ///
 /// This is the initial backlog the client receives before it starts seeing
@@ -134,6 +149,11 @@ pub struct LogService {
     /// never deleted out from under a caller. `Some` is only ever set via
     /// [`LogService::with_archive`], wired up from `TEMPS_LOG_STORAGE_BACKEND=s3`.
     archive: Option<Arc<dyn LogArchiveStorage>>,
+    /// Bounds how many `archive_log` uploads run concurrently. Always
+    /// allocated (even when `archive` is `None`, in which case it's never
+    /// touched -- `archive_log` returns before reaching it) so the type
+    /// doesn't need a second `Option` layered on top of `archive`'s.
+    archive_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl LogService {
@@ -153,6 +173,9 @@ impl LogService {
             log_base_path,
             structured_service,
             archive,
+            archive_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                ARCHIVE_MAX_CONCURRENT_UPLOADS,
+            )),
         }
     }
 
@@ -198,6 +221,18 @@ impl LogService {
             return Ok(());
         };
 
+        // Bound how many uploads run -- and therefore how many full logs sit
+        // buffered in memory at once, since S3 has no streaming-append
+        // primitive -- concurrently. Acquired *before* reading the file, so
+        // a call queued behind a burst of concurrent completions holds no
+        // log data in memory while it waits, only cheap suspended-task
+        // state. See `ARCHIVE_MAX_CONCURRENT_UPLOADS`.
+        let _permit = self.archive_semaphore.acquire().await.map_err(|e| {
+            std::io::Error::other(format!(
+                "archive concurrency semaphore closed unexpectedly: {e}"
+            ))
+        })?;
+
         let log_path = self.get_log_path(log_id);
         let data = match tokio::fs::read(&log_path).await {
             Ok(data) => data,
@@ -207,29 +242,56 @@ impl LogService {
 
         let key = self.archive_key(log_id);
 
-        // Transient failures (a momentary network blip, a backend container
-        // mid-restart) are retried with backoff rather than immediately
-        // stranding the log on local disk -- each attempt is individually
-        // bounded by ARCHIVE_UPLOAD_TIMEOUT so a hung connection can't block
-        // the retry loop indefinitely.
+        // Hand-rolled retry loop rather than `temps_core::retry::RetryConfig::retry`
+        // (its own doc comment on `compute_delay` names this exact
+        // situation): a permanent failure -- bad credentials, a bucket that
+        // doesn't exist -- fails identically on every attempt, and
+        // `RetryConfig::retry` has no way to stop early on those, only on
+        // exhausting `max_attempts`. Reusing `compute_delay` keeps the same
+        // backoff math without duplicating it.
         let retry_config = temps_core::retry::RetryConfig::new(ARCHIVE_UPLOAD_RETRIES)
             .with_base_delay(Duration::from_secs(1))
             .with_max_delay(Duration::from_secs(10));
-        retry_config
-            .retry(|| {
-                let data = data.clone();
-                let key = key.clone();
-                async move {
-                    tokio::time::timeout(ARCHIVE_UPLOAD_TIMEOUT, archive.upload_log(&key, data))
-                        .await
-                        .map_err(|_| format!("upload timed out after {ARCHIVE_UPLOAD_TIMEOUT:?}"))?
-                        .map_err(|e| e.to_string())
+        let mut last_error = None;
+        'attempts: for attempt in 0..ARCHIVE_UPLOAD_RETRIES {
+            let upload = tokio::time::timeout(
+                ARCHIVE_UPLOAD_TIMEOUT,
+                archive.upload_log(&key, data.clone()),
+            )
+            .await;
+            match upload {
+                Ok(Ok(())) => {
+                    last_error = None;
+                    break 'attempts;
                 }
-            })
-            .await
-            .map_err(|e| {
-                std::io::Error::other(format!("failed to archive log '{log_id}' to S3: {e}"))
-            })?;
+                Ok(Err(e)) => {
+                    let retryable = e.is_retryable();
+                    let message = e.to_string();
+                    if !retryable {
+                        warn!(
+                            log_id,
+                            error = %message,
+                            "Archive upload failed permanently, not retrying"
+                        );
+                        last_error = Some(message);
+                        break 'attempts;
+                    }
+                    last_error = Some(message);
+                }
+                Err(_) => {
+                    last_error = Some(format!("upload timed out after {ARCHIVE_UPLOAD_TIMEOUT:?}"));
+                }
+            }
+            let is_last_attempt = attempt + 1 >= ARCHIVE_UPLOAD_RETRIES;
+            if !is_last_attempt {
+                tokio::time::sleep(retry_config.compute_delay(attempt)).await;
+            }
+        }
+        if let Some(e) = last_error {
+            return Err(std::io::Error::other(format!(
+                "failed to archive log '{log_id}' to S3: {e}"
+            )));
+        }
 
         if let Err(e) = tokio::fs::remove_file(&log_path).await {
             // The archive upload succeeded -- the important half of this
@@ -978,6 +1040,208 @@ mod tests {
                     key: key.to_string(),
                 })
         }
+    }
+
+    /// An archive backend that fails its first `fail_until` upload attempts
+    /// (with a caller-chosen `retryable` classification) before succeeding,
+    /// recording how many times `upload_log` was actually called so tests
+    /// can assert on retry behavior.
+    struct FailingArchive {
+        attempts: std::sync::atomic::AtomicU32,
+        fail_until: u32,
+        retryable: bool,
+    }
+
+    impl FailingArchive {
+        fn new(fail_until: u32, retryable: bool) -> Self {
+            Self {
+                attempts: std::sync::atomic::AtomicU32::new(0),
+                fail_until,
+                retryable,
+            }
+        }
+
+        fn attempt_count(&self) -> u32 {
+            self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LogArchiveStorage for FailingArchive {
+        async fn upload_log(
+            &self,
+            _key: &str,
+            _data: Vec<u8>,
+        ) -> Result<(), LogArchiveStorageError> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt < self.fail_until {
+                return Err(LogArchiveStorageError::Upload {
+                    bucket: "test-bucket".to_string(),
+                    key: "irrelevant".to_string(),
+                    reason: "synthetic failure".to_string(),
+                    retryable: self.retryable,
+                });
+            }
+            Ok(())
+        }
+
+        async fn download_log(&self, key: &str) -> Result<Vec<u8>, LogArchiveStorageError> {
+            Err(LogArchiveStorageError::NotFound {
+                bucket: "test-bucket".to_string(),
+                key: key.to_string(),
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_archive_log_does_not_retry_permanent_failure() {
+        // A permanent failure (bad credentials, missing bucket) fails
+        // identically on every attempt -- retrying it wastes the retry
+        // budget and the backoff delay on something that cannot succeed.
+        // `archive_log` must give up after exactly one attempt.
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(FailingArchive::new(u32::MAX, false));
+        let log_service =
+            LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive.clone()));
+
+        let log_id = realistic_log_id("test-archive-permanent-failure");
+        let log_id = log_id.as_str();
+        log_service.log_info(log_id, "building...").await.unwrap();
+        let log_path = log_service.get_log_path(log_id);
+
+        let result = log_service.archive_log(log_id).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            archive.attempt_count(),
+            1,
+            "a permanent failure must not be retried"
+        );
+        // Upload never succeeded, so the local scratch file must survive.
+        assert!(log_path.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_archive_log_retries_transient_failure_until_success() {
+        // A transient failure (network blip, backend mid-restart) should be
+        // retried with backoff until it succeeds, within the configured
+        // attempt budget (ARCHIVE_UPLOAD_RETRIES = 3).
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(FailingArchive::new(2, true));
+        let log_service =
+            LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive.clone()));
+
+        let log_id = realistic_log_id("test-archive-transient-failure");
+        let log_id = log_id.as_str();
+        log_service.log_info(log_id, "building...").await.unwrap();
+        let log_path = log_service.get_log_path(log_id);
+
+        let result = log_service.archive_log(log_id).await;
+
+        assert!(result.is_ok(), "expected eventual success: {result:?}");
+        assert_eq!(
+            archive.attempt_count(),
+            3,
+            "expected exactly 2 failed attempts followed by 1 successful attempt"
+        );
+        assert!(
+            !log_path.exists(),
+            "successful archive must delete the local file"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_archive_log_gives_up_after_exhausting_retries_on_persistent_transient_failure() {
+        // A transient failure that never actually clears (a sustained
+        // outage) must still give up after ARCHIVE_UPLOAD_RETRIES attempts,
+        // leaving the local file in place, rather than retrying forever.
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(FailingArchive::new(u32::MAX, true));
+        let log_service =
+            LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive.clone()));
+
+        let log_id = realistic_log_id("test-archive-exhausted-retries");
+        let log_id = log_id.as_str();
+        log_service.log_info(log_id, "building...").await.unwrap();
+        let log_path = log_service.get_log_path(log_id);
+
+        let result = log_service.archive_log(log_id).await;
+
+        assert!(result.is_err());
+        assert_eq!(archive.attempt_count(), 3, "expected exactly 3 attempts");
+        assert!(log_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_archive_log_bounds_concurrent_uploads() {
+        // ARCHIVE_MAX_CONCURRENT_UPLOADS caps how many uploads run at once.
+        // Drive more concurrent archive_log calls than the limit through an
+        // archive backend that tracks its own in-flight count, and assert
+        // the observed peak never exceeds the configured bound.
+        struct ConcurrencyTrackingArchive {
+            in_flight: std::sync::atomic::AtomicUsize,
+            peak: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LogArchiveStorage for ConcurrencyTrackingArchive {
+            async fn upload_log(
+                &self,
+                _key: &str,
+                _data: Vec<u8>,
+            ) -> Result<(), LogArchiveStorageError> {
+                let current = self
+                    .in_flight
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                self.peak
+                    .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn download_log(&self, key: &str) -> Result<Vec<u8>, LogArchiveStorageError> {
+                Err(LogArchiveStorageError::NotFound {
+                    bucket: "test-bucket".to_string(),
+                    key: key.to_string(),
+                })
+            }
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(ConcurrencyTrackingArchive {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let log_service = Arc::new(LogService::with_archive(
+            temp_dir.path().to_path_buf(),
+            Some(archive.clone()),
+        ));
+
+        // Twice ARCHIVE_MAX_CONCURRENT_UPLOADS jobs "finish" at once.
+        let job_count = ARCHIVE_MAX_CONCURRENT_UPLOADS * 2;
+        let mut handles = Vec::with_capacity(job_count);
+        for i in 0..job_count {
+            let log_id = realistic_log_id(&format!("test-archive-concurrency-{i}"));
+            log_service.log_info(&log_id, "building...").await.unwrap();
+            let log_service = log_service.clone();
+            handles.push(tokio::spawn(async move {
+                log_service.archive_log(&log_id).await
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+
+        let peak = archive.peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak <= ARCHIVE_MAX_CONCURRENT_UPLOADS,
+            "observed {peak} concurrent uploads, expected at most {ARCHIVE_MAX_CONCURRENT_UPLOADS}"
+        );
     }
 
     #[tokio::test]

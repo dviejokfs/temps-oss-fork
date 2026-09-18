@@ -21,6 +21,7 @@
 //! directly.
 
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::Config;
@@ -34,6 +35,16 @@ pub enum LogArchiveStorageError {
         bucket: String,
         key: String,
         reason: String,
+        /// Whether retrying this exact upload might succeed. `false` for
+        /// permanent failures (bad credentials, a bucket that doesn't exist,
+        /// malformed configuration) that will fail identically on every
+        /// attempt -- `LogService::archive_log`'s retry loop checks this and
+        /// stops immediately rather than spending its remaining attempts
+        /// (and the delay between them) on an error that cannot resolve
+        /// itself. See CLAUDE.md's "Resilience Patterns" section: retrying
+        /// authentication/not-found failures is explicitly called out as
+        /// something to avoid.
+        retryable: bool,
     },
 
     #[error("Failed to download archived log '{key}' from bucket '{bucket}': {reason}")]
@@ -45,6 +56,50 @@ pub enum LogArchiveStorageError {
 
     #[error("Archived log '{key}' not found in bucket '{bucket}'")]
     NotFound { bucket: String, key: String },
+}
+
+impl LogArchiveStorageError {
+    /// Whether retrying the operation that produced this error stands a
+    /// chance of succeeding. `Upload` carries its own classification (set at
+    /// the point the underlying S3 SDK error is known); every other variant
+    /// is either not part of the upload retry path (`Download`) or
+    /// definitionally permanent (`NotFound`).
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            LogArchiveStorageError::Upload { retryable, .. } => *retryable,
+            LogArchiveStorageError::Download { .. } => false,
+            LogArchiveStorageError::NotFound { .. } => false,
+        }
+    }
+}
+
+/// S3 error codes that indicate a permanent failure -- retrying with the
+/// same credentials/bucket/key will fail identically every time. Anything
+/// not in this list (5xx service errors, throttling, or no error code at
+/// all because the request never reached S3 -- a timeout or connection
+/// failure) is treated as potentially transient and left retryable.
+const PERMANENT_S3_ERROR_CODES: &[&str] = &[
+    "AccessDenied",
+    "AllAccessDisabled",
+    "AuthorizationHeaderMalformed",
+    "ExpiredToken",
+    "InvalidAccessKeyId",
+    "InvalidBucketName",
+    "InvalidToken",
+    "NoSuchBucket",
+    "SignatureDoesNotMatch",
+];
+
+/// Classify an S3 SDK error as retryable or permanent from its error code.
+/// `err.code()` (via [`ProvideErrorMetadata`]) is only populated for
+/// responses S3 actually returned (`SdkError::ServiceError`); construction,
+/// dispatch, timeout and malformed-response failures never reached S3 at
+/// all and are conservatively treated as transient network conditions.
+fn is_retryable_s3_error(err: &impl ProvideErrorMetadata) -> bool {
+    match err.code() {
+        Some(code) => !PERMANENT_S3_ERROR_CODES.contains(&code),
+        None => true,
+    }
 }
 
 /// Pluggable archive backend for finished build/deploy logs.
@@ -136,10 +191,14 @@ impl LogArchiveStorage for S3LogArchive {
             .content_type("application/jsonl")
             .send()
             .await
-            .map_err(|e| LogArchiveStorageError::Upload {
-                bucket: self.bucket.clone(),
-                key: full_key.clone(),
-                reason: e.to_string(),
+            .map_err(|e| {
+                let retryable = is_retryable_s3_error(&e);
+                LogArchiveStorageError::Upload {
+                    bucket: self.bucket.clone(),
+                    key: full_key.clone(),
+                    reason: e.to_string(),
+                    retryable,
+                }
             })?;
 
         debug!(bucket = %self.bucket, key = %full_key, "Archived build/deploy log to S3");
