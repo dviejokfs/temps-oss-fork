@@ -26,7 +26,8 @@ use temps_audit::AuditPlugin;
 use temps_auth::{ApiKeyPlugin, AuthPlugin};
 use temps_backup::BackupPlugin;
 use temps_blob::BlobPlugin;
-use temps_cloud::{CloudPlugin, CloudService};
+use temps_cloud::{CloudPlugin, CloudService, CloudServiceError};
+use temps_cloud_client::EnrollmentKind;
 use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
 use temps_core::plugin::{PluginManager, TempsPlugin};
@@ -817,6 +818,124 @@ fn ensure_existing_initial_admin_is_active(
         });
     }
     Ok(())
+}
+
+/// `TEMPS_CLOUD_ENROLLMENT_CODE` -- bootstrap-time only, never a runtime
+/// setting.
+///
+/// The same sanctioned exception as `TEMPS_ADMIN_EMAIL`/
+/// `TEMPS_ADMIN_PASSWORD_FILE` above (CLAUDE.md: "the only legitimate
+/// exception is bootstrap-time config needed before a database connection
+/// exists"): read exactly once, during first-boot startup, and never
+/// re-read for the life of the process. It carries a short-lived enrollment
+/// code minted for this instance's Temps Cloud tenant (see the Cloud repo's
+/// ADR 0040) so an automated provisioning flow can link a freshly booted
+/// instance to Temps Cloud with no human present to paste the code into the
+/// console -- the same code an operator would otherwise enter under
+/// Settings > Cloud.
+///
+/// Enrollment through this variable is best-effort and must never block or
+/// fail server startup: an invalid, expired, or already-consumed code, or an
+/// unreachable backend, degrades to a warning log and the server continues
+/// starting normally. An instance that is already linked treats the
+/// variable as a silent no-op instead of attempting to re-enroll, so a
+/// leftover value from a previous boot (e.g. a `.env` a provisioning tool
+/// reused) is harmless.
+const TEMPS_CLOUD_ENROLLMENT_CODE_VAR: &str = "TEMPS_CLOUD_ENROLLMENT_CODE";
+
+/// Interprets a raw `std::env::var(TEMPS_CLOUD_ENROLLMENT_CODE_VAR)` result.
+///
+/// Split out (mirroring [`optional_environment_variable_result`] above) so a
+/// test can drive every outcome -- absent, blank, non-unicode, present -- by
+/// passing a synthetic `Result` directly, without mutating the real process
+/// environment, which would race with other tests running in parallel in
+/// this binary.
+fn parse_cloud_enrollment_code_env(result: Result<String, std::env::VarError>) -> Option<String> {
+    match result {
+        Ok(code) if !code.trim().is_empty() => Some(code),
+        Ok(_) | Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn!(
+                "{TEMPS_CLOUD_ENROLLMENT_CODE_VAR} is set but is not valid UTF-8; skipping \
+                 unattended Temps Cloud enrollment. Unset it, or set it to the enrollment \
+                 code text, and restart to retry."
+            );
+            None
+        }
+    }
+}
+
+/// Attempt unattended Temps Cloud enrollment from
+/// [`TEMPS_CLOUD_ENROLLMENT_CODE_VAR`], if it is set.
+///
+/// Called once during first-boot startup, after plugin services (including
+/// `CloudService`) have finished registering and initializing. Never
+/// returns an error: every failure mode here is logged and swallowed so it
+/// cannot block or fail server startup, per the ADR's requirement that this
+/// be best-effort.
+async fn bootstrap_cloud_enrollment_from_env(
+    service_context: &temps_core::plugin::ServiceRegistrationContext,
+) {
+    let Some(code) =
+        parse_cloud_enrollment_code_env(std::env::var(TEMPS_CLOUD_ENROLLMENT_CODE_VAR))
+    else {
+        return;
+    };
+
+    let Some(cloud_service) = service_context.get_service::<CloudService>() else {
+        warn!(
+            "{TEMPS_CLOUD_ENROLLMENT_CODE_VAR} is set but this build has no Cloud plugin \
+             registered; skipping unattended enrollment"
+        );
+        return;
+    };
+
+    let already_linked = cloud_service.link().is_linked();
+    run_cloud_enrollment_bootstrap(already_linked, &code, |code| async move {
+        cloud_service.enroll(&code).await.map(|(_, _, kind)| kind)
+    })
+    .await;
+}
+
+/// The testable core of [`bootstrap_cloud_enrollment_from_env`].
+///
+/// Takes the already-linked check and the enroll operation as parameters
+/// (rather than a concrete `CloudService`) so a unit test can assert
+/// "enroll was never attempted" on an already-linked instance, and can drive
+/// success/failure outcomes, without constructing a real `CloudService` --
+/// which needs a live database connection and managed-backend configuration
+/// this module does not otherwise depend on.
+async fn run_cloud_enrollment_bootstrap<F, Fut>(already_linked: bool, code: &str, enroll: F)
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<EnrollmentKind, CloudServiceError>>,
+{
+    if already_linked {
+        debug!(
+            "{TEMPS_CLOUD_ENROLLMENT_CODE_VAR} is set but this instance is already linked to \
+             Temps Cloud; ignoring it rather than re-enrolling"
+        );
+        return;
+    }
+
+    match enroll(code.to_string()).await {
+        Ok(kind) => {
+            info!(
+                enrollment = kind.as_str(),
+                "Unattended Temps Cloud enrollment via {TEMPS_CLOUD_ENROLLMENT_CODE_VAR} \
+                 succeeded"
+            );
+        }
+        Err(error) => {
+            warn!(
+                %error,
+                "Unattended Temps Cloud enrollment via {TEMPS_CLOUD_ENROLLMENT_CODE_VAR} \
+                 failed; continuing startup without a Cloud link. This is non-fatal -- mint a \
+                 fresh code and restart to retry, or connect from Settings > Cloud once the \
+                 server is up."
+            );
+        }
+    }
 }
 
 fn prompt_for_admin_email() -> anyhow::Result<Option<String>> {
@@ -3021,6 +3140,15 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("UserService not available, skipping user initialization");
     }
 
+    // Unattended Temps Cloud enrollment via TEMPS_CLOUD_ENROLLMENT_CODE (see
+    // the doc comment on `TEMPS_CLOUD_ENROLLMENT_CODE_VAR` above; ADR 0040 in
+    // the Cloud repo). Deliberately not nested inside the `users.is_empty()`
+    // block above: idempotency comes from the already-linked check inside
+    // `bootstrap_cloud_enrollment_from_env`, not from whether this was the
+    // instance's very first boot, so a restart with a leftover env var is
+    // always safe. Best-effort -- logs and continues on any failure.
+    bootstrap_cloud_enrollment_from_env(service_context).await;
+
     // NOTE: The backup scheduler is started by `BackupPlugin` during plugin
     // initialization (see `temps-backup/src/plugin.rs`). Do NOT start it here as
     // well -- spawning a second scheduler loop makes both loops independently
@@ -4146,6 +4274,7 @@ mod health_tests {
 mod initial_admin_tests {
     use super::*;
     use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn configured_initial_admin_is_optional_for_interactive_starts() {
@@ -4343,6 +4472,104 @@ mod initial_admin_tests {
         assert_eq!(
             bootstrap[3].sql, "ROLLBACK",
             "a failed role assignment must roll back the initial user insert"
+        );
+    }
+
+    #[test]
+    fn cloud_enrollment_code_env_is_absent_when_the_variable_is_unset() {
+        assert_eq!(
+            parse_cloud_enrollment_code_env(Err(std::env::VarError::NotPresent)),
+            None
+        );
+    }
+
+    #[test]
+    fn cloud_enrollment_code_env_is_absent_when_blank() {
+        assert_eq!(parse_cloud_enrollment_code_env(Ok("".to_string())), None);
+        assert_eq!(parse_cloud_enrollment_code_env(Ok("   ".to_string())), None);
+    }
+
+    #[test]
+    fn cloud_enrollment_code_env_degrades_to_absent_on_non_unicode_value() {
+        // Must not panic and must not surface as "present" -- the caller
+        // treats this exactly like the variable being unset, after logging a
+        // warning explaining why.
+        assert_eq!(
+            parse_cloud_enrollment_code_env(Err(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from("invalid-value")
+            ))),
+            None
+        );
+    }
+
+    #[test]
+    fn cloud_enrollment_code_env_is_present_when_set() {
+        assert_eq!(
+            parse_cloud_enrollment_code_env(Ok("ABCD-EFGH".to_string())),
+            Some("ABCD-EFGH".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn unattended_cloud_enrollment_succeeds_with_a_valid_code() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_for_closure = called.clone();
+        run_cloud_enrollment_bootstrap(false, "valid-code", move |code| {
+            let called = called_for_closure.clone();
+            async move {
+                called.store(true, Ordering::SeqCst);
+                assert_eq!(code, "valid-code");
+                Ok(EnrollmentKind::First)
+            }
+        })
+        .await;
+
+        assert!(
+            called.load(Ordering::SeqCst),
+            "an unlinked instance must attempt enrollment"
+        );
+    }
+
+    #[tokio::test]
+    async fn unattended_cloud_enrollment_degrades_to_a_warning_on_an_invalid_code() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_for_closure = called.clone();
+        // The important assertion is what does NOT happen: no panic, no
+        // propagated error -- server startup must continue exactly as if the
+        // variable had never been set.
+        run_cloud_enrollment_bootstrap(false, "expired-code", move |_code| {
+            let called = called_for_closure.clone();
+            async move {
+                called.store(true, Ordering::SeqCst);
+                Err(CloudServiceError::InvalidBackend {
+                    reason: "enrollment code expired".to_string(),
+                })
+            }
+        })
+        .await;
+
+        assert!(
+            called.load(Ordering::SeqCst),
+            "enrollment must still be attempted before failing"
+        );
+    }
+
+    #[tokio::test]
+    async fn unattended_cloud_enrollment_is_a_silent_no_op_when_already_linked() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_for_closure = called.clone();
+        run_cloud_enrollment_bootstrap(true, "leftover-code", move |_code| {
+            let called = called_for_closure.clone();
+            async move {
+                called.store(true, Ordering::SeqCst);
+                Ok(EnrollmentKind::First)
+            }
+        })
+        .await;
+
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "an already-linked instance must not attempt re-enrollment at all"
         );
     }
 }
