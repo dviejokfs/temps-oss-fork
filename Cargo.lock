@@ -10949,6 +10949,7 @@ name = "temps-cloud"
 version = "0.1.0-beta.56"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aws-sdk-s3",
  "axum",
  "chrono",

@@ -919,7 +919,8 @@ fn bootstrap_cloud_enrollment_from_env(
 
     Some(tokio::spawn(async move {
         let enroll_service = cloud_service.clone();
-        let provision_service = cloud_service;
+        let provision_service = cloud_service.clone();
+        let console_access_service = cloud_service;
         let link_audit = audit_logger.clone();
         let backup_audit = audit_logger;
         run_cloud_enrollment_bootstrap(
@@ -937,6 +938,32 @@ fn bootstrap_cloud_enrollment_from_env(
                     None => error!(
                         "Unattended Temps Cloud enrollment succeeded but no audit logger is \
                          registered; the CLOUD_LINK_CONNECTED audit record was not written"
+                    ),
+                }
+                // ADR-045 §5: the unattended first-boot bootstrap is the one
+                // enrollment path that defaults console access *on* -- set
+                // it here, once, immediately after the link's own audit row,
+                // and audit the default itself. A failure here is logged
+                // and never turns a successful enrollment into a failure;
+                // console access simply stays off until an operator flips
+                // it from Settings > Temps Cloud.
+                match console_access_service
+                    .enable_console_access_for_unattended_bootstrap()
+                    .await
+                {
+                    Ok(()) => {
+                        if let Some(audit_logger) = &link_audit {
+                            temps_cloud::record_console_access_default_enabled_audit(
+                                audit_logger.as_ref(),
+                                CloudEnrollmentActor::UnattendedBootstrap,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(error) => warn!(
+                        %error,
+                        "Unattended Temps Cloud enrollment succeeded but console access could \
+                         not be enabled by default; enable it from Settings > Temps Cloud"
                     ),
                 }
             },

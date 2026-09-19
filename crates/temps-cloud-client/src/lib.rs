@@ -66,6 +66,11 @@ pub struct CloudFeatureSwitches {
     pub telemetry: bool,
     pub backups: bool,
     pub notifications: bool,
+    /// ADR-045 §5: console access through Temps Cloud's console-proxy
+    /// tunnel. Unlike the other three switches, the unattended first-boot
+    /// bootstrap sets this `true` once at link time — see
+    /// `CloudSettings::console_access_enabled` in `temps-core`.
+    pub console_access: bool,
 }
 
 use std::{
