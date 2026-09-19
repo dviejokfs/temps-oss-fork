@@ -10,7 +10,8 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, Quer
 use serde::Serialize;
 use std::sync::OnceLock;
 use temps_cloud_client::{
-    BackendUrl, CloudError, CloudFeatureSwitches, CloudLink, EnrollmentKind, FirstLinkEnrollment,
+    BackendUrl, CloudError, CloudFeatureSwitches, CloudLink, ConsoleDispatchSlot,
+    ConsoleProxyWorker, EnrollmentKind, FirstLinkEnrollment,
 };
 use temps_cloud_protocol::{
     ManagedBackupCapability, ManagedNotificationAccepted, ManagedNotificationRequest,
@@ -181,6 +182,11 @@ pub struct CloudService {
     backup_credential_rotation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     heartbeat_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     lifecycle_notify_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// ADR-045 §3: the console-proxy connection task and its own stop
+    /// switch. Separate from `cancel` because the worker owns a dedicated
+    /// `watch` channel (`ConsoleProxyWorker::spawn` returns it) rather than
+    /// subscribing to the service-wide one.
+    console_proxy_task: Mutex<Option<(tokio::task::JoinHandle<()>, watch::Sender<bool>)>>,
     /// Lets [`Self::wake_backup_mirror`] pull the next sweep tick forward the
     /// moment a local backup finishes, instead of it waiting behind whatever
     /// backoff `backup_mirror::run` is currently sitting on. See the comment
@@ -242,6 +248,7 @@ impl CloudService {
             backup_credential_rotation_task: Mutex::new(None),
             heartbeat_task: Mutex::new(None),
             lifecycle_notify_task: Mutex::new(None),
+            console_proxy_task: Mutex::new(None),
             backup_mirror_wake: Arc::new(Notify::new()),
             allow_loopback_development,
             configuration_issue: RwLock::new(None),
@@ -262,12 +269,7 @@ impl CloudService {
 
     /// Tracks `cloud.console_access_enabled` for
     /// `ConsoleProxyWorker::spawn`'s `enabled: watch::Receiver<bool>`
-    /// parameter (ADR-045 §1). The wiring point: once
-    /// `crates/temps-cloud-client/src/console_proxy.rs` exists, the console
-    /// connection is started from `CloudPlugin::initialize_plugin_services`
-    /// (or an equivalent lazy-start task) with
-    /// `ConsoleProxyWorker::spawn(link, dispatch_target,
-    /// service.console_access_enabled_rx(), Arc::new(CloudConsoleOidcAdapter::new(service.clone())), cancel)`.
+    /// parameter (ADR-045 §1); see [`Self::start_console_proxy_worker`].
     pub fn console_access_enabled_rx(&self) -> watch::Receiver<bool> {
         self.console_access_tx.subscribe()
     }
@@ -620,6 +622,32 @@ impl CloudService {
             }));
         } else {
             tracing::debug!("Cloud backup lifecycle notifier task is already registered");
+        }
+    }
+
+    /// ADR-045 §3: launch the console-proxy worker that lets Temps Cloud
+    /// reach this instance's console through the outbound tunnel. Safe to
+    /// spawn unconditionally at startup: it does nothing until the link is
+    /// established *and* `cloud.console_access_enabled` is on (both are
+    /// re-checked before every connection attempt), and a mid-connection
+    /// flip to off closes the tunnel. `dispatch` is the slot the host
+    /// process fills with the console router once that router exists.
+    pub fn start_console_proxy_worker(self: &Arc<Self>, dispatch: ConsoleDispatchSlot) {
+        let mut task = self
+            .console_proxy_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if task.is_none() {
+            tracing::info!("Cloud service launching console-proxy worker task");
+            let sink = Arc::new(crate::console_oidc::ConsoleOidcAdapter::new(self.clone()));
+            *task = Some(ConsoleProxyWorker::spawn(
+                self.link.clone(),
+                self.console_access_enabled_rx(),
+                dispatch,
+                sink,
+            ));
+        } else {
+            tracing::debug!("Cloud console-proxy worker task is already registered");
         }
     }
 
@@ -1346,6 +1374,17 @@ impl CloudService {
             .take();
         if let Some(task) = heartbeat_task {
             await_task_shutdown(task, "Cloud heartbeat sender", SHUTDOWN_TASK_TIMEOUT).await;
+        }
+        let console_proxy_task = self
+            .console_proxy_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some((task, stop)) = console_proxy_task {
+            // The worker answers this with `GoingAway` on its open streams so
+            // Cloud can tell browsers to retry (ADR-045 §3).
+            let _ = stop.send(true);
+            await_task_shutdown(task, "Cloud console-proxy worker", SHUTDOWN_TASK_TIMEOUT).await;
         }
     }
 }

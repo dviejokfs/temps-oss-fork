@@ -4293,20 +4293,28 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // slot for the console-proxy dispatcher — the same "shared slot, filled
     // post-construction" shape `RouterHostApi`'s bridge uses just below, and
     // for the same reason: the router does not exist until this point in
-    // startup. Registered as a service so whichever component starts
-    // `ConsoleProxyWorker` (the Cloud plugin, once `cloud.console_access_enabled`
-    // exists) can fetch this exact slot via `get_service`. Starting/stopping
-    // that worker, and everything settings-related, is deliberately out of
-    // scope here — this only ever provides the dispatch target.
-    let console_dispatch_slot = temps_cloud_client::ConsoleDispatchSlot::new();
+    // startup. The Cloud plugin registers the slot (and starts
+    // `ConsoleProxyWorker` reading from it) during service registration;
+    // this fills it. The fallback only exists for builds without that
+    // plugin, so the console still starts — nothing reads the slot then.
+    let console_dispatch_slot = match plugin_manager
+        .service_context()
+        .get_service::<temps_cloud_client::ConsoleDispatchSlot>()
+    {
+        Some(slot) => slot.as_ref().clone(),
+        None => {
+            let slot = temps_cloud_client::ConsoleDispatchSlot::new();
+            plugin_manager
+                .service_context()
+                .register_service(Arc::new(slot.clone()));
+            slot
+        }
+    };
     console_dispatch_slot
         .set(Arc::new(temps_cloud_client::ConsoleRouterHandle::new(
             console_router,
         )))
         .await;
-    plugin_manager
-        .service_context()
-        .register_service(Arc::new(console_dispatch_slot));
 
     let external_plugins_service = plugin_manager
         .service_context()

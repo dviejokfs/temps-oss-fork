@@ -16,7 +16,7 @@ mod lifecycle_notify;
 mod plugin;
 mod service;
 
-pub use console_oidc::{ConsoleOidcAdapter, ConsoleOidcSink};
+pub use console_oidc::ConsoleOidcAdapter;
 pub use handler::{
     cloud_routes, record_backup_outcome_audit, record_console_access_default_enabled_audit,
     record_enrollment_audit, record_link_connected_audit, CloudApiDoc, CloudEnrollmentActor,
