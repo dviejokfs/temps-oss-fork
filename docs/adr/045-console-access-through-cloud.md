@@ -208,10 +208,16 @@ stream when the instance is shutting down (§1).
 
 **Data frames carry no JSON and no base64.** Request-body chunks,
 response-body chunks, and post-upgrade relay bytes are `Message::Binary`
-with a fixed 17-byte header (`frame_kind: u8`, `stream_id: u128`,
-`sequence: u32`) then payload — avoiding the ~33% base64 tax plus
-JSON-string escaping a byte field on an `Envelope` would cost, which
-matters continuously streaming log tails on a 3 vCPU/4 GB box.
+with a fixed 17-byte header then payload: byte 0 packs the format version
+in the high nibble (`1`) and the frame kind in the low nibble
+(`RequestBodyChunk = 0`, `ResponseBodyChunk = 1`, `WsRelay = 2`); bytes
+1–16 are the `stream_id` as a big-endian `u128`. There is no sequence
+number — one WebSocket connection already delivers a stream's frames in
+order — and no length field, because the WebSocket message boundary is the
+length. This avoids the ~33% base64 tax plus JSON-string escaping a byte
+field on an `Envelope` would cost, which matters continuously streaming log
+tails on a 3 vCPU/4 GB box. `temps_cloud_protocol::console_proxy` is the
+normative encoder/decoder.
 
 **Limits (instance-enforced regardless of what Cloud claims):**
 
