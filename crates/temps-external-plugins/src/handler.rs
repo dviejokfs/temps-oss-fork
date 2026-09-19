@@ -670,6 +670,7 @@ pub struct InstallRepositoryRequest {
     pub name: Option<String>,
     pub repository_url: String,
     pub ref_name: Option<String>,
+    pub path: Option<String>,
     #[serde(default)]
     pub grants: Option<crate::grants::PluginGrantConfig>,
 }
@@ -764,6 +765,7 @@ pub struct PluginSourceResponse {
     pub kind: String,
     pub repository_url: String,
     pub ref_name: String,
+    pub path: Option<String>,
     pub commit: String,
     pub version: String,
     pub builder_image: String,
@@ -784,6 +786,7 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
         ExternalPluginsError::Repository(
             crate::repository::RepositoryError::UnsafeUrl
             | crate::repository::RepositoryError::UnsafeRef { .. }
+            | crate::repository::RepositoryError::UnsafePath { .. }
             | crate::repository::RepositoryError::Manifest { .. },
         ) => (StatusCode::BAD_REQUEST, "Invalid Plugin Repository"),
         ExternalPluginsError::Repository(crate::repository::RepositoryError::SourceConflict {
@@ -867,6 +870,9 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ) => {
             "Use a GitHub URL in the form https://github.com/owner/repo and a safe ref".to_string()
         }
+        ExternalPluginsError::Repository(crate::repository::RepositoryError::UnsafePath {
+            ..
+        }) => "Use a relative plugin directory of at most 512 ASCII characters: letters, digits, '.', '_', '-', and '/' only. Segments must not be empty, '.', '..', or '.git'. Omit the path or use an empty string for the repository root.".to_string(),
         ExternalPluginsError::Repository(crate::repository::RepositoryError::Manifest {
             ..
         }) => "Repository must contain a matching package.json and src/index.ts".to_string(),
@@ -1164,6 +1170,14 @@ async fn install_repository(
     )
     .await?;
     let context = audit_context(&auth, &metadata);
+    let requested_source = crate::repository::parse_repository(&request.repository_url)
+        .ok()
+        .and_then(|(owner, repo)| {
+            let canonical = format!("https://github.com/{owner}/{repo}");
+            crate::repository::normalize_path(request.path.as_deref(), &canonical)
+                .ok()
+                .map(|path| crate::manager::repository_actor_source(&canonical, path.as_deref()))
+        });
     record_audit(
         &state,
         &ExternalPluginWriteAudit {
@@ -1174,7 +1188,7 @@ async fn install_repository(
             platform: None,
             sha256: None,
             signer_key_id: None,
-            registry_source: None,
+            registry_source: requested_source.clone(),
             failure: None,
         },
     )
@@ -1185,6 +1199,7 @@ async fn install_repository(
             request.name.as_deref(),
             &request.repository_url,
             request.ref_name.as_deref(),
+            request.path.as_deref(),
         )
         .await;
     let selected = match selected {
@@ -1200,7 +1215,7 @@ async fn install_repository(
                     platform: None,
                     sha256: None,
                     signer_key_id: None,
-                    registry_source: None,
+                    registry_source: requested_source,
                     failure: Some(public_error_detail(&error)),
                 },
             )
@@ -1211,7 +1226,8 @@ async fn install_repository(
     let commit = selected.source_commit().to_string();
     let selected_name = selected.name().to_string();
     let version = selected.version().to_string();
-    let repository = selected.repository().to_string();
+    let repository =
+        crate::manager::repository_actor_source(selected.repository(), selected.path());
     record_required_audit(
         &state,
         &ExternalPluginWriteAudit {
@@ -1319,6 +1335,8 @@ async fn update_repository(
         .ok_or_else(|| {
             service_problem(&ExternalPluginsError::NotInstalled { name: name.clone() })
         })?;
+    let source_identity =
+        crate::manager::repository_actor_source(&previous.repository, previous.path.as_deref());
     let reference = request.ref_name.unwrap_or(previous.ref_name);
     let context = audit_context(&auth, &metadata);
     record_required_audit(
@@ -1331,14 +1349,19 @@ async fn update_repository(
             platform: None,
             sha256: Some(previous.commit),
             signer_key_id: None,
-            registry_source: Some(previous.repository.clone()),
+            registry_source: Some(source_identity.clone()),
             failure: None,
         },
     )
     .await?;
     let selected = state
         .service
-        .select_repository(Some(&name), &previous.repository, Some(&reference))
+        .select_repository(
+            Some(&name),
+            &previous.repository,
+            Some(&reference),
+            previous.path.as_deref(),
+        )
         .await
         .map_err(|error| service_problem(&error))?;
     let selected_commit = selected.source_commit().to_string();
@@ -1352,7 +1375,7 @@ async fn update_repository(
             platform: None,
             sha256: Some(selected_commit.clone()),
             signer_key_id: None,
-            registry_source: Some(previous.repository.clone()),
+            registry_source: Some(source_identity.clone()),
             failure: None,
         },
     )
@@ -1370,7 +1393,7 @@ async fn update_repository(
                     platform: None,
                     sha256: Some(selected_commit),
                     signer_key_id: None,
-                    registry_source: Some(previous.repository),
+                    registry_source: Some(source_identity),
                     failure: Some(public_error_detail(&error)),
                 },
             )
@@ -1388,7 +1411,7 @@ async fn update_repository(
             platform: Some(outcome.platform.clone()),
             sha256: Some(outcome.sha256.clone()),
             signer_key_id: None,
-            registry_source: Some(previous.repository),
+            registry_source: Some(source_identity),
             failure: None,
         },
     )
@@ -1507,6 +1530,7 @@ async fn get_plugin_status(
             kind: "github".to_string(),
             repository_url: receipt.repository,
             ref_name: receipt.ref_name,
+            path: receipt.path,
             commit: receipt.commit,
             version: receipt.version,
             builder_image: receipt.builder,
@@ -2598,6 +2622,34 @@ mod tests {
             .get("detail")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|detail| detail.contains("rotated-without-anchor")));
+    }
+
+    #[test]
+    fn unsafe_repository_path_is_bad_request_with_safe_directory_guidance() {
+        let secret_path = "../../private/token?credential=must-not-leak";
+        let secret_url = "https://user:must-not-leak@github.com/example/plugin";
+        let error =
+            ExternalPluginsError::Repository(crate::repository::RepositoryError::UnsafePath {
+                repository: secret_url.into(),
+                path: secret_path.into(),
+            });
+        let detail = public_error_detail(&error);
+        let problem = service_problem(&error);
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert!(detail.contains("relative plugin directory"));
+        assert!(detail.contains("512 ASCII characters"));
+        assert!(detail.contains("Segments must not be empty"));
+        assert!(detail.contains("repository root"));
+        assert!(!detail.contains(secret_path));
+        assert!(!detail.contains(secret_url));
+        assert!(!detail.contains("must-not-leak"));
+        assert_eq!(
+            problem
+                .body
+                .get("detail")
+                .and_then(serde_json::Value::as_str),
+            Some(detail.as_str())
+        );
     }
 
     #[test]
