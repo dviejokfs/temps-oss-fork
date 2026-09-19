@@ -204,6 +204,12 @@ pub enum ConsoleRefusalReason {
     /// `https://<console_host>` — rejected before the router sees it
     /// (ADR-045 Security Model).
     OriginMismatch,
+    /// A `ConsoleStreamOpen` reused a `stream_id` that already has an open
+    /// stream on this connection. Never overwrites the existing stream's
+    /// table entry — that would desync the two sides' bookkeeping and
+    /// silently lose whatever the original stream was doing — always
+    /// refused outright instead.
+    DuplicateStream,
     /// A reason introduced by a newer peer.
     #[serde(other)]
     Unknown,
@@ -598,6 +604,7 @@ mod tests {
             ConsoleRefusalReason::TooManyStreams,
             ConsoleRefusalReason::Disabled,
             ConsoleRefusalReason::OriginMismatch,
+            ConsoleRefusalReason::DuplicateStream,
         ] {
             let refused = ConsoleStreamRefused {
                 stream_id: uuid(),

@@ -4171,6 +4171,20 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let plugin_api_router =
         Router::new().nest("/api", public_router.clone().merge(admin_router.clone()));
 
+    // ADR-045 §3: a second clone of `admin_router`, shaped exactly like
+    // `admin_app` below (`nest("/api", ..)` + the static-file fallback) but
+    // taken *before* that router is wrapped in the admin IP-allowlist gate —
+    // for the same reason `plugin_api_router` above omits it: authorization
+    // for a console-proxied request comes from Cloud's own auth plus the
+    // browser's session cookie, not from network topology. Installed into
+    // the shared `ConsoleDispatchSlot` near the `RouterHostApi` wiring below,
+    // for `temps-cloud-client::console_proxy::ConsoleProxyWorker` (started
+    // elsewhere, once the `cloud.console_access_enabled` setting exists) to
+    // drive in-process.
+    let console_router = Router::new()
+        .nest("/api", admin_router.clone())
+        .fallback(serve_static_file);
+
     // Build root-level MCP routes (ADR-039). These live outside /api so the
     // CLI wizard's unauthenticated probe (GET /mcp/tools) works without a key.
     // The authenticated sub-router gets the full plugin middleware stack (auth,
@@ -4247,6 +4261,25 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     }
 
     info!("Plugin system initialized successfully with static file serving");
+
+    // ADR-045 §3: install the just-assembled `console_router` into a shared
+    // slot for the console-proxy dispatcher — the same "shared slot, filled
+    // post-construction" shape `RouterHostApi`'s bridge uses just below, and
+    // for the same reason: the router does not exist until this point in
+    // startup. Registered as a service so whichever component starts
+    // `ConsoleProxyWorker` (the Cloud plugin, once `cloud.console_access_enabled`
+    // exists) can fetch this exact slot via `get_service`. Starting/stopping
+    // that worker, and everything settings-related, is deliberately out of
+    // scope here — this only ever provides the dispatch target.
+    let console_dispatch_slot = temps_cloud_client::ConsoleDispatchSlot::new();
+    console_dispatch_slot
+        .set(Arc::new(temps_cloud_client::ConsoleRouterHandle::new(
+            console_router,
+        )))
+        .await;
+    plugin_manager
+        .service_context()
+        .register_service(Arc::new(console_dispatch_slot));
 
     let external_plugins_service = plugin_manager
         .service_context()
