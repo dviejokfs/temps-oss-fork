@@ -671,6 +671,8 @@ pub struct InstallRepositoryRequest {
     pub repository_url: String,
     pub ref_name: Option<String>,
     pub path: Option<String>,
+    #[serde(default, rename = "progressId")]
+    pub progress_id: Option<String>,
     #[serde(default)]
     pub grants: Option<crate::grants::PluginGrantConfig>,
 }
@@ -1130,6 +1132,37 @@ async fn install_plugin(
 
 #[utoipa::path(
     tag = "External Plugins",
+    get,
+    path = "/x/plugins/install/progress/{id}",
+    operation_id = "getRepositoryInstallProgress",
+    params(("id" = String, Path, description = "Client-generated installation UUID")),
+    responses(
+        (status = 200, body = crate::install_progress::ProgressSnapshot),
+        (status = 404, body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_repository_install_progress(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::install_progress::ProgressSnapshot>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    let canonical = uuid::Uuid::parse_str(&id).ok().map(|id| id.to_string());
+    let snapshot = match canonical {
+        Some(id) => state.service.repository_install_progress(&id).await,
+        None => None,
+    }
+    .ok_or_else(|| {
+        temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Install Progress Not Found")
+            .with_detail("No tracked installation exists for this progress ID")
+    })?;
+    Ok(Json(snapshot))
+}
+
+#[utoipa::path(
+    tag = "External Plugins",
     post,
     path = "/x/plugins/install/repository",
     request_body = InstallRepositoryRequest,
@@ -1169,15 +1202,40 @@ async fn install_repository(
         },
     )
     .await?;
+    // The service validates source identity before reserving a progress ID.
+    let preparation = state
+        .service
+        .prepare_repository_install(
+            &request.repository_url,
+            request.path.as_deref(),
+            request.progress_id.as_deref(),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::service::RepositoryInstallPreparationError::InvalidProgressId => {
+                temps_core::problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Install Progress ID")
+                    .with_detail("progressId must be a UUID")
+            }
+            crate::service::RepositoryInstallPreparationError::Repository(error) => {
+                service_problem(&ExternalPluginsError::Repository(error))
+            }
+            crate::service::RepositoryInstallPreparationError::Progress(
+                crate::install_progress::ProgressError::Duplicate { .. },
+            ) => temps_core::problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Install Progress ID In Use")
+                .with_detail("This progressId is already registered"),
+            crate::service::RepositoryInstallPreparationError::Progress(
+                crate::install_progress::ProgressError::Full,
+            ) => temps_core::problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Install Progress Unavailable")
+                .with_detail("Too many installations are being tracked; retry shortly"),
+        })?;
+    let progress = preparation
+        .progress
+        .map(crate::install_progress::ProgressGuard::new);
     let context = audit_context(&auth, &metadata);
-    let requested_source = crate::repository::parse_repository(&request.repository_url)
-        .ok()
-        .and_then(|(owner, repo)| {
-            let canonical = format!("https://github.com/{owner}/{repo}");
-            crate::repository::normalize_path(request.path.as_deref(), &canonical)
-                .ok()
-                .map(|path| crate::manager::repository_actor_source(&canonical, path.as_deref()))
-        });
+    let requested_source = preparation.requested_source;
     record_audit(
         &state,
         &ExternalPluginWriteAudit {
@@ -1195,11 +1253,14 @@ async fn install_repository(
     .await;
     let selected = state
         .service
-        .select_repository(
+        .select_repository_with_progress(
             request.name.as_deref(),
             &request.repository_url,
             request.ref_name.as_deref(),
             request.path.as_deref(),
+            progress
+                .as_ref()
+                .map(crate::install_progress::ProgressGuard::handle),
         )
         .await;
     let selected = match selected {
@@ -1243,7 +1304,16 @@ async fn install_repository(
         },
     )
     .await?;
-    let outcome = match state.service.install_repository(selected).await {
+    let outcome = match state
+        .service
+        .install_repository_with_progress(
+            selected,
+            progress
+                .as_ref()
+                .map(crate::install_progress::ProgressGuard::handle),
+        )
+        .await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             record_audit(
@@ -1287,6 +1357,9 @@ async fn install_repository(
         },
     )
     .await;
+    if let Some(progress) = &progress {
+        progress.finish_success().await;
+    }
     Ok(Json(InstallRepositoryResponse {
         name: outcome.name,
         version: outcome.version,
@@ -1559,6 +1632,10 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             get(get_installation_reporting).put(put_installation_reporting),
         )
         .route("/x/plugins/install/repository", post(install_repository))
+        .route(
+            "/x/plugins/install/progress/{id}",
+            get(get_repository_install_progress),
+        )
         .route("/x/plugins/{name}/update", post(update_repository))
         .route("/x/plugins/{name}/uninstall", post(uninstall_plugin))
         .route("/x/plugins/{name}/status", get(get_plugin_status))
@@ -1578,6 +1655,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         get_installation_reporting,
         put_installation_reporting,
         install_repository,
+        get_repository_install_progress,
         update_repository,
         uninstall_plugin,
         get_plugin_status,
@@ -1603,6 +1681,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             PluginCatalogResponse,
             RepositoryCatalogResponse,
             crate::source_catalog::RepositoryCatalogPlugin,
+            crate::source_catalog::RepositoryCatalogPermission,
             crate::source_catalog::RepositoryScreenshot,
             crate::source_catalog::RepositoryValidation,
             PluginStatusResponse,
@@ -2582,6 +2661,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn repository_progress_id_is_camel_case_and_registered_in_openapi() {
+        let request: InstallRepositoryRequest = serde_json::from_str(r#"{"repository_url":"https://github.com/example/plugin","progressId":"f60d7244-79a3-43db-bcb4-041e1ad6ea31"}"#).expect("progress request");
+        assert_eq!(
+            request.progress_id.as_deref(),
+            Some("f60d7244-79a3-43db-bcb4-041e1ad6ea31")
+        );
+        assert!(serde_json::from_str::<InstallRepositoryRequest>(r#"{"repository_url":"https://github.com/example/plugin","progress_id":"f60d7244-79a3-43db-bcb4-041e1ad6ea31"}"#).is_err());
+        let spec = serde_json::to_value(ExternalPluginsApiDoc::openapi()).expect("OpenAPI");
+        assert!(spec["paths"]["/x/plugins/install/progress/{id}"]["get"].is_object());
+        assert!(spec["paths"]["/x/plugins/install/progress/{id}"]["get"]["security"].is_array());
     }
 
     #[test]
