@@ -38,8 +38,8 @@ pub mod state;
 pub mod status;
 
 pub use link::{
-    CloudFallbackReason, CloudLink, CloudTelemetryFallback, EnrollmentKind, FlushOutcome,
-    OutboxShipOutcome, SubmissionScope, SubmissionScopeBusy,
+    CloudFallbackReason, CloudLink, CloudTelemetryFallback, EnrollmentKind, FirstLinkEnrollment,
+    FlushOutcome, OutboxShipOutcome, SubmissionScope, SubmissionScopeBusy,
 };
 pub use outbox::{
     ClaimedSpan, ClaimedTelemetryRow, DeadLetterSummary, EnqueueOutcome, OutboxStats, SpanOutbox,
