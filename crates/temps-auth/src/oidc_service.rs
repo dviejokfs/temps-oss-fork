@@ -38,13 +38,6 @@ use temps_entities::types::RoleType;
 use temps_entities::users;
 
 const LOGIN_STATE_TTL_MINUTES: i64 = 10;
-/// ADR-045 §Security Model: the Cloud-managed console-access provider's
-/// authorization codes are single-use and expire in 60s on Cloud's side, with
-/// reuse detection. The RP's own `state` TTL is tightened to match rather
-/// than using the generic [`LOGIN_STATE_TTL_MINUTES`], which would leave a
-/// much longer window than the code it is paired with actually lives for —
-/// narrowing the window a compromised Hub has to replay a captured callback.
-const CLOUD_MANAGED_LOGIN_STATE_TTL_SECONDS: i64 = 60;
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(3600);
 /// Hard cap on how long an OIDC discovery or token-exchange round-trip
 /// can take. openidconnect 4.x lets us own the `reqwest::Client`, so
@@ -1933,19 +1926,15 @@ fn evaluate_role(
     parse_sso_role(&provider.default_role).unwrap_or(RoleType::User)
 }
 
-/// ADR-045 §Security Model: the `oidc_login_states.expires_at` window for a
-/// login attempt. The Cloud-managed provider's authorization codes are
-/// single-use and expire in 60s on Cloud's side, so its `state` window is
-/// tightened to match rather than the generic [`LOGIN_STATE_TTL_MINUTES`]
-/// every other provider gets -- narrowing how long a compromised Hub has to
-/// replay a captured callback. A free function so the decision is testable
-/// without a database or network discovery round-trip.
-fn login_state_ttl(managed_by_cloud: bool) -> ChronoDuration {
-    if managed_by_cloud {
-        ChronoDuration::seconds(CLOUD_MANAGED_LOGIN_STATE_TTL_SECONDS)
-    } else {
-        ChronoDuration::minutes(LOGIN_STATE_TTL_MINUTES)
-    }
+/// The `oidc_login_states.expires_at` window for a login attempt. The same
+/// for every provider, the Cloud-managed console-access one included: the
+/// window has to cover the user's *interactive* sign-in at the issuer
+/// (password, a social round trip, MFA), which routinely takes longer than
+/// a minute. Replay of a captured callback is bounded on the issuer's side
+/// -- the managed provider's authorization codes are single-use and expire
+/// in 60s -- not by how long the RP is willing to wait for the user.
+fn login_state_ttl(_managed_by_cloud: bool) -> ChronoDuration {
+    ChronoDuration::minutes(LOGIN_STATE_TTL_MINUTES)
 }
 
 /// ADR-045 §4 role gate, layer 2 (belt-and-suspenders behind Cloud's own
@@ -3032,12 +3021,14 @@ mod tests {
     // against a stub issuer" case in ADR-045's Testing section for the
     // network-level version of this test.
     #[test]
-    fn login_state_ttl_is_60_seconds_for_the_managed_cloud_provider() {
+    fn login_state_ttl_covers_an_interactive_sign_in_for_the_managed_provider_too() {
+        // A user who needs a minute or more to sign in at Cloud must not
+        // come back to an expired `state`; replay is bounded by the
+        // issuer's single-use 60s code, not by this window.
         assert_eq!(
             login_state_ttl(true),
-            ChronoDuration::seconds(CLOUD_MANAGED_LOGIN_STATE_TTL_SECONDS)
+            ChronoDuration::minutes(LOGIN_STATE_TTL_MINUTES)
         );
-        assert_eq!(login_state_ttl(true), ChronoDuration::seconds(60));
     }
 
     #[test]
