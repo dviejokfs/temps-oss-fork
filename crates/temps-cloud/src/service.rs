@@ -1090,17 +1090,16 @@ impl CloudService {
         // ADR-045 §4: revoke the managed console-access OIDC provider (and
         // its sessions) before the credential itself, the same ordering
         // `remove_managed_backup_source` already follows below.
-        let console_oidc_revoked = match self.revoke_console_oidc_provider().await {
-            Ok(revoked) => revoked,
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    "could not revoke the managed console-access OIDC provider while \
-                     disconnecting from Temps Cloud; continuing with disconnect"
-                );
-                false
-            }
-        };
+        //
+        // SECURITY: a failure here is fatal to the disconnect, like the
+        // schedule release above. Swallowing it would report a successful
+        // disconnect while the enabled provider and every session it issued
+        // stayed live — Cloud identities keeping console access on an
+        // instance the operator believes they just cut loose, with no audit
+        // row recording a revocation and nothing to retry. Leaving the link
+        // intact instead means the operator sees the error and can retry the
+        // disconnect once the database is reachable again.
+        let console_oidc_revoked = self.revoke_console_oidc_provider().await?;
         match self.link.revoke().await {
             Ok(()) | Err(CloudError::CredentialRejected) => {}
             Err(error) => return Err(CloudServiceError::Client(error)),
@@ -1720,5 +1719,94 @@ mod tests {
                 panic!("expected a bucket-changed outcome")
             }
         }
+    }
+
+    /// A [`CloudService`] whose link is already enrolled, so `disconnect`
+    /// runs its full release sequence instead of returning `NotEnrolled`.
+    /// Returns the `TempDir` too: dropping it removes the state file the link
+    /// reads and writes.
+    fn linked_cloud_service(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> (tempfile::TempDir, CloudService) {
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let state_dir = temp.path().join("cloud-link");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::json!({
+                "instance_id": uuid::Uuid::new_v4(),
+                "base_url": "http://127.0.0.1:9/",
+                "allow_loopback_development": true,
+                "token": "test-link-token",
+                "tenant_id": serde_json::Value::Null,
+                "account_email": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("state file");
+
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ));
+        let config = Arc::new(ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgresql://test".to_string(),
+                    None,
+                    Some("127.0.0.1:8000".to_string()),
+                )
+                .expect("ServerConfig::new"),
+            ),
+            db.clone(),
+        ));
+        let encryption = Arc::new(EncryptionService::new_from_password("cloud-service-test"));
+        (temp, CloudService::new(link, config, db, encryption, true))
+    }
+
+    /// SECURITY: disconnecting must not report success while the managed
+    /// console-access provider — and every session it issued — is still
+    /// live. If revocation fails, the link stays intact so the operator sees
+    /// the failure and can retry, rather than being told the instance is
+    /// disconnected while Cloud identities keep console access.
+    #[tokio::test]
+    async fn disconnect_fails_when_the_managed_console_provider_cannot_be_revoked() {
+        // The service's own DB: one lookup for the managed backup source,
+        // which finds nothing, so schedule release is a no-op.
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::s3_sources::Model>::new()])
+                .into_connection(),
+        );
+        let (_temp, service) = linked_cloud_service(db);
+
+        // The auth DB fails the moment revocation touches it.
+        let oidc_db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors(vec![sea_orm::DbErr::Custom(
+                    "connection reset while revoking the managed provider".to_string(),
+                )])
+                .into_connection(),
+        );
+        let oidc = Arc::new(temps_auth::oidc_service::OidcService::new(
+            oidc_db.clone(),
+            Arc::new(EncryptionService::new_from_password("oidc-revocation-test")),
+            Arc::new(temps_auth::UserService::new(oidc_db)),
+        ));
+        service.set_oidc_service(oidc);
+
+        let error = service
+            .disconnect()
+            .await
+            .expect_err("a failed console-provider revocation must fail the disconnect");
+        assert!(
+            matches!(error, CloudServiceError::ConsoleOidcProvisioning(_)),
+            "expected the revocation failure to surface, got {error}"
+        );
+        assert!(
+            service.link.is_linked(),
+            "the link must stay intact so the operator can retry the disconnect"
+        );
     }
 }
